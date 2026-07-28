@@ -11,6 +11,7 @@ import type {
 	NodeExecutionResult,
 	NodeRuntimeState,
 	ResultManifest,
+	SubagentAcceptanceInput,
 } from "./types.ts";
 import { GRAPH_RESULT_VERSION } from "./types.ts";
 import { GraphStore } from "./store.ts";
@@ -46,6 +47,45 @@ function modelOverride(node: CompiledNode): string | undefined {
 	return node.thinking ? `${node.model}:${node.thinking}` : node.model;
 }
 
+const DEFAULT_CHILD_ACCEPTANCE = {
+	level: "none",
+	reason: "Acceptance is enforced by the pi-graph supervisor.",
+} as const satisfies SubagentAcceptanceInput;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertValidChildAcceptance(value: unknown): asserts value is SubagentAcceptanceInput {
+	if (value === false) return;
+	if (typeof value === "string") {
+		if (["auto", "attested", "checked", "verified"].includes(value)) return;
+		throw new Error("childAcceptance must be false, a supported bare level, or an acceptance config object.");
+	}
+	if (!isRecord(value)) throw new Error("childAcceptance must be false, a supported bare level, or an acceptance config object.");
+	if (value.level !== undefined && (typeof value.level !== "string" || !["auto", "none", "attested", "checked", "verified"].includes(value.level))) {
+		throw new Error("childAcceptance.level is unsupported.");
+	}
+	if (value.criteria === undefined) return;
+	if (!Array.isArray(value.criteria)) throw new Error("childAcceptance.criteria must be an array.");
+	for (const [index, criterion] of value.criteria.entries()) {
+		if (typeof criterion === "string") {
+			if (criterion.trim()) continue;
+			throw new Error(`childAcceptance.criteria[${index}] must be a non-empty string or criterion object.`);
+		}
+		if (!isRecord(criterion)) throw new Error(`childAcceptance.criteria[${index}] must be a non-empty string or criterion object.`);
+		if (typeof criterion.id !== "string" || !criterion.id.trim()) throw new Error(`childAcceptance.criteria[${index}].id must be a non-empty string.`);
+		if (typeof criterion.must !== "string" || !criterion.must.trim()) throw new Error(`childAcceptance.criteria[${index}].must must be a non-empty string.`);
+	}
+}
+
+/** Select child-layer acceptance without consulting Graph supervisor acceptance. */
+export function childAcceptanceFor(node: { acceptance?: unknown; childAcceptance?: unknown }): SubagentAcceptanceInput {
+	if (node.childAcceptance === undefined) return { ...DEFAULT_CHILD_ACCEPTANCE };
+	assertValidChildAcceptance(node.childAcceptance);
+	return node.childAcceptance;
+}
+
 function within(root: string, target: string): boolean {
 	const rel = relative(root, target);
 	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
@@ -74,7 +114,29 @@ async function assertSafeAttemptOutputTarget(path: string, attemptDir: string, a
 	if (info.isSymbolicLink() || !info.isFile()) throw new Error("Subagent output artifact must be a regular file, not a symlink or directory.");
 }
 
-function taskPrompt(graph: CompiledGraph, node: CompiledNode, workspace: PreparedWorkspace, lineage?: ChildLineage): string {
+function graphAcceptancePrompt(node: CompiledNode): string[] {
+	const acceptance = node.acceptance;
+	if (acceptance === undefined || acceptance === false) return [];
+	const heading = "Acceptance criteria (enforced by Graph supervisor):";
+	if (typeof acceptance === "string") return [heading, acceptance];
+	if (acceptance === true) {
+		const commands = node.validationCommands ?? [];
+		return [
+			heading,
+			"Acceptance is determined by the node's validationCommands.",
+			...(commands.length > 0 ? commands.map((command) => `- ${command}`) : ["- No validationCommands are configured."]),
+		];
+	}
+	if (!isRecord(acceptance) || !Array.isArray(acceptance.criteria)) return [];
+	const criteria = acceptance.criteria.flatMap((criterion) => {
+		if (typeof criterion === "string" && criterion.trim()) return [`- ${criterion}`];
+		if (!isRecord(criterion) || typeof criterion.must !== "string" || !criterion.must.trim()) return [];
+		return [`- ${typeof criterion.id === "string" && criterion.id ? `[${criterion.id}] ` : ""}${criterion.must}`];
+	});
+	return criteria.length > 0 ? [heading, ...criteria] : [];
+}
+
+export function taskPrompt(graph: CompiledGraph, node: CompiledNode, workspace: PreparedWorkspace, lineage?: ChildLineage): string {
 	const inputs = Object.entries(workspace.artifactPaths).map(([name, path]) => `- ${name}: ${path}`);
 	return [
 		`[pi-graph node ${graph.graphId}/${node.taskId}]`,
@@ -84,6 +146,7 @@ function taskPrompt(graph: CompiledGraph, node: CompiledNode, workspace: Prepare
 		"If .pi-graph/recovery-handoff.md exists, read it before working. It contains bounded evidence from the prior attempt; this workspace is still a fresh isolated copy.",
 		`Declared side effect: ${node.sideEffect}`,
 		inputs.length ? `Input artifacts:\n${inputs.join("\n")}` : "Input artifacts: none",
+		...graphAcceptancePrompt(node),
 		"Complete only this node. Report evidence, changed files, validation performed, and unresolved blockers.",
 		"",
 		node.task,
@@ -170,7 +233,7 @@ export class NodeExecutor {
 			...(modelOverride(node) ? { model: modelOverride(node) } : {}),
 			...(node.progress !== undefined ? { progress: node.progress } : {}),
 			...(node.toolBudget ? { toolBudget: node.toolBudget } : {}),
-			...(node.acceptance !== undefined ? { acceptance: node.acceptance } : {}),
+			acceptance: childAcceptanceFor(node),
 		};
 	}
 
@@ -723,6 +786,7 @@ export class NodeExecutor {
 			attempt: attempt.attempt,
 			status,
 			context: node.context ?? this.graph.context,
+			...(node.acceptance !== undefined ? { acceptance: node.acceptance } : {}),
 			inputs: await Promise.all(Object.entries(workspace.artifactPaths).map(async ([path, source]) => ({ path, digest: await digestFile(source) }))),
 			reads: workspace.contract.readScope.map((entry) => entry.path),
 			writes,

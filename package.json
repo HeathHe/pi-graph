@@ -27,7 +27,7 @@
   },
 	"dependencies": {
 		"jiti": "2.7.0",
-		"pi-subagents": "0.35.1"
+		"pi-subagents": "0.37.2"
 	},
 	"overrides": {
 		"protobufjs": "7.6.5"

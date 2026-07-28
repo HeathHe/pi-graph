@@ -42,6 +42,62 @@ export interface RetryPolicy {
 	retryOn?: Array<"dispatch" | "timeout" | "failed" | "validation">;
 }
 
+export interface GraphAcceptanceGate {
+	id?: string;
+	must: string;
+}
+
+export interface GraphAcceptanceCriteria {
+	criteria: Array<string | GraphAcceptanceGate>;
+}
+
+export type SubagentAcceptanceLevel = "auto" | "none" | "attested" | "checked" | "verified";
+export type SubagentAcceptanceEvidenceKind =
+	| "changed-files"
+	| "tests-added"
+	| "commands-run"
+	| "validation-output"
+	| "residual-risks"
+	| "no-staged-files"
+	| "diff-summary"
+	| "review-findings"
+	| "manual-notes";
+
+export interface SubagentAcceptanceGate {
+	id: string;
+	must: string;
+	evidence?: SubagentAcceptanceEvidenceKind[];
+	severity?: "required" | "recommended";
+}
+
+export interface SubagentAcceptanceVerifyCommand {
+	id: string;
+	command: string;
+	timeoutMs?: number;
+	cwd?: string;
+	env?: Record<string, string>;
+	allowFailure?: boolean;
+}
+
+export interface SubagentAcceptanceReviewGate {
+	agent?: string;
+	focus?: string;
+	required?: boolean;
+}
+
+export interface SubagentAcceptanceConfig {
+	level?: SubagentAcceptanceLevel;
+	criteria?: Array<string | SubagentAcceptanceGate>;
+	evidence?: SubagentAcceptanceEvidenceKind[];
+	verify?: SubagentAcceptanceVerifyCommand[];
+	review?: SubagentAcceptanceReviewGate | false;
+	stopRules?: string[];
+	reason?: string;
+}
+
+/** Mirrors the public pi-subagents AcceptanceInput contract without importing package internals. */
+export type SubagentAcceptanceInput = Exclude<SubagentAcceptanceLevel, "none"> | false | SubagentAcceptanceConfig;
+
 export interface GraphNodeSpec {
 	taskId: string;
 	agent: string;
@@ -57,7 +113,8 @@ export interface GraphNodeSpec {
 	parallelizable?: boolean;
 	atomic?: boolean;
 	scopeJustification?: string;
-	acceptance?: string | boolean | Record<string, unknown>;
+	acceptance?: string | boolean | GraphAcceptanceCriteria;
+	childAcceptance?: SubagentAcceptanceInput;
 	validationCommands?: string[];
 	retryPolicy?: RetryPolicy;
 	model?: string;
@@ -129,6 +186,7 @@ export interface ResultManifest {
 	attempt: number;
 	status: "complete" | "partial" | "blocked" | "stale";
 	context?: ContextRef;
+	acceptance?: GraphNodeSpec["acceptance"];
 	inputs: Array<{ path: string; digest?: string }>;
 	reads: string[];
 	writes: FileDigest[];

@@ -1,7 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
-import type { CompiledGraph, CompiledNode, GraphSpec, ScopeEntry } from "./types.ts";
+import type {
+	CompiledGraph,
+	CompiledNode,
+	GraphAcceptanceCriteria,
+	GraphNodeSpec,
+	GraphSpec,
+	ScopeEntry,
+	SubagentAcceptanceConfig,
+	SubagentAcceptanceInput,
+} from "./types.ts";
 
 export class GraphCompileError extends Error {
 	constructor(message: string) {
@@ -17,6 +26,66 @@ export function validateGraphId(value: string): string {
 
 function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new GraphCompileError(message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeGraphCriteria(value: unknown, label: string): GraphAcceptanceCriteria {
+	assert(isRecord(value), `${label} must be an object with a criteria array.`);
+	assert(Object.keys(value).every((key) => key === "criteria"), `${label} contains unsupported fields.`);
+	assert(Array.isArray(value.criteria) && value.criteria.length > 0, `${label}.criteria must be a non-empty array.`);
+	const criteria = value.criteria.map((criterion, index) => {
+		if (typeof criterion === "string") {
+			assert(Boolean(criterion.trim()), `${label}.criteria[${index}] must be a non-empty string or criterion object.`);
+			return criterion.trim();
+		}
+		assert(isRecord(criterion), `${label}.criteria[${index}] must be a non-empty string or criterion object.`);
+		assert(Object.keys(criterion).every((key) => key === "id" || key === "must"), `${label}.criteria[${index}] contains unsupported fields.`);
+		assert(typeof criterion.must === "string" && Boolean(criterion.must.trim()), `${label}.criteria[${index}].must must be a non-empty string.`);
+		assert(criterion.id === undefined || (typeof criterion.id === "string" && Boolean(criterion.id.trim())), `${label}.criteria[${index}].id must be a non-empty string.`);
+		return {
+			...(criterion.id !== undefined ? { id: criterion.id.trim() } : {}),
+			must: criterion.must.trim(),
+		};
+	});
+	return { criteria };
+}
+
+function normalizeGraphAcceptance(value: unknown, label: string): GraphNodeSpec["acceptance"] {
+	if (value === undefined || typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		assert(Boolean(value.trim()), `${label} must be a non-empty string.`);
+		return value.trim();
+	}
+	return normalizeGraphCriteria(value, label);
+}
+
+const CHILD_ACCEPTANCE_LEVELS = ["auto", "none", "attested", "checked", "verified"] as const;
+const CHILD_ACCEPTANCE_BARE_LEVELS = ["auto", "attested", "checked", "verified"] as const;
+
+function normalizeChildAcceptance(value: unknown, label: string): SubagentAcceptanceInput | undefined {
+	if (value === undefined || value === false) return value;
+	if (typeof value === "string") {
+		assert((CHILD_ACCEPTANCE_BARE_LEVELS as readonly string[]).includes(value), `${label} must be false, a supported bare level, or an acceptance config object.`);
+		return value as Exclude<SubagentAcceptanceInput, false | SubagentAcceptanceConfig>;
+	}
+	assert(isRecord(value), `${label} must be false, a supported bare level, or an acceptance config object.`);
+	assert(value.level === undefined || (typeof value.level === "string" && (CHILD_ACCEPTANCE_LEVELS as readonly string[]).includes(value.level)), `${label}.level is unsupported.`);
+	if (value.criteria === undefined) return value as SubagentAcceptanceConfig;
+	assert(Array.isArray(value.criteria), `${label}.criteria must be an array.`);
+	const criteria = value.criteria.map((criterion, index) => {
+		if (typeof criterion === "string") {
+			assert(Boolean(criterion.trim()), `${label}.criteria[${index}] must be a non-empty string or criterion object.`);
+			return criterion.trim();
+		}
+		assert(isRecord(criterion), `${label}.criteria[${index}] must be a non-empty string or criterion object.`);
+		assert(typeof criterion.id === "string" && Boolean(criterion.id.trim()), `${label}.criteria[${index}].id must be a non-empty string.`);
+		assert(typeof criterion.must === "string" && Boolean(criterion.must.trim()), `${label}.criteria[${index}].must must be a non-empty string.`);
+		return { ...criterion, id: criterion.id.trim(), must: criterion.must.trim() };
+	});
+	return { ...value, criteria } as SubagentAcceptanceConfig;
 }
 
 function canonicalPath(input: string, cwd: string): string {
@@ -107,11 +176,13 @@ export function compileGraph(spec: GraphSpec, sourceCwd: string, maxSpawnBudget 
 		ids.add(node.taskId);
 		assert(typeof node.agent === "string" && node.agent.trim(), `${node.taskId}: agent is required.`);
 		assert(typeof node.task === "string" && node.task.trim(), `${node.taskId}: task is required.`);
+		const acceptance = normalizeGraphAcceptance(node.acceptance, `${node.taskId}: acceptance`);
+		const childAcceptance = normalizeChildAcceptance(node.childAcceptance, `${node.taskId}: childAcceptance`);
 		if (spec.contractPolicy === "strict") {
 			assert(typeof node.capabilityId === "string" && Boolean(node.capabilityId.trim()), `${node.taskId}: strict contract policy requires capabilityId.`);
-			const observableAcceptance = (typeof node.acceptance === "string" && Boolean(node.acceptance.trim()))
-				|| (Boolean(node.acceptance) && typeof node.acceptance === "object" && !Array.isArray(node.acceptance) && Object.keys(node.acceptance).length > 0)
-				|| (node.acceptance === true && (node.validationCommands?.length ?? 0) > 0);
+			const observableAcceptance = typeof acceptance === "string"
+				|| (Boolean(acceptance) && typeof acceptance === "object")
+				|| (acceptance === true && (node.validationCommands?.length ?? 0) > 0);
 			assert(observableAcceptance, `${node.taskId}: strict contract policy requires observable acceptance.`);
 		}
 		assert(node.model === undefined || (typeof node.model === "string" && node.model.trim()), `${node.taskId}: model must be a non-empty string.`);
@@ -141,7 +212,6 @@ export function compileGraph(spec: GraphSpec, sourceCwd: string, maxSpawnBudget 
 		for (const inputArtifact of inputArtifacts) assert(inputArtifact !== "." && !isAbsolute(inputArtifact) && !relative(".", inputArtifact).startsWith(".."), `${node.taskId}: inputArtifact must stay inside the graph artifact directory: ${inputArtifact}`);
 		assert(new Set(inputArtifacts).size === inputArtifacts.length, `${node.taskId}: duplicate inputArtifacts are not allowed.`);
 			assert(node.validationCommands === undefined || (Array.isArray(node.validationCommands) && node.validationCommands.every((command) => typeof command === "string" && command.trim())), `${node.taskId}: validationCommands must be an array of non-empty strings.`);
-			assert(node.acceptance === undefined || typeof node.acceptance === "string" || typeof node.acceptance === "boolean" || (Boolean(node.acceptance) && typeof node.acceptance === "object" && !Array.isArray(node.acceptance)), `${node.taskId}: acceptance must be a string, boolean, or object.`);
 		assert(["none", "local_read", "local_write", "external_read", "external_write"].includes(node.sideEffect), `${node.taskId}: invalid sideEffect.`);
 		const cwd = canonicalPath(node.cwd ?? rootCwd, rootCwd);
 		assert(within(rootCwd, cwd), `${node.taskId}: cwd must stay within graph source cwd.`);
@@ -186,6 +256,8 @@ export function compileGraph(spec: GraphSpec, sourceCwd: string, maxSpawnBudget 
 		}
 		return {
 			...node,
+			...(acceptance !== undefined ? { acceptance } : {}),
+			...(childAcceptance !== undefined ? { childAcceptance } : {}),
 			outputArtifact,
 			inputArtifacts,
 			cwd,

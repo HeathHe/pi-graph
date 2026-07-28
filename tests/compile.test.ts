@@ -46,6 +46,43 @@ test("compiler rejects artifact prefix conflicts and malformed runtime values", 
 	assert.throws(() => compileGraph({ schemaVersion: 1, goal: "acceptance", nodes: [node("a", { acceptance: [] })] } as unknown as GraphSpec, cwd), /acceptance/);
 });
 
+test("compiler normalizes Graph and child acceptance inputs", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-compile-"));
+	const graph = compileGraph({
+		schemaVersion: 1,
+		goal: "acceptance",
+		nodes: [node("a", {
+			acceptance: { criteria: ["  Cite sources.  ", { id: " proof ", must: " Show validation output. " }] },
+			childAcceptance: { level: "checked", criteria: ["  Child report is complete.  ", { id: "child-proof", must: " Include evidence. " }] },
+		})],
+	} as GraphSpec, cwd);
+	assert.deepEqual(graph.nodes[0]?.acceptance, {
+		criteria: ["Cite sources.", { id: "proof", must: "Show validation output." }],
+	});
+	assert.deepEqual(graph.nodes[0]?.childAcceptance, {
+		level: "checked",
+		criteria: ["Child report is complete.", { id: "child-proof", must: "Include evidence." }],
+	});
+});
+
+test("compiler rejects malformed Graph and child acceptance inputs", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-compile-"));
+	for (const acceptance of ["   ", null, [], {}, { criteria: [] }, { criteria: [""] }, { criteria: [{ id: "only-id" }] }, { level: "verified" }]) {
+		assert.throws(
+			() => compileGraph({ schemaVersion: 1, goal: "bad acceptance", nodes: [node("a", { acceptance })] } as unknown as GraphSpec, cwd),
+			/acceptance/,
+		);
+	}
+	assert.throws(
+		() => compileGraph({ schemaVersion: 1, goal: "bad child level", nodes: [node("a", { childAcceptance: { level: "unknown" } })] } as unknown as GraphSpec, cwd),
+		/childAcceptance\.level is unsupported/,
+	);
+	assert.throws(
+		() => compileGraph({ schemaVersion: 1, goal: "bad child criteria", nodes: [node("a", { childAcceptance: { criteria: [{ must: "Missing id" }] } })] } as unknown as GraphSpec, cwd),
+		/childAcceptance\.criteria\[0\]\.id/,
+	);
+});
+
 test("compiler verifies existing scope kinds", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-compile-"));
 	await mkdir(join(cwd, "directory"));
@@ -101,7 +138,7 @@ test("strict contract policy gates capability and acceptance without breaking le
 		contractPolicy: "strict",
 		goal: "strict empty",
 		nodes: [node("a", { capabilityId: "read.research", acceptance: {} })],
-	} as GraphSpec, cwd), /requires observable acceptance/);
+	} as unknown as GraphSpec, cwd), /acceptance\.criteria/);
 	assert.doesNotThrow(() => compileGraph({
 		schemaVersion: 1,
 		contractPolicy: "strict",
