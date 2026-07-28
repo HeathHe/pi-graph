@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { registerBackgroundWorkProvider } from "pi-subagents/background-work";
 import { GraphManager, graphSummary } from "../src/manager.ts";
 import { doctorGraphRuns, formatDoctorReport } from "../src/doctor.ts";
+import { recommendGraphConfig, formatRecommendReport } from "../src/recommend.ts";
 import { loadGraphConfig } from "../src/config.ts";
 import {
 	compactRun,
@@ -23,7 +24,7 @@ import {
 import type { GraphSpec } from "../src/types.ts";
 
 const Parameters = Type.Object({
-	action: Type.Optional(Type.String({ enum: ["start", "status", "list", "stop", "resume", "doctor"], description: "Operation. Omit for start." })),
+	action: Type.Optional(Type.String({ enum: ["start", "status", "list", "stop", "resume", "doctor", "recommend"], description: "Operation. Omit for start." })),
 	id: Type.Optional(Type.String({ description: "Graph id for status, stop, or resume." })),
 	spec: Type.Optional(Type.Unsafe({
 		type: "object",
@@ -48,14 +49,18 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("graphs", {
 		description: "Inspect, maintain, restore, or remove pi-graph runs",
 		getArgumentCompletions: (prefix) => {
-			const commands = ["doctor", "list", "storage", "maintain", "pin", "unpin", "archive", "unarchive", "acknowledge", "compact", "delete", "trash", "restore", "purge", "discard-trash", "discard-staging", "discard-control"];
+			const commands = ["doctor", "recommend", "list", "storage", "maintain", "pin", "unpin", "archive", "unarchive", "acknowledge", "compact", "delete", "trash", "restore", "purge", "discard-trash", "discard-staging", "discard-control"];
 			const matches = commands.filter((command) => command.startsWith(prefix.trim()));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
 			handler: async (args, ctx) => {
-				const config = await loadGraphConfig();
 				const [command = "doctor", ...argumentParts] = args.trim().split(/\s+/);
 				const id = argumentParts.join(" ") || undefined;
+			if (command === "recommend") {
+				ctx.ui.notify(formatRecommendReport(await recommendGraphConfig()), "info");
+				return;
+			}
+			const config = await loadGraphConfig();
 			if (command === "doctor") {
 				ctx.ui.notify(formatDoctorReport(await doctorGraphRuns(config.runsDir, config.maxSpawnBudget)), "info");
 				return;
@@ -94,7 +99,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (!id) {
-				ctx.ui.notify(`Usage: /graphs ${command} <graph-or-trash-id>`, "warning");
+				ctx.ui.notify(`Usage: /graphs recommend or /graphs ${command} <graph-or-trash-id>`, "warning");
 				return;
 			}
 			if (["pin", "unpin", "archive", "unarchive"].includes(command)) {
@@ -150,7 +155,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Discarded ${await discardControlQuarantine(config.runsDir, id)}.`, "warning");
 					return;
 				}
-				ctx.ui.notify("Usage: /graphs doctor|list|storage|maintain|pin|unpin|archive|unarchive|acknowledge|compact|delete|trash|restore|purge|discard-trash|discard-staging|discard-control", "warning");
+				ctx.ui.notify("Usage: /graphs doctor|recommend|list|storage|maintain|pin|unpin|archive|unarchive|acknowledge|compact|delete|trash|restore|purge|discard-trash|discard-staging|discard-control", "warning");
 		},
 	});
 	pi.registerTool({
@@ -181,6 +186,10 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					const config = await loadGraphConfig();
 					const report = await doctorGraphRuns(config.runsDir, config.maxSpawnBudget);
 					return result(formatDoctorReport(report), report);
+				}
+				if (action === "recommend") {
+					const report = await recommendGraphConfig();
+					return result(formatRecommendReport(report), report);
 				}
 				if (!params.id) return result(`graph ${action} requires id.`, undefined, true);
 				if (action === "status") {

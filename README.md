@@ -4,13 +4,50 @@ Durable DAG execution for Pi. `pi-graph` compiles a supplied GraphSpec, launches
 
 It deliberately does not decide whether a Graph is needed, decompose the user's goal, select models, search context, or replace `pi-subagents`/`pi-convergence`.
 
+## Recommended configuration
+
+`pi-graph` requires the exact `pi-subagents` version declared by this package (`0.37.2`). Paste this `graph` block into the user-local `settings.json` to use the current defaults:
+
+```json
+{
+  "graph": {
+    "enabled": true,
+    "maxConcurrency": 3,
+    "readOnlyBurst": 3,
+    "maxSpawnBudget": 20,
+    "rpcTimeoutMs": 10000,
+    "validationTimeoutMs": 300000,
+    "notifyOnComplete": true,
+    "runtimeV2Dispatch": true,
+    "resourceLimits": {},
+    "history": {
+      "autoCompact": true,
+      "compactAfterDays": 7,
+      "autoPrune": false,
+      "emergencyPurge": false,
+      "pruneAfterDays": 180,
+      "trashGraceDays": 7,
+      "maxStorageGB": 5,
+      "targetStorageGB": 4,
+      "keepRecentTerminal": 50
+    }
+  }
+}
+```
+
+These values parse to the same effective configuration as `parseGraphConfig({})`. `runsDir` is intentionally omitted so the parser uses the current Pi agent directory's `graph-runs` subdirectory instead of baking a machine-specific path into shared configuration; the GiB settings normalize to the parser's byte values.
+
+Run `/graphs recommend` to compare the declared and installed `pi-subagents` versions, validate the current `settings.graph`, and print the effective recommended block. The equivalent tool action is `graph { action: "recommend" }`. This is configuration inspection only and does not recommend models.
+
+API keys belong only in the user's local `auth.json` or environment variables. Documentation and examples must never contain real keys, and the recommended configuration intentionally contains no `provider` or `model` fields.
+
 ## Runtime contract
 
 - GraphSpec remains schema v1. New runs use Runtime V2; existing Runtime V1 runs remain readable and recoverable without in-place migration.
 - V2 treats `authorization.json`, per-attempt authority records, validated results, and acceptance records as durable evidence. `snapshot.json` is a recoverable projection, while `events.jsonl` is observability only.
 - Atomic state writes fsync the file and parent directory. External fencing claims prevent two Pi sessions from supervising the same graph, including while a run directory is moved. New claims and source reservations bind both the PID and its process-start identity so PID reuse does not preserve abandoned ownership.
 - Every V2 attempt has a stable nonce, persistent source reservation, deterministic child request identity, dispatch ledger, and lineage. Source reservation acquire, release, and active-record garbage collection share a cross-process transaction gate; completed records move atomically into `.history`, whose retention scan runs outside that gate because history is immutable and no longer grants ownership. Once dispatch may have escaped, the same attempt is looked up or protected; it is never blindly emitted again.
-- Default graph concurrency is 2; eligible read-only nodes may burst to 3.
+- A GraphSpec that omits `maxConcurrency` uses a per-graph base concurrency of 2. The user-level `settings.graph.maxConcurrency` execution cap defaults to 3; with the default `readOnlyBurst` of 3, eligible read-only nodes may use the third slot.
 - Unordered overlapping writers are rejected at compile time. Runtime V2 also rejects `external_write`.
 - Clean Git repositories use detached worktrees. Other work uses declared-scope shadow workspaces.
 - Every attempt writes to an attempt-private output path. Only a validated, accepted attempt is atomically published under `artifacts/`.
@@ -85,6 +122,7 @@ State lives under `~/.pi/agent/graph-runs/<graphId>/`.
 - `graph { action: "status", id }`: inspect persisted state.
 - `graph { action: "list" }`: list graph runs.
 - `graph { action: "doctor" }`: validate V1 state or the complete V2 evidence chain without writing or repairing anything. Run and Graph-lock inspection use bounded concurrency, while report ordering remains deterministic. Live transaction claims are treated as normal activity; stale or malformed claims and active source-reservation damage are reported.
+- `graph { action: "recommend" }`: inspect the installed dependency and current Graph configuration, then return the recommended effective settings without changing files.
 - `graph { action: "stop", id }`: stop and confirm active children where possible.
 - `graph { action: "resume", id }`: adopt a recoverable run. A known queued, running, or completed child is monitored in place. Missing, stopped, failed, paused, or ambiguous children are never replaced inside the same graph; reconcile them and start a new graph when more work is required.
 
@@ -123,6 +161,7 @@ Safe defaults:
 Operational commands:
 
 - `/graphs doctor`: inspect evidence and control-plane health; the command handler itself does not modify run data.
+- `/graphs recommend`: inspect the installed dependency and current Graph configuration, then print the recommended effective settings without changing files.
 - `/graphs storage`: report Graph, Trash, and control/recovery storage without modifying run data. Orphan purge staging and interrupted `.initialize-*` directories count toward the soft limit.
 - `/graphs maintain`: run configured compaction, pruning, authorized recovery, and safe control-record cleanup. A malformed recovery record is isolated so unrelated maintenance continues. Initialization staging with no live Graph Supervisor, dead or process-reused claims, expired partial claim writes, completed source reservations, recovered fencing-generation quarantine, invalid Graph-lock entries, and other metadata-only crash leftovers are reclaimed or archived automatically. Entry-level symbolic links are unlinked without following their targets. Orphan Graph lock metadata is detached under a short graph-keyed mutation gate before deletion, so cleanup cannot remove a claim being created by a concurrent initialization while unrelated Graphs remain parallel. Unknown purge payloads remain protected.
 - `/graphs pin <id>` and `/graphs unpin <id>`: protect or release a run.
