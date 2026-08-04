@@ -1,0 +1,43 @@
+flowchart TD
+    A["父级 Agent 调用 graph 工具<br/>{ action: start, spec }"] --> B["extensions/pi-graph.ts<br/>GraphManager.start"]
+    B --> C["src/compile.ts<br/>编译期静态校验"]
+    C -->|路径逃逸 / 环 /<br/>写范围重叠| CX["GraphCompileError<br/>拒绝"]
+    C -->|通过| D["src/store.ts<br/>创建 run 目录<br/>~/.pi/agent/graph-runs/&lt;graphId&gt;/"]
+    D --> E["src/runner.ts GraphRunner.run<br/>获取 Supervisor fencing claim"]
+    E --> F{"DAG 主循环<br/>reconcile + canStart"}
+
+    F -->|"依赖全部 ACCEPTED<br/>且有并发容量"| G["src/executor.ts<br/>NodeExecutor.execute"]
+    G --> H{"有 writeScope?"}
+    H -->|是| I["获取 lease +<br/>source reservation"]
+    H -->|否| J
+    I -->|被占用| RW["resource_wait<br/>1s 后重试"]
+    RW --> F
+    I -->|获得| J["prepareWorkspace<br/>git worktree 或 shadow<br/>拷贝 input artifacts"]
+    J --> K["写入 recovery-handoff.md<br/>（若是重试 attempt）"]
+    K --> L["leased → dispatching<br/>写 attempt authority +<br/>dispatch ledger"]
+    L --> M["child-runtime 派发<br/>pi-subagents async 子 Agent"]
+    M -->|RPC 超时| LU{"resolveDispatch<br/>找回同一 attempt?"}
+    LU -->|找不到| ST["stale<br/>绝不盲目重发"]
+    LU -->|找回| N
+    M -->|成功| N["running<br/>等待子 Agent 完成"]
+    N -->|子 Agent failed| F1["classifyChildFailure<br/>区分 provider/dispatch/<br/>timeout/validation"]
+    N -->|complete| O["collecting<br/>校验 output artifact<br/>必须是常规文件、不逃逸"]
+    O --> P["verifying<br/>runValidations<br/>确定性验证命令"]
+    P -->|验证失败| F2["failed<br/>retryKind=validation"]
+    P -->|通过| Q["写 validated-result.json<br/>记录 outputDigest"]
+    Q --> R["workspace.apply<br/>隔离区写回源仓库<br/>（多文件 v2 plan + 备份 + 断点恢复）"]
+    R --> S["原子 rename 发布<br/>attempt 私有输出 → artifacts/"]
+    S --> T["写 acceptance 记录<br/>manifestDigest + outputDigest"]
+    T --> U["ACCEPTED<br/>解锁下游节点"]
+    U --> F
+
+    F1 --> RT{"可重试?<br/>retryOn + maxAttempts /<br/>maxProviderRetries"}
+    F2 --> RT
+    RT -->|是| RJ["retry_wait<br/>指数退避<br/>provider 同车道冷却"]
+    RJ --> F
+    RT -->|否| FT["failed / blocked<br/>下游级联 blocked"]
+
+    F -->|"全部节点 terminal"| Z{"汇总图状态"}
+    Z -->|全部 accepted| Z1["complete"]
+    Z -->|有 stale / dispatch_unknown| Z2["needs_attention"]
+    Z -->|有 failed| Z3["failed"]
