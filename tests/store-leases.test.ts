@@ -185,6 +185,19 @@ test("graph store rejects traversal ids", async () => {
 	assert.throws(() => new GraphStore(root, "../escape"), /graphId/);
 });
 
+test("graph store initialization independently rejects scopes into its runs root", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-store-protected-runs-"));
+	const runsRoot = join(cwd, "graph-runs");
+	const graph = compileGraph({
+		schemaVersion: 1,
+		graphId: "protected-runs",
+		goal: "read runtime state",
+		nodes: [{ taskId: "reader", agent: "researcher", task: "read another run", outputArtifact: "result.md", sideEffect: "none", readScope: [{ kind: "tree", path: "graph-runs/.control" }] }],
+	} as GraphSpec, cwd, 20, 2);
+	const store = new GraphStore(runsRoot, graph.graphId);
+	await assert.rejects(store.initialize(graph, initialSnapshot(graph, cwd, "session", 2)), /readScope intersects protected Graph runs root/);
+});
+
 test("graph store fails closed on a corrupted snapshot", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-graph-store-corrupt-"));
 	const graph = compileGraph({ schemaVersion: 1, graphId: "corrupt", goal: "x", nodes: [{ taskId: "a", agent: "x", task: "x", outputArtifact: "a.md", sideEffect: "none" }] } as GraphSpec, root);

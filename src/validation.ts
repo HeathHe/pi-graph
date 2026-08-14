@@ -23,6 +23,14 @@ function validateInvocation(executable: string, args: string[]): void {
 	}
 }
 
+export function validateValidationCommand(command: string): string[] {
+	const parsed = parseCommand(command);
+	const [executable, ...args] = parsed;
+	if (!executable || !ALLOWED_EXECUTABLES.has(executable)) throw new Error(`Validation executable is not allowed: ${executable ?? "<empty>"}`);
+	validateInvocation(executable, args);
+	return parsed;
+}
+
 function appendLimited(current: string, chunk: Buffer | string): string {
 	const next = current + chunk.toString();
 	return next.length <= OUTPUT_LIMIT ? next : next.slice(0, OUTPUT_LIMIT) + "\n[output truncated]";
@@ -37,27 +45,17 @@ export function runValidation(command: string, cwd: string, timeoutMs: number, s
 		let aborted = false;
 		let parsed: string[];
 		try {
-			parsed = parseCommand(command);
+			parsed = validateValidationCommand(command);
 		} catch (error) {
 			resolvePromise({ command, ok: false, exitCode: null, stdout, stderr: error instanceof Error ? error.message : String(error), durationMs: Date.now() - started });
 			return;
 		}
 		const [executable, ...args] = parsed;
-		if (!executable || !ALLOWED_EXECUTABLES.has(executable)) {
-			resolvePromise({ command, ok: false, exitCode: null, stdout, stderr: `Validation executable is not allowed: ${executable ?? "<empty>"}`, durationMs: Date.now() - started });
-			return;
-		}
-		try {
-			validateInvocation(executable, args);
-		} catch (error) {
-			resolvePromise({ command, ok: false, exitCode: null, stdout, stderr: error instanceof Error ? error.message : String(error), durationMs: Date.now() - started });
-			return;
-		}
 		if (signal?.aborted) {
 			resolvePromise({ command, ok: false, exitCode: null, stdout, stderr: "Validation aborted.", durationMs: Date.now() - started, aborted: true });
 			return;
 		}
-		const child = spawn(executable, args, { cwd, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(executable!, args, { cwd, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
 		child.stdout.on("data", (chunk) => { stdout = appendLimited(stdout, chunk); });
 		child.stderr.on("data", (chunk) => { stderr = appendLimited(stderr, chunk); });
 		const timer = setTimeout(() => {

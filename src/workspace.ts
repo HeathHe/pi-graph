@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { cp, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
-import type { CompiledNode, FileDigest, ScopeEntry } from "./types.ts";
+import type { CompiledNode, ExternalAction, FileDigest, ResourceScope, ScopeEntry, SideEffect } from "./types.ts";
 
 export interface NodeContract {
 	schemaVersion: 1;
@@ -18,10 +18,16 @@ export interface NodeContract {
 	workspaceCwd: string;
 	readScope: ScopeEntry[];
 	writeScope: ScopeEntry[];
+	sideEffect?: SideEffect;
+	resourceScopes?: ResourceScope[];
+	externalAction?: ExternalAction;
 	allowBash: boolean;
 	writeBaseline: Record<string, string | null>;
 	readBaseline: Record<string, string | null>;
+	protectedSourceRoots?: string[];
+	protectedWorkspaceRoots?: string[];
 	inputBaseline: Record<string, { sourcePath: string; digest: string | null }>;
+	sourceGitEvidence?: { path: string; digest: string; sourceReadScope: ScopeEntry[] };
 	gitRoot?: string;
 	gitWorktreeRoot?: string;
 	contextDigest?: string;
@@ -32,6 +38,7 @@ export interface PreparedWorkspace {
 	cwd: string;
 	contract: NodeContract;
 	artifactPaths: Record<string, string>;
+	sourceGitEvidencePath?: string;
 	inspectWrites(): Promise<FileDigest[]>;
 	apply(signal?: AbortSignal): Promise<FileDigest[]>;
 	cleanup(): Promise<void>;
@@ -47,6 +54,51 @@ export class WorkspaceConflictError extends Error {
 function within(root: string, target: string): boolean {
 	const rel = relative(root, target);
 	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+function canonicalPath(input: string): string {
+	let candidate = resolve(input);
+	const suffix: string[] = [];
+	while (!existsSync(candidate)) {
+		const parent = dirname(candidate);
+		if (parent === candidate) break;
+		suffix.unshift(basename(candidate));
+		candidate = parent;
+	}
+	const root = existsSync(candidate) ? realpathSync.native(candidate) : candidate;
+	return resolve(root, ...suffix);
+}
+
+function protectedWorkspaceRoots(root: string, additionalRoots: readonly string[] = []): string[] {
+	return [...new Set([join(root, ".pi-graph"), join(root, ".pi", "agents"), join(root, ".pi-subagents"), join(root, ".git"), ...additionalRoots.map((path) => resolve(path))])];
+}
+
+function hasProtectedControlSegment(root: string, target: string): boolean {
+	if (!within(root, target)) return false;
+	const parts = relative(root, target).split(sep).filter(Boolean);
+	return parts.some((part, index) => part === ".git" || part === ".pi-graph" || part === ".pi-subagents" || (part === "agents" && parts[index - 1] === ".pi"));
+}
+
+function isNestedProtectedControlPath(root: string, target: string): boolean {
+	if (!within(root, target)) return false;
+	const parts = relative(root, target).split(sep).filter(Boolean);
+	return parts.some((part, index) => index > 0 && (part === ".git" || part === ".pi-graph" || part === ".pi-subagents" || (part === "agents" && parts[index - 1] === ".pi")));
+}
+
+function isProtectedWorkspacePath(root: string, target: string, additionalRoots: readonly string[] = []): boolean {
+	return hasProtectedControlSegment(root, target) || protectedWorkspaceRoots(root, additionalRoots).some((protectedRoot) => within(protectedRoot, target));
+}
+
+function scopeIntersectsRoot(scope: ScopeEntry, root: string): boolean {
+	return within(root, scope.path) || (scope.kind === "tree" && within(scope.path, root));
+}
+
+function relevantProtectedSourceRoots(sourceCwd: string, roots: readonly string[]): string[] {
+	return [...new Set(roots.map((root) => canonicalPath(root)).filter((root) => within(sourceCwd, root) || within(root, sourceCwd)))];
+}
+
+function mappedProtectedWorkspaceRoots(sourceCwd: string, workspaceCwd: string, roots: readonly string[]): string[] {
+	return [...new Set(roots.map((root) => within(sourceCwd, root) ? resolve(workspaceCwd, relative(sourceCwd, root)) : workspaceCwd))];
 }
 
 async function copyIfPresent(source: string, target: string): Promise<void> {
@@ -111,6 +163,10 @@ async function prepareProjectAgent(sourceCwd: string, workspaceCwd: string, agen
 	}
 	const guarded: MaterializedAgent = {
 		...agent,
+		// An explicit array makes pi-subagents pass --no-extensions and then add
+		// only the resolved runtime/configured paths. Without it, ambient host
+		// Extensions remain eligible even though Graph injected its own guard.
+		extensions: Array.isArray(agent.extensions) ? agent.extensions : [],
 		subagentOnlyExtensions: [...new Set([...(agent.subagentOnlyExtensions ?? []), GRAPH_GUARD_PATH])],
 	};
 	const target = join(workspaceCwd, ".pi", "agents");
@@ -122,27 +178,31 @@ async function prepareProjectAgent(sourceCwd: string, workspaceCwd: string, agen
 	await writeFile(join(target, fileName), internals.serializeAgent(guarded), "utf8");
 }
 
-async function filesUnder(path: string): Promise<string[]> {
+async function filesUnder(path: string, excludedRoots: readonly string[] = []): Promise<string[]> {
+	if (excludedRoots.some((root) => within(root, path))) return [];
 	if (!existsSync(path)) return [];
 	const info = await stat(path);
 	if (!info.isDirectory()) return [path];
 	const output: string[] = [];
 	for (const entry of await readdir(path, { withFileTypes: true })) {
 		const child = join(path, entry.name);
-		if (entry.isDirectory()) output.push(...await filesUnder(child));
+		if (excludedRoots.some((root) => within(root, child))) continue;
+		if (isNestedProtectedControlPath(path, child)) continue;
+		if (entry.isDirectory()) output.push(...await filesUnder(child, excludedRoots));
 		else if (entry.isFile() || entry.isSymbolicLink()) output.push(child);
 	}
 	return output;
 }
 
-async function writeBaseline(scopes: ScopeEntry[]): Promise<Record<string, string | null>> {
+async function writeBaseline(scopes: ScopeEntry[], excludedRoots: readonly string[] = []): Promise<Record<string, string | null>> {
 	const baseline: Record<string, string | null> = {};
 	for (const scope of scopes) {
+		if (excludedRoots.some((root) => within(root, scope.path))) continue;
 		if (scope.kind === "file") {
 			baseline[scope.path] = (await digestFile(scope.path)) ?? null;
 			continue;
 		}
-		for (const path of await filesUnder(scope.path)) baseline[path] = (await digestFile(path)) ?? null;
+		for (const path of await filesUnder(scope.path, excludedRoots)) baseline[path] = (await digestFile(path)) ?? null;
 	}
 	return baseline;
 }
@@ -156,8 +216,9 @@ async function rejectSymlinks(path: string, label = "Graph scopes"): Promise<voi
 	for (const entry of await readdir(path)) await rejectSymlinks(join(path, entry), label);
 }
 
-async function assertSafeSourceTarget(root: string, path: string): Promise<void> {
+async function assertSafeSourceTarget(root: string, path: string, protectedSourceRoots: readonly string[] = []): Promise<void> {
 	if (!within(root, path)) throw new WorkspaceConflictError(`Graph source target escapes its declared cwd: ${path}`);
+	if (isProtectedWorkspacePath(root, path, protectedSourceRoots)) throw new WorkspaceConflictError(`Graph source target enters a protected runtime or repository-control directory: ${path}`);
 	let cursor = root;
 	for (const part of relative(root, dirname(path)).split(sep).filter(Boolean)) {
 		cursor = join(cursor, part);
@@ -217,6 +278,75 @@ function gitRepositoryInfo(cwd: string): { root: string; relativeCwd: string } |
 	if (rootResult.status !== 0) return null;
 	const root = rootResult.stdout.trim();
 	return { root, relativeCwd: relative(root, cwd) };
+}
+
+function sourceGitEvidence(sourceCwd: string, scopes: ScopeEntry[]): string {
+	const repositories = new Map<string, Set<string>>();
+	for (const scope of scopes) {
+		const repository = gitRepositoryInfo(scope.kind === "file" ? dirname(scope.path) : scope.path);
+		if (!repository) continue;
+		const paths = repositories.get(repository.root) ?? new Set<string>();
+		paths.add(relative(repository.root, scope.path) || ".");
+		repositories.set(repository.root, paths);
+	}
+	const lines = ["PI_GRAPH_SOURCE_GIT_EVIDENCE_V2"];
+	if (repositories.size === 0) lines.push("", "No Git repository was detected from the declared read/write scope entries.");
+	for (const [root, scopedPaths] of [...repositories.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+		const paths = [...scopedPaths].sort();
+		const options = { encoding: "utf8" as const, maxBuffer: 64 * 1024 * 1024 };
+		const capture = () => {
+			const gitDir = spawnSync("git", ["-C", root, "rev-parse", "--absolute-git-dir"], options);
+			const commonDir = spawnSync("git", ["-C", root, "rev-parse", "--git-common-dir"], options);
+			const head = spawnSync("git", ["-C", root, "rev-parse", "--verify", "HEAD"], options);
+			const branch = spawnSync("git", ["-C", root, "symbolic-ref", "--quiet", "--short", "HEAD"], options);
+			const status = spawnSync("git", ["-C", root, "status", "--porcelain=v1", "--untracked-files=all", "--", ...paths], options);
+			for (const [label, result] of [["Git directory", gitDir], ["Git common directory", commonDir], ["scoped Git status", status]] as const) {
+				if (result.status !== 0 || result.error) throw new Error(`Could not capture ${label} for '${root}': ${result.error?.message ?? result.stderr.trim()}`);
+			}
+			let diff = "[HEAD is unavailable; no tracked diff could be generated.]";
+			if (head.status === 0 && !head.error) {
+				const result = spawnSync("git", ["-C", root, "diff", "--no-ext-diff", "--no-color", "HEAD", "--", ...paths], options);
+				if (result.status !== 0 || result.error) throw new Error(`Could not capture scoped Git diff for '${root}': ${result.error?.message ?? result.stderr.trim()}`);
+				diff = result.stdout || "[No tracked changes in the declared scope.]";
+			}
+			return {
+				repositoryRoot: realpathSync(root),
+				gitDir: realpathSync(gitDir.stdout.trim()),
+				commonDir: realpathSync(resolve(root, commonDir.stdout.trim())),
+				head: head.status === 0 ? head.stdout.trim() : "unborn",
+				branch: branch.status === 0 ? branch.stdout.trim() : "detached-or-unborn",
+				status: status.stdout || "[Clean in the declared scope.]",
+				diff,
+			};
+		};
+		let snapshot = capture();
+		let stable = false;
+		for (let retry = 0; retry < 3; retry += 1) {
+			const confirmation = capture();
+			if (JSON.stringify(snapshot) === JSON.stringify(confirmation)) {
+				stable = true;
+				break;
+			}
+			snapshot = confirmation;
+		}
+		if (!stable) throw new Error(`Scoped Git evidence for '${root}' did not remain stable while it was sampled.`);
+		lines.push(
+			"",
+			`Repository: ${relative(sourceCwd, root) || "."}`,
+			`Repository root identity: ${snapshot.repositoryRoot}`,
+			`Git directory identity: ${snapshot.gitDir}`,
+			`Git common directory identity: ${snapshot.commonDir}`,
+			`Branch: ${snapshot.branch}`,
+			`HEAD: ${snapshot.head}`,
+			"Scoped paths:",
+			...paths.map((path) => `- ${path}`),
+			"Status:",
+			snapshot.status,
+			"Diff against HEAD:",
+			snapshot.diff,
+		);
+	}
+	return `${lines.join("\n")}\n`;
 }
 
 async function atomicCopy(source: string, target: string): Promise<void> {
@@ -290,7 +420,7 @@ function validateApplyPlan(plan: ApplyPlan, node: CompiledNode, workspaceCwd: st
 	if (plan.applyingIndex !== undefined && (!Number.isInteger(plan.applyingIndex) || plan.applyingIndex < 0 || plan.applyingIndex >= plan.entries.length)) throw new Error(`Invalid graph apply index: ${planPath}`);
 	const seen = new Set<string>();
 	for (const entry of plan.entries) {
-		if (!entry || typeof entry.sourcePath !== "string" || !isAbsolute(entry.sourcePath) || !node.writeScope.some((scope) => scopeContains(scope, entry.sourcePath)) || seen.has(entry.sourcePath)) throw new Error(`Invalid graph apply target: ${planPath}`);
+		if (!entry || typeof entry.sourcePath !== "string" || !isAbsolute(entry.sourcePath) || isProtectedWorkspacePath(node.cwd, entry.sourcePath, contract.protectedSourceRoots) || !node.writeScope.some((scope) => scopeContains(scope, entry.sourcePath)) || seen.has(entry.sourcePath)) throw new Error(`Invalid graph apply target: ${planPath}`);
 		seen.add(entry.sourcePath);
 		if (entry.workspacePath !== undefined) {
 			const expected = resolve(workspaceCwd, relative(node.cwd, entry.sourcePath));
@@ -316,7 +446,7 @@ async function assertSafeAttemptFile(attemptDir: string, path: string, label: st
 
 async function recoverApplyPlan(path: string, plan: ApplyPlan, node: CompiledNode, contract: NodeContract): Promise<FileDigest[] | null> {
 	const observed = await Promise.all(plan.entries.map(async (entry) => {
-		await assertSafeSourceTarget(node.cwd, entry.sourcePath);
+		await assertSafeSourceTarget(node.cwd, entry.sourcePath, contract.protectedSourceRoots);
 		const current = await digestFile(entry.sourcePath);
 		const after = entry.deleted ? undefined : entry.after;
 		if (current === entry.before) return "before" as const;
@@ -352,12 +482,12 @@ async function recoverApplyPlan(path: string, plan: ApplyPlan, node: CompiledNod
 		if (backup !== expectedBackup || backup !== entry.before) throw new WorkspaceConflictError(`Cannot roll back graph write with an invalid backup: ${entry.sourcePath}`);
 	}
 	for (const { entry } of restore.reverse()) {
-		await assertSafeSourceTarget(node.cwd, entry.sourcePath);
+		await assertSafeSourceTarget(node.cwd, entry.sourcePath, contract.protectedSourceRoots);
 		if (entry.before) await atomicCopy(entry.backupPath!, entry.sourcePath);
 		else await rm(entry.sourcePath, { force: true });
 	}
 	for (const entry of plan.entries) {
-		await assertSafeSourceTarget(node.cwd, entry.sourcePath);
+		await assertSafeSourceTarget(node.cwd, entry.sourcePath, contract.protectedSourceRoots);
 		if (await digestFile(entry.sourcePath) !== entry.before) throw new WorkspaceConflictError(`Graph write rollback could not restore: ${entry.sourcePath}`);
 	}
 	plan.status = "rolled_back";
@@ -376,13 +506,19 @@ async function assertInputsUnchanged(contract: NodeContract): Promise<void> {
 	for (const [name, input] of Object.entries(contract.inputBaseline)) {
 		if ((await digestFile(input.sourcePath) ?? null) !== input.digest) throw new WorkspaceConflictError(`Input artifact changed while node was running: ${name}`);
 	}
+	if (contract.sourceGitEvidence) {
+		const current = sourceGitEvidence(contract.sourceCwd, contract.sourceGitEvidence.sourceReadScope);
+		const digest = createHash("sha256").update(current).digest("hex");
+		if (digest !== contract.sourceGitEvidence.digest) throw new WorkspaceConflictError("Scoped Git HEAD, index, or working-tree evidence changed while node was running.");
+	}
 }
 
 async function inspectWorkspaceWrites(node: CompiledNode, workspaceCwd: string, workspaceContract: NodeContract): Promise<FileDigest[]> {
 	const entries = new Map<string, FileDigest>();
+	const protectedRoots = protectedWorkspaceRoots(workspaceCwd, workspaceContract.protectedWorkspaceRoots);
 	for (const scope of node.writeScope) {
 		const workspacePath = resolve(workspaceCwd, relative(node.cwd, scope.path));
-		for (const workspaceFile of await filesUnder(workspacePath)) {
+		for (const workspaceFile of await filesUnder(workspacePath, protectedRoots)) {
 			if ((await lstat(workspaceFile)).isSymbolicLink()) continue;
 			const sourcePath = resolve(scope.path, scope.kind === "tree" ? relative(workspacePath, workspaceFile) : "");
 			const before = workspaceContract.writeBaseline[sourcePath] ?? undefined;
@@ -410,12 +546,14 @@ async function applyScopes(node: CompiledNode, workspaceCwd: string, workspaceCo
 	if (signal?.aborted) throw new Error("Graph source apply aborted before commit.");
 	await assertInputsUnchanged(workspaceContract);
 	const entries = new Map<string, ApplyPlanEntry>();
+	const protectedWorkspace = protectedWorkspaceRoots(workspaceCwd, workspaceContract.protectedWorkspaceRoots);
+	const protectedSource = protectedWorkspaceRoots(node.cwd, workspaceContract.protectedSourceRoots);
 	for (const scope of node.writeScope) {
 		const workspacePath = resolve(workspaceCwd, relative(node.cwd, scope.path));
-		const workspaceFiles = await filesUnder(workspacePath);
+		const workspaceFiles = await filesUnder(workspacePath, protectedWorkspace);
 		for (const sourceFile of workspaceFiles) {
 			const sourcePath = resolve(scope.path, scope.kind === "tree" ? relative(workspacePath, sourceFile) : "");
-			await assertSafeSourceTarget(node.cwd, sourcePath);
+			await assertSafeSourceTarget(node.cwd, sourcePath, workspaceContract.protectedSourceRoots);
 			if ((await lstat(sourceFile)).isSymbolicLink()) throw new WorkspaceConflictError(`Refusing to apply a symlink from graph workspace: ${sourceFile}`);
 			const before = await digestFile(sourcePath);
 			const after = await digestFile(sourceFile);
@@ -429,10 +567,10 @@ async function applyScopes(node: CompiledNode, workspaceCwd: string, workspaceCo
 			entries.set(sourcePath, { sourcePath, workspacePath: sourceFile, before, after });
 		}
 		if (!node.allowDelete || !existsSync(scope.path)) continue;
-		for (const sourceFile of await filesUnder(scope.path)) {
+		for (const sourceFile of await filesUnder(scope.path, protectedSource)) {
 			const workspaceFile = resolve(workspacePath, scope.kind === "tree" ? relative(scope.path, sourceFile) : "");
 			if (existsSync(workspaceFile)) continue;
-			await assertSafeSourceTarget(node.cwd, sourceFile);
+			await assertSafeSourceTarget(node.cwd, sourceFile, workspaceContract.protectedSourceRoots);
 			const before = await digestFile(sourceFile);
 			const expected = workspaceContract.writeBaseline[sourceFile] ?? null;
 			if ((before ?? null) !== expected) throw new WorkspaceConflictError(`Source changed while node was running: ${sourceFile}`);
@@ -468,7 +606,7 @@ async function applyScopes(node: CompiledNode, workspaceCwd: string, workspaceCo
 		for (let index = 0; index < plan.entries.length; index += 1) {
 			if (signal?.aborted) throw new Error("Graph source apply aborted during commit.");
 			const entry = plan.entries[index]!;
-			await assertSafeSourceTarget(node.cwd, entry.sourcePath);
+			await assertSafeSourceTarget(node.cwd, entry.sourcePath, workspaceContract.protectedSourceRoots);
 				const current = await digestFile(entry.sourcePath);
 				if (current !== entry.before) throw new WorkspaceConflictError(`Source changed immediately before graph commit: ${entry.sourcePath}`);
 			plan.applyingIndex = index;
@@ -497,15 +635,22 @@ export async function prepareWorkspace(input: {
 	attempt: number;
 	attemptDir: string;
 	strategy: "auto" | "shadow" | "git";
+	protectedSourceRoots?: string[];
 	contextDigest?: string;
 	artifacts?: Array<{ name: string; source: string }>;
 }): Promise<PreparedWorkspace> {
 	const { graphId, node, attempt, attemptDir } = input;
+	const protectedSourceRoots = relevantProtectedSourceRoots(node.cwd, input.protectedSourceRoots ?? []);
+	for (const scope of [...node.readScope, ...node.writeScope]) {
+		const protectedRoot = protectedSourceRoots.find((root) => scopeIntersectsRoot(scope, root));
+		if (protectedRoot) throw new WorkspaceConflictError(`Graph scope intersects protected Graph runs root: ${protectedRoot}`);
+	}
 	await mkdir(attemptDir, { recursive: true });
 	for (const scope of [...node.readScope, ...node.writeScope]) await rejectSymlinks(scope.path);
-	const baseline = await writeBaseline(node.writeScope);
-	const readBaseline = await writeBaseline(node.readScope);
-	const git = input.strategy !== "shadow" ? gitInfo(node.cwd) : null;
+	const baseline = await writeBaseline(node.writeScope, protectedWorkspaceRoots(node.cwd, protectedSourceRoots));
+	const readBaseline = await writeBaseline(node.readScope, protectedSourceRoots);
+	const forceShadowForRetry = (node.retryPolicy.maxProviderRetries ?? 0) > 0;
+	const git = input.strategy !== "shadow" && !(input.strategy === "auto" && (node.routingProfile || forceShadowForRetry)) ? gitInfo(node.cwd) : null;
 	let kind: "shadow" | "git" = "shadow";
 	let workspaceCwd = join(attemptDir, "workspace");
 	let gitWorktreeRoot: string | undefined;
@@ -526,6 +671,10 @@ export async function prepareWorkspace(input: {
 			await copyIfPresent(entry.path, resolve(workspaceCwd, relative(node.cwd, entry.path)));
 		}
 	}
+	await rm(join(workspaceCwd, ".pi-graph"), { recursive: true, force: true });
+	await rm(join(workspaceCwd, ".pi", "agents"), { recursive: true, force: true });
+	await rm(join(workspaceCwd, ".pi-subagents"), { recursive: true, force: true });
+	if (kind === "shadow") await rm(join(workspaceCwd, ".git"), { recursive: true, force: true });
 	await prepareProjectAgent(node.cwd, workspaceCwd, node.agent);
 	const artifactPaths: Record<string, string> = {};
 	const inputBaseline: NodeContract["inputBaseline"] = {};
@@ -538,6 +687,13 @@ export async function prepareWorkspace(input: {
 		artifactPaths[artifact.name] = target;
 		inputBaseline[artifact.name] = { sourcePath: artifact.source, digest: await digestFile(artifact.source) ?? null };
 	}
+	const sourceEvidencePath = join(workspaceCwd, ".pi-graph", "source-git-evidence.txt");
+	const evidenceScopes = [...node.readScope, ...node.writeScope].filter((entry, index, entries) => entries.findIndex((candidate) => candidate.kind === entry.kind && candidate.path === entry.path) === index);
+	const sourceEvidence = sourceGitEvidence(node.cwd, evidenceScopes);
+	await mkdir(dirname(sourceEvidencePath), { recursive: true });
+	await writeFile(sourceEvidencePath, sourceEvidence, "utf8");
+	const sourceEvidenceDigest = createHash("sha256").update(sourceEvidence).digest("hex");
+	const protectedWorkspace = mappedProtectedWorkspaceRoots(node.cwd, workspaceCwd, protectedSourceRoots);
 	const contract: NodeContract = {
 		schemaVersion: 1,
 		graphId,
@@ -549,12 +705,19 @@ export async function prepareWorkspace(input: {
 		readScope: [
 			...mapScope(node.readScope, node.cwd, workspaceCwd),
 			...Object.values(artifactPaths).map((path) => ({ kind: "file" as const, path })),
+			{ kind: "file", path: sourceEvidencePath },
+			...(input.attempt > 1 ? [{ kind: "file" as const, path: join(workspaceCwd, ".pi-graph", "recovery-handoff.md") }] : []),
 		],
 		writeScope: mapScope(node.writeScope, node.cwd, workspaceCwd),
+		sideEffect: node.sideEffect,
+		resourceScopes: node.resourceScopes,
+		externalAction: node.externalAction,
 		allowBash: node.allowBash === true,
 		writeBaseline: baseline,
 		readBaseline,
+		...(protectedSourceRoots.length ? { protectedSourceRoots, protectedWorkspaceRoots: protectedWorkspace } : {}),
 		inputBaseline,
+		sourceGitEvidence: { path: sourceEvidencePath, digest: sourceEvidenceDigest, sourceReadScope: evidenceScopes },
 		...(git ? { gitRoot: git.root } : {}),
 		...(gitWorktreeRoot ? { gitWorktreeRoot } : {}),
 		...(input.contextDigest ? { contextDigest: input.contextDigest } : {}),
@@ -566,6 +729,7 @@ export async function prepareWorkspace(input: {
 		cwd: workspaceCwd,
 		contract,
 		artifactPaths,
+		sourceGitEvidencePath: sourceEvidencePath,
 		inspectWrites: () => inspectWorkspaceWrites(node, workspaceCwd, contract),
 		apply: (signal) => applyScopes(node, workspaceCwd, contract, signal),
 		cleanup: async () => {
@@ -576,15 +740,27 @@ export async function prepareWorkspace(input: {
 	};
 }
 
-export async function reopenWorkspace(node: CompiledNode, workspaceCwd: string, kind: "shadow" | "git"): Promise<PreparedWorkspace> {
+export async function reopenWorkspace(node: CompiledNode, workspaceCwd: string, kind: "shadow" | "git", protectedRoots: readonly string[] = []): Promise<PreparedWorkspace> {
 	const contract = JSON.parse(await readFile(join(workspaceCwd, ".pi-graph", "node-contract.json"), "utf8")) as NodeContract;
 	const graphRoot = isAbsolute(contract.attemptDir ?? "") ? dirname(dirname(dirname(contract.attemptDir))) : "";
 	if (contract.schemaVersion !== 1 || contract.graphId !== basename(graphRoot) || contract.taskId !== node.taskId || !Number.isInteger(contract.attempt) || contract.attempt < 1 || contract.attemptDir !== join(graphRoot, "nodes", node.taskId, `attempt-${contract.attempt}`) || contract.sourceCwd !== node.cwd || contract.workspaceCwd !== workspaceCwd || !isAbsolute(contract.attemptDir) || !within(contract.attemptDir, workspaceCwd)) throw new Error("Persisted graph node contract does not match the recovered node.");
 	const expectedWriteScope = mapScope(node.writeScope, node.cwd, workspaceCwd);
 	if (JSON.stringify(contract.writeScope) !== JSON.stringify(expectedWriteScope)) throw new Error("Persisted graph node contract has a modified write scope.");
+	const expectedProtectedSourceRoots = relevantProtectedSourceRoots(node.cwd, protectedRoots);
+	const expectedProtectedWorkspaceRoots = mappedProtectedWorkspaceRoots(node.cwd, workspaceCwd, expectedProtectedSourceRoots);
+	if (JSON.stringify(contract.protectedSourceRoots ?? []) !== JSON.stringify(expectedProtectedSourceRoots) || JSON.stringify(contract.protectedWorkspaceRoots ?? []) !== JSON.stringify(expectedProtectedWorkspaceRoots)) throw new Error("Persisted graph node contract has modified protected Graph runs roots.");
+	if (contract.sideEffect !== undefined && contract.sideEffect !== node.sideEffect) throw new Error("Persisted graph node contract has a modified side effect.");
+	if (JSON.stringify(contract.resourceScopes ?? []) !== JSON.stringify(node.resourceScopes ?? [])) throw new Error("Persisted graph node contract has modified remote resource scopes.");
+	if (JSON.stringify(contract.externalAction ?? null) !== JSON.stringify(node.externalAction ?? null)) throw new Error("Persisted graph node contract has a modified external action.");
 	const expectedArtifactPaths = Object.fromEntries((node.inputArtifacts ?? []).map((name) => [name, join(workspaceCwd, ".pi-graph", "inputs", name)]));
-	const expectedReadScope = [...mapScope(node.readScope, node.cwd, workspaceCwd), ...Object.values(expectedArtifactPaths).map((path) => ({ kind: "file" as const, path }))];
+	const sourceEvidencePath = join(workspaceCwd, ".pi-graph", "source-git-evidence.txt");
+	const expectedReadScope = [...mapScope(node.readScope, node.cwd, workspaceCwd), ...Object.values(expectedArtifactPaths).map((path) => ({ kind: "file" as const, path })), ...(contract.sourceGitEvidence ? [{ kind: "file" as const, path: sourceEvidencePath }] : []), ...(contract.attempt > 1 ? [{ kind: "file" as const, path: join(workspaceCwd, ".pi-graph", "recovery-handoff.md") }] : [])];
 	if (!Array.isArray(contract.readScope) || JSON.stringify(contract.readScope) !== JSON.stringify(expectedReadScope)) throw new Error("Persisted graph node contract has a modified read scope.");
+	if (contract.sourceGitEvidence) {
+		const evidenceScopes = [...node.readScope, ...node.writeScope].filter((entry, index, entries) => entries.findIndex((candidate) => candidate.kind === entry.kind && candidate.path === entry.path) === index);
+		const persistedScopes = JSON.stringify(contract.sourceGitEvidence.sourceReadScope);
+		if (contract.sourceGitEvidence.path !== sourceEvidencePath || !validDigest(contract.sourceGitEvidence.digest) || (persistedScopes !== JSON.stringify(node.readScope) && persistedScopes !== JSON.stringify(evidenceScopes)) || await digestFile(sourceEvidencePath) !== contract.sourceGitEvidence.digest) throw new Error("Persisted graph node contract has invalid source Git evidence.");
+	}
 	if (!contract.writeBaseline || typeof contract.writeBaseline !== "object" || Array.isArray(contract.writeBaseline) || Object.entries(contract.writeBaseline).some(([path, digest]) => !node.writeScope.some((scope) => scopeContains(scope, path)) || (digest !== null && (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest))))) throw new Error("Persisted graph node contract has an invalid write baseline.");
 	if (!contract.readBaseline || typeof contract.readBaseline !== "object" || Array.isArray(contract.readBaseline) || Object.entries(contract.readBaseline).some(([path, digest]) => !node.readScope.some((scope) => scopeContains(scope, path)) || (digest !== null && !validDigest(digest)))) throw new Error("Persisted graph node contract has an invalid read baseline.");
 	const expectedInputNames = [...(node.inputArtifacts ?? [])].sort();
@@ -595,6 +771,7 @@ export async function reopenWorkspace(node: CompiledNode, workspaceCwd: string, 
 		cwd: workspaceCwd,
 		contract,
 		artifactPaths,
+		...(contract.sourceGitEvidence ? { sourceGitEvidencePath: sourceEvidencePath } : {}),
 		inspectWrites: () => inspectWorkspaceWrites(node, workspaceCwd, contract),
 		apply: (signal) => applyScopes(node, workspaceCwd, contract, signal),
 		cleanup: async () => {

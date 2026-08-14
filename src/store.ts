@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { CompiledGraph, GraphEvent, GraphSnapshot } from "./types.ts";
-import { validateGraphId } from "./compile.ts";
+import { assertGraphScopesOutsideProtectedRoots, validateGraphId } from "./compile.ts";
 import { compareClaims, contentionWindow, createClaim, liveClaims, markClaimHeld, releaseClaim, withExclusiveKeyedClaim, type CreatedClaim } from "./claims.ts";
 import { appendDurable, atomicWriteJson, createDurableFile, createDurableJson, syncDirectory } from "./durable.ts";
 import { encodeSnapshot, isTerminalGraphStatus, validateAndDecodeSnapshot } from "./snapshot.ts";
-import { authorizationFor, canonicalDigest, type AcceptanceRecord, type AttemptRecord, type AttemptRecoveryRecord, type ValidatedResultRecord, type WorkspaceRecord } from "./authority.ts";
+import { authorizationFor, canonicalDigest, validateAuthorizedPlanningReceipt, type AcceptanceRecord, type AttemptRecord, type AttemptRecoveryRecord, type AuthorizationRecord, type ValidatedResultRecord, type WorkspaceRecord } from "./authority.ts";
+import type { PlanningReceipt } from "./subagent-router/planning-gate.ts";
+import type { ChildLineage } from "./child-runtime.ts";
 export { isProcessAlive } from "./claims.ts";
 
 export class GraphAlreadySupervisedError extends Error {
@@ -34,7 +36,8 @@ export class GraphStore {
 		return join(this.root, ...parts);
 	}
 
-	async initialize(graph: CompiledGraph, snapshot: GraphSnapshot): Promise<void> {
+	async initialize(graph: CompiledGraph, snapshot: GraphSnapshot, planningReceipt?: PlanningReceipt, sourceGraphSpecDigest?: string): Promise<void> {
+		assertGraphScopesOutsideProtectedRoots(graph, [this.runsRoot]);
 		await mkdir(this.runsRoot, { recursive: true });
 		const runsRootInfo = await lstat(this.runsRoot);
 		if (runsRootInfo.isSymbolicLink() || !runsRootInfo.isDirectory()) throw new Error(`Graph runs root must be a real directory: ${this.runsRoot}`);
@@ -61,14 +64,17 @@ export class GraphStore {
 					|| await realpath(staging) !== stagingCanonical
 				) throw new Error("Graph initialization staging identity changed during publication.");
 			};
-			if (snapshot.schemaVersion === 2) snapshot.fencingGeneration = initializationLock.currentFencingGeneration();
+			if (snapshot.schemaVersion === 2) {
+				snapshot.fencingGeneration = initializationLock.currentFencingGeneration();
+				if (planningReceipt) snapshot.planningAdmissionId = planningReceipt.receiptId;
+			}
 			await assertStagingIdentity();
 			await createDurableJson(join(staging, "graph.json"), graph);
 			await assertStagingIdentity();
 			await createDurableJson(join(staging, "snapshot.json"), encodeSnapshot(snapshot, this.root));
 			await assertStagingIdentity();
 			if (snapshot.schemaVersion === 2) {
-				await createDurableJson(join(staging, "authorization.json"), authorizationFor(graph, snapshot));
+				await createDurableJson(join(staging, "authorization.json"), authorizationFor(graph, snapshot, planningReceipt, sourceGraphSpecDigest));
 				await assertStagingIdentity();
 			}
 			const created: GraphEvent = {
@@ -105,15 +111,30 @@ export class GraphStore {
 		const projection = JSON.parse(await readFile(this.path("graph.json"), "utf8")) as CompiledGraph;
 		try {
 			await this.assertManagedFilePath(this.path("authorization.json"), "Graph authorization");
-			const authorization = JSON.parse(await readFile(this.path("authorization.json"), "utf8")) as { schemaVersion?: unknown; graphDigest?: unknown; graph?: CompiledGraph };
+			const authorization = JSON.parse(await readFile(this.path("authorization.json"), "utf8")) as Parameters<typeof validateAuthorizedPlanningReceipt>[0] & { schemaVersion?: unknown; graph?: CompiledGraph };
+			const persistedSnapshot = JSON.parse(await readFile(this.path("snapshot.json"), "utf8")) as { planningAdmissionId?: unknown };
 			const comparableProjection = { ...projection } as Omit<CompiledGraph, "projectionVersion"> & { projectionVersion?: 1 };
 			if (authorization.graph && !("projectionVersion" in authorization.graph)) delete comparableProjection.projectionVersion;
-			if (authorization.schemaVersion !== 2 || !authorization.graph || authorization.graphDigest !== canonicalDigest(authorization.graph) || canonicalDigest(comparableProjection) !== authorization.graphDigest) throw new Error("Invalid graph authorization record.");
+			if (authorization.graph && !("spawnBudget" in authorization.graph)) delete comparableProjection.spawnBudget;
+			if (![2, 3].includes(authorization.schemaVersion as number) || !authorization.graph || authorization.graphDigest !== canonicalDigest(authorization.graph) || canonicalDigest(comparableProjection) !== authorization.graphDigest) throw new Error("Invalid graph authorization record.");
+			validateAuthorizedPlanningReceipt(authorization as Parameters<typeof validateAuthorizedPlanningReceipt>[0]);
+			if ((authorization.schemaVersion === 3 || persistedSnapshot.planningAdmissionId !== undefined)
+				&& (authorization.schemaVersion !== 3 || typeof persistedSnapshot.planningAdmissionId !== "string" || authorization.planningAdmissionId !== persistedSnapshot.planningAdmissionId)) {
+				throw new Error("Graph planning admission marker does not match its authorization schema and receipt.");
+			}
 			return authorization.graph;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return projection;
 			throw error;
 		}
+	}
+
+	async loadAuthorization(): Promise<AuthorizationRecord> {
+		await this.assertManagedFilePath(this.path("authorization.json"), "Graph authorization");
+		const authorization = JSON.parse(await readFile(this.path("authorization.json"), "utf8")) as AuthorizationRecord;
+		if (![2, 3].includes(authorization.schemaVersion) || !authorization.graph || authorization.graphDigest !== canonicalDigest(authorization.graph)) throw new Error("Invalid graph authorization record.");
+		validateAuthorizedPlanningReceipt(authorization);
+		return authorization;
 	}
 
 	async loadSnapshot(): Promise<GraphSnapshot> {
@@ -126,16 +147,28 @@ export class GraphStore {
 			await this.prepareManagedFilePath(this.path("snapshot.json"), "Graph snapshot");
 			snapshot.updatedAt = new Date().toISOString();
 			if (snapshot.schemaVersion === 2 && this.fencingGeneration !== undefined) snapshot.fencingGeneration = this.fencingGeneration;
-			if (snapshot.schemaVersion === 2 && isTerminalGraphStatus(snapshot.status)) snapshot.terminalAt ??= snapshot.updatedAt;
 			if (snapshot.schemaVersion === 2) {
 				let previous: GraphSnapshot | undefined;
 				try {
 					previous = await this.loadSnapshot();
 					if (previous.schemaVersion === 2 && previous.runInstanceId !== snapshot.runInstanceId) throw new Error("Graph run instance identity cannot change.");
-					if (previous.schemaVersion === 2 && previous.terminalAt && snapshot.terminalAt !== previous.terminalAt) throw new Error("Graph terminalAt is immutable.");
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
+				// needs_attention is resumable. Older attention snapshots may contain a
+				// terminalAt from before attentionAt was introduced; do not carry it into
+				// the resumed run or its later true terminal state. Other statuses retain
+				// the original immutable timestamp across authority/projection recovery.
+				if (previous?.schemaVersion === 2 && previous.status === "needs_attention") {
+					if (snapshot.status !== "needs_attention") {
+						delete snapshot.terminalAt;
+						if (isTerminalGraphStatus(snapshot.status)) snapshot.terminalAt = snapshot.updatedAt;
+					}
+				} else {
+					if (isTerminalGraphStatus(snapshot.status) && snapshot.status !== "needs_attention") snapshot.terminalAt ??= snapshot.updatedAt;
+					if (previous?.schemaVersion === 2 && previous.terminalAt && snapshot.terminalAt !== previous.terminalAt) throw new Error("Graph terminalAt is immutable.");
+				}
+				if (snapshot.status === "needs_attention" && !(previous?.schemaVersion === 2 && previous.status === "needs_attention")) delete snapshot.terminalAt;
 				if (snapshot.status === "needs_attention") {
 					snapshot.attentionAt = previous?.schemaVersion === 2 && previous.status === "needs_attention" && previous.attentionAt
 						? previous.attentionAt
@@ -475,7 +508,12 @@ export class GraphStore {
 			const next = {
 				...previous,
 				...record,
+				...(record.routingDecision ?? previous?.routingDecision ? { routingDecision: record.routingDecision ?? previous?.routingDecision } : {}),
 				...(record.requestDigest ?? previous?.requestDigest ? { requestDigest: record.requestDigest ?? previous?.requestDigest } : {}),
+				...(record.launchContractDigest ?? previous?.launchContractDigest ? { launchContractDigest: record.launchContractDigest ?? previous?.launchContractDigest } : {}),
+				...(record.extensionContentDigest ?? previous?.extensionContentDigest ? { extensionContentDigest: record.extensionContentDigest ?? previous?.extensionContentDigest } : {}),
+				...(record.runtimeLaunchContractDigest ?? previous?.runtimeLaunchContractDigest ? { runtimeLaunchContractDigest: record.runtimeLaunchContractDigest ?? previous?.runtimeLaunchContractDigest } : {}),
+				...(record.runtimeGuardAcknowledged ?? previous?.runtimeGuardAcknowledged ? { runtimeGuardAcknowledged: record.runtimeGuardAcknowledged ?? previous?.runtimeGuardAcknowledged } : {}),
 				...(record.asyncId ?? previous?.asyncId ? { asyncId: record.asyncId ?? previous?.asyncId } : {}),
 				...(record.sessionId ?? previous?.sessionId ? { sessionId: record.sessionId ?? previous?.sessionId } : {}),
 				...(record.phase === "terminal" && (record.terminalStatus ?? previous?.terminalStatus) ? { terminalStatus: record.terminalStatus ?? previous?.terminalStatus } : {}),
@@ -496,6 +534,58 @@ export class GraphStore {
 		const path = this.path("nodes", validateGraphId(taskId), `attempt-${attempt}`, "attempt.json");
 		await this.assertManagedFilePath(path, "Attempt authority");
 		return JSON.parse(await readFile(path, "utf8")) as AttemptRecord;
+	}
+
+	async restorePreparedAttemptAfterPreEmitAbort(taskId: string, attempt: number, lineage: ChildLineage, requestDigest: string): Promise<void> {
+		const normalizedTaskId = validateGraphId(taskId);
+		const attemptRoot = this.path("nodes", normalizedTaskId, `attempt-${attempt}`);
+		if (dirname(lineage.sessionDir) !== attemptRoot || lineage.providerDispatch !== undefined) throw new Error("Only the first provider dispatch can restore prepared attempt authority after a proven pre-emit abort.");
+		const authorityPath = join(attemptRoot, "attempt.json");
+		const ledgerPath = join(attemptRoot, "child-dispatch.json");
+		const tombstonePath = join(attemptRoot, "child-tombstone.json");
+		await this.withFencedWrite(async () => {
+			await this.assertManagedFilePath(authorityPath, "Attempt authority pre-emit rollback");
+			await this.assertManagedFilePath(ledgerPath, "Child dispatch ledger pre-emit rollback");
+			await this.assertManagedFilePath(tombstonePath, "Child dispatch tombstone pre-emit rollback");
+			const authority = JSON.parse(await readFile(authorityPath, "utf8")) as AttemptRecord;
+			const ledger = JSON.parse(await readFile(ledgerPath, "utf8")) as Record<string, unknown>;
+			const authorityProvesPreEmit = (
+				authority.schemaVersion !== 2
+				|| authority.runInstanceId !== lineage.runInstanceId
+				|| authority.graphId !== lineage.graphId
+				|| authority.taskId !== normalizedTaskId
+				|| authority.attempt !== attempt
+				|| authority.attemptNonce !== lineage.attemptNonce
+			) ? false : (
+				(authority.phase === "dispatching" && authority.requestDigest === requestDigest && authority.asyncId === undefined)
+				|| (authority.phase === "prepared" && authority.requestDigest === undefined && authority.asyncId === undefined)
+			);
+			if (
+				!authorityProvesPreEmit
+				|| ledger.schemaVersion !== 1
+				|| ledger.phase !== "prepared"
+				|| ledger.requestDigest !== requestDigest
+				|| JSON.stringify(ledger.lineage) !== JSON.stringify(lineage)
+				|| ledger.dispatchKey !== canonicalDigest({ lineage, requestDigest })
+				|| ledger.requestId !== `pi-graph-v2-${String(ledger.dispatchKey).slice(0, 40)}`
+				|| ledger.asyncId !== undefined
+				|| ledger.asyncDir !== undefined
+			) throw new Error("Pre-emit abort evidence does not prove that attempt authority can safely return to prepared.");
+			try {
+				await readFile(tombstonePath, "utf8");
+				throw new Error("A tombstoned child dispatch cannot return to prepared attempt authority.");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			const restored: AttemptRecord = { ...authority, phase: "prepared", updatedAt: new Date().toISOString() };
+			delete restored.requestDigest;
+			delete restored.asyncId;
+			delete restored.sessionId;
+			delete restored.terminalStatus;
+			delete restored.terminalError;
+			delete restored.terminalRetryKind;
+			await atomicWriteJson(authorityPath, restored);
+		});
 	}
 
 	async hasAttemptRecovery(taskId: string, attempt: number): Promise<boolean> {
@@ -551,7 +641,10 @@ export class GraphStore {
 		};
 		const nextPhases = allowed[previous.phase];
 		if (!nextPhases) throw new Error(`Invalid previous attempt authority phase: ${String(previous.phase)}.`);
-		for (const field of ["requestDigest", "asyncId", "sessionId"] as const) {
+		if (previous.routingDecision !== undefined && next.routingDecision !== undefined && canonicalDigest(previous.routingDecision) !== canonicalDigest(next.routingDecision)) {
+			throw new Error("Attempt authority routingDecision cannot change.");
+		}
+		for (const field of ["requestDigest", "launchContractDigest", "extensionContentDigest", "runtimeLaunchContractDigest", "runtimeGuardAcknowledged", "asyncId", "sessionId"] as const) {
 			if (previous[field] !== undefined && next[field] !== undefined && previous[field] !== next[field]) {
 				throw new Error(`Attempt authority ${field} cannot change.`);
 			}
@@ -585,6 +678,12 @@ export class GraphStore {
 
 	async writeWorkspaceRecord(taskId: string, attempt: number, record: WorkspaceRecord): Promise<string> {
 		return this.writeJson(join("nodes", validateGraphId(taskId), `attempt-${attempt}`, "workspace.json"), record);
+	}
+
+	async readWorkspaceRecord(taskId: string, attempt: number): Promise<WorkspaceRecord> {
+		const path = this.path("nodes", validateGraphId(taskId), `attempt-${attempt}`, "workspace.json");
+		await this.assertManagedFilePath(path, "Workspace authority");
+		return JSON.parse(await readFile(path, "utf8")) as WorkspaceRecord;
 	}
 
 	async writeValidatedResult(taskId: string, attempt: number, record: ValidatedResultRecord): Promise<string> {

@@ -27,10 +27,16 @@ async function readJson(path: string): Promise<Record<string, unknown> | null> {
 	}
 }
 
-function completionOutput(value: Record<string, unknown> | undefined): string {
+function completionFinalOutput(value: Record<string, unknown> | undefined): string {
 	if (!value) return "";
 	const results = Array.isArray(value.results) ? value.results as Array<Record<string, unknown>> : [];
-	return results.map((result) => typeof result.summary === "string" ? result.summary : typeof result.finalOutput === "string" ? result.finalOutput : "").filter(Boolean).join("\n\n");
+	return results.map((result) => typeof result.finalOutput === "string" ? result.finalOutput : "").filter(Boolean).join("\n\n");
+}
+
+function completionSummary(value: Record<string, unknown> | undefined): string {
+	if (!value) return "";
+	const results = Array.isArray(value.results) ? value.results as Array<Record<string, unknown>> : [];
+	return results.map((result) => typeof result.summary === "string" ? result.summary : "").filter(Boolean).join("\n\n");
 }
 
 function within(root: string, target: string): boolean {
@@ -53,6 +59,8 @@ export async function waitForAsyncRun(input: {
 	asyncDir: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	preferCompletionFinalOutput?: boolean;
+	completionEventGraceMs?: number;
 }): Promise<AsyncTerminal> {
 	assertAsyncRunIdentity(input.asyncId, input.asyncDir);
 	const statusPath = join(input.asyncDir, "status.json");
@@ -60,13 +68,21 @@ export async function waitForAsyncRun(input: {
 		let watcher: FSWatcher | undefined;
 		let poller: NodeJS.Timeout | undefined;
 		let deadline: NodeJS.Timeout | undefined;
+		let completionGrace: NodeJS.Timeout | undefined;
+		let completionGraceExpired = false;
 		let completion: Record<string, unknown> | undefined;
 		let checking = false;
 		let settled = false;
+		const completionEventGraceMs = input.completionEventGraceMs ?? 3_000;
+		if (!Number.isFinite(completionEventGraceMs) || completionEventGraceMs < 0) {
+			reject(new Error("Subagent completion-event grace must be a non-negative finite number."));
+			return;
+		}
 		const finish = (action: () => void) => {
 			if (settled) return;
 			settled = true;
 			if (deadline) clearTimeout(deadline);
+			if (completionGrace) clearTimeout(completionGrace);
 			if (poller) clearInterval(poller);
 			watcher?.close();
 			if (typeof unsubscribe === "function") unsubscribe();
@@ -82,11 +98,30 @@ export async function waitForAsyncRun(input: {
 				if (status.runId !== input.asyncId) throw new Error(`Subagent status identity does not match ${input.asyncId}.`);
 				const state = status.state;
 				if (state !== "complete" && state !== "failed" && state !== "stopped" && state !== "paused") return;
-				let output = completionOutput(completion);
 				const outputFile = typeof status.outputFile === "string" ? status.outputFile : undefined;
-				if (!output && outputFile) {
-					output = await readSafeOutput(outputFile, input.asyncDir);
+				const fileOutput = !input.preferCompletionFinalOutput && outputFile ? await readSafeOutput(outputFile, input.asyncDir) : "";
+				if (state === "complete" && input.preferCompletionFinalOutput && !completion) {
+					if (completionGraceExpired) {
+						throw new Error(`Subagent completion event for ${input.asyncId} was not observed within ${completionEventGraceMs}ms of terminal status.`);
+					}
+					if (!completionGrace) {
+						completionGrace = setTimeout(() => {
+							completionGrace = undefined;
+							completionGraceExpired = true;
+							void check();
+						}, completionEventGraceMs);
+						completionGrace.unref();
+					}
+					return;
 				}
+				const finalOutput = completionFinalOutput(completion);
+				const summary = completionSummary(completion);
+				if (state === "complete" && input.preferCompletionFinalOutput && !finalOutput && !summary) {
+					throw new Error(`Subagent completion event for ${input.asyncId} did not include usable final output.`);
+				}
+				const output = input.preferCompletionFinalOutput
+					? finalOutput || summary
+					: fileOutput || finalOutput || summary;
 				finish(() => resolvePromise({ state, status, completion, output }));
 			} catch (error) {
 				finish(() => reject(error));
@@ -99,6 +134,10 @@ export async function waitForAsyncRun(input: {
 			const id = event.runId ?? event.id;
 			if (id !== input.asyncId || (event.asyncDir !== undefined && event.asyncDir !== input.asyncDir)) return;
 			completion = event;
+			if (completionGrace) {
+				clearTimeout(completionGrace);
+				completionGrace = undefined;
+			}
 			void check();
 		});
 			const onAbort = () => finish(() => reject(new Error("Graph node monitoring aborted.")));
@@ -129,6 +168,37 @@ export async function readAsyncRunState(asyncId: string, asyncDir: string): Prom
 	const status = await readJson(join(asyncDir, "status.json"));
 	if (status && status.runId !== asyncId) throw new Error(`Subagent status identity does not match ${asyncId}.`);
 	return typeof status?.state === "string" ? status.state : undefined;
+}
+
+export async function waitForObservedProcessTerminal(asyncId: string, asyncDir: string, timeoutMs = 30_000): Promise<boolean> {
+	assertAsyncRunIdentity(asyncId, asyncDir);
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const status = await readJson(join(asyncDir, "status.json"));
+		if (status && status.runId !== asyncId) throw new Error(`Subagent status identity does not match ${asyncId}.`);
+		const sidecar = await readJson(join(asyncDir, "process-terminal.json"));
+		for (const proof of [sidecar, status?.processTerminal]) {
+			if (!proof || typeof proof !== "object" || Array.isArray(proof)) continue;
+			const value = proof as Record<string, unknown>;
+			if (typeof value.runId === "string" && value.runId !== asyncId) throw new Error(`Subagent process-terminal proof identity does not match ${asyncId}.`);
+			const instances = Array.isArray(value.instances) ? value.instances : [];
+			const runner = instances.find((entry) => entry && typeof entry === "object" && !Array.isArray(entry) && (entry as Record<string, unknown>).kind === "runner") as Record<string, unknown> | undefined;
+			if (value.version === 1
+				&& value.state === "observed"
+				&& value.runId === asyncId
+				&& typeof value.runnerProcessInstanceId === "string"
+				&& Boolean(value.runnerProcessInstanceId)
+				&& typeof value.observedAt === "number"
+				&& Number.isFinite(value.observedAt)
+				&& runner?.processInstanceId === value.runnerProcessInstanceId
+				&& typeof runner.closeObservedAt === "number"
+				&& Number.isFinite(runner.closeObservedAt)
+				&& (typeof runner.exitCode === "number" || runner.exitCode === null)
+				&& (typeof runner.signal === "string" || runner.signal === null)) return true;
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+	}
+	return false;
 }
 
 export async function requestAsyncStop(asyncDir: string): Promise<void> {

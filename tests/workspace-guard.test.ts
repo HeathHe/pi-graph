@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
-import graphGuard from "../extensions/pi-graph-guard.ts";
+import graphGuard, { remoteToolViolation } from "../extensions/pi-graph-guard.ts";
 import { compileGraph } from "../src/compile.ts";
 import { digestFile, prepareWorkspace, reopenWorkspace } from "../src/workspace.ts";
 import type { GraphSpec } from "../src/types.ts";
@@ -16,15 +16,66 @@ function registerGuard(): ((event: any, ctx: any) => any) {
 	const previous = process.env.PI_SUBAGENT_CHILD;
 	process.env.PI_SUBAGENT_CHILD = "1";
 	let handler: ((event: any, ctx: any) => any) | undefined;
+	let acknowledged = false;
 	try {
-		graphGuard({ on: (_name: string, value: typeof handler) => { handler = value; } } as any);
+		graphGuard({
+			events: { emit: (name: string, payload: unknown) => { acknowledged = name === "subagent:acknowledge-extension" && (payload as { id?: unknown }).id === "pi-graph-guard"; } },
+			on: (_name: string, value: typeof handler) => { handler = value; },
+		} as any);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previous;
 	}
+	assert.equal(acknowledged, true);
 	assert.ok(handler);
 	return handler!;
 }
+
+test("remote read guard binds a conservative read-only tool to its exact input", () => {
+	const contract = { resourceScopes: [{ kind: "mailbox" as const, resource: "primary", access: "read" as const, toolNames: ["gmail_search"], toolInput: { query: "from:example", account: "primary" } }] };
+	assert.equal(remoteToolViolation("gmail_search", { account: "primary", query: "from:example" }, contract), null);
+	assert.match(remoteToolViolation("gmail_search", { account: "other", query: "from:example" }, contract) ?? "", /exact input/);
+	assert.match(remoteToolViolation("gmail_send_email", { account: "primary" }, contract) ?? "", /not an attested read-only/);
+	const camelCaseAttack = { resourceScopes: [{ kind: "mailbox" as const, resource: "primary", access: "read" as const, toolNames: ["gmail_get_deleteMessage"], toolInput: { id: "message-1" } }] };
+	assert.match(remoteToolViolation("gmail_get_deleteMessage", { id: "message-1" }, camelCaseAttack) ?? "", /not an attested read-only/);
+	for (const toolName of ["gmail_mark_as_read", "gmailGetMarkRead", "gmail_get_trashMessage", "gmail_readAndArchive"]) {
+		const semanticAttack = { resourceScopes: [{ kind: "mailbox" as const, resource: "primary", access: "read" as const, toolNames: [toolName], toolInput: { id: "message-1" } }] };
+		assert.match(remoteToolViolation(toolName, { id: "message-1" }, semanticAttack) ?? "", /not an attested read-only/);
+	}
+});
+
+test("root tree writes never inspect or apply workspace .pi-graph control files", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-root-scope-"));
+	const cwd = join(root, "project");
+	await mkdir(join(cwd, ".pi-graph"), { recursive: true });
+	await mkdir(join(cwd, ".git"), { recursive: true });
+	await mkdir(join(cwd, ".pi-subagents"), { recursive: true });
+	await writeFile(join(cwd, ".pi-graph", "source-control.txt"), "source-control\n");
+	await writeFile(join(cwd, ".git", "config"), "credential-bearing-control\n");
+	await writeFile(join(cwd, ".pi-subagents", "state.json"), "{}\n");
+	await writeFile(join(cwd, "existing.md"), "before\n");
+	const graph = compileGraph({ schemaVersion: 1, goal: "root write", workspace: "shadow", nodes: [{
+		taskId: "writer", agent: "document-writer", task: "write", outputArtifact: "result.md", sideEffect: "local_write",
+		writeScope: [{ kind: "tree", path: "." }], atomic: true, scopeJustification: "Exercise a root tree write without copying control files.", validationCommands: ["test -f existing.md"],
+	}] } as GraphSpec, cwd);
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir: join(root, "runs", graph.graphId, "nodes", "writer", "attempt-1"), strategy: "shadow" });
+	assert.equal(existsSync(join(workspace.cwd, ".git")), false);
+	assert.equal(existsSync(join(workspace.cwd, ".pi-subagents")), false);
+	await writeFile(join(workspace.cwd, "existing.md"), "after\n");
+	await writeFile(join(workspace.cwd, ".pi-graph", "poison.json"), "{}\n");
+	const inspected = await workspace.inspectWrites();
+	const sourceCwd = graph.nodes[0]!.cwd;
+	assert.ok(inspected.some((entry) => entry.path === join(sourceCwd, "existing.md")));
+	assert.equal(inspected.some((entry) => entry.path.includes(`${join(sourceCwd, ".pi-graph")}/`) || entry.path.includes(`${join(sourceCwd, ".pi", "agents")}/`) || entry.path.includes(`${join(sourceCwd, ".pi-subagents")}/`) || entry.path.includes(`${join(sourceCwd, ".git")}/`)), false);
+	const applied = await workspace.apply();
+	assert.ok(applied.some((entry) => entry.path === join(sourceCwd, "existing.md")));
+	assert.equal(applied.some((entry) => entry.path.includes(`${join(sourceCwd, ".pi-graph")}/`) || entry.path.includes(`${join(sourceCwd, ".pi", "agents")}/`) || entry.path.includes(`${join(sourceCwd, ".pi-subagents")}/`) || entry.path.includes(`${join(sourceCwd, ".git")}/`)), false);
+	assert.equal(await readFile(join(cwd, ".pi-graph", "source-control.txt"), "utf8"), "source-control\n");
+	assert.equal(existsSync(join(cwd, ".pi-graph", "poison.json")), false);
+	assert.equal(existsSync(join(cwd, ".pi", "agents", "document-writer.md")), false);
+	assert.equal(await readFile(join(cwd, ".git", "config"), "utf8"), "credential-bearing-control\n");
+	assert.equal(await readFile(join(cwd, ".pi-subagents", "state.json"), "utf8"), "{}\n");
+});
 
 test("shadow workspace applies only declared writes", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-workspace-"));
@@ -43,6 +94,61 @@ test("shadow workspace applies only declared writes", async () => {
 	assert.equal(await readFile(join(cwd, "outside.md"), "utf8"), "outside");
 	assert.equal(changes.length, 1);
 	assert.equal(workspace.contract.allowBash, false);
+});
+
+test("shadow workspace exposes scoped Git diff evidence and detects index drift", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-git-evidence-"));
+	const cwd = join(root, "project");
+	await mkdir(cwd);
+	spawnSync("git", ["-C", cwd, "init"], { encoding: "utf8" });
+	spawnSync("git", ["-C", cwd, "config", "user.email", "pi-graph@example.invalid"], { encoding: "utf8" });
+	spawnSync("git", ["-C", cwd, "config", "user.name", "pi-graph"], { encoding: "utf8" });
+	await writeFile(join(cwd, "reviewed.md"), "before\n");
+	await writeFile(join(cwd, "outside.md"), "outside-before\n");
+	spawnSync("git", ["-C", cwd, "add", "reviewed.md", "outside.md"], { encoding: "utf8" });
+	assert.equal(spawnSync("git", ["-C", cwd, "commit", "-m", "baseline"], { encoding: "utf8" }).status, 0);
+	await writeFile(join(cwd, "reviewed.md"), "after\n");
+	await writeFile(join(cwd, "outside.md"), "outside-secret-change\n");
+	const graph = compileGraph({ schemaVersion: 1, goal: "review dirty diff", workspace: "shadow", nodes: [{
+		taskId: "review", agent: "code-reviewer", task: "review", outputArtifact: "review.md", sideEffect: "none",
+		readScope: [{ kind: "file", path: "reviewed.md" }],
+	}] } as GraphSpec, cwd);
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir: join(root, "run", "nodes", "review", "attempt-1"), strategy: "shadow" });
+	assert.ok(workspace.sourceGitEvidencePath);
+	const evidence = await readFile(workspace.sourceGitEvidencePath!, "utf8");
+	assert.match(evidence, /reviewed\.md/);
+	assert.match(evidence, /Branch:/);
+	assert.match(evidence, /Git directory identity:/);
+	assert.match(evidence, /Git common directory identity:/);
+	assert.match(evidence, /-before/);
+	assert.match(evidence, /\+after/);
+	assert.doesNotMatch(evidence, /outside\.md|outside-secret-change/);
+	const handler = registerGuard();
+	assert.equal(handler({ toolName: "read", input: { path: workspace.sourceGitEvidencePath } }, { cwd: workspace.cwd }), undefined);
+	spawnSync("git", ["-C", cwd, "add", "reviewed.md"], { encoding: "utf8" });
+	await assert.rejects(workspace.apply(), /Git HEAD, index, or working-tree evidence changed/);
+});
+
+test("write-only scope Git index drift blocks source apply", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-write-git-evidence-"));
+	const cwd = join(root, "project");
+	await mkdir(cwd);
+	for (const args of [["init"], ["config", "user.email", "pi-graph@example.invalid"], ["config", "user.name", "pi-graph"]]) {
+		assert.equal(spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).status, 0);
+	}
+	await writeFile(join(cwd, "target.md"), "committed\n");
+	spawnSync("git", ["-C", cwd, "add", "target.md"], { encoding: "utf8" });
+	assert.equal(spawnSync("git", ["-C", cwd, "commit", "-m", "baseline"], { encoding: "utf8" }).status, 0);
+	await writeFile(join(cwd, "target.md"), "source-dirty\n");
+	const graph = compileGraph({ schemaVersion: 1, goal: "write dirty file", workspace: "shadow", nodes: [{
+		taskId: "writer", agent: "document-writer", task: "write", outputArtifact: "result.md", sideEffect: "local_write",
+		writeScope: [{ kind: "file", path: "target.md" }], validationCommands: ["test -f target.md"],
+	}] } as GraphSpec, cwd);
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir: join(root, "run", "nodes", "writer", "attempt-1"), strategy: "shadow" });
+	await writeFile(join(workspace.cwd, "target.md"), "agent-after\n");
+	assert.equal(spawnSync("git", ["-C", cwd, "add", "target.md"], { encoding: "utf8" }).status, 0);
+	await assert.rejects(workspace.apply(), /Git HEAD, index, or working-tree evidence changed/);
+	assert.equal(await readFile(join(cwd, "target.md"), "utf8"), "source-dirty\n");
 });
 
 test("apply-back refuses to overwrite a concurrent source edit", async () => {
@@ -88,7 +194,83 @@ test("Graph Guard blocks undeclared direct paths and read-only bash", async () =
 	assert.equal(handler({ toolName: "read", input: { path: "outside.md" } }, { cwd }).block, true);
 	assert.equal(handler({ toolName: "bash", input: { command: "pwd" } }, { cwd }).block, true);
 	assert.equal(handler({ toolName: "write", input: { path: ".pi-graph/node-contract.json" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "write", input: { path: ".pi-graph/poison.json" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "write", input: { path: ".pi/agents/worker.md" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "write", input: { path: ".git/config" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "write", input: { path: ".pi-subagents/state.json" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "read", input: { path: ".git/config" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "read", input: { path: ".pi/agents/worker.md" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "read", input: { path: ".pi-subagents/state.json" } }, { cwd }).block, true);
 	assert.equal(handler({ toolName: "custom-path-tool", input: { path: "allowed.md" } }, { cwd }).block, true);
+});
+
+test("dynamic Graph runs roots are blocked from child reads and writes even when declared in scope", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-guard-dynamic-runs-"));
+	const protectedRoot = join(cwd, "graph-runs");
+	await mkdir(join(cwd, ".pi-graph"));
+	await mkdir(protectedRoot);
+	await writeFile(join(protectedRoot, "snapshot.json"), "{}\n");
+	await writeFile(join(cwd, ".pi-graph", "node-contract.json"), JSON.stringify({
+		schemaVersion: 1,
+		graphId: "g",
+		taskId: "n",
+		attempt: 1,
+		attemptDir: cwd,
+		sourceCwd: cwd,
+		workspaceCwd: cwd,
+		readScope: [{ kind: "tree", path: cwd }],
+		writeScope: [{ kind: "tree", path: cwd }],
+		protectedWorkspaceRoots: [protectedRoot],
+		allowBash: false,
+		writeBaseline: {},
+	}));
+	const handler = registerGuard();
+	assert.equal(handler({ toolName: "read", input: { path: "graph-runs/snapshot.json" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "write", input: { path: "graph-runs/snapshot.json" } }, { cwd }).block, true);
+});
+
+test("workspace preparation rejects scopes into the dynamic Graph runs root before creating an attempt", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-workspace-protected-runs-"));
+	const runsRoot = join(cwd, "graph-runs");
+	const attemptDir = join(cwd, "attempt");
+	const graph = compileGraph({ schemaVersion: 1, goal: "read runtime", workspace: "shadow", nodes: [{
+		taskId: "reader", agent: "researcher", task: "read runtime", outputArtifact: "result.md", sideEffect: "none",
+		readScope: [{ kind: "tree", path: "graph-runs/.control" }],
+	}] } as GraphSpec, cwd);
+	await assert.rejects(() => prepareWorkspace({
+		graphId: graph.graphId,
+		node: graph.nodes[0]!,
+		attempt: 1,
+		attemptDir,
+		strategy: "shadow",
+		protectedSourceRoots: [runsRoot],
+	}), /Graph scope intersects protected Graph runs root/);
+	assert.equal(existsSync(attemptDir), false);
+});
+
+test("reopen rejects tampered dynamic Graph runs-root protections", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-reopen-protected-runs-"));
+	const runsRoot = join(cwd, "graph-runs");
+	await writeFile(join(cwd, "target.md"), "before\n");
+	const graph = compileGraph({ schemaVersion: 1, goal: "write", workspace: "shadow", nodes: [{
+		taskId: "writer", agent: "document-writer", task: "write", outputArtifact: "result.md", sideEffect: "local_write",
+		writeScope: [{ kind: "file", path: "target.md" }], validationCommands: ["test -f target.md"],
+	}] } as GraphSpec, cwd);
+	const attemptDir = join(runsRoot, graph.graphId, "nodes", "writer", "attempt-1");
+	const workspace = await prepareWorkspace({
+		graphId: graph.graphId,
+		node: graph.nodes[0]!,
+		attempt: 1,
+		attemptDir,
+		strategy: "shadow",
+		protectedSourceRoots: [runsRoot],
+	});
+	const contractPath = join(workspace.cwd, ".pi-graph", "node-contract.json");
+	const contract = JSON.parse(await readFile(contractPath, "utf8"));
+	contract.protectedSourceRoots = [];
+	contract.protectedWorkspaceRoots = [];
+	await writeFile(contractPath, JSON.stringify(contract));
+	await assert.rejects(() => reopenWorkspace(graph.nodes[0]!, workspace.cwd, "shadow", [runsRoot]), /modified protected Graph runs roots/);
 });
 
 test("Graph Guard blocks parent traversal and control files for bash-enabled nodes", async () => {
@@ -98,7 +280,20 @@ test("Graph Guard blocks parent traversal and control files for bash-enabled nod
 	const handler = registerGuard();
 	assert.equal(handler({ toolName: "bash", input: { command: "cd .." } }, { cwd }).block, true);
 	assert.equal(handler({ toolName: "bash", input: { command: "cat .pi-graph/node-contract.json" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "bash", input: { command: "cat ${HOME}/secret" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "bash", input: { command: "printf x > $(find . -name node-contract.json)" } }, { cwd }).block, true);
 	assert.equal(handler({ toolName: "custom-reader", input: { filePath: "/etc/passwd" } }, { cwd }).block, true);
+});
+
+test("Graph Guard blocks nested control directories even under a declared tree", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-guard-nested-control-"));
+	await mkdir(join(cwd, ".pi-graph"));
+	await mkdir(join(cwd, "nested", ".git"), { recursive: true });
+	await writeFile(join(cwd, "nested", ".git", "config"), "secret");
+	await writeFile(join(cwd, ".pi-graph", "node-contract.json"), JSON.stringify({ schemaVersion: 1, graphId: "g", taskId: "n", attempt: 1, attemptDir: cwd, sourceCwd: cwd, workspaceCwd: cwd, readScope: [{ kind: "tree", path: cwd }], writeScope: [], allowBash: false, writeBaseline: {}, readBaseline: {}, inputBaseline: {} }));
+	const handler = registerGuard();
+	assert.equal(handler({ toolName: "read", input: { path: "nested/.git/config" } }, { cwd }).block, true);
+	assert.equal(handler({ toolName: "ls", input: { path: "nested/.git" } }, { cwd }).block, true);
 });
 
 test("Graph Guard is inert in an ordinary parent Pi process", () => {
@@ -203,6 +398,29 @@ test("recovered Git workspace cleans up after source becomes dirty", async () =>
 	const worktreeRoot = workspace.contract.gitWorktreeRoot!;
 	await (await reopenWorkspace(graph.nodes[0]!, workspace.cwd, "git")).cleanup();
 	assert.equal(existsSync(worktreeRoot), false);
+});
+
+test("auto workspace uses shadow for provider retries even in a clean Git repository", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-auto-provider-retry-"));
+	const cwd = join(root, "project");
+	await mkdir(cwd);
+	spawnSync("git", ["-C", cwd, "init"], { encoding: "utf8" });
+	spawnSync("git", ["-C", cwd, "config", "user.email", "pi-graph@example.invalid"], { encoding: "utf8" });
+	spawnSync("git", ["-C", cwd, "config", "user.name", "pi-graph"], { encoding: "utf8" });
+	await writeFile(join(cwd, "tracked.md"), "tracked\n");
+	spawnSync("git", ["-C", cwd, "add", "tracked.md"], { encoding: "utf8" });
+	assert.equal(spawnSync("git", ["-C", cwd, "commit", "-m", "baseline"], { encoding: "utf8" }).status, 0);
+	const graph = compileGraph({ schemaVersion: 1, goal: "retry", workspace: "auto", nodes: [{
+		taskId: "retry",
+		agent: "researcher",
+		task: "retry safely",
+		outputArtifact: "retry.md",
+		sideEffect: "none",
+		retryPolicy: { maxAttempts: 1, maxProviderRetries: 1 },
+	}] } as GraphSpec, cwd);
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir: join(root, "run", "attempt-1"), strategy: "auto" });
+	assert.equal(workspace.kind, "shadow");
+	assert.equal(workspace.contract.gitWorktreeRoot, undefined);
 });
 
 test("reopen rejects a modified node contract", async () => {

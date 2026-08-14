@@ -55,15 +55,24 @@ export class RpcRejectedError extends Error {
 	}
 }
 
+export class RpcPreEmitError extends Error {
+	readonly cause: unknown;
+	constructor(cause: unknown) {
+		super(`RPC request was rejected before emit: ${cause instanceof Error ? cause.message : String(cause)}`);
+		this.name = "RpcPreEmitError";
+		this.cause = cause;
+	}
+}
+
 export class SubagentRpcClient {
-	private readonly events: EventBus;
+	readonly events: EventBus;
 	private readonly timeoutMs: number;
 	constructor(events: EventBus, timeoutMs = 10_000) {
 		this.events = events;
 		this.timeoutMs = timeoutMs;
 	}
 
-	call(method: "ping" | "status" | "spawn" | "interrupt" | "stop", params?: unknown, stableRequestId?: string): Promise<unknown> {
+	call(method: "ping" | "status" | "spawn" | "interrupt" | "stop" | "resume", params?: unknown, stableRequestId?: string, beforeEmit?: () => void): Promise<unknown> {
 		const requestId = stableRequestId ?? `pi-graph-${randomUUID()}`;
 		return new Promise((resolvePromise, reject) => {
 			let settled = false;
@@ -82,12 +91,21 @@ export class SubagentRpcClient {
 				if (typeof unsubscribe === "function") unsubscribe();
 				reject(new RpcTimeoutError(requestId, method));
 			}, this.timeoutMs);
+			try {
+				beforeEmit?.();
+			} catch (error) {
+				settled = true;
+				clearTimeout(timer);
+				if (typeof unsubscribe === "function") unsubscribe();
+				reject(new RpcPreEmitError(error));
+				return;
+			}
 			this.events.emit(RPC_REQUEST, { version: 1, requestId, method, params, source: { extension: "pi-graph" } });
 		});
 	}
 
-	async spawn(params: Record<string, unknown>, stableRequestId?: string): Promise<{ asyncId: string; asyncDir: string }> {
-		const response = await this.call("spawn", params, stableRequestId) as { details?: { asyncId?: string; asyncDir?: string }; isError?: boolean; text?: string };
+	async spawn(params: Record<string, unknown>, stableRequestId?: string, beforeEmit?: () => void): Promise<{ asyncId: string; asyncDir: string }> {
+		const response = await this.call("spawn", params, stableRequestId, beforeEmit) as { details?: { asyncId?: string; asyncDir?: string }; isError?: boolean; text?: string };
 		const asyncId = response?.details?.asyncId;
 		const asyncDir = response?.details?.asyncDir;
 		if (response?.isError || !asyncId || !asyncDir) throw new RpcRejectedError(stableRequestId ?? "unknown", "spawn", response?.text ?? "pi-subagents RPC spawn returned no async run identity.");
@@ -134,6 +152,7 @@ export async function recoverRunBySessionDir(
 	sessionDir: string,
 	asyncRoot = subagentAsyncRoot(),
 	ownerSessionId?: string,
+	ownerSessionFile?: string,
 ): Promise<{ asyncId: string; asyncDir: string } | null> {
 	let entries;
 	try {
@@ -177,9 +196,11 @@ export async function recoverRunBySessionDir(
 				if (record) index.set(record.asyncId, record);
 			}
 		}
+	const canonicalOwnerSessionFile = ownerSessionFile && isAbsolute(ownerSessionFile) ? resolve(ownerSessionFile) : undefined;
 	const matches = [...index.values()]
 		.filter((record) => current.has(record.asyncId))
-		.filter((record) => !ownerSessionId || record.sessionId === ownerSessionId)
+		.filter((record) => !ownerSessionId || record.sessionId === ownerSessionId
+			|| (canonicalOwnerSessionFile !== undefined && typeof record.sessionId === "string" && isAbsolute(record.sessionId) && resolve(record.sessionId) === canonicalOwnerSessionFile))
 		.filter((record) => within(expected, record.sessionDir))
 		.map(({ asyncId, asyncDir }) => ({ asyncId, asyncDir }));
 	if (matches.length > 1) throw new Error(`Multiple pi-subagents runs match graph attempt session root: ${sessionDir}`);

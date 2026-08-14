@@ -571,6 +571,15 @@ async function writeHistory(store: GraphStore, snapshot: GraphSnapshot, history:
 	await rm(store.path("history-transaction.json"), { force: true });
 }
 
+export async function prepareAttentionResume(store: GraphStore, snapshot: GraphSnapshot): Promise<void> {
+	if (snapshot.schemaVersion !== 2 || snapshot.status !== "needs_attention") return;
+	const history = await readHistory(store, snapshot);
+	if (snapshot.terminalAt === undefined && history.terminalAt === undefined) return;
+	delete snapshot.terminalAt;
+	delete history.terminalAt;
+	await writeHistory(store, snapshot, history);
+}
+
 async function openTransaction(store: GraphStore, snapshot: GraphSnapshot): Promise<boolean> {
 	for (const state of Object.values(snapshot.nodes)) {
 		for (const attempt of state.attempts) {
@@ -585,9 +594,12 @@ async function activeChild(snapshot: GraphSnapshot): Promise<boolean> {
 	for (const state of Object.values(snapshot.nodes)) {
 		const attempt = state.attempts.at(-1);
 		if (!attempt || ["accepted", "failed", "blocked", "stopped"].includes(attempt.status)) continue;
-		if (!attempt.asyncId || !attempt.asyncDir) return true;
+		const providerDispatch = attempt.providerDispatches?.at(-1);
+		const asyncId = providerDispatch?.asyncId ?? attempt.asyncId;
+		const asyncDir = providerDispatch?.asyncDir ?? attempt.asyncDir;
+		if (!asyncId || !asyncDir) return true;
 		try {
-			const child = await readAsyncRunState(attempt.asyncId, attempt.asyncDir);
+			const child = await readAsyncRunState(asyncId, asyncDir);
 			if (child === "running" || child === "queued" || child === "paused") return true;
 			if (child === undefined) return true;
 		} catch {

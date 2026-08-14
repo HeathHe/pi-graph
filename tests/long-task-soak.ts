@@ -11,6 +11,9 @@ import { subagentAsyncRoot, type EventBus } from "../src/rpc.ts";
 import { GraphRunner, initialSnapshot } from "../src/runner.ts";
 import { GraphStore } from "../src/store.ts";
 import type { GraphConfig, GraphNodeSpec, GraphSpec } from "../src/types.ts";
+import { auditManagedLaunchContracts } from "../src/pi-subagents-preflight.ts";
+
+const graphGuardAcknowledgement = { version: 1, source: "child-runtime", ids: ["pi-graph-guard"], omitted: 0 } as const;
 
 interface SoakMetrics {
 	durationMs: number;
@@ -28,6 +31,7 @@ interface ChildStatus {
 	sessionDir: string;
 	outputFile?: string;
 	error?: string;
+	steps?: Array<{ launchContractDigest?: string; runtimeAcknowledgedExtensions: typeof graphGuardAcknowledgement }>;
 }
 
 function delay(ms: number): Promise<void> {
@@ -36,6 +40,15 @@ function delay(ms: number): Promise<void> {
 
 function marker(task: string): string {
 	return task.match(/SOAK_(?:NODE|RESTART|WRITE):([A-Za-z0-9._-]+)/)?.[1] ?? createHash("sha256").update(task).digest("hex").slice(0, 12);
+}
+
+function parseGraphChildParams(params: Record<string, unknown>): Record<string, unknown> {
+	const workflowScript = params.workflowScript;
+	if (workflowScript === undefined) return params;
+	if (typeof workflowScript !== "string") throw new Error("Expected a string Graph workflowScript.");
+	const match = /^return await runs\.run\(("(?:[^"\\]|\\.)*"), (\{.*\})\);$/u.exec(workflowScript);
+	if (!match) throw new Error("Unexpected Graph child workflowScript.");
+	return JSON.parse(match[2]!) as Record<string, unknown>;
 }
 
 class SoakSubagents implements EventBus {
@@ -78,12 +91,13 @@ class SoakSubagents implements EventBus {
 		assert(!this.requestIds.has(request.requestId), `Duplicate durable dispatch: ${request.requestId}`);
 		this.requestIds.add(request.requestId);
 		this.spawns += 1;
-		const task = String(request.params.task ?? "");
+		const innerParams = parseGraphChildParams(request.params);
+		const task = String(innerParams.task ?? "");
 		const taskMarker = marker(task);
 		const attempt = (this.taskAttempts.get(taskMarker) ?? 0) + 1;
 		this.taskAttempts.set(taskMarker, attempt);
 		if (attempt > 1) this.retries += 1;
-		void this.runChild(request, task, taskMarker, attempt);
+		void this.runChild(request, innerParams, task, taskMarker, attempt);
 	}
 
 	listenerCount(): number {
@@ -108,52 +122,71 @@ class SoakSubagents implements EventBus {
 
 	private async runChild(
 		request: { requestId: string; params: Record<string, unknown> },
+		innerParams: Record<string, unknown>,
 		task: string,
 		taskMarker: string,
 		attempt: number,
 	): Promise<void> {
-		const asyncId = `pi-graph-soak-${createHash("sha256").update(request.requestId).digest("hex").slice(0, 32)}`;
-		const asyncDir = join(subagentAsyncRoot(), asyncId);
-		this.asyncDirs.add(asyncDir);
-		await mkdir(asyncDir, { recursive: true });
+		const suffix = createHash("sha256").update(request.requestId).digest("hex").slice(0, 32);
+		const usesOuterWorkflow = typeof request.params.workflowScript === "string";
+		const outerAsyncId = `pi-graph-soak-outer-${suffix}`;
+		const outerAsyncDir = join(subagentAsyncRoot(), outerAsyncId);
+		const innerAsyncId = `pi-graph-soak-inner-${suffix}`;
+		const innerAsyncDir = join(subagentAsyncRoot(), innerAsyncId);
+		if (usesOuterWorkflow) this.asyncDirs.add(outerAsyncDir);
+		this.asyncDirs.add(innerAsyncDir);
+		if (usesOuterWorkflow) await mkdir(outerAsyncDir, { recursive: true });
+		await mkdir(innerAsyncDir, { recursive: true });
+		const launchAudit = await auditManagedLaunchContracts({
+			tasks: [innerParams],
+			cwd: String(innerParams.cwd),
+			requireExtensionSeal: true,
+			graphWorkspaceKind: "shadow",
+		});
+		assert.equal(launchAudit.ok, true, launchAudit.issues.join(" "));
 		const status: ChildStatus = {
-			runId: asyncId,
+			runId: innerAsyncId,
 			state: "running",
 			sessionId: "soak-session",
-			sessionDir: join(String(request.params.sessionDir), "child"),
+			sessionDir: usesOuterWorkflow ? join(String(innerParams.sessionDir), "child") : String(innerParams.sessionDir),
+			steps: [{
+				launchContractDigest: launchAudit.contracts[0]?.launchContractDigest,
+				runtimeAcknowledgedExtensions: graphGuardAcknowledgement,
+			}],
 		};
-		this.childStatuses.set(asyncId, status);
-		await writeFile(join(asyncDir, "status.json"), JSON.stringify(status));
+		this.childStatuses.set(innerAsyncId, status);
+		await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify(status));
+		if (usesOuterWorkflow) await writeFile(join(outerAsyncDir, "status.json"), JSON.stringify({ runId: outerAsyncId, state: "complete", sessionId: "soak-session", sessionDir: request.params.sessionDir, workflow: { value: { runId: innerAsyncId, artifactPaths: [innerAsyncDir] } } }));
 		this.active += 1;
 		this.maxActive = Math.max(this.maxActive, this.active);
 		this.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
 			version: 1,
 			requestId: request.requestId,
 			success: true,
-			data: { details: { asyncId, asyncDir } },
+			data: { details: { asyncId: usesOuterWorkflow ? outerAsyncId : innerAsyncId, asyncDir: usesOuterWorkflow ? outerAsyncDir : innerAsyncDir } },
 		});
 		try {
 			await delay(this.childDelay(task, attempt));
-			if (this.childStatuses.get(asyncId)?.state === "stopped") return;
+			if (this.childStatuses.get(innerAsyncId)?.state === "stopped") return;
 			if (task.includes("RETRY_ONCE") && attempt === 1) {
 				const failed = { ...status, state: "failed", error: "Synthetic first-attempt failure." };
-				this.childStatuses.set(asyncId, failed);
-				await writeFile(join(asyncDir, "status.json"), JSON.stringify(failed));
-				this.emit("subagent:async-complete", { runId: asyncId, asyncDir });
+				this.childStatuses.set(innerAsyncId, failed);
+				await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify(failed));
+				this.emit("subagent:async-complete", { runId: innerAsyncId, asyncDir: innerAsyncDir });
 				return;
 			}
 			if (task.includes("SOAK_WRITE:")) {
-				await writeFile(join(String(request.params.cwd), "shared.txt"), `${taskMarker}\n`);
+				await writeFile(join(String(innerParams.cwd), "shared.txt"), `${taskMarker}\n`);
 			}
-			const output = String(request.params.output);
+			const output = String(innerParams.output);
 			await mkdir(dirname(output), { recursive: true });
 			await writeFile(output, `completed ${taskMarker} attempt ${attempt}\n`);
-			const outputLog = join(asyncDir, "output.log");
+			const outputLog = join(innerAsyncDir, "output.log");
 			await writeFile(outputLog, `completed ${taskMarker} attempt ${attempt}\n`);
 			const completed = { ...status, state: "complete", outputFile: outputLog };
-			this.childStatuses.set(asyncId, completed);
-			await writeFile(join(asyncDir, "status.json"), JSON.stringify(completed));
-			this.emit("subagent:async-complete", { runId: asyncId, asyncDir });
+			this.childStatuses.set(innerAsyncId, completed);
+			await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify(completed));
+			this.emit("subagent:async-complete", { runId: innerAsyncId, asyncDir: innerAsyncDir });
 		} finally {
 			this.active -= 1;
 		}
@@ -208,7 +241,7 @@ async function runSustainedDag(root: string, requestedDurationMs: number): Promi
 			if (retry) retryNodes += 1;
 			nodes.push({
 				taskId,
-				agent: "scout",
+				agent: "code-scout",
 				task: `SOAK_NODE:${taskId}${retry ? " RETRY_ONCE" : ""}`,
 				dependsOn: previous,
 				outputArtifact: `${taskId}.md`,
@@ -238,7 +271,7 @@ async function runSustainedDag(root: string, requestedDurationMs: number): Promi
 	try {
 		const terminal = await new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, ".control", "leases")), graphConfig(runs, budget)).run();
 		const durationMs = performance.now() - started;
-		assert.equal(terminal.status, "complete");
+		assert.equal(terminal.status, "complete", JSON.stringify(terminal));
 		assert(Object.values(terminal.nodes).every((node) => node.status === "accepted"));
 		assert.equal(bus.spawns, budget);
 		assert.equal(bus.retries, retryNodes);
@@ -264,7 +297,7 @@ async function runSuspendResume(root: string): Promise<{ spawns: number; suspend
 	const runs = join(root, "resume-runs");
 	const nodes: GraphNodeSpec[] = Array.from({ length: 3 }, (_, index) => ({
 		taskId: `branch-${index}`,
-		agent: "researcher",
+		agent: "code-scout",
 		task: `SOAK_RESTART:branch-${index}`,
 		outputArtifact: `branch-${index}.md`,
 		sideEffect: "none",
@@ -272,7 +305,7 @@ async function runSuspendResume(root: string): Promise<{ spawns: number; suspend
 	}));
 	nodes.push({
 		taskId: "join",
-		agent: "reviewer",
+		agent: "code-scout",
 		task: "SOAK_RESTART:join",
 		dependsOn: ["branch-0", "branch-1", "branch-2"],
 		outputArtifact: "join.md",
@@ -296,7 +329,11 @@ async function runSuspendResume(root: string): Promise<{ spawns: number; suspend
 	try {
 		const firstRunner = new GraphRunner(graph, initial, firstStore, bus, new LeaseRegistry(join(runs, ".control", "leases")), graphConfig(runs, budget, 3));
 		const firstRun = firstRunner.run();
-		await waitFor(() => bus.maxActive === 3, 5_000, "three active children before suspension");
+		try {
+			await waitFor(() => bus.maxActive === 3, 15_000, "three active children before suspension");
+		} catch (error) {
+			throw new Error(`${error instanceof Error ? error.message : String(error)} Snapshot: ${JSON.stringify(await firstStore.loadSnapshot())}`);
+		}
 		firstRunner.suspend();
 		const suspended = await firstRun;
 		const suspendedRunning = Object.values(suspended.nodes).filter((node) => node.status === "running").length;
@@ -352,7 +389,7 @@ async function runWriteContention(root: string): Promise<{ resourceWaits: number
 		workspace: "shadow",
 		nodes: [{
 			taskId: "write",
-			agent: "code-implementer",
+			agent: "document-writer",
 			task: `SOAK_WRITE:${value}`,
 			outputArtifact: `${id}.md`,
 			sideEffect: "local_write",

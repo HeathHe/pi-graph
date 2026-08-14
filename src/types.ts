@@ -1,8 +1,12 @@
+import type { MaxAuthorization, ModelExecution, RoutingDecision, TaskRisk } from "./model-routing/types.ts";
+
 export const GRAPH_SPEC_VERSION = 1 as const;
 export const GRAPH_RESULT_VERSION = 1 as const;
 
 export type SideEffect = "none" | "local_read" | "local_write" | "external_read" | "external_write";
 export type ScopeKind = "file" | "tree";
+export type NodeOutputType = "file" | "text" | "json" | "table" | "citation-set" | "url" | "screenshot" | "document" | "email-draft" | "connector-record" | "decision";
+export type ResourceScopeKind = "url" | "domain" | "service" | "account" | "database" | "table" | "record" | "mailbox" | "calendar" | "document" | "browser-session" | "connector" | "action";
 export type NodeStatus =
 	| "pending"
 	| "ready"
@@ -25,6 +29,36 @@ export type GraphStatus = "queued" | "running" | "complete" | "failed" | "blocke
 export interface ScopeEntry {
 	kind: ScopeKind;
 	path: string;
+}
+
+export interface NodeOutput {
+	type: NodeOutputType;
+	path?: string;
+	mediaType?: string;
+	schema?: string;
+}
+
+export interface ResourceScope {
+	kind: ResourceScopeKind;
+	resource: string;
+	access: "read" | "write";
+	toolNames?: string[];
+	/** Exact, canonical tool input authorized for the listed read-only tools. */
+	toolInput?: Record<string, unknown>;
+}
+
+export interface ExternalAction {
+	service: string;
+	account?: string;
+	action: string;
+	target: string;
+	idempotencyKey?: string;
+	requiresApproval: boolean;
+	approvalRef?: string;
+	reversible: boolean;
+	compensation?: string;
+	expectedState?: string;
+	verifyByReadback: boolean;
 }
 
 export interface ContextRef {
@@ -105,9 +139,12 @@ export interface GraphNodeSpec {
 	capabilityId?: string;
 	dependsOn?: string[];
 	inputArtifacts?: string[];
-	outputArtifact: string;
+	outputArtifact?: string;
+	output?: NodeOutput;
 	readScope?: ScopeEntry[];
 	writeScope?: ScopeEntry[];
+	resourceScopes?: ResourceScope[];
+	externalAction?: ExternalAction;
 	sideEffect: SideEffect;
 	idempotent?: boolean;
 	parallelizable?: boolean;
@@ -117,8 +154,14 @@ export interface GraphNodeSpec {
 	childAcceptance?: SubagentAcceptanceInput;
 	validationCommands?: string[];
 	retryPolicy?: RetryPolicy;
+	taskRisk?: TaskRisk;
+	routingProfile?: string;
+	producerRefs?: string[];
+	maxAuthorization?: MaxAuthorization;
 	model?: string;
 	thinking?: string;
+	/** Runtime provenance only; never accepted as GraphSpec input. */
+	resolvedModel?: never;
 	context?: ContextRef;
 	cwd?: string;
 	progress?: boolean;
@@ -142,8 +185,9 @@ export interface GraphSpec {
 	workspace?: "auto" | "shadow" | "git";
 }
 
-export interface CompiledNode extends Omit<GraphNodeSpec, "dependsOn" | "readScope" | "writeScope" | "retryPolicy" | "cwd"> {
+export interface CompiledNode extends Omit<GraphNodeSpec, "dependsOn" | "outputArtifact" | "readScope" | "writeScope" | "retryPolicy" | "cwd"> {
 	dependsOn: string[];
+	outputArtifact: string;
 	readScope: ScopeEntry[];
 	writeScope: ScopeEntry[];
 	retryPolicy: RetryPolicy;
@@ -152,6 +196,8 @@ export interface CompiledNode extends Omit<GraphNodeSpec, "dependsOn" | "readSco
 
 export interface CompiledGraph extends Omit<GraphSpec, "graphId" | "nodes" | "maxConcurrency" | "failFast" | "workspace"> {
 	projectionVersion: 1;
+	/** Spawn ceiling sealed when this run was admitted. */
+	spawnBudget?: number;
 	graphId: string;
 	nodes: CompiledNode[];
 	maxConcurrency: number;
@@ -191,9 +237,12 @@ export interface ResultManifest {
 	reads: string[];
 	writes: FileDigest[];
 	validation: ValidationResult[];
+	output?: NodeOutput;
+	resourceScopes?: ResourceScope[];
 	outputArtifact: string;
 	outputDigest?: string;
 	canonicalOutputArtifact?: string;
+	modelExecution?: ModelExecution;
 	failure?: FailureDetails;
 	unresolvedQuestions: string[];
 	createdAt: string;
@@ -205,13 +254,14 @@ export type FailureKind =
 	| "provider_transient"
 	| "hard_deadline"
 	| "budget_checkpoint"
+	| "routing_preflight_drift"
 	| "task_failed"
 	| "validation"
 	| "workspace_conflict"
 	| "monitoring"
 	| "cancelled";
 
-export type RetryKind = "dispatch" | "timeout" | "failed" | "validation" | "provider";
+export type RetryKind = "dispatch" | "timeout" | "failed" | "validation" | "provider" | "model_degrade";
 
 export interface FailureDetails {
 	kind: FailureKind;
@@ -235,6 +285,26 @@ export interface NodeAttemptState {
 	outputPath?: string;
 	manifestPath?: string;
 	writesCommittedAt?: string;
+	routingDecision?: RoutingDecision;
+	modelExecution?: ModelExecution;
+	error?: string;
+	failure?: FailureDetails;
+	providerDispatches?: ProviderDispatchState[];
+}
+
+export interface ProviderDispatchState {
+	dispatch: number;
+	status: "prepared" | "dispatching" | "dispatch_unknown" | "running" | "complete" | "failed" | "stopped" | "paused";
+	sessionDir: string;
+	startedAt: string;
+	endedAt?: string;
+	requestDigest?: string;
+	launchContractDigest?: string;
+	extensionContentDigest?: string;
+	runtimeLaunchContractDigest?: string;
+	asyncId?: string;
+	asyncDir?: string;
+	modelExecution?: ModelExecution;
 	error?: string;
 	failure?: FailureDetails;
 }
@@ -270,6 +340,7 @@ export interface GraphSnapshotV1 extends GraphSnapshotBase {
 export interface GraphSnapshotV2 extends GraphSnapshotBase {
 	schemaVersion: 2;
 	runInstanceId: string;
+	planningAdmissionId?: string;
 	terminalAt?: string;
 	attentionAt?: string;
 	lifecycleRevision: number;

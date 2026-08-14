@@ -25,6 +25,7 @@ import {
 } from "../src/retention.ts";
 import type { GraphConfig, GraphSnapshot } from "../src/types.ts";
 import { doctorGraphRuns } from "../src/doctor.ts";
+import { subagentAsyncRoot } from "../src/rpc.ts";
 
 async function terminalFixture(root: string, graphId: string) {
 	const graph = compileGraph({
@@ -930,6 +931,37 @@ test("needs_attention requires explicit acknowledgement before manual disposal",
 	await updateHistoryFlag(runs, "attention", "acknowledge");
 	const plan = await createPrunePlan(runs, ["attention"]);
 	assert.equal(plan.entries[0]?.graphId, "attention");
+});
+
+test("attention acknowledgement follows the latest provider dispatch identity", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-attention-provider-child-"));
+	const { runs, store } = await terminalFixture(root, "attention-provider-child");
+	const oldId = `pi-graph-retention-old-${randomUUID()}`;
+	const activeId = `pi-graph-retention-active-${randomUUID()}`;
+	const oldDir = join(subagentAsyncRoot(), oldId);
+	const activeDir = join(subagentAsyncRoot(), activeId);
+	try {
+		await mkdir(oldDir, { recursive: true });
+		await mkdir(activeDir, { recursive: true });
+		await writeFile(join(oldDir, "status.json"), JSON.stringify({ runId: oldId, state: "failed" }));
+		await writeFile(join(activeDir, "status.json"), JSON.stringify({ runId: activeId, state: "running" }));
+		const snapshot = await store.loadSnapshot();
+		const attempt = snapshot.nodes.done!.attempts[0]!;
+		snapshot.status = "needs_attention";
+		snapshot.nodes.done!.status = "stale";
+		attempt.status = "stale";
+		attempt.asyncId = oldId;
+		attempt.asyncDir = oldDir;
+		attempt.providerDispatches = [
+			{ dispatch: 1, status: "failed", sessionDir: attempt.sessionDir, startedAt: snapshot.createdAt, asyncId: oldId, asyncDir: oldDir, failure: { kind: "provider_transient", retryKind: "provider" } },
+			{ dispatch: 2, status: "running", sessionDir: join(dirname(attempt.sessionDir), "provider-dispatch-2", "session"), startedAt: snapshot.createdAt, asyncId: activeId, asyncDir: activeDir },
+		];
+		await store.saveSnapshot(snapshot);
+		await assert.rejects(updateHistoryFlag(runs, snapshot.graphId, "acknowledge"), /child is active or unverifiable/);
+	} finally {
+		await rm(oldDir, { recursive: true, force: true });
+		await rm(activeDir, { recursive: true, force: true });
+	}
 });
 
 test("a new needs_attention incident cannot reuse an earlier acknowledgement", async () => {

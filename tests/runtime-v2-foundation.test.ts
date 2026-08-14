@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { processIdentityForPid } from "../src/claims.ts";
 import { compileGraph } from "../src/compile.ts";
 import { GraphStore } from "../src/store.ts";
@@ -14,8 +14,10 @@ import { SubagentRpcClient, subagentAsyncRoot, type EventBus } from "../src/rpc.
 import { NodeExecutor } from "../src/executor.ts";
 import type { GraphConfig, GraphSnapshotV2 } from "../src/types.ts";
 import { prepareWorkspace } from "../src/workspace.ts";
-import { canonicalDigest } from "../src/authority.ts";
+import { authorizationFor, canonicalDigest } from "../src/authority.ts";
 import { loadValidatedRun } from "../src/reconciler.ts";
+import { prepareAttentionResume, readHistory, updateHistoryFlag } from "../src/retention.ts";
+import { canonicalJson, PlanningGate, graphSpecDigest, type PlanningReceipt, type TaskAssessment } from "../src/subagent-router/planning-gate.ts";
 
 function graphAt(root: string, graphId: string) {
 	return compileGraph({
@@ -52,6 +54,90 @@ function snapshot(graph: ReturnType<typeof graphAt>, sourceCwd: string): GraphSn
 	};
 }
 
+function lineageDigestFor(receipt: PlanningReceipt): string {
+	return createHash("sha256").update(canonicalJson({
+		configDigest: receipt.configDigest,
+		effectiveRiskClass: receipt.effectiveRiskClass,
+		effectiveTier: receipt.effectiveTier,
+		finalGraphSpecDigest: receipt.finalGraphSpecDigest,
+		flashAssessmentDigest: receipt.flashAssessmentDigest,
+		lockedContextDigest: receipt.lockedContextDigest,
+		parentDraftDigest: receipt.parentDraftDigest,
+		parentModel: receipt.parentModel,
+		planner: receipt.planner,
+		plannerOutputDigest: receipt.plannerOutputDigest,
+		planningProfile: receipt.planningProfile,
+		postHardFloor: receipt.postHardFloor,
+		postRiskFloor: receipt.postRiskFloor,
+		preHardFloor: receipt.preHardFloor,
+		preRiskFloor: receipt.preRiskFloor,
+		promptDigest: receipt.promptDigest,
+	})).digest("hex");
+}
+
+test("v2 snapshot round-trips a ready node before its first attempt", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-ready-roundtrip-"));
+	const graph = graphAt(root, "ready-roundtrip");
+	const store = new GraphStore(join(root, "runs"), graph.graphId);
+	const state = snapshot(graph, root);
+	await store.initialize(graph, state);
+	state.status = "running";
+	state.nodes.write!.status = "ready";
+	await store.saveSnapshot(state);
+	const loaded = await store.loadSnapshot();
+	assert.equal(loaded.nodes.write?.status, "ready");
+	assert.equal(loaded.nodes.write?.attempt, 0);
+	assert.deepEqual(loaded.nodes.write?.attempts, []);
+});
+
+test("needs_attention uses attentionAt and does not reuse a terminal timestamp after resume", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-attention-time-"));
+	const graph = graphAt(root, "attention-time");
+	const store = new GraphStore(join(root, "runs"), graph.graphId);
+	const state = snapshot(graph, root);
+	await store.initialize(graph, state);
+	state.status = "needs_attention";
+	await store.saveSnapshot(state);
+	assert.match(state.attentionAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
+	assert.equal(state.terminalAt, undefined);
+	const attentionAt = state.attentionAt;
+	state.status = "queued";
+	await store.saveSnapshot(state);
+	assert.equal(state.attentionAt, undefined);
+	assert.equal(state.terminalAt, undefined);
+	state.status = "failed";
+	await store.saveSnapshot(state);
+	assert.match(state.terminalAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
+	assert.notEqual(state.terminalAt, attentionAt);
+});
+
+test("legacy attention terminal timestamps are cleared transactionally with retained history", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-attention-history-"));
+	const runs = join(root, "runs");
+	const graph = graphAt(root, "attention-history");
+	const store = new GraphStore(runs, graph.graphId);
+	const state = snapshot(graph, root);
+	state.status = "needs_attention";
+	state.terminalAt = state.updatedAt;
+	state.attentionAt = state.updatedAt;
+	await store.initialize(graph, state);
+	await updateHistoryFlag(runs, graph.graphId, "pin");
+	const release = await store.acquireSupervisor("attention-resume");
+	try {
+		const resumable = await store.loadSnapshot();
+		assert.equal((await readHistory(store, resumable)).terminalAt, resumable.schemaVersion === 2 ? resumable.terminalAt : undefined);
+		await prepareAttentionResume(store, resumable);
+		const migrated = await store.loadSnapshot();
+		const history = await readHistory(store, migrated);
+		assert.equal(migrated.schemaVersion === 2 ? migrated.terminalAt : undefined, undefined);
+		assert.equal(history.terminalAt, undefined);
+		assert.ok(history.pinnedAt, "unrelated history flags must survive the migration");
+		assert.equal(migrated.schemaVersion === 2 ? migrated.lifecycleRevision : undefined, history.revision);
+	} finally {
+		await release();
+	}
+});
+
 test("v2 authorization is authoritative and graph projection tampering is rejected", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-graph-auth-"));
 	await writeFile(join(root, "target.md"), "before");
@@ -64,6 +150,96 @@ test("v2 authorization is authoritative and graph projection tampering is reject
 	projection.goal = "tampered";
 	await writeFile(store.path("graph.json"), JSON.stringify(projection));
 	await assert.rejects(store.loadGraph(), /authorization/);
+});
+
+test("PlanningGate receipts round-trip through durable Graph authorization", () => {
+	const root = "/workspace";
+	const sourceSpec = {
+		schemaVersion: 1 as const,
+		graphId: "planning-gate-roundtrip",
+		goal: "inspect the requested change",
+		nodes: [{ taskId: "inspect", agent: "task-executor", task: "inspect", outputArtifact: "inspect.md", sideEffect: "none" as const }],
+	};
+	const gate = new PlanningGate();
+	const assessment: TaskAssessment = {
+		schemaVersion: 1, taskType: "general", proposedTier: "tactical", confidence: 0.9,
+		reasons: ["multiple steps"], plannedActions: ["inspect", "report"], complexitySignals: {},
+		riskClass: "R0", riskReasons: [], riskSignals: {},
+	};
+	const parentModel = { resolvedModel: "deepseek/deepseek-v4-flash:max", modelFamily: "deepseek", providerDomain: "deepseek", identityConfidence: "runtime_reported" as const };
+	const planner = { decisionId: "planner", resolvedModel: "kimi-coding/k3:high", attemptedModels: ["kimi-coding/k3:high"], modelFamily: "kimi", providerDomain: "moonshot" };
+	const reviewer = { decisionId: "reviewer", resolvedModel: "wisdomrouter/gpt-5.6-sol:high", attemptedModels: ["wisdomrouter/gpt-5.6-sol:high"], modelFamily: "gpt", providerDomain: "wisdomrouter" };
+	const configDigest = "c".repeat(64);
+	gate.beginTurn({ sessionId: "session", cwd: root, prompt: "Inspect and report." });
+	gate.assessTurn({ sessionId: "session", cwd: root, assessment, draftSpec: sourceSpec, parentModel });
+	gate.beginPlanning({ sessionId: "session", cwd: root, configDigest, planningProfile: "tactical-planning", expectedPlannerModel: planner.resolvedModel });
+	gate.completePlanning({ sessionId: "session", cwd: root, configDigest, evidence: planner, output: "# Plan\n- inspect" });
+	const reviewBinding = gate.beginReview({ sessionId: "session", cwd: root, configDigest, spec: sourceSpec });
+	const receipt = gate.completeReview({
+		sessionId: "session", cwd: root, configDigest, reviewer,
+		review: { schemaVersion: 2, reviewedDigest: reviewBinding.digest, lineageDigest: reviewBinding.lineageDigest, verdict: "pass", findings: [] },
+	});
+	const graph = compileGraph(sourceSpec, root, 20, 2);
+	const state = snapshot(graph, root);
+	state.sessionId = "session";
+	assert.doesNotThrow(() => authorizationFor(graph, state, receipt, graphSpecDigest(sourceSpec)));
+});
+
+test("v2 authorization durably binds and validates the planning receipt", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-planning-auth-"));
+	await writeFile(join(root, "target.md"), "before");
+	const graph = graphAt(root, "planning-authority");
+	const state = snapshot(graph, root);
+	const digest = "a".repeat(64);
+	const receipt: PlanningReceipt = {
+		schemaVersion: 2, receiptId: randomUUID(), sessionId: "session", cwd: root, promptDigest: digest, lockedContextDigest: digest, configDigest: digest,
+		flashProposedTier: "strategic", flashConfidence: 0.9, preHardFloor: "strategic", postHardFloor: "tactical", effectiveTier: "strategic",
+		flashProposedRisk: "R1", preRiskFloor: "R1", postRiskFloor: "R1", effectiveRiskClass: "R1",
+		flashAssessmentDigest: digest, parentDraftDigest: digest, plannerOutputDigest: digest, finalGraphSpecDigest: digest, lineageDigest: digest,
+		planningProfile: "strategic-planning", planner: { decisionId: "p", resolvedModel: "wisdomrouter/gpt-5.6-sol:high", attemptedModels: ["wisdomrouter/gpt-5.6-sol:high"], modelFamily: "gpt", providerDomain: "wisdomrouter" },
+		parentModel: { resolvedModel: "deepseek/deepseek-v4-flash:max", modelFamily: "deepseek", providerDomain: "deepseek", identityConfidence: "runtime_reported" },
+		reviewer: { decisionId: "r", resolvedModel: "kimi-coding/k3:high", attemptedModels: ["kimi-coding/k3:high"], modelFamily: "kimi", providerDomain: "moonshot" }, issuedAt: new Date().toISOString(),
+	};
+	state.sessionId = "session";
+	const store = new GraphStore(join(root, "runs"), graph.graphId);
+	receipt.lineageDigest = lineageDigestFor(receipt);
+	await store.initialize(graph, state, receipt, digest);
+	const authorization = JSON.parse(await readFile(store.path("authorization.json"), "utf8"));
+	assert.equal(authorization.schemaVersion, 3);
+	assert.equal(authorization.planningReceipt.consumedByRunId, graph.graphId);
+	assert.equal(authorization.planningReceiptDigest, canonicalDigest(authorization.planningReceipt));
+	const downgraded = structuredClone(authorization);
+	downgraded.schemaVersion = 2;
+	for (const field of ["planningReceipt", "planningReceiptDigest", "planningBindingDigest", "planningAdmissionId", "sourceGraphSpecDigest"]) delete downgraded[field];
+	await writeFile(store.path("authorization.json"), JSON.stringify(downgraded));
+	await assert.rejects(store.loadGraph(), /planning admission marker/);
+	await assert.rejects(loadValidatedRun(store, 20), /planning admission marker/);
+	await writeFile(store.path("authorization.json"), JSON.stringify(authorization));
+	const forgedAttempts = structuredClone(authorization);
+	forgedAttempts.planningReceipt.planner.attemptedModels = ["cheap/weak:low", "wisdomrouter/gpt-5.6-sol:high"];
+	forgedAttempts.planningReceipt.lineageDigest = lineageDigestFor(forgedAttempts.planningReceipt);
+	forgedAttempts.planningReceiptDigest = canonicalDigest(forgedAttempts.planningReceipt);
+	forgedAttempts.planningBindingDigest = canonicalDigest({ graphDigest: forgedAttempts.graphDigest, planningReceiptDigest: forgedAttempts.planningReceiptDigest, runInstanceId: forgedAttempts.runInstanceId, sourceGraphSpecDigest: forgedAttempts.sourceGraphSpecDigest });
+	await writeFile(store.path("authorization.json"), JSON.stringify(forgedAttempts));
+	await assert.rejects(store.loadGraph(), /attempted-model provenance/);
+	await writeFile(store.path("authorization.json"), JSON.stringify(authorization));
+	const forgedPlanner = structuredClone(authorization);
+	forgedPlanner.planningReceipt.planner = { decisionId: "forged", resolvedModel: "cheap/weak:low", attemptedModels: ["cheap/weak:low"], modelFamily: "cheap", providerDomain: "cheap" };
+	forgedPlanner.planningReceipt.lineageDigest = lineageDigestFor(forgedPlanner.planningReceipt);
+	forgedPlanner.planningReceiptDigest = canonicalDigest(forgedPlanner.planningReceipt);
+	forgedPlanner.planningBindingDigest = canonicalDigest({
+		graphDigest: forgedPlanner.graphDigest,
+		planningReceiptDigest: forgedPlanner.planningReceiptDigest,
+		runInstanceId: forgedPlanner.runInstanceId,
+		sourceGraphSpecDigest: forgedPlanner.sourceGraphSpecDigest,
+	});
+	await writeFile(store.path("authorization.json"), JSON.stringify(forgedPlanner));
+	await assert.rejects(store.loadGraph(), /mandatory strategic\/R1 model/);
+	await writeFile(store.path("authorization.json"), JSON.stringify(authorization));
+	authorization.planningReceipt.plannerOutputDigest = "b".repeat(64);
+	await writeFile(store.path("authorization.json"), JSON.stringify(authorization));
+	await assert.rejects(store.loadGraph(), /planning receipt digest/);
+	await assert.rejects(loadValidatedRun(store, 20), /planning receipt digest/);
 });
 
 test("lowering the admission spawn budget does not invalidate an existing run", async () => {
@@ -86,7 +262,20 @@ test("lowering the admission spawn budget does not invalidate an existing run", 
 	}, root, 2, 2);
 	const store = new GraphStore(join(root, "runs"), graph.graphId);
 	await store.initialize(graph, snapshot(graph, root));
+	assert.equal(graph.spawnBudget, 2);
 	assert.equal((await loadValidatedRun(store, 1)).graph.graphId, graph.graphId);
+});
+
+test("persisted graph validation uses the sealed admission spawn budget", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-sealed-budget-"));
+	await writeFile(join(root, "target.md"), "before");
+	const graph = graphAt(root, "sealed-budget");
+	const store = new GraphStore(join(root, "runs"), graph.graphId);
+	await store.initialize(graph, snapshot(graph, root));
+	const persisted = JSON.parse(await readFile(store.path("graph.json"), "utf8"));
+	persisted.spawnBudget = 0;
+	await writeFile(store.path("graph.json"), JSON.stringify(persisted));
+	await assert.rejects(loadValidatedRun(store, 20), /spawn budget|authorization graph digest|invalid graph authorization/i);
 });
 
 test("external graph lock fencing rejects a stale writer", async () => {
@@ -589,6 +778,12 @@ test("G2 keeps v2 dispatch closed while committing attempt and workspace authori
 	assert.equal(attemptAuthority.phase, "terminal");
 	assert.equal(attemptAuthority.terminalStatus, "stale");
 	assert.equal(JSON.parse(await readFile(store.path("nodes", "read", "attempt-1", "workspace.json"), "utf8")).schemaVersion, 2);
+	assert.equal((await loadValidatedRun(store, 2)).snapshot.status, "needs_attention");
+	const contractPath = store.path("nodes", "read", "attempt-1", "workspace", ".pi-graph", "node-contract.json");
+	const contract = JSON.parse(await readFile(contractPath, "utf8"));
+	contract.contextDigest = "f".repeat(64);
+	await writeFile(contractPath, JSON.stringify(contract));
+	await assert.rejects(loadValidatedRun(store, 2), /Workspace contract digest mismatch/);
 });
 
 test("durable stop synchronizes v2 snapshot and attempt authority", async () => {
@@ -606,12 +801,12 @@ test("durable stop synchronizes v2 snapshot and attempt authority", async () => 
 	await store.initialize(graph, state);
 	const attemptDir = store.path("nodes", "read", "attempt-1");
 	await store.ensureManagedSubdirectory("nodes/read/attempt-1", "Test attempt");
-	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir, strategy: "shadow" });
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir, strategy: "shadow", protectedSourceRoots: [runs] });
 	const attemptNonce = randomUUID();
 	const asyncId = `stop-${randomUUID()}`;
 	const asyncDir = join(subagentAsyncRoot(), asyncId);
 	await mkdir(asyncDir, { recursive: true });
-	await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, state: "running" }));
+	await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, state: "running", sessionId: "session", sessionDir: join(attemptDir, "session", "child") }));
 	state.status = "running";
 	state.nodes.read = {
 		taskId: "read",
@@ -657,6 +852,19 @@ test("durable stop synchronizes v2 snapshot and attempt authority", async () => 
 	});
 	await store.writeAttemptRecord("read", 1, { ...base, phase: "dispatching", requestDigest: "0".repeat(64), updatedAt: new Date().toISOString() });
 	await store.writeAttemptRecord("read", 1, { ...base, phase: "running", requestDigest: "0".repeat(64), asyncId, updatedAt: new Date().toISOString() });
+	const lineage = { runInstanceId: state.runInstanceId, graphId: graph.graphId, taskId: "read", attempt: 1, attemptNonce, sessionDir: join(attemptDir, "session"), ownerSessionId: "session" };
+	await store.writeJson("nodes/read/attempt-1/child-dispatch.json", {
+		schemaVersion: 1,
+		dispatchKey: canonicalDigest({ lineage, requestDigest: "0".repeat(64) }),
+		requestId: `pi-graph-v2-${canonicalDigest({ lineage, requestDigest: "0".repeat(64) }).slice(0, 40)}`,
+		requestDigest: "0".repeat(64),
+		lineage,
+		phase: "bound",
+		asyncId,
+		asyncDir,
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+	});
 	await store.requestControl("stop");
 	let stopCalls = 0;
 	const handlers = new Map<string, Set<(data: unknown) => void>>();
@@ -674,14 +882,14 @@ test("durable stop synchronizes v2 snapshot and attempt authority", async () => 
 			if (request.method !== "stop") return;
 			stopCalls += 1;
 			void (async () => {
-				await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, state: "stopped" }));
+				await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, state: "stopped", sessionId: "session", sessionDir: join(attemptDir, "session", "child") }));
 				bus.emit(`subagents:rpc:v1:reply:${request.requestId}`, { success: true, data: { state: "stopping" } });
 			})();
 		},
 	};
 	const config: GraphConfig = { enabled: true, runsDir: runs, maxConcurrency: 1, readOnlyBurst: 1, maxSpawnBudget: 2, rpcTimeoutMs: 50, validationTimeoutMs: 1_000, notifyOnComplete: false, runtimeV2Dispatch: true };
 	const terminal = await new GraphRunner(graph, state, store, bus, new LeaseRegistry(join(runs, ".control", "leases")), config).run();
-	assert.equal(terminal.status, "stopped");
+	assert.equal(terminal.status, "stopped", JSON.stringify(terminal));
 	assert.equal(stopCalls, 1);
 	assert.equal((await store.readAttemptRecord("read", 1)).terminalStatus, "stopped");
 	assert.equal((await loadValidatedRun(new GraphStore(runs, graph.graphId), 2)).snapshot.status, "stopped");

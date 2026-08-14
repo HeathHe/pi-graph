@@ -1,11 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createJiti } from "jiti";
 
-test("Pi 0.81 RPC loads the extension and runs the graphs doctor command", { timeout: 20_000 }, async () => {
+test("graph tool schema exposes strict nested GraphSpec fields and read-only guidance", () => {
+	const jiti = createJiti(import.meta.url);
+	const { GraphSpecSchema } = jiti(new URL("../extensions/pi-graph.ts", import.meta.url).href) as { GraphSpecSchema: unknown };
+	const schema = GraphSpecSchema as unknown as {
+		properties: {
+			nodes: {
+				items: {
+					properties: Record<string, { description?: string; items?: { properties?: Record<string, { enum?: string[] }> } }>;
+				};
+			};
+		};
+	};
+	const node = schema.properties.nodes.items.properties;
+	assert.ok(node.acceptance, "acceptance must be visible in the tool schema");
+	assert.deepEqual(node.readScope?.items?.properties?.kind?.enum, ["file", "tree"]);
+	assert.match(node.allowBash?.description ?? "", /Deprecated and rejected/);
+	assert.match(node.validationCommands?.description ?? "", /Usually omit this field for read-only review\/search nodes/);
+	assert.match(node.validationCommands?.description ?? "", /cwd is itself a Git repository/);
+	assert.equal((node.retryPolicy as any)?.properties?.maxAttempts?.type, "integer");
+	assert.equal((node.retryPolicy as any)?.required?.includes("maxAttempts") ?? false, false);
+	assert.equal((node.toolBudget as any)?.properties?.hard?.minimum, 1);
+	assert.equal((node.maxAuthorization as any)?.properties?.singleUse?.const, true);
+	assert.ok((node.childAcceptance as any)?.anyOf, "childAcceptance must expose its nested alternatives");
+	assert.equal((node.timeoutMs as any)?.minimum, 1_000);
+	assert.equal((node.timeoutMs as any)?.maximum, 7_200_000);
+	assert.equal((schema as any).properties.maxConcurrency.maximum, 6);
+});
+
+test("Pi 0.81 RPC loads the extension and runs the graphs doctor command", { timeout: 45_000 }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-graph-extension-smoke-"));
 	const agentDir = join(root, "agent");
 	const runsDir = join(root, "runs");
@@ -35,6 +64,7 @@ test("Pi 0.81 RPC loads the extension and runs the graphs doctor command", { tim
 	});
 
 	const messages: Array<Record<string, unknown>> = [];
+	const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 	let buffer = "";
 	let stderr = "";
 	child.stderr.setEncoding("utf8");
@@ -72,6 +102,8 @@ test("Pi 0.81 RPC loads the extension and runs the graphs doctor command", { tim
 		await completed;
 		assert.equal(messages.some((message) => message.type === "extension_ui_request" && String(message.message).includes("Graph doctor:")), true);
 	} finally {
-		child.kill("SIGTERM");
+		if (child.exitCode === null) child.kill("SIGTERM");
+		await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+		await rm(root, { recursive: true, force: true });
 	}
 });

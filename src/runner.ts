@@ -6,6 +6,8 @@ import { NodeExecutor, type TransitionOptions } from "./executor.ts";
 import { SubagentRpcClient, type EventBus } from "./rpc.ts";
 import { reopenWorkspace } from "./workspace.ts";
 import { loadValidatedRun } from "./reconciler.ts";
+import type { ModelRoutingConfig } from "./model-routing/types.ts";
+import type { AvailableModelSnapshot } from "./pi-subagents-preflight.ts";
 
 const NODE_TERMINAL = new Set(["accepted", "blocked", "failed", "stale", "stopped", "waiting_input"]);
 const ATTEMPT_STATUSES = new Set(["leased", "dispatching", "dispatch_unknown", "running", "collecting", "verifying", "accepted", "waiting_input", "stale", "failed", "stopped"]);
@@ -76,6 +78,10 @@ export class GraphRunner {
 		leases: LeaseRegistry,
 		config: GraphConfig,
 		onTerminal?: (snapshot: GraphSnapshot) => void,
+		routingConfig?: ModelRoutingConfig,
+		availableModels?: ReadonlyArray<AvailableModelSnapshot> | (() => ReadonlyArray<AvailableModelSnapshot> | undefined),
+		ownerSessionFile?: string,
+		orchestratorIntercomTarget?: string,
 	) {
 		this.graph = graph;
 		this.snapshot = snapshot;
@@ -93,12 +99,19 @@ export class GraphRunner {
 			config,
 			snapshot.supervisorEpoch,
 			snapshot.sessionId,
-			snapshot.schemaVersion === 2 ? { runInstanceId: snapshot.runInstanceId, fencingGeneration: snapshot.fencingGeneration } : {},
+			snapshot.schemaVersion === 2 ? { runInstanceId: snapshot.runInstanceId, fencingGeneration: snapshot.fencingGeneration, ownerSessionFile, orchestratorIntercomTarget } : {},
 			this.transition.bind(this),
+			routingConfig,
+			undefined,
+			availableModels,
 		);
 	}
 
 	private readonly executor: NodeExecutor;
+
+	dispose(options: { preserveReapers?: boolean } = {}): boolean {
+		return this.executor.dispose(options);
+	}
 
 	private enqueuePersistence(operation: () => Promise<void>): Promise<void> {
 		const current = this.persistQueue.then(operation);
@@ -158,6 +171,20 @@ export class GraphRunner {
 					continue;
 				}
 			}
+			if (attempt && state.status === "waiting_input" && attempt.status === "waiting_input" && this.snapshot.schemaVersion === 2) {
+				const authority = await this.store.readAttemptRecord(state.taskId, attempt.attempt);
+				const providerDispatch = attempt.providerDispatches?.at(-1);
+				const preparedWithoutDispatch = authority.phase === "prepared"
+					&& authority.requestDigest === undefined
+					&& authority.asyncId === undefined
+					&& (!providerDispatch || (providerDispatch.status === "prepared" && providerDispatch.requestDigest === undefined && providerDispatch.asyncId === undefined));
+				if (preparedWithoutDispatch) {
+					state.status = "stopped";
+					attempt.status = "stopped";
+					await this.executor.recordTerminalResult(node, state, { status: "stopped" });
+					continue;
+				}
+			}
 				const childMayBeActive = attempt
 					&& ["running", "dispatching", "dispatch_unknown", "waiting_input", "resource_wait"].includes(attempt.status)
 					&& ["running", "dispatching", "dispatch_unknown", "waiting_input", "resource_wait"].includes(state.status);
@@ -179,7 +206,7 @@ export class GraphRunner {
 						const controller = new AbortController();
 						controller.abort("stop");
 						try {
-							await (await reopenWorkspace(this.graph.nodes.find((node) => node.taskId === state.taskId)!, attempt.workspaceDir, attempt.workspaceKind)).apply(controller.signal);
+							await (await reopenWorkspace(this.graph.nodes.find((node) => node.taskId === state.taskId)!, attempt.workspaceDir, attempt.workspaceKind, [this.store.runsRoot])).apply(controller.signal);
 						} catch (error) {
 							if (!(error instanceof Error) || !error.message.includes("aborted")) throw error;
 						}
@@ -303,9 +330,12 @@ export class GraphRunner {
 
 	private retryFailureCount(state: NodeRuntimeState, result: NodeExecutionResult): number {
 		const retryKind = result.retryKind ?? "failed";
+		const currentDecision = state.attempts.at(-1)?.routingDecision;
 		const matches = (attempt: NodeRuntimeState["attempts"][number]) => {
 			const attemptKind = attempt.failure?.retryKind ?? "failed";
-			return retryKind === "provider" ? attemptKind === "provider" : attemptKind !== "provider";
+			if (retryKind === "provider") return attemptKind === "provider" && (!currentDecision || attempt.routingDecision?.selectedModel === currentDecision.selectedModel);
+			if (retryKind === "model_degrade") return attemptKind === "model_degrade";
+			return attemptKind !== "provider" && attemptKind !== "model_degrade";
 		};
 		const recorded = state.attempts.filter((attempt) => attempt.status === "failed" && matches(attempt)).length;
 		const last = state.attempts.at(-1);
@@ -316,7 +346,14 @@ export class GraphRunner {
 	private retryAllowed(node: CompiledNode, state: NodeRuntimeState, result: NodeExecutionResult): boolean {
 		const retryKind: RetryKind = result.retryKind ?? "failed";
 		const used = this.retryFailureCount(state, result);
-		if (retryKind === "provider") return used <= (node.retryPolicy.maxProviderRetries ?? 0);
+		if (retryKind === "provider") {
+			if (state.attempts.at(-1)?.providerDispatches?.length) return false;
+			return used <= (state.attempts.at(-1)?.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0);
+		}
+		if (retryKind === "model_degrade") {
+			const decision = state.attempts.at(-1)?.routingDecision;
+			return Boolean(decision && decision.candidateIndex !== undefined && decision.candidateIndex + 1 < decision.eligibleCandidates.length && used <= decision.budget.modelDegradations);
+		}
 		const retryOn = node.retryPolicy.retryOn ?? ["dispatch", "timeout", "failed", "validation"];
 		return retryOn.includes(retryKind as "dispatch" | "timeout" | "failed" | "validation") && used < node.retryPolicy.maxAttempts;
 	}
@@ -386,6 +423,14 @@ export class GraphRunner {
 		if (result.status === "suspended") return;
 		const node = this.graph.nodes.find((candidate) => candidate.taskId === taskId)!;
 		const state = this.snapshot.nodes[taskId]!;
+		if (result.status === "failed" && result.retryKind === "provider" && !this.retryAllowed(node, state, result)) {
+			const degradation: NodeExecutionResult = {
+				...result,
+				retryKind: "model_degrade",
+				failure: { ...(result.failure ?? { kind: "provider_transient" as const }), retryKind: "model_degrade" },
+			};
+			if (this.retryAllowed(node, state, degradation)) result = degradation;
+		}
 		await this.executor.recordTerminalResult(node, state, result);
 		if (result.status === "resource_wait") {
 			const resourceWaitStartedAt = state.resourceWaitStartedAt ?? Date.now();
@@ -411,7 +456,7 @@ export class GraphRunner {
 			});
 			return;
 		}
-		await this.transition(taskId, result.status, {
+		await this.transition(taskId, result.status as NodeRuntimeState["status"], {
 			endedAt: new Date().toISOString(),
 			error: result.error,
 			failure,
@@ -458,9 +503,10 @@ export class GraphRunner {
 				else await delay(Math.min(1_000, Math.max(50, Math.min(...states.map((state) => Math.max(0, (state.nextRetryAt ?? Date.now() + 1_000) - Date.now()))))));
 				}
 				if (this.active.size) await Promise.allSettled(this.active.values());
+				if (this.userStopped) await this.recoverDurableStop();
 				if (this.failFastTriggered) await this.recoverDurableStop();
 				const states = Object.values(this.snapshot.nodes);
-			if (this.suspended) return this.snapshot;
+			if (this.suspended && !this.userStopped) return this.snapshot;
 			const crossedCommitPoint = [...this.stopActiveNodes].some((taskId) => {
 				const state = this.snapshot.nodes[taskId];
 				return state?.status === "accepted" && Boolean(state.attempts.at(-1)?.writesCommittedAt);
@@ -499,12 +545,20 @@ export class GraphRunner {
 	}
 
 	stop(): void {
-		this.stopActiveNodes = new Set(this.active.keys());
-		this.userStopped = true;
+		this.beginStop();
 		this.abort.abort("stop");
 	}
 
+	beginStop(): void {
+		if (!this.userStopped) this.stopActiveNodes = new Set(this.active.keys());
+		this.userStopped = true;
+	}
+
 	suspend(): void {
+		if (this.userStopped) {
+			this.abort.abort("stop");
+			return;
+		}
 		this.suspended = true;
 		this.abort.abort("suspend");
 	}

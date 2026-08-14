@@ -7,40 +7,45 @@
   "engines": {
     "node": ">=22.19.0"
   },
-	"files": [
-		"extensions/",
-		"src/",
-		"tests/long-task-soak.ts",
-		"README.md"
-	],
+  "files": [
+    "extensions/",
+    "scripts/",
+    "src/",
+    "tests/long-task-soak.ts",
+    "README.md"
+  ],
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:soak": "node --expose-gc --experimental-strip-types tests/long-task-soak.ts",
+    "routing:shadow-report": "node --experimental-strip-types scripts/routing-shadow-report.ts",
+    "test:latest-integration": "node --experimental-strip-types tests/pi-subagents-latest-integration.ts",
     "pack:check": "npm pack --dry-run"
   },
   "pi": {
     "extensions": [
       "./extensions/pi-graph.ts",
-      "./extensions/pi-graph-guard.ts"
+      "./extensions/pi-graph-guard.ts",
+      "./extensions/subagent-model-router.ts"
     ]
   },
-	"dependencies": {
-		"jiti": "2.7.0",
-		"pi-subagents": "0.37.2"
-	},
-	"overrides": {
-		"protobufjs": "7.6.5"
-	},
+  "dependencies": {
+    "jiti": "2.7.0"
+  },
+  "overrides": {
+    "protobufjs": "7.6.5"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.81.0",
     "@earendil-works/pi-coding-agent": ">=0.81.0",
+    "pi-subagents": ">=0.40.0",
     "typebox": ">=1.0.0"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.81.1",
     "@earendil-works/pi-coding-agent": "0.81.1",
     "@types/node": "^24.0.0",
+    "pi-subagents": "latest",
     "typebox": "1.1.38",
     "typescript": "^5.9.0"
   }

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { childAcceptanceFor, taskPrompt } from "../src/executor.ts";
+import { childAcceptanceFor, taskPrompt, validateTypedOutput } from "../src/executor.ts";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { CompiledGraph, CompiledNode } from "../src/types.ts";
 
 const DEFAULT_CHILD_ACCEPTANCE = {
@@ -76,9 +79,10 @@ test("child dispatch defensively rejects invalid childAcceptance values", () => 
 	assert.throws(() => childAcceptanceFor({ childAcceptance: { criteria: [{ must: "Missing id" }] } }), /\.id must be a non-empty string/);
 });
 
-test("task prompt includes string Graph acceptance for supervisor enforcement", () => {
+test("task prompt declares string Graph acceptance without claiming semantic machine enforcement", () => {
 	const prompt = promptFor(compiledNode({ acceptance: "引用证据并给出结论。" }));
-	assert.match(prompt, /Acceptance criteria \(enforced by Graph supervisor\):/);
+	assert.match(prompt, /persisted for Supervisor\/parent inspection/);
+	assert.doesNotMatch(prompt, /enforced by Graph supervisor/);
 	assert.match(prompt, /引用证据并给出结论。/);
 });
 
@@ -94,9 +98,25 @@ test("task prompt expands structured and validation-command Graph acceptance", (
 	assert.match(deterministic, /- npm test/);
 });
 
+test("typed outputs enforce format, media type, and inline JSON Schema", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-typed-acceptance-"));
+	const path = join(cwd, "output.json");
+	const citationNode = compiledNode({ output: { type: "citation-set", mediaType: "application/json", schema: JSON.stringify({ type: "array", minItems: 1 }) } });
+	await writeFile(path, JSON.stringify([{ url: "https://example.com", title: "Example" }]));
+	await assert.doesNotReject(validateTypedOutput(citationNode, path));
+	await writeFile(path, "not json");
+	await assert.rejects(validateTypedOutput(citationNode, path), /valid JSON/);
+	await writeFile(path, JSON.stringify([{ title: "missing url" }]));
+	await assert.rejects(validateTypedOutput(citationNode, path), /absolute HTTP/);
+	await writeFile(path, JSON.stringify([]));
+	await assert.rejects(validateTypedOutput(citationNode, path), /JSON Schema/);
+	await writeFile(path, Buffer.from([0xff, 0xfe, 0x41]));
+	await assert.rejects(validateTypedOutput(compiledNode({ output: { type: "text" } }), path), /valid UTF-8/);
+});
+
 test("task prompt tolerates arbitrary legacy acceptance objects", () => {
 	const legacyNode = compiledNode();
 	(legacyNode as { acceptance?: unknown }).acceptance = { level: "verified" };
 	assert.doesNotThrow(() => promptFor(legacyNode));
-	assert.doesNotMatch(promptFor(legacyNode), /Acceptance criteria \(enforced by Graph supervisor\):/);
+	assert.doesNotMatch(promptFor(legacyNode), /Graph acceptance criteria/);
 });

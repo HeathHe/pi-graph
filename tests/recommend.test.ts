@@ -5,117 +5,123 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseGraphConfig } from "../src/config.ts";
 import { formatRecommendReport, recommendGraphConfig } from "../src/recommend.ts";
+import type { PiSubagentsRpcLike } from "../src/pi-subagents-compat.ts";
 
 interface FixtureOptions {
-	required?: string;
+	peer?: string;
+	development?: string;
+	direct?: string;
 	installed?: string;
 	settings?: unknown;
 }
 
-async function createFixture(t: TestContext, options: FixtureOptions = {}): Promise<{ agentDir: string; packageRoot: string }> {
+const compatibleRpc: PiSubagentsRpcLike = {
+	async call(method) {
+		assert.equal(method, "ping");
+		return {
+			protocolVersion: 1,
+			packageVersion: "99.0.0",
+			capabilities: {
+				methods: ["ping", "spawn", "status", "stop", "resume"],
+				providerFailureStructured: true,
+				exactModel: true,
+			},
+		};
+	},
+};
+
+async function createFixture(t: TestContext, options: FixtureOptions = {}): Promise<{ agentDir: string; packageRoot: string; rpc: PiSubagentsRpcLike }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-graph-recommend-"));
-	t.after(() => rm(root, { recursive: true, force: true }));
+	t.after(async () => rm(root, { recursive: true, force: true }));
 	const agentDir = join(root, "agent");
 	const packageRoot = join(root, "package");
-	await Promise.all([
-		mkdir(agentDir, { recursive: true }),
-		mkdir(packageRoot, { recursive: true }),
-	]);
+	await mkdir(agentDir, { recursive: true });
+	await mkdir(packageRoot, { recursive: true });
 	await writeFile(join(packageRoot, "package.json"), JSON.stringify({
-		dependencies: options.required === undefined ? {} : { "pi-subagents": options.required },
-	}));
-	if (options.installed !== undefined) {
-		const installedRoot = join(packageRoot, "node_modules", "pi-subagents");
-		await mkdir(installedRoot, { recursive: true });
-		await writeFile(join(installedRoot, "package.json"), JSON.stringify({ version: options.installed }));
+		...(options.direct ? { dependencies: { "pi-subagents": options.direct } } : {}),
+		...(options.peer ? { peerDependencies: { "pi-subagents": options.peer } } : {}),
+		...(options.development ? { devDependencies: { "pi-subagents": options.development } } : {}),
+	}), "utf8");
+	if (options.installed) {
+		const dependencyDir = join(packageRoot, "node_modules", "pi-subagents");
+		await mkdir(dependencyDir, { recursive: true });
+		await writeFile(join(dependencyDir, "package.json"), JSON.stringify({ version: options.installed }), "utf8");
 	}
-	if (options.settings !== undefined) {
-		await writeFile(join(agentDir, "settings.json"), JSON.stringify(options.settings));
-	}
-	return { agentDir, packageRoot };
+	if (options.settings !== undefined) await writeFile(join(agentDir, "settings.json"), JSON.stringify(options.settings), "utf8");
+	return { agentDir, packageRoot, rpc: compatibleRpc };
 }
 
-test("recommend reports a matching pi-subagents dependency and parser-derived graph defaults", async (t) => {
+test("recommend accepts the latest-provider dependency policy and compatible public RPC capabilities", async (t) => {
 	const fixture = await createFixture(t, {
-		required: "0.37.2",
-		installed: "0.37.2",
-		settings: { graph: {} },
+		peer: ">=0.40.0",
+		development: "latest",
+		installed: "0.40.0",
+		settings: {},
 	});
 	const report = await recommendGraphConfig(fixture);
 	assert.equal(report.dependency.status, "ok");
-	assert.equal(report.dependency.required, "0.37.2");
-	assert.equal(report.dependency.installed, "0.37.2");
-	assert.equal(report.graph.status, "valid");
+	assert.equal(report.dependency.required, ">=0.40.0");
+	assert.equal(report.dependency.development, "latest");
+	assert.equal(report.dependency.installed, "0.40.0");
+	assert.equal(report.piSubagents.packageVersion, "99.0.0");
+	assert.equal(report.piSubagents.routingCompatible, true);
+	assert.equal(report.graph.status, "missing");
 	assert.deepEqual(report.graph.recommended, parseGraphConfig({}, fixture.agentDir));
 
 	const formatted = formatRecommendReport(report);
 	const marker = "Recommended settings.graph (valid JSON):\n";
+	assert.ok(formatted.includes("version is diagnostic only"));
 	assert.ok(formatted.includes(marker));
 	assert.deepEqual(JSON.parse(formatted.slice(formatted.indexOf(marker) + marker.length)), report.graph.recommended);
 });
 
-test("recommend reports a mismatched pi-subagents dependency", async (t) => {
+test("recommend rejects a direct pinned pi-subagents dependency even when the installed copy matches", async (t) => {
 	const fixture = await createFixture(t, {
-		required: "0.37.2",
-		installed: "0.37.1",
+		direct: "0.37.2",
+		peer: ">=0.40.0",
+		development: "latest",
+		installed: "0.37.2",
 		settings: {},
 	});
 	const report = await recommendGraphConfig(fixture);
 	assert.equal(report.dependency.status, "mismatch");
-	assert.match(report.dependency.recommendation, /npm install pi-subagents@0\.37\.2/);
-	assert.equal(report.graph.status, "missing");
+	assert.match(report.dependency.recommendation, /Remove the direct pi-subagents dependency/);
 });
 
-test("recommend compares SemVer numeric identifiers without precision loss", async (t) => {
-	const mismatchFixture = await createFixture(t, {
-		required: "9007199254740992.0.0",
-		installed: "9007199254740993.0.0",
-		settings: {},
-	});
-	const mismatchReport = await recommendGraphConfig(mismatchFixture);
-	assert.equal(mismatchReport.dependency.status, "mismatch");
-
-	const matchingFixture = await createFixture(t, {
-		required: "9007199254740993.0.0",
-		installed: "9007199254740993.0.0",
-		settings: {},
-	});
-	const matchingReport = await recommendGraphConfig(matchingFixture);
-	assert.equal(matchingReport.dependency.status, "ok");
-});
-
-test("recommend never accepts identical malformed versions", async (t) => {
-	for (const version of ["1.2", "01.2.3", "1.2.3-01"]) {
-		const fixture = await createFixture(t, {
-			required: version,
-			installed: version,
-			settings: {},
-		});
-		const report = await recommendGraphConfig(fixture);
-		assert.equal(report.dependency.status, "mismatch", version);
-	}
-});
-
-test("recommend reports a missing dependency and treats absent settings.json as missing configuration", async (t) => {
-	const fixture = await createFixture(t, { required: "0.37.2" });
+test("recommend reports a missing peer declaration without requiring a nested runtime copy", async (t) => {
+	const fixture = await createFixture(t, { development: "latest" });
 	const report = await recommendGraphConfig(fixture);
 	assert.equal(report.dependency.status, "missing");
 	assert.equal(report.dependency.installed, null);
 	assert.equal(report.graph.status, "missing");
-	assert.deepEqual(report.graph.issues, []);
+});
+
+test("recommend separates a compatible RPC v1 runtime from controlled-routing limitations", async (t) => {
+	const fixture = await createFixture(t, { peer: ">=0.40.0", development: "latest", settings: {} });
+	const report = await recommendGraphConfig({
+		...fixture,
+		rpc: {
+			async call() {
+				return { protocolVersion: 1, packageVersion: "100.0.0", capabilities: {} };
+			},
+		},
+	});
+	assert.equal(report.dependency.status, "ok");
+	assert.equal(report.piSubagents.providerFailureStructured, false);
+	assert.equal(report.piSubagents.exactModelControl, false);
+	assert.equal(report.piSubagents.routingCompatible, true);
+	assert.equal(report.piSubagents.controlledRoutingReady, false);
+	assert.match(formatRecommendReport(report), /controlledRoutingReady=false/);
 });
 
 test("recommend reports invalid graph configuration without exposing settings secrets", async (t) => {
 	const fakeApiKey = "sk-test-do-not-expose-123456";
 	const fixture = await createFixture(t, {
-		required: "0.37.2",
-		installed: "0.37.2",
+		peer: ">=0.40.0",
+		development: "latest",
 		settings: {
 			apiKey: fakeApiKey,
-			graph: {
-				authToken: fakeApiKey,
-				history: [],
-			},
+			graph: { authToken: fakeApiKey, history: [] },
 		},
 	});
 	const report = await recommendGraphConfig(fixture);

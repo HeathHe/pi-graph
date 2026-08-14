@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { compileGraph } from "../src/compile.ts";
 import { LeaseRegistry } from "../src/leases.ts";
@@ -13,12 +13,19 @@ import { loadOrRebuildValidatedRun, loadValidatedRun } from "../src/reconciler.t
 import { canonicalDigest } from "../src/authority.ts";
 import { createPrunePlan, executePrunePlan, listTrashInventory, restoreTrash } from "../src/retention.ts";
 import type { GraphConfig, GraphSpec } from "../src/types.ts";
+import { prepareWorkspace } from "../src/workspace.ts";
+import { auditManagedLaunchContracts } from "../src/pi-subagents-preflight.ts";
+
+const graphGuardAcknowledgement = { version: 1, source: "child-runtime", ids: ["pi-graph-guard"], omitted: 0 } as const;
 
 class V2Subagents implements EventBus {
 	private handlers = new Map<string, Set<(data: unknown) => void>>();
 	spawns = 0;
 	stopCalls = 0;
 	complete = true;
+	spawnParams: Record<string, unknown>[] = [];
+	innerParams: Record<string, unknown>[] = [];
+	acknowledgeGuard = true;
 	omitOutputCount = 0;
 	rejectSpawnCount = 0;
 	on(channel: string, handler: (data: unknown) => void) {
@@ -44,29 +51,51 @@ class V2Subagents implements EventBus {
 		}
 		if (request.method !== "spawn") return;
 		this.spawns += 1;
+		this.spawnParams.push(structuredClone(request.params));
 		if (this.rejectSpawnCount > 0) {
 			this.rejectSpawnCount -= 1;
 			this.emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, success: false, error: { code: "INVALID_AGENT", message: "Unknown agent." } });
 			return;
 		}
-		const asyncId = `v2-${request.requestId.slice(-24)}`;
-		const asyncDir = join(subagentAsyncRoot(), asyncId);
+		const workflowScript = request.params.workflowScript;
+		if (typeof workflowScript !== "string") throw new Error("Expected workflowScript-only Graph spawn payload.");
+		const match = /^return await runs\.run\(("(?:[^"\\]|\\.)*"), (\{.*\})\);$/u.exec(workflowScript);
+		if (!match) throw new Error("Unexpected Graph child workflowScript.");
+		const innerParams = JSON.parse(match[2]!) as Record<string, unknown>;
+		this.innerParams.push(innerParams);
+		const outerAsyncId = `v2-outer-${request.requestId.slice(-18)}`;
+		const outerAsyncDir = join(subagentAsyncRoot(), outerAsyncId);
+		const innerAsyncId = `v2-inner-${request.requestId.slice(-18)}`;
+		const innerAsyncDir = join(subagentAsyncRoot(), innerAsyncId);
 		void (async () => {
-			await mkdir(asyncDir, { recursive: true });
-			const status = { runId: asyncId, state: "running", sessionId: "owner", sessionDir: join(request.params.sessionDir as string, "child") };
-			await writeFile(join(asyncDir, "status.json"), JSON.stringify(status));
-			this.emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: { details: { asyncId, asyncDir } } });
+			await mkdir(outerAsyncDir, { recursive: true });
+			await mkdir(innerAsyncDir, { recursive: true });
+			const launchAudit = await auditManagedLaunchContracts({
+				tasks: [innerParams],
+				cwd: innerParams.cwd as string,
+				requireExtensionSeal: true,
+				graphWorkspaceKind: "shadow",
+			});
+			const runtimeEvidence = {
+				launchContractDigest: launchAudit.contracts[0]?.launchContractDigest,
+				...(this.acknowledgeGuard ? { runtimeAcknowledgedExtensions: graphGuardAcknowledgement } : {}),
+			};
+			const innerStatus = { runId: innerAsyncId, state: "running", sessionId: "owner", sessionDir: join(innerParams.sessionDir as string, "run-0"), steps: [runtimeEvidence] };
+			await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify(innerStatus));
+			const outerStatus = { runId: outerAsyncId, state: "complete", sessionId: "owner", sessionDir: request.params.sessionDir, workflow: { value: { runId: innerAsyncId, artifactPaths: [innerAsyncDir] } } };
+			await writeFile(join(outerAsyncDir, "status.json"), JSON.stringify(outerStatus));
+			this.emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: { details: { asyncId: outerAsyncId, asyncDir: outerAsyncDir } } });
 			if (!this.complete) return;
 			const omitOutput = this.omitOutputCount > 0;
 			if (omitOutput) this.omitOutputCount -= 1;
 			if (!omitOutput) {
-				await mkdir(join(request.params.output as string, ".."), { recursive: true });
-				await writeFile(request.params.output as string, "v2 output");
+				await mkdir(dirname(innerParams.output as string), { recursive: true });
+				await writeFile(innerParams.output as string, "v2 output");
 			}
-			const outputLog = join(asyncDir, "output.log");
+			const outputLog = join(innerAsyncDir, "output.log");
 			await writeFile(outputLog, omitOutput ? "" : "v2 output");
-			await writeFile(join(asyncDir, "status.json"), JSON.stringify({ ...status, state: "complete", outputFile: outputLog }));
-			this.emit("subagent:async-complete", { runId: asyncId, asyncDir });
+			await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify({ ...innerStatus, state: "complete", outputFile: outputLog }));
+			this.emit("subagent:async-complete", { runId: innerAsyncId, asyncDir: innerAsyncDir });
 		})();
 	}
 }
@@ -94,8 +123,31 @@ function config(runsDir: string): GraphConfig {
 }
 
 function spec(graphId: string): GraphSpec {
-	return { schemaVersion: 1, graphId, goal: "v2 execution", workspace: "shadow", nodes: [{ taskId: "read", agent: "scout", task: "inspect", outputArtifact: "read.md", sideEffect: "local_read" }] };
+	return { schemaVersion: 1, graphId, goal: "v2 execution", workspace: "shadow", nodes: [{ taskId: "read", agent: "code-scout", task: "inspect", outputArtifact: "read.md", sideEffect: "local_read" }] };
 }
+
+test("authority prepared before its leased snapshot is adopted without changing attempt identity", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-v2-prepared-orphan-"));
+	const runs = join(cwd, "runs");
+	const graph = compileGraph(spec("v2-prepared-orphan"), cwd, 10, 2);
+	const snapshot = initialSnapshot(graph, cwd, "owner", 2);
+	if (snapshot.schemaVersion !== 2) throw new Error("Expected a v2 snapshot.");
+	const store = new GraphStore(runs, graph.graphId);
+	await store.initialize(graph, snapshot);
+	const attemptNonce = randomUUID();
+	const attemptRoot = store.path("nodes", "read", "attempt-1");
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir: attemptRoot, strategy: "shadow", protectedSourceRoots: [runs] });
+	const authority = { schemaVersion: 2 as const, runInstanceId: snapshot.runInstanceId, graphId: graph.graphId, taskId: "read", attempt: 1, attemptNonce, phase: "prepared" as const, supervisorEpoch: snapshot.supervisorEpoch, fencingGeneration: snapshot.fencingGeneration, updatedAt: new Date().toISOString() };
+	await store.writeAttemptRecord("read", 1, authority);
+	await store.writeWorkspaceRecord("read", 1, { schemaVersion: 2, runInstanceId: snapshot.runInstanceId, graphId: graph.graphId, taskId: "read", attempt: 1, workspaceKind: workspace.kind, workspaceDir: workspace.cwd, contractDigest: canonicalDigest(workspace.contract), writeBaseline: workspace.contract.writeBaseline, readBaseline: workspace.contract.readBaseline, inputBaseline: workspace.contract.inputBaseline, createdAt: new Date().toISOString() });
+	const bus = new V2Subagents();
+	const terminal = await new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, ".control", "leases")), config(runs)).run();
+	assert.equal(terminal.status, "complete", JSON.stringify(terminal));
+	assert.equal(terminal.nodes.read?.attempts[0]?.attemptNonce, attemptNonce);
+	assert.equal(bus.spawns, 1);
+	for (const attempt of terminal.nodes.read?.attempts ?? []) if (attempt.asyncDir) await rm(attempt.asyncDir, { recursive: true, force: true });
+	await rm(cwd, { recursive: true, force: true });
+});
 
 test("result projection failure cannot rewrite immutable terminal authority", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-v2-result-projection-"));
@@ -125,7 +177,7 @@ test("parallel retries persist coherent node and attempt states", async () => {
 	const runs = join(cwd, "runs");
 	const nodes = Array.from({ length: 6 }, (_, index) => ({
 		taskId: `retry-${index}`,
-		agent: "scout",
+		agent: "code-scout",
 		task: `parallel retry ${index}`,
 		outputArtifact: `retry-${index}.md`,
 		sideEffect: "none" as const,
@@ -162,7 +214,9 @@ test("parallel retries persist coherent node and attempt states", async () => {
 test("new v2 runtime executes through ChildRuntime and commits the complete evidence chain", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-v2-run-"));
 	const runs = join(cwd, "runs");
-	const graph = compileGraph(spec("v2-success"), cwd, 10, 2);
+	const graphSpec = spec("v2-success");
+	graphSpec.nodes[0]!.model = "openai-codex/gpt-5.6-sol";
+	const graph = compileGraph(graphSpec, cwd, 10, 2);
 	const snapshot = initialSnapshot(graph, cwd, "owner", 2);
 	const store = new GraphStore(runs, graph.graphId);
 	await store.initialize(graph, snapshot);
@@ -170,11 +224,39 @@ test("new v2 runtime executes through ChildRuntime and commits the complete evid
 	const terminal = await new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, ".control", "leases")), config(runs)).run();
 	assert.equal(terminal.status, "complete");
 	assert.equal(bus.spawns, 1);
+	const outerParams = bus.spawnParams[0]!;
+	const innerParams = bus.innerParams[0]!;
+	assert.equal(typeof outerParams.workflowScript, "string");
+	assert.equal(Object.hasOwn(outerParams, "agent"), false);
+	assert.equal(Object.hasOwn(outerParams, "task"), false);
+	assert.equal(outerParams.async, true);
+	assert.equal(outerParams.artifacts, true);
+	assert.equal(outerParams.mission, false);
+	assert.equal(outerParams.cwd, innerParams.cwd);
+	assert.equal(dirname(innerParams.sessionDir as string), dirname(outerParams.sessionDir as string));
+	assert.notEqual(outerParams.sessionDir, innerParams.sessionDir);
+	assert.equal(innerParams.agent, "code-scout");
+	assert.match(innerParams.task as string, /\ninspect$/u);
+	assert.equal(innerParams.context, "fresh");
+	assert.equal(innerParams.async, true);
+	assert.equal(innerParams.agentScope, "both");
+	assert.equal(innerParams.artifacts, true);
+	assert.equal(innerParams.outputMode, "file-only");
+	assert.equal(innerParams.model, "openai-codex/gpt-5.6-sol");
+	assert.equal(innerParams.sessionDir, terminal.nodes.read?.attempts[0]?.sessionDir);
+	assert.equal(innerParams.output, terminal.nodes.read?.attempts[0]?.outputPath);
+	assert.deepEqual(innerParams.acceptance, { level: "none", reason: "Acceptance is enforced by the pi-graph supervisor." });
 	const attemptRoot = store.path("nodes", "read", "attempt-1");
 	for (const name of ["attempt.json", "workspace.json", "validated-result.json", "result-manifest.json", "acceptance.json", "child-dispatch.json"]) {
 		assert.doesNotReject(readFile(join(attemptRoot, name), "utf8"));
 	}
 	assert.equal((await loadValidatedRun(store, 10)).snapshot.status, "complete");
+	const authority = await store.readAttemptRecord("read", 1);
+	assert.equal(authority.requestDigest, createHash("sha256").update(JSON.stringify(innerParams)).digest("hex"));
+	const ledger = JSON.parse(await readFile(join(attemptRoot, "child-dispatch.json"), "utf8"));
+	assert.equal(ledger.requestDigest, authority.requestDigest);
+	assert.equal(authority.runtimeGuardAcknowledged, true);
+	assert.equal(authority.runtimeLaunchContractDigest, authority.launchContractDigest);
 	await writeFile(store.path("snapshot.json"), "{corrupt");
 	const rebuildStore = new GraphStore(runs, graph.graphId);
 	const releaseRebuild = await rebuildStore.acquireSupervisor("rebuild");
@@ -184,6 +266,46 @@ test("new v2 runtime executes through ChildRuntime and commits the complete evid
 	assert.equal(rebuilt.snapshot.schemaVersion, 2);
 	const child = terminal.nodes.read?.attempts[0]?.asyncDir;
 	if (child) await rm(child, { recursive: true, force: true });
+});
+
+test("a v2 node without routingProfile rejects completion when pi-graph-guard is not acknowledged", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-v2-missing-guard-"));
+	const runs = join(cwd, "runs");
+	const graph = compileGraph(spec("v2-missing-guard"), cwd, 10, 2);
+	const snapshot = initialSnapshot(graph, cwd, "owner", 2);
+	const store = new GraphStore(runs, graph.graphId);
+	await store.initialize(graph, snapshot);
+	const bus = new V2Subagents();
+	bus.acknowledgeGuard = false;
+	const terminal = await new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, ".control", "leases")), config(runs)).run();
+	assert.equal(terminal.status, "needs_attention");
+	assert.equal(terminal.nodes.read?.status, "waiting_input");
+	assert.match(terminal.nodes.read?.error ?? "", /did not acknowledge loading pi-graph-guard/i);
+	const child = terminal.nodes.read?.attempts[0]?.asyncDir;
+	if (child) await rm(child, { recursive: true, force: true });
+	await rm(cwd, { recursive: true, force: true });
+});
+
+test("v2 recovery rejects a missing durable guard seal even without routingProfile", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-v2-guard-recovery-"));
+	const runs = join(cwd, "runs");
+	const graph = compileGraph(spec("v2-guard-recovery"), cwd, 10, 2);
+	const snapshot = initialSnapshot(graph, cwd, "owner", 2);
+	const store = new GraphStore(runs, graph.graphId);
+	await store.initialize(graph, snapshot);
+	const terminal = await new GraphRunner(graph, snapshot, store, new V2Subagents(), new LeaseRegistry(join(runs, ".control", "leases")), config(runs)).run();
+	const attemptPath = store.path("nodes", "read", "attempt-1", "attempt.json");
+	const authority = JSON.parse(await readFile(attemptPath, "utf8"));
+	delete authority.runtimeGuardAcknowledged;
+	await writeFile(attemptPath, JSON.stringify(authority));
+	await assert.rejects(loadValidatedRun(store, 10), /no durable pi-graph-guard acknowledgement/i);
+	authority.runtimeGuardAcknowledged = true;
+	authority.runtimeLaunchContractDigest = authority.launchContractDigest === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64);
+	await writeFile(attemptPath, JSON.stringify(authority));
+	await assert.rejects(loadValidatedRun(store, 10), /launch contract differs from its preflight seal/i);
+	const child = terminal.nodes.read?.attempts[0]?.asyncDir;
+	if (child) await rm(child, { recursive: true, force: true });
+	await rm(cwd, { recursive: true, force: true });
 });
 
 test("v2 unknown dispatch remains protected and is not re-emitted after restart", async () => {
@@ -206,13 +328,14 @@ test("v2 unknown dispatch remains protected and is not re-emitted after restart"
 	assert.equal(bus.spawns, 1);
 });
 
-test("v2 rejects external writes and trusted loading detects acceptance tampering", async () => {
+test("v2 rejects external writes until a trusted broker exists and trusted loading detects acceptance tampering", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-v2-tamper-"));
 	assert.throws(() => compileGraph({
 		schemaVersion: 1,
+		contractPolicy: "strict",
 		goal: "external",
-		nodes: [{ taskId: "external", agent: "worker", task: "send", outputArtifact: "out.md", sideEffect: "external_write" }],
-	}, cwd, 10, 2), /does not support external_write/);
+		nodes: [{ taskId: "external", agent: "worker", task: "send", capabilityId: "mail.send", acceptance: "Readback confirms the approved message.", outputArtifact: "out.md", sideEffect: "external_write", resourceScopes: [{ kind: "mailbox", resource: "primary/outbox", access: "write" }], externalAction: { service: "mail", action: "send", target: "approved-message", requiresApproval: true, approvalRef: "approval:test", reversible: false, expectedState: "Exactly one sent message.", verifyByReadback: true } }],
+	}, cwd, 10, 2), /trusted approval broker/);
 
 	const runs = join(cwd, "runs");
 	const graph = compileGraph(spec("v2-tamper"), cwd, 10, 2);
@@ -415,6 +538,7 @@ test("attempt recovery journal bridges the authority-first collecting crash wind
 	await store.initialize(graph, snapshot);
 	const attemptNonce = randomUUID();
 	const attemptRoot = store.path("nodes", "read", "attempt-1");
+	const workspace = await prepareWorkspace({ graphId: graph.graphId, node: graph.nodes[0]!, attempt: 1, attemptDir: attemptRoot, strategy: "shadow" });
 	snapshot.status = "running";
 	snapshot.nodes.read = {
 		taskId: "read",
@@ -425,8 +549,8 @@ test("attempt recovery journal bridges the authority-first collecting crash wind
 			attemptNonce,
 			status: "running",
 			sessionDir: join(attemptRoot, "session"),
-			workspaceDir: join(attemptRoot, "workspace"),
-			workspaceKind: "shadow",
+			workspaceDir: workspace.cwd,
+			workspaceKind: workspace.kind,
 		}],
 	};
 	await store.saveSnapshot(snapshot);
@@ -448,11 +572,11 @@ test("attempt recovery journal bridges the authority-first collecting crash wind
 		graphId: graph.graphId,
 		taskId: "read",
 		attempt: 1,
-		workspaceKind: "shadow",
-		contractDigest: "0".repeat(64),
-		writeBaseline: {},
-		readBaseline: {},
-		inputBaseline: {},
+		workspaceKind: workspace.kind,
+		contractDigest: canonicalDigest(workspace.contract),
+		writeBaseline: workspace.contract.writeBaseline,
+		readBaseline: workspace.contract.readBaseline,
+		inputBaseline: workspace.contract.inputBaseline,
 		createdAt: new Date().toISOString(),
 	});
 	await store.writeAttemptRecord("read", 1, { ...authority, phase: "terminal", terminalStatus: "stale", updatedAt: new Date().toISOString() });
@@ -668,8 +792,8 @@ test("terminal authority recovery restores fail-fast before independent nodes di
 		goal: "fail fast",
 		failFast: true,
 		nodes: [
-			{ taskId: "first", agent: "scout", task: "first", outputArtifact: "first.md", sideEffect: "local_read" },
-			{ taskId: "second", agent: "scout", task: "second", outputArtifact: "second.md", sideEffect: "local_read" },
+			{ taskId: "first", agent: "code-scout", task: "first", outputArtifact: "first.md", sideEffect: "local_read" },
+			{ taskId: "second", agent: "code-scout", task: "second", outputArtifact: "second.md", sideEffect: "local_read" },
 		],
 	};
 	const graph = compileGraph(failFastSpec, cwd, 10, 2);
@@ -771,8 +895,8 @@ test("fail-fast preserves an independently accepted authority ahead of its snaps
 		goal: "preserve accepted sibling",
 		failFast: true,
 		nodes: [
-			{ taskId: "failed", agent: "scout", task: "first", outputArtifact: "failed.md", sideEffect: "local_read" },
-			{ taskId: "accepted", agent: "scout", task: "second", outputArtifact: "accepted.md", sideEffect: "local_read" },
+			{ taskId: "failed", agent: "code-scout", task: "first", outputArtifact: "failed.md", sideEffect: "local_read" },
+			{ taskId: "accepted", agent: "code-scout", task: "second", outputArtifact: "accepted.md", sideEffect: "local_read" },
 		],
 	} as GraphSpec, cwd, 10, 2);
 	const snapshot = initialSnapshot(graph, cwd, "owner", 2);
@@ -894,7 +1018,7 @@ test("durable stop preserves an immutable failed authority from retry-wait", asy
 		goal: "stop retry",
 		nodes: [{
 			taskId: "read",
-			agent: "scout",
+			agent: "code-scout",
 			task: "read",
 			outputArtifact: "read.md",
 			sideEffect: "local_read",

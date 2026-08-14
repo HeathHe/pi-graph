@@ -1,6 +1,6 @@
 import { isAbsolute, join, relative, sep } from "node:path";
 import { subagentAsyncRoot } from "./rpc.ts";
-import type { GraphSnapshot, GraphSnapshotV1, GraphSnapshotV2, NodeAttemptState, NodeRuntimeState } from "./types.ts";
+import type { GraphSnapshot, GraphSnapshotV1, GraphSnapshotV2, NodeAttemptState, NodeRuntimeState, ProviderDispatchState } from "./types.ts";
 import { validateGraphId } from "./compile.ts";
 
 const GRAPH_STATUSES = new Set(["queued", "running", "complete", "failed", "blocked", "stopped", "needs_attention"]);
@@ -15,13 +15,18 @@ function validIsoTimestamp(value: unknown): value is string {
 	return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString() === value;
 }
 
-interface PersistedAttemptV2 extends Omit<NodeAttemptState, "sessionDir" | "workspaceDir" | "asyncDir" | "outputPath" | "manifestPath"> {
+interface PersistedProviderDispatchV2 extends Omit<ProviderDispatchState, "sessionDir" | "asyncDir"> {
+	session: string;
+}
+
+interface PersistedAttemptV2 extends Omit<NodeAttemptState, "sessionDir" | "workspaceDir" | "asyncDir" | "outputPath" | "manifestPath" | "providerDispatches"> {
 	paths: {
 		session: string;
 		workspace?: string;
 		output?: string;
 		manifest?: string;
 	};
+	providerDispatches?: PersistedProviderDispatchV2[];
 }
 
 interface PersistedNodeV2 extends Omit<NodeRuntimeState, "attempts"> {
@@ -59,6 +64,7 @@ function validateCommon(snapshot: GraphSnapshot, expectedGraphId: string, graphR
 	if (!validIsoTimestamp(snapshot.createdAt) || !validIsoTimestamp(snapshot.updatedAt) || !snapshot.nodes || typeof snapshot.nodes !== "object" || Array.isArray(snapshot.nodes)) throw new Error("Invalid graph snapshot nodes or timestamps.");
 	if (snapshot.schemaVersion === 2) {
 		if (!UUID.test(snapshot.runInstanceId) || !Number.isInteger(snapshot.lifecycleRevision) || snapshot.lifecycleRevision < 0 || !Number.isInteger(snapshot.fencingGeneration) || snapshot.fencingGeneration < 0) throw new Error("Invalid graph snapshot v2 lifecycle identity.");
+		if (snapshot.planningAdmissionId !== undefined && !UUID.test(snapshot.planningAdmissionId)) throw new Error("Invalid graph snapshot v2 planning admission identity.");
 		if (snapshot.terminalAt !== undefined && !validIsoTimestamp(snapshot.terminalAt)) throw new Error("Invalid graph snapshot v2 terminal timestamp.");
 		if (snapshot.attentionAt !== undefined && (!validIsoTimestamp(snapshot.attentionAt) || snapshot.status !== "needs_attention")) throw new Error("Invalid graph snapshot v2 attention timestamp.");
 	}
@@ -88,6 +94,20 @@ function validateCommon(snapshot: GraphSnapshot, expectedGraphId: string, graphR
 			if (attempt.asyncId !== undefined) {
 				if (typeof attempt.asyncId !== "string" || !ASYNC_ID.test(attempt.asyncId) || attempt.asyncDir !== join(subagentAsyncRoot(), attempt.asyncId)) throw new Error(`Invalid graph snapshot async path: ${taskId}`);
 			}
+			if (attempt.providerDispatches !== undefined) {
+				if (!Array.isArray(attempt.providerDispatches) || attempt.providerDispatches.length === 0) throw new Error(`Invalid graph snapshot provider dispatches: ${taskId}`);
+				for (const [dispatchIndex, dispatch] of attempt.providerDispatches.entries()) {
+					const number = dispatchIndex + 1;
+					const expectedSession = number === 1 ? attempt.sessionDir : join(attemptRoot, `provider-dispatch-${number}`, "session");
+					if (!dispatch || dispatch.dispatch !== number || !["prepared", "dispatching", "dispatch_unknown", "running", "complete", "failed", "stopped", "paused"].includes(dispatch.status) || dispatch.sessionDir !== expectedSession || !validIsoTimestamp(dispatch.startedAt) || (dispatch.endedAt !== undefined && !validIsoTimestamp(dispatch.endedAt))) throw new Error(`Invalid graph snapshot provider dispatch: ${taskId}/${attempt.attempt}/${number}`);
+					if ((dispatch.asyncId === undefined) !== (dispatch.asyncDir === undefined)) throw new Error(`Invalid graph snapshot provider dispatch identity: ${taskId}/${attempt.attempt}/${number}`);
+					if (dispatch.asyncId !== undefined && (typeof dispatch.asyncId !== "string" || !ASYNC_ID.test(dispatch.asyncId) || dispatch.asyncDir !== join(subagentAsyncRoot(), dispatch.asyncId))) throw new Error(`Invalid graph snapshot provider dispatch path: ${taskId}/${attempt.attempt}/${number}`);
+					if (dispatch.requestDigest !== undefined && (typeof dispatch.requestDigest !== "string" || !/^[a-f0-9]{64}$/i.test(dispatch.requestDigest))) throw new Error(`Invalid graph snapshot provider request digest: ${taskId}/${attempt.attempt}/${number}`);
+					if (dispatch.launchContractDigest !== undefined && (typeof dispatch.launchContractDigest !== "string" || !/^[a-f0-9]{64}$/i.test(dispatch.launchContractDigest))) throw new Error(`Invalid graph snapshot provider launch contract digest: ${taskId}/${attempt.attempt}/${number}`);
+					if (dispatch.extensionContentDigest !== undefined && (typeof dispatch.extensionContentDigest !== "string" || !/^[a-f0-9]{64}$/i.test(dispatch.extensionContentDigest))) throw new Error(`Invalid graph snapshot provider Extension content digest: ${taskId}/${attempt.attempt}/${number}`);
+					if (dispatch.runtimeLaunchContractDigest !== undefined && (typeof dispatch.runtimeLaunchContractDigest !== "string" || !/^[a-f0-9]{64}$/i.test(dispatch.runtimeLaunchContractDigest))) throw new Error(`Invalid graph snapshot provider runtime launch contract digest: ${taskId}/${attempt.attempt}/${number}`);
+				}
+			}
 		}
 		const latest = raw.attempts.at(-1);
 		if (ATTEMPT_BOUND_STATUSES.has(raw.status) && !(raw.status === "stopped" && raw.attempt === 0) && (!latest || latest.status !== raw.status)) throw new Error(`Invalid graph snapshot node/attempt status: ${taskId}`);
@@ -102,11 +122,16 @@ function decodeV2(value: PersistedSnapshotV2, graphRoot: string): GraphSnapshotV
 		{
 			...node,
 			attempts: (node.attempts ?? []).map((attempt) => {
-				const { paths, asyncId, ...rest } = attempt;
+				const { paths, asyncId, providerDispatches, ...rest } = attempt;
 				if (!paths || typeof paths !== "object") throw new Error(`Invalid graph snapshot v2 attempt paths: ${taskId}`);
 				return {
 					...rest,
 					...(asyncId ? { asyncId, asyncDir: join(subagentAsyncRoot(), asyncId) } : {}),
+					...(providerDispatches ? { providerDispatches: providerDispatches.map(({ session, asyncId: dispatchAsyncId, ...dispatch }) => ({
+						...dispatch,
+						...(dispatchAsyncId ? { asyncId: dispatchAsyncId, asyncDir: join(subagentAsyncRoot(), dispatchAsyncId) } : {}),
+						sessionDir: expandToken(graphRoot, session, `${taskId}.providerDispatch.session`),
+					})) } : {}),
 					sessionDir: expandToken(graphRoot, paths.session, `${taskId}.session`),
 					...(paths.workspace ? { workspaceDir: expandToken(graphRoot, paths.workspace, `${taskId}.workspace`) } : {}),
 					...(paths.output ? { outputPath: expandToken(graphRoot, paths.output, `${taskId}.output`) } : {}),
@@ -134,9 +159,13 @@ export function encodeSnapshot(snapshot: GraphSnapshot, graphRoot: string): Grap
 		{
 			...node,
 			attempts: node.attempts.map((attempt) => {
-				const { sessionDir, workspaceDir, asyncDir: _asyncDir, outputPath, manifestPath, ...rest } = attempt;
+				const { sessionDir, workspaceDir, asyncDir: _asyncDir, outputPath, manifestPath, providerDispatches, ...rest } = attempt;
 				return {
 					...rest,
+					...(providerDispatches ? { providerDispatches: providerDispatches.map(({ sessionDir: dispatchSession, asyncDir: _dispatchAsyncDir, ...dispatch }) => ({
+						...dispatch,
+						session: safeToken(graphRoot, dispatchSession, `${taskId}.providerDispatch.session`),
+					})) } : {}),
 					paths: {
 						session: safeToken(graphRoot, sessionDir, `${taskId}.session`),
 						...(workspaceDir ? { workspace: safeToken(graphRoot, workspaceDir, `${taskId}.workspace`) } : {}),
