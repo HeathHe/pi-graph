@@ -50,7 +50,7 @@
 
 - 只记录 Graph 运行内部事实：提交者（sessionId）、GraphSpec digest/摘要、节点执行与工具调用事实、验收方式（machine-verified / declared）。
 - schema 显式标记 unverified、append-only、有界保留；生产执行路径可写事件但**不读取事件影响决策**；离线诊断工具可读。
-- 规划来源缺失记 unknown，禁止推断补全；`provenance_note` 可选自由文本，任何输出中永久标注 unverified。
+- 不记录规划来源或自由文本归因；缺失事实不推断补全。
 
 ## 兼容矩阵
 
