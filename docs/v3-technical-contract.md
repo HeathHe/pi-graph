@@ -59,7 +59,6 @@ interface GraphNodeSpecV3 {
   validationCommands?: string[]; // local_write 必填非空，见 §3
   childAcceptance?: {            // 可选；显式配置才参与判定，不能替代 validationCommands
     criteria: string[];
-    reviewer?: "child" | "supervisor"; // 缺省 "child"
   };
 }
 ```
@@ -134,6 +133,8 @@ interface GraphNodeSpecV3 {
 | 其余状态/组合 | needs_attention |
 
 为允许的转换保留**隔离的冻结 legacy writer**：它只能写 legacy 格式的终态转换（validated/applying → 终态），不实现任何新逻辑，不再称为"只读恢复"。
+
+**Phase 1A 实现边界**：本阶段只识别并只读展示 legacy 格式，不实现 legacy resume，也不实现上述冻结 legacy writer；legacy writer 延后到后续明确授权的阶段。
 
 ### 状态恢复矩阵
 
@@ -231,3 +232,12 @@ interface V3Event {
 - 校验 package.json、package-lock.json、node_modules 三处 pi-subagents 均为 0.49.0，任一不符即失败；
 - `lockHash` 必须等于 **testedCommit**（`git show <commit>:package-lock.json`）的内容哈希，不是工作区文件；
 - 同时记录 per-file TAP（层级测试名）与 full-suite 519/519 官方统计。
+
+### 已知 governance 测试波动（Phase 1A 基线）
+
+以下旧治理测试存在已知偶发波动，必须如实记录并复跑，禁止通过放宽断言或盲目增加 timeout 隐藏：
+
+- `tests/model-routing.test.ts:1257`：`routed_subagent` 预检偶发超时；
+- 旧治理流程的最终状态断言偶发出现 `needs_attention` 与 `complete` 不一致。
+
+若偶发一次后完整测试连续两次全绿，不阻塞 Phase 1A；若连续复现则视为阻塞。V3 新测试的任何不稳定均视为阻塞。

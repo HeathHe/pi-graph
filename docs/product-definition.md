@@ -32,11 +32,12 @@
 
 ### GraphSpec 节点字段
 
-必填：`taskId`、`agent`、`task`；可选：`dependsOn`、`inputArtifacts`、`outputArtifact`、`timeoutMs`、`maxAttempts`、`writeScope`、`acceptance`（声明式）、`validationCommands`。
+必填：`taskId`、`agent`、`task`；可选：`dependsOn`、`inputArtifacts`、`outputArtifact`、`timeoutMs`、`retryPolicy.maxAttempts`、`writeScope`、`acceptance`（声明式）、`validationCommands`、`childAcceptance`。
 
 规则：
-- `local_write` 节点必须定义确定性验证命令或 childAcceptance，否则编译失败——**childAcceptance 不能替代 validationCommands**；纯读节点豁免（判定依据：未声明写出，而非节点自称 read）。V3 MVP sideEffect 白名单：none / local_read / local_write。
-- 写范围冲突节点由调度器串行化（编译期互斥检查）。
+- `local_write` 节点必须同时声明非空 `writeScope` 和非空、确定性的 `validationCommands`，否则编译失败；纯读节点豁免（判定依据：声明的 `sideEffect` 与 `writeScope`）。V3 MVP sideEffect 白名单：none / local_read / local_write。
+- `childAcceptance` 只能作为 `validationCommands` 之外的附加语义复核层，不能替代机器验证命令。
+- 无拓扑依赖且 `writeScope` 重叠的节点必须在编译期拒绝；存在拓扑依赖时允许按依赖顺序执行。
 - 自然语言 acceptance 默认仅声明（declared），机器验证通过时才标 verified。
 
 ### 持久化与恢复语义
