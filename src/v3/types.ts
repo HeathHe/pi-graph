@@ -78,6 +78,7 @@ export interface CompiledGraphProjectionV3 {
 }
 
 export interface CompiledGraphV3 extends CompiledGraphProjectionV3 {
+	sourceGraphSpec: GraphSpecV3;
 	sourceGraphSpecDigest: string;
 	graphDigest: string;
 }

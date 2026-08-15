@@ -1,18 +1,19 @@
 import { posix } from "node:path";
-import { validateValidationCommand } from "../validation.ts";
-import { canonicalDigest } from "./digests.ts";
+import { canonicalDigest, canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
 import type {
 	ChildAcceptanceV3,
 	CompiledGraphNodeV3,
 	CompiledGraphProjectionV3,
 	CompiledGraphV3,
+	GraphSpecV3,
 	RetryPolicyV3,
 	RetryReasonV3,
 	ScopeEntryV3,
 	SideEffectV3,
 	WorkspaceModeV3,
 } from "./types.ts";
+import { validateValidationCommandV3 } from "./validation-command.ts";
 
 const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "maxConcurrency", "failFast", "workspace"]);
 const NODE_FIELDS = new Set([
@@ -31,6 +32,8 @@ const SIDE_EFFECTS = new Set<SideEffectV3>(["none", "local_read", "local_write"]
 const RETRY_REASONS = new Set<RetryReasonV3>(["task_failed", "validation", "timeout", "workspace_conflict"]);
 const WORKSPACES = new Set<WorkspaceModeV3>(["auto", "shadow", "git"]);
 const TASK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u;
+const MAX_CONCURRENCY_V3 = 64;
+const PROTECTED_CONTROL_SEGMENTS = new Set([".git", ".pi-graph", ".pi", ".pi-agents", ".pi-subagents"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -91,13 +94,18 @@ function stringArray(value: unknown, field: string, taskId?: string, allowEmpty 
 }
 
 function normalizeRelativePath(value: string, field: string, taskId: string, allowDot: boolean): string {
+	const errorCode = field.includes("Artifact") ? "INVALID_ARTIFACT" : "INVALID_SCOPE";
 	const slashed = value.replaceAll("\\", "/");
 	if (slashed.includes("\0") || slashed.startsWith("/") || /^[a-zA-Z]:\//u.test(slashed) || slashed.split("/").includes("..")) {
-		graphV3Error(field.includes("Artifact") ? "INVALID_ARTIFACT" : "INVALID_SCOPE", `${field} must be a relative path that does not escape its root.`, { taskId, field, details: { path: value } });
+		graphV3Error(errorCode, `${field} must be a relative path that does not escape its root.`, { taskId, field, details: { path: value } });
 	}
 	const normalized = posix.normalize(slashed).replace(/^\.\//u, "").replace(/\/$/u, "");
 	if (!normalized || (!allowDot && normalized === ".")) {
-		graphV3Error(field.includes("Artifact") ? "INVALID_ARTIFACT" : "INVALID_SCOPE", `${field} must identify a non-empty relative path.`, { taskId, field, details: { path: value } });
+		graphV3Error(errorCode, `${field} must identify a non-empty relative path.`, { taskId, field, details: { path: value } });
+	}
+	const protectedSegment = normalized.split("/").find((segment) => PROTECTED_CONTROL_SEGMENTS.has(segment));
+	if (protectedSegment) {
+		graphV3Error(errorCode, `${field} may not target protected control path '${protectedSegment}'.`, { taskId, field, details: { path: value, protectedSegment } });
 	}
 	return normalized;
 }
@@ -174,7 +182,7 @@ function normalizeValidationCommands(value: unknown, taskId: string): string[] {
 	const commands = stringArray(value, "validationCommands", taskId);
 	for (const command of commands) {
 		try {
-			validateValidationCommand(command);
+			validateValidationCommandV3(command);
 		} catch (error) {
 			throw new GraphV3Error("INVALID_VALIDATION_COMMAND", `Invalid validation command for node '${taskId}': ${error instanceof Error ? error.message : String(error)}`, {
 				taskId,
@@ -234,11 +242,18 @@ function ancestorMap(nodes: ReadonlyArray<CompiledGraphNodeV3>, order: string[])
 	return ancestors;
 }
 
+function artifactPathsOverlap(left: string, right: string): boolean {
+	return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
 function validateArtifacts(nodes: CompiledGraphNodeV3[], ancestors: Map<string, Set<string>>): void {
 	const producers = new Map<string, string>();
 	for (const node of nodes) {
-		const existing = producers.get(node.outputArtifact);
-		if (existing) graphV3Error("INVALID_ARTIFACT", `Nodes '${existing}' and '${node.taskId}' produce the same output artifact '${node.outputArtifact}'.`, { taskId: node.taskId, field: "outputArtifact", details: { producer: existing, artifact: node.outputArtifact } });
+		for (const [artifact, producer] of producers) {
+			if (artifactPathsOverlap(artifact, node.outputArtifact)) {
+				graphV3Error("INVALID_ARTIFACT", `Nodes '${producer}' and '${node.taskId}' produce overlapping artifact paths '${artifact}' and '${node.outputArtifact}'.`, { taskId: node.taskId, field: "outputArtifact", details: { producer, artifacts: [artifact, node.outputArtifact] } });
+			}
+		}
 		producers.set(node.outputArtifact, node.taskId);
 	}
 	for (const node of nodes) {
@@ -290,7 +305,7 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 	const graphId = explicitGraphId ?? `graph-${sourceGraphSpecDigest.slice(0, 16)}`;
 	if (graphId.length > 200) graphV3Error("INVALID_GRAPH_SPEC", "GraphSpec V3 graphId must be at most 200 characters.", { field: "graphId" });
 	const maxConcurrency = input.maxConcurrency ?? 2;
-	if (!Number.isInteger(maxConcurrency) || (maxConcurrency as number) < 1) graphV3Error("INVALID_GRAPH_SPEC", "maxConcurrency must be a positive integer.", { field: "maxConcurrency" });
+	if (!Number.isInteger(maxConcurrency) || (maxConcurrency as number) < 1 || (maxConcurrency as number) > MAX_CONCURRENCY_V3) graphV3Error("INVALID_GRAPH_SPEC", `maxConcurrency must be an integer from 1 through ${MAX_CONCURRENCY_V3}.`, { field: "maxConcurrency" });
 	const failFast = input.failFast ?? false;
 	if (typeof failFast !== "boolean") graphV3Error("INVALID_GRAPH_SPEC", "failFast must be a boolean.", { field: "failFast" });
 	const workspace = input.workspace ?? "auto";
@@ -330,6 +345,9 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		if (sideEffectValue === "local_write" && (writeScope.length === 0 || validationCommands.length === 0)) {
 			graphV3Error("LOCAL_WRITE_REQUIREMENTS", `local_write node '${taskId}' requires non-empty writeScope and validationCommands; childAcceptance cannot replace validationCommands.`, { taskId, details: { hasWriteScope: writeScope.length > 0, hasValidationCommands: validationCommands.length > 0 } });
 		}
+		if (sideEffectValue !== "local_write" && writeScope.length > 0) {
+			graphV3Error("INVALID_SCOPE", `Node '${taskId}' may declare writeScope only with sideEffect 'local_write'.`, { taskId, field: "writeScope", details: { sideEffect: sideEffectValue } });
+		}
 		const node: CompiledGraphNodeV3 = {
 			taskId,
 			agent,
@@ -366,5 +384,6 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		failFast,
 		workspace: workspace as WorkspaceModeV3,
 	};
-	return { ...projection, sourceGraphSpecDigest, graphDigest: canonicalDigest(projection) };
+	const sourceGraphSpec = JSON.parse(canonicalJson(input)) as GraphSpecV3;
+	return { ...projection, sourceGraphSpec, sourceGraphSpecDigest, graphDigest: canonicalDigest(projection) };
 }

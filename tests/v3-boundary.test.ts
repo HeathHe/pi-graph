@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -12,9 +12,31 @@ async function v3Sources(): Promise<Array<{ file: string; source: string }>> {
 	return Promise.all(files.map(async (file) => ({ file, source: await readFile(join(v3SourceDir, file), "utf8") })));
 }
 
-test("src/v3 has zero imports from model routing, subagent routing, recommendations, adapters, or extensions", async () => {
-	const forbidden = /(?:from\s+|import\s*\()["'][^"']*(?:model-routing|subagent-router|recommend|model-routing-adapter|extensions\/)/u;
+test("src/v3 has zero direct imports from model routing, subagent routing, recommendations, adapters, extensions, or legacy validation", async () => {
+	const forbidden = /(?:from\s+|import\s*\()["'][^"']*(?:model-routing|subagent-router|recommend|model-routing-adapter|extensions\/|\.\.\/validation\.ts)/u;
 	for (const { file, source } of await v3Sources()) assert.doesNotMatch(source, forbidden, file);
+});
+
+test("src/v3 complete relative import closure stays inside the governance-free V3 kernel", async () => {
+	const importPattern = /(?:from\s+|import\s*\()\s*["']([^"']+)["']/gu;
+	const pending = (await readdir(v3SourceDir)).filter((file) => file.endsWith(".ts")).map((file) => join(v3SourceDir, file));
+	const visited = new Set<string>();
+	while (pending.length > 0) {
+		const file = resolve(pending.pop()!);
+		if (visited.has(file)) continue;
+		visited.add(file);
+		const source = await readFile(file, "utf8");
+		for (const match of source.matchAll(importPattern)) {
+			const specifier = match[1]!;
+			if (!specifier.startsWith(".")) continue;
+			const imported = resolve(dirname(file), specifier);
+			const fromV3 = relative(v3SourceDir, imported);
+			assert.equal(fromV3.startsWith("..") || fromV3 === "", false, `${relative(repositoryRoot, file)} imports governance-bearing module ${relative(repositoryRoot, imported)}`);
+			assert.doesNotMatch(imported, /model-routing|subagent-router|recommend|model-routing-adapter|extensions|src\/types\.ts/u);
+			pending.push(imported);
+		}
+	}
+	assert.ok(visited.size >= 10);
 });
 
 test("V3 initialize and inspect have no governance configuration probes", async () => {

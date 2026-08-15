@@ -253,3 +253,61 @@ test("V3 compiler rejects invalid schema versions and unknown fields", () => {
 	unknown.unrecognized = true;
 	expectGraphError(() => compileGraphSpecV3(unknown), "INVALID_FIELD");
 });
+
+test("V3 compiler rejects writeScope on none and local_read nodes", () => {
+	for (const sideEffect of ["none", "local_read"]) {
+		const input = validThreeNodeSpec();
+		const node = (input.nodes as Array<Record<string, unknown>>)[0]!;
+		node.sideEffect = sideEffect;
+		node.writeScope = [{ kind: "file", path: "out/value.txt" }];
+		const error = expectGraphError(() => compileGraphSpecV3(input), "INVALID_SCOPE");
+		assert.equal(error.taskId, "collect");
+		assert.equal(error.field, "writeScope");
+	}
+});
+
+test("V3 compiler rejects protected control paths in scopes and artifacts", () => {
+	const protectedPaths = [
+		".git", "nested/.git/config", ".pi-graph/runs", ".pi/settings.json", ".pi/agents/worker", ".pi-agents/worker", ".pi-subagents/run",
+	];
+	for (const path of protectedPaths) {
+		const readInput = validThreeNodeSpec();
+		(readInput.nodes as Array<Record<string, unknown>>)[0]!.readScope = [{ kind: "tree", path }];
+		expectGraphError(() => compileGraphSpecV3(readInput), "INVALID_SCOPE");
+
+		const writeInput = validThreeNodeSpec();
+		(writeInput.nodes as Array<Record<string, unknown>>)[1]!.writeScope = [{ kind: "tree", path }];
+		expectGraphError(() => compileGraphSpecV3(writeInput), "INVALID_SCOPE");
+
+		const artifactInput = validThreeNodeSpec();
+		(artifactInput.nodes as Array<Record<string, unknown>>)[0]!.outputArtifact = path;
+		expectGraphError(() => compileGraphSpecV3(artifactInput), "INVALID_ARTIFACT");
+	}
+	const normal = validThreeNodeSpec();
+	(normal.nodes as Array<Record<string, unknown>>)[0]!.readScope = [{ kind: "tree", path: ".github/workflows" }];
+	assert.equal(compileGraphSpecV3(normal).nodes[0]?.readScope[0]?.path, ".github/workflows");
+});
+
+test("V3 compiler rejects output artifact ancestor and descendant collisions", () => {
+	const input = {
+		schemaVersion: 3,
+		graphId: "artifacts",
+		goal: "Check artifact prefixes",
+		nodes: [
+			{ taskId: "left", agent: "reader", task: "Left", sideEffect: "none", outputArtifact: "foo" },
+			{ taskId: "right", agent: "reader", task: "Right", sideEffect: "none", outputArtifact: "foo/bar" },
+		],
+	};
+	expectGraphError(() => compileGraphSpecV3(input), "INVALID_ARTIFACT");
+	(input.nodes[1] as Record<string, unknown>).outputArtifact = "foobar/result";
+	assert.equal(compileGraphSpecV3(input).nodes.length, 2);
+});
+
+test("V3 compiler enforces the maxConcurrency hard ceiling", () => {
+	const accepted = validThreeNodeSpec();
+	accepted.maxConcurrency = 64;
+	assert.equal(compileGraphSpecV3(accepted).maxConcurrency, 64);
+	const rejected = validThreeNodeSpec();
+	rejected.maxConcurrency = 65;
+	expectGraphError(() => compileGraphSpecV3(rejected), "INVALID_GRAPH_SPEC");
+});
