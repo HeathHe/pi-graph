@@ -1,15 +1,13 @@
-name: pi-subagents latest compatibility
+name: pi-subagents latest compatibility (drift, non-blocking)
 
 on:
-  pull_request:
-  push:
-    branches: [main]
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
 jobs:
   latest:
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

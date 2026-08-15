@@ -35,15 +35,15 @@
 必填：`taskId`、`agent`、`task`；可选：`dependsOn`、`inputArtifacts`、`outputArtifact`、`timeoutMs`、`maxAttempts`、`writeScope`、`acceptance`（声明式）、`validationCommands`。
 
 规则：
-- `local_write` 节点必须定义确定性验证命令或 childAcceptance，否则编译失败；纯读节点豁免（判定依据：未声明写出，而非节点自称 read）。
+- `local_write` 节点必须定义确定性验证命令或 childAcceptance，否则编译失败——**childAcceptance 不能替代 validationCommands**；纯读节点豁免（判定依据：未声明写出，而非节点自称 read）。V3 MVP sideEffect 白名单：none / local_read / local_write。
 - 写范围冲突节点由调度器串行化（编译期互斥检查）。
 - 自然语言 acceptance 默认仅声明（declared），机器验证通过时才标 verified。
 
 ### 持久化与恢复语义
 
-- 新 V3 运行：事件记录不含任何 planning 字段；不再生成 PlanningReceipt。
-- 旧 V2/V3 证据保持原样，由冻结的兼容读取器恢复，不迁移、不重写。
-- 恢复前置条件全部满足才自动续跑；任一不满足 → needs_attention，人工介入。
+- 新 V3 运行：snapshot schemaVersion 3 + authorization schemaVersion 4（runtimeSchemaVersion 3）；authorization 只承载不可变图级 admission，attempt 级状态由 attempt.json / workspace.json / validated-result.json / acceptance.json 承载。
+- 旧 V2/V3 证据保持原样，由冻结的 legacy 兼容层处理：V1 不 resume；V2 只允许监控已知 child、完成 validated/applying；禁止新派发、重路由、模型降级、新 retry；其余 needs_attention。
+- 恢复判定只来自现场验证（digest、owner/child 身份、版本、runtime 能力），不信任持久化的完整性标记。
 
 ### 影子记录（thin shadow）
 
@@ -55,9 +55,9 @@
 
 | 运行版本 | 处理 | 说明 |
 |---|---|---|
-| V1 run（旧目录格式） | 只读归档，doctor 可查看，不支持 resume | 不迁移 |
-| V2 run（含治理收据） | 冻结兼容读取器恢复；新代码不再生成 | PlanningReceipt 保持原样，不清空 |
-| V3 run（新格式） | 新 Graph 使用；事件无 planning 字段 | 恢复语义按上文 |
+| V1 run（旧目录格式） | 只读展示，**不支持 resume** | 不迁移 |
+| V2 run（含治理收据） | 冻结 legacy 策略：监控已知 child、完成 validated/applying；禁止新派发/重路由/降级/新 retry | PlanningReceipt 保持原样，不清空 |
+| V3 run（snapshot v3 + auth v4） | 新 Graph 使用；现场验证后才恢复 | 恢复语义按技术合同 §6 |
 
 ## 验收清单
 

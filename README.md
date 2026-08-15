@@ -1,12 +1,17 @@
 # pi-graph
 
+> **当前版本（current）：v1-governed**（tag `v1-governed`，治理路由 + 持久化 DAG 执行）。
+> **目标版本（target）：V3** —— 默认隐形、显式调用的单机持久化 DAG 执行器。
+> 产品合同见 `docs/product-definition.md`，技术合同见 `docs/v3-technical-contract.md`；二者冲突时以技术合同为准。
+> 当前代码仍是 v1-governed 行为（含强制门链、模型路由）；V3 尚未实现。下表内容为现状说明，V3 落地前按技术合同逐步收敛。
+
 Durable DAG execution for Pi. `pi-graph` compiles a supplied GraphSpec, launches one independent `pi-subagents` async run per node, persists every transition, isolates writes, validates results, and unlocks dependents only after Supervisor `ACCEPTED`.
 
 The main model still owns task understanding and the first draft. Before a new Graph can start, the bundled planning gate requires its structured task assessment, applies deterministic planning/risk floors, routes tactical or strategic strengthening to an independent model, and requires a second-model review of the complete derivation. The Graph runtime then executes only the approved DAG; it does not replace `pi-subagents`/`pi-convergence`.
 
 ## Recommended configuration
 
-`pi-graph` does not pin or patch `pi-subagents`. Pi supplies the current official runtime through the `pi-subagents` peer dependency (`>=0.40.0`), while development and CI install `pi-subagents@latest`. Runtime compatibility is decided by the public `subagents:rpc:v1` capability contract, not by version equality. Paste this `graph` block into the user-local `settings.json` to use the current defaults:
+`pi-graph` does not pin or patch `pi-subagents`. Pi supplies the current official runtime through the `pi-subagents` peer dependency (`>=0.40.0`). The **certified channel** pins development/CI to `pi-subagents@0.49.0`（`npm ci` + check + test + pack）；the **drift channel**（`.github/workflows/pi-subagents-latest.yml`）installs `pi-subagents@latest` and is **non-blocking**. Runtime compatibility is decided by the public `subagents:rpc:v1` capability contract, not by version equality. Paste this `graph` block into the user-local `settings.json` to use the current defaults:
 
 ```json
 {
