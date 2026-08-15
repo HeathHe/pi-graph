@@ -1,6 +1,7 @@
 import { validateAuthorizationV4 } from "./authorization.ts";
+import { canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
-import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, V3RunVerification } from "./types.ts";
+import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, SourceIdentityV3, V3RunVerification } from "./types.ts";
 
 const SNAPSHOT_FIELDS = new Set([
 	"schemaVersion", "runInstanceId", "graphId", "graphDigest", "sourceGraphSpecDigest", "status", "sessionId", "supervisorEpoch", "createdAt", "updatedAt",
@@ -29,7 +30,6 @@ export interface SnapshotV3Metadata {
 	sessionId: string;
 	supervisorEpoch: string;
 	createdAt: string;
-	status?: GraphRuntimeStatusV3;
 	updatedAt?: string;
 }
 
@@ -40,7 +40,7 @@ export function graphSnapshotV3For(graph: CompiledGraphV3, metadata: SnapshotV3M
 		graphId: graph.graphId,
 		graphDigest: graph.graphDigest,
 		sourceGraphSpecDigest: graph.sourceGraphSpecDigest,
-		status: metadata.status ?? "queued",
+		status: "queued",
 		sessionId: metadata.sessionId,
 		supervisorEpoch: metadata.supervisorEpoch,
 		createdAt: metadata.createdAt,
@@ -79,7 +79,7 @@ export function validateGraphSnapshotV3(value: unknown): GraphSnapshotV3 {
 	};
 }
 
-export function verifyV3Run(snapshotValue: unknown, authorizationValue: unknown): V3RunVerification {
+export function verifyV3Run(snapshotValue: unknown, authorizationValue: unknown, observedSourceIdentity?: SourceIdentityV3): V3RunVerification {
 	const reasons: string[] = [];
 	let snapshot: GraphSnapshotV3 | undefined;
 	let authorization: AuthorizationV4 | undefined;
@@ -94,6 +94,7 @@ export function verifyV3Run(snapshotValue: unknown, authorizationValue: unknown)
 		reasons.push(error instanceof GraphV3Error ? `${error.code}: ${error.message}` : `INVALID_AUTHORIZATION: ${String(error)}`);
 	}
 	if (snapshot && authorization) {
+		if (snapshot.status !== "queued") reasons.push("STATUS_MISMATCH: a V3 admission without attempt evidence must remain queued.");
 		const comparisons: Array<[string, string, string]> = [
 			["runInstanceId", snapshot.runInstanceId, authorization.runInstanceId],
 			["graphId", snapshot.graphId, authorization.graph.graphId],
@@ -105,6 +106,10 @@ export function verifyV3Run(snapshotValue: unknown, authorizationValue: unknown)
 		];
 		for (const [field, snapshotField, authorizationField] of comparisons) {
 			if (snapshotField !== authorizationField) reasons.push(`IDENTITY_MISMATCH: snapshot.${field} does not match authorization.${field}.`);
+		}
+		if (observedSourceIdentity) {
+			if (authorization.sourceCwd !== observedSourceIdentity.sourceCwd) reasons.push("SOURCE_IDENTITY_MISMATCH: current sourceCwd does not match the admitted sourceCwd.");
+			if (canonicalJson(authorization.sourceRepository) !== canonicalJson(observedSourceIdentity.sourceRepository)) reasons.push("SOURCE_IDENTITY_MISMATCH: current repository identity does not match the admitted repository identity.");
 		}
 	}
 	return {

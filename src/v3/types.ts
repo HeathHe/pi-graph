@@ -98,9 +98,19 @@ export interface GraphSnapshotV3 {
 	updatedAt: string;
 }
 
-export interface AuthorizationV4 {
+export type SourceRepositoryIdentityV3 =
+	| { kind: "git"; root: string; head: string }
+	| { kind: "directory"; root: string };
+
+export interface SourceIdentityV3 {
+	sourceCwd: string;
+	sourceRepository: SourceRepositoryIdentityV3;
+}
+
+export interface AuthorizationV4 extends SourceIdentityV3 {
 	schemaVersion: typeof AUTHORIZATION_V4_SCHEMA_VERSION;
 	runtimeSchemaVersion: typeof SNAPSHOT_V3_SCHEMA_VERSION;
+	sourceGraphSpec: GraphSpecV3;
 	sourceGraphSpecDigest: string;
 	graphDigest: string;
 	runInstanceId: string;

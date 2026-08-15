@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -68,6 +69,16 @@ function collectKeys(value: unknown, output = new Set<string>()): Set<string> {
 	return output;
 }
 
+async function createGitRepository(path: string, content: string): Promise<void> {
+	await mkdir(path, { recursive: true });
+	execFileSync("git", ["init", "-q", path]);
+	execFileSync("git", ["-C", path, "config", "user.name", "V3 Test"]);
+	execFileSync("git", ["-C", path, "config", "user.email", "v3@example.invalid"]);
+	await writeFile(join(path, "identity.txt"), content);
+	execFileSync("git", ["-C", path, "add", "identity.txt"]);
+	execFileSync("git", ["-C", path, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "identity"]);
+}
+
 test("V3 initialization atomically writes snapshot-v3/auth-v4 and inspect verifies the round trip", async (t) => {
 	const { root, runDir, initialized } = await newRun("pi-graph-v3-roundtrip-");
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -79,7 +90,7 @@ test("V3 initialization atomically writes snapshot-v3/auth-v4 and inspect verifi
 	assert.equal(authorization.schemaVersion, 4);
 	assert.equal(authorization.runtimeSchemaVersion, 3);
 	assert.deepEqual(Object.keys(authorization).sort(), [
-		"createdAt", "graph", "graphDigest", "runInstanceId", "runtimeSchemaVersion", "schemaVersion", "sessionId", "sourceGraphSpecDigest", "supervisorEpoch",
+		"createdAt", "graph", "graphDigest", "runInstanceId", "runtimeSchemaVersion", "schemaVersion", "sessionId", "sourceCwd", "sourceGraphSpec", "sourceGraphSpecDigest", "sourceRepository", "supervisorEpoch",
 	]);
 	assert.deepEqual(verifyV3Run(snapshot, authorization), {
 		ok: true,
@@ -134,7 +145,7 @@ test("V3 initialization failure leaves no recognizable run or temporary artifact
 	assert.deepEqual(await readdir(root), []);
 	const inspection = await inspectV3Run(runDir);
 	assert.equal(inspection.status, "needs_attention");
-	assert.ok(inspection.reasons.some((reason) => reason.includes("MISSING_FILE")));
+	assert.ok(inspection.reasons.some((reason) => reason.includes("MISSING_RUN_DIRECTORY")));
 });
 
 test("V3 inspect reports needs_attention when snapshot identity is tampered", async (t) => {
@@ -159,7 +170,7 @@ test("V3 inspect reports needs_attention when authorization graph bytes are tamp
 	await writeFile(authorizationPath, JSON.stringify(authorization));
 	const inspection = await inspectV3Run(runDir);
 	assert.equal(inspection.status, "needs_attention");
-	assert.ok(inspection.reasons.some((reason) => reason.includes("graphDigest")));
+	assert.ok(inspection.reasons.some((reason) => reason.includes("compiler projection")));
 });
 
 test("V3 inspect recomputes the graph digest instead of trusting persisted digest fields", async (t) => {
@@ -221,4 +232,155 @@ test("V3 inspect reports mixed authorization versions, corrupt JSON, and missing
 	inspection = await inspectV3Run(runDir);
 	assert.equal(inspection.status, "needs_attention");
 	assert.ok(inspection.reasons.some((reason) => reason.includes("MISSING_FILE")));
+});
+
+test("V3 initialization never deletes a competing run directory after rename failure", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-v3-race-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const runDir = join(root, "run-1");
+	await assert.rejects(
+		initializeV3Run(
+			{ runDir, graph: compiledGraph(), sessionId: "session", supervisorEpoch: "epoch", createdAt: CREATED_AT },
+			{
+				atomicRename: async (_source, destination) => {
+					await mkdir(destination);
+					await writeFile(join(destination, "competitor.txt"), "owned by competitor");
+					throw new Error("simulated competing publish");
+				},
+			},
+		),
+		(error: unknown) => error instanceof GraphV3Error && error.code === "RUN_ALREADY_EXISTS",
+	);
+	assert.equal(await readFile(join(runDir, "competitor.txt"), "utf8"), "owned by competitor");
+	assert.deepEqual(await readdir(root), ["run-1"]);
+});
+
+test("V3 inspect rejects symbolic-link authority files and a symbolic-link run root", async (t) => {
+	for (const label of ["snapshot.json", "authorization.json"]) {
+		const first = await newRun(`pi-graph-v3-symlink-${label}-first-`);
+		const second = await newRun(`pi-graph-v3-symlink-${label}-second-`);
+		t.after(() => rm(first.root, { recursive: true, force: true }));
+		t.after(() => rm(second.root, { recursive: true, force: true }));
+		await rm(join(first.runDir, label));
+		await symlink(join(second.runDir, label), join(first.runDir, label));
+		const inspection = await inspectV3Run(first.runDir);
+		assert.equal(inspection.status, "needs_attention");
+		assert.ok(inspection.reasons.some((reason) => reason.includes("UNSAFE_FILE")), label);
+	}
+	const { root, runDir } = await newRun("pi-graph-v3-symlink-root-");
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const alias = join(root, "run-alias");
+	await symlink(runDir, alias);
+	const inspection = await inspectV3Run(alias);
+	assert.equal(inspection.status, "needs_attention");
+	assert.ok(inspection.reasons.some((reason) => reason.includes("UNSAFE_RUN_DIRECTORY")));
+});
+
+test("V3 inspect rejects directory-shaped authority files", async (t) => {
+	const { root, runDir } = await newRun("pi-graph-v3-nonregular-authority-");
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const authorizationPath = join(runDir, "authorization.json");
+	await rm(authorizationPath);
+	await mkdir(authorizationPath);
+	const inspection = await inspectV3Run(runDir);
+	assert.equal(inspection.status, "needs_attention");
+	assert.ok(inspection.reasons.some((reason) => reason.includes("UNSAFE_FILE")));
+});
+
+test("V3 authorization binds the source directory and Git repository identity", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-v3-source-identity-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const repositoryA = join(root, "repository-a");
+	const repositoryB = join(root, "repository-b");
+	await createGitRepository(repositoryA, "repository A\n");
+	await createGitRepository(repositoryB, "repository B\n");
+	const runDirA = join(repositoryA, "runs", "run-1");
+	await initializeV3Run({ runDir: runDirA, graph: compiledGraph(), sessionId: "session", supervisorEpoch: "epoch", sourceCwd: repositoryA, createdAt: CREATED_AT });
+	const originalInspection = await inspectV3Run(runDirA, { sourceCwd: repositoryA });
+	assert.equal(originalInspection.status, "ok");
+	const runDirB = join(repositoryB, "runs", "run-1");
+	await mkdir(join(repositoryB, "runs"), { recursive: true });
+	await cp(runDirA, runDirB, { recursive: true });
+	const copiedInspection = await inspectV3Run(runDirB, { sourceCwd: repositoryB });
+	assert.equal(copiedInspection.status, "needs_attention");
+	assert.ok(copiedInspection.reasons.some((reason) => reason.includes("SOURCE_IDENTITY_MISMATCH")));
+});
+
+test("V3 inspect rejects an initialization snapshot whose status was changed to complete", async (t) => {
+	const { root, runDir } = await newRun("pi-graph-v3-status-tamper-");
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const snapshotPath = join(runDir, "snapshot.json");
+	const snapshot = await jsonFile(snapshotPath);
+	snapshot.status = "complete";
+	await writeFile(snapshotPath, JSON.stringify(snapshot));
+	const inspection = await inspectV3Run(runDir);
+	assert.equal(inspection.status, "needs_attention");
+	assert.ok(inspection.reasons.some((reason) => reason.includes("STATUS_MISMATCH")));
+});
+
+test("V3 initialization takes over a lock owned by a dead process identity", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-v3-stale-lock-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const runDir = join(root, "run-1");
+	const lockDir = join(root, ".run-1.initialize-lock");
+	await mkdir(lockDir);
+	await writeFile(join(lockDir, "owner.json"), JSON.stringify({ schemaVersion: 1, pid: 99_999_999, processIdentity: "ps:dead process", token: "stale-token", createdAt: CREATED_AT }));
+	await initializeV3Run({ runDir, graph: compiledGraph(), sessionId: "session", supervisorEpoch: "epoch", createdAt: CREATED_AT });
+	assert.equal((await inspectV3Run(runDir)).status, "ok");
+	assert.deepEqual(await readdir(root), ["run-1"]);
+});
+
+test("V3 initialization rejects a damaged lock identity instead of guessing ownership", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-v3-invalid-lock-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const runDir = join(root, "run-1");
+	const lockDir = join(root, ".run-1.initialize-lock");
+	await mkdir(lockDir);
+	await writeFile(join(lockDir, "owner.json"), JSON.stringify({ schemaVersion: 1, pid: 99_999_999, token: "missing-process-identity", createdAt: CREATED_AT }));
+	await assert.rejects(
+		initializeV3Run({ runDir, graph: compiledGraph(), sessionId: "session", supervisorEpoch: "epoch", createdAt: CREATED_AT }),
+		(error: unknown) => error instanceof GraphV3Error && error.code === "INVALID_INITIALIZATION_LOCK",
+	);
+	assert.deepEqual(await readdir(lockDir), ["owner.json"]);
+});
+
+test("V3 inspect recomputes sourceGraphSpecDigest from persisted source material", async (t) => {
+	const { root, runDir } = await newRun("pi-graph-v3-source-digest-");
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const snapshotPath = join(runDir, "snapshot.json");
+	const authorizationPath = join(runDir, "authorization.json");
+	const snapshot = await jsonFile(snapshotPath);
+	const authorization = await jsonFile(authorizationPath);
+	const forgedDigest = "2".repeat(64);
+	snapshot.sourceGraphSpecDigest = forgedDigest;
+	authorization.sourceGraphSpecDigest = forgedDigest;
+	await writeFile(snapshotPath, JSON.stringify(snapshot));
+	await writeFile(authorizationPath, JSON.stringify(authorization));
+	const inspection = await inspectV3Run(runDir);
+	assert.equal(inspection.status, "needs_attention");
+	assert.ok(inspection.reasons.some((reason) => reason.includes("sourceGraphSpecDigest")));
+});
+
+test("V3 inspect rejects authorization missing source GraphSpec material", async (t) => {
+	const { root, runDir } = await newRun("pi-graph-v3-source-material-");
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const authorizationPath = join(runDir, "authorization.json");
+	const authorization = await jsonFile(authorizationPath);
+	delete authorization.sourceGraphSpec;
+	await writeFile(authorizationPath, JSON.stringify(authorization));
+	const inspection = await inspectV3Run(runDir);
+	assert.equal(inspection.status, "needs_attention");
+	assert.ok(inspection.reasons.some((reason) => reason.includes("sourceGraphSpec")));
+});
+
+test("V3 initialization fsyncs the committed run directory and its parent", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-graph-v3-fsync-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const runDir = join(root, "run-1");
+	const synced: string[] = [];
+	await initializeV3Run(
+		{ runDir, graph: compiledGraph(), sessionId: "session", supervisorEpoch: "epoch", createdAt: CREATED_AT },
+		{ syncDirectory: async (path) => { synced.push(path); } },
+	);
+	assert.deepEqual(synced.slice(-2), [runDir, root]);
 });

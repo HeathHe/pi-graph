@@ -8,6 +8,8 @@ export { detectRunFormat } from "./format-detector.ts";
 export { initializeV3Run } from "./initialize.ts";
 export type { InitializeV3RunOptions, InitializeV3RunResult, V3InitializationDependencies } from "./initialize.ts";
 export { inspectV3Run } from "./inspect.ts";
+export type { InspectV3RunOptions } from "./inspect.ts";
+export { resolveSourceIdentityV3 } from "./source-identity.ts";
 export { graphSnapshotV3For, validateGraphSnapshotV3, verifyV3Run } from "./snapshot.ts";
 export type { SnapshotV3Metadata } from "./snapshot.ts";
 export * from "./types.ts";
