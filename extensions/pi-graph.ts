@@ -2,6 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { registerBackgroundWorkProvider } from "pi-subagents/background-work";
 import { GraphManager, graphSummary } from "../src/manager.ts";
+import { V3GraphHost, graphStatusTextV3, v3IsGraphSpecV3 } from "../src/v3/host.ts";
+import type { GraphSpecV3 } from "../src/v3/types.ts";
+import { SubagentRpcClient as V3SubagentRpcClient } from "../src/v3/rpc.ts";
 import { doctorGraphRuns, formatDoctorReport } from "../src/doctor.ts";
 import { recommendGraphConfig, formatRecommendReport } from "../src/recommend.ts";
 import { loadGraphConfig } from "../src/config.ts";
@@ -200,10 +203,44 @@ export const GraphSpecSchema = Type.Object({
 	description: "GraphSpec v1. Nodes need outputArtifact or typed output. Strict nodes need capabilityId plus observable acceptance. External writes additionally require write resourceScopes and a fully authorized, verifiable externalAction contract.",
 });
 
+export const GraphSpecV3NodeSchema = Type.Object({
+	taskId: Type.String({ minLength: 1 }),
+	agent: Type.String({ minLength: 1 }),
+	task: Type.String({ minLength: 1 }),
+	dependsOn: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	inputArtifacts: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	outputArtifact: Type.Optional(Type.String({ minLength: 1 })),
+	readScope: Type.Optional(Type.Array(ScopeEntrySchema)),
+	writeScope: Type.Optional(Type.Array(ScopeEntrySchema)),
+	sideEffect: Type.Optional(Type.String({ enum: ["none", "local_read", "local_write"] })),
+	acceptance: Type.Optional(Type.String({ description: "Declared natural-language acceptance; never used for verdicts unless machine-verified." })),
+	childAcceptance: Type.Optional(Type.Object({ criteria: Type.Array(Type.String({ minLength: 1 })) })),
+	validationCommands: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
+	retryPolicy: Type.Optional(Type.Object({
+		maxAttempts: Type.Integer({ minimum: 1 }),
+		retryOn: Type.Array(Type.String({ enum: ["task_failed", "validation", "timeout", "workspace_conflict"] })),
+		backoffMs: Type.Integer({ minimum: 0 }),
+	})),
+}, { additionalProperties: false });
+
+export const GraphSpecV3Schema = Type.Object({
+	schemaVersion: Type.Literal(3),
+	graphId: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+	goal: Type.String({ minLength: 1 }),
+	nodes: Type.Array(GraphSpecV3NodeSchema, { minItems: 1 }),
+	maxConcurrency: Type.Optional(Type.Integer({ minimum: 1 })),
+	failFast: Type.Optional(Type.Boolean()),
+	workspace: Type.Optional(Type.String({ enum: ["auto", "shadow", "git"] })),
+}, {
+	additionalProperties: false,
+	description: "GraphSpec v3: governance-free DAG executed by the V3 kernel. Strict validation happens in the compiler; this schema only routes.",
+});
+
 const Parameters = Type.Object({
 	action: Type.Optional(Type.String({ enum: ["start", "status", "list", "stop", "resume", "doctor", "recommend"], description: "Operation. Omit for start." })),
 	id: Type.Optional(Type.String({ description: "Graph id for status, stop, or resume." })),
-	spec: Type.Optional(GraphSpecSchema),
+	spec: Type.Optional(Type.Union([GraphSpecSchema, GraphSpecV3Schema])),
 }, { additionalProperties: false });
 
 function result(text: string, details?: unknown, isError = false) {
@@ -214,6 +251,14 @@ function trustedSessionId(ctx: { sessionManager: { getSessionId: () => string } 
 	const sessionId = ctx.sessionManager.getSessionId();
 	if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("Graph start requires a trusted Pi session ID.");
 	return sessionId.trim();
+}
+
+function commandSessionId(ctx: { sessionManager?: { getSessionId: () => string } }): string {
+	try {
+		return trustedSessionId(ctx as { sessionManager: { getSessionId: () => string } });
+	} catch {
+		return "graph-command";
+	}
 }
 
 function resetPlanningSession(ctx: { sessionManager: { getSessionId: () => string } }): void {
@@ -228,7 +273,15 @@ function resetPlanningSession(ctx: { sessionManager: { getSessionId: () => strin
 export default function piGraphExtension(pi: ExtensionAPI): void {
 	const manager = new GraphManager(pi);
 	const rpc = new SubagentRpcClient(pi.events);
+	const v3Rpc = new V3SubagentRpcClient(pi.events);
 	const startExecutions = new Map<string, { signature: string; promise: Promise<ReturnType<typeof result>> }>();
+	let v3Host: V3GraphHost | undefined;
+	let supervisorEpochV3 = `v3-${Date.now()}`;
+	const ensureV3Host = (config: { runsDir: string }, sessionId: string): V3GraphHost => {
+		if (!v3Host) v3Host = new V3GraphHost({ rpc: v3Rpc, runsDir: config.runsDir, sessionId, supervisorEpoch: supervisorEpochV3 });
+		else v3Host.setSessionContext(sessionId, supervisorEpochV3);
+		return v3Host;
+	};
 	registerBackgroundWorkProvider({
 		name: "pi-graph",
 		listActiveWork: () => manager.listActiveWork(),
@@ -237,12 +290,22 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		startExecutions.clear();
 		resetPlanningSession(ctx);
+		supervisorEpochV3 = `v3-${Date.now()}`;
 		await manager.initialize(ctx);
+		// Recover any V3 runs left mid-flight by a crashed/previous supervisor.
+		try {
+			const config = await loadGraphConfig();
+			const host = ensureV3Host(config, trustedSessionId(ctx));
+			await host.adoptCrashedRuns();
+		} catch {
+			// Adoption must not break session startup; doctor can surface issues.
+		}
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		startExecutions.clear();
 		resetPlanningSession(ctx);
 		await manager.suspendAll();
+		v3Host?.suspendAll();
 	});
 	pi.registerCommand("graphs", {
 		description: "Inspect, maintain, restore, or remove pi-graph runs",
@@ -259,8 +322,12 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			const config = await loadGraphConfig();
+			const host = ensureV3Host(config, commandSessionId(ctx));
 			if (command === "doctor") {
-				ctx.ui.notify(formatDoctorReport(await doctorGraphRuns(config.runsDir, config.maxSpawnBudget)), "info");
+				const report = await doctorGraphRuns(config.runsDir, config.maxSpawnBudget);
+				const v3Doctor = await host.doctor();
+				const v3Lines = v3Doctor.issues.map((issue) => `Graph: ${issue.runId ?? "<unknown>"}\nV3 ${issue.kind}: ${issue.detail}`);
+				ctx.ui.notify(`${formatDoctorReport(report)}${v3Lines.length ? `\n\nV3 issues:\n${v3Lines.join("\n")}` : ""}`, report.protected > 0 || v3Doctor.issues.length > 0 ? "warning" : "info");
 				return;
 			}
 			if (command === "list") {
@@ -269,6 +336,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					...report.snapshots.map((snapshot) => graphSummary(snapshot, config.runsDir)),
 					...report.protected.map((entry) => `Graph: ${entry.graphId}\nStatus: protected\nError: ${entry.reason}`),
 				];
+				for (const summary of await host.list()) lines.push(await graphStatusTextV3(summary.snapshot, config.runsDir));
 				ctx.ui.notify(lines.length ? lines.join("\n\n") : "No graph runs found.", report.protected.length ? "warning" : "info");
 				return;
 			}
@@ -367,9 +435,26 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				const action = params.action ?? "start";
 				if (action === "start") {
 					if (!params.spec) return result("graph start requires spec.", undefined, true);
-					const spec = params.spec as GraphSpec;
+					const spec = params.spec;
 					const sessionId = trustedSessionId(ctx);
-					const signature = JSON.stringify({ sessionId, cwd: ctx.cwd, spec: canonicalGraphSpec(spec) });
+					if (v3IsGraphSpecV3(spec)) {
+						const signature = JSON.stringify({ sessionId, cwd: ctx.cwd, v3: spec });
+						const existing = startExecutions.get(toolCallId);
+						if (existing) {
+							if (existing.signature !== signature) return result("A graph start toolCallId cannot be reused with a different GraphSpec.", undefined, true);
+							return existing.promise;
+						}
+						const promise = (async () => {
+							const config = await loadGraphConfig();
+							const host = ensureV3Host(config, sessionId);
+							const started = await host.start(spec as GraphSpecV3, ctx.cwd);
+							return result(`Graph accepted for asynchronous V3 execution.\n${await graphStatusTextV3(started.snapshot, config.runsDir)}`, started.snapshot);
+						})();
+						startExecutions.set(toolCallId, { signature, promise });
+						return promise;
+					}
+					const legacySpec = spec as GraphSpec;
+					const signature = JSON.stringify({ sessionId, cwd: ctx.cwd, spec: canonicalGraphSpec(legacySpec) });
 					const existing = startExecutions.get(toolCallId);
 					if (existing) {
 						if (existing.signature !== signature) return result("A graph start toolCallId cannot be reused with a different GraphSpec.", undefined, true);
@@ -377,9 +462,9 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					}
 					const promise = (async () => {
 						const configDigest = await planningGate.currentConfigDigest();
-						const reservedReceipt = planningGate.reserveStart({ sessionId, cwd: ctx.cwd, configDigest, spec, toolCallId });
+						const reservedReceipt = planningGate.reserveStart({ sessionId, cwd: ctx.cwd, configDigest, spec: legacySpec, toolCallId });
 						try {
-							const snapshot = await manager.start(spec, reservedReceipt);
+							const snapshot = await manager.start(legacySpec, reservedReceipt);
 							const receipt = planningGate.commitStart({ sessionId, cwd: ctx.cwd, toolCallId, runId: snapshot.graphId });
 							const config = await loadGraphConfig();
 							return result(`Graph accepted for asynchronous execution.\n${graphSummary(snapshot, config.runsDir)}`, { ...snapshot, planningReceipt: receipt });
@@ -393,35 +478,55 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				}
 				if (action === "list") {
 					const config = await loadGraphConfig();
+					const host = ensureV3Host(config, trustedSessionId(ctx));
 					const report = await manager.listReport();
 					const lines = [
 						...report.snapshots.map((snapshot) => graphSummary(snapshot, config.runsDir)),
 						...report.protected.map((entry) => `Graph: ${entry.graphId}\nStatus: protected\nError: ${entry.reason}`),
 					];
-					return result(lines.length ? lines.join("\n\n") : "No graph runs found.", report, report.protected.length > 0);
+					const v3Summaries = await host.list();
+					for (const summary of v3Summaries) lines.push(await graphStatusTextV3(summary.snapshot, config.runsDir));
+					return result(lines.length ? lines.join("\n\n") : "No graph runs found.", { legacy: report, v3: v3Summaries }, report.protected.length > 0);
 				}
 				if (action === "doctor") {
 					const config = await loadGraphConfig();
+					const host = ensureV3Host(config, trustedSessionId(ctx));
 					const report = await doctorGraphRuns(config.runsDir, config.maxSpawnBudget);
-					return result(formatDoctorReport(report), report);
+					const v3Doctor = await host.doctor();
+					const v3Lines = v3Doctor.issues.map((issue) => `Graph: ${issue.runId ?? "<unknown>"}\nV3 ${issue.kind}: ${issue.detail}`);
+					const text = `${formatDoctorReport(report)}${v3Lines.length ? `\n\nV3 issues:\n${v3Lines.join("\n")}` : ""}`;
+					return result(text, { legacy: report, v3: v3Doctor }, report.protected > 0 || v3Doctor.issues.length > 0);
 				}
 				if (action === "recommend") {
 					const report = await recommendGraphConfig({ rpc });
 					return result(formatRecommendReport(report), report);
 				}
 				if (!params.id) return result(`graph ${action} requires id.`, undefined, true);
+				const config = await loadGraphConfig();
+				const host = ensureV3Host(config, trustedSessionId(ctx));
+				if (action === "status" || action === "stop" || action === "resume") {
+					if (await host.isV3Run(host.runDirFor(params.id))) {
+						if (action === "status") {
+							const snapshot = await host.status(params.id);
+							return result(await graphStatusTextV3(snapshot, config.runsDir), snapshot);
+						}
+						if (action === "stop") {
+							const snapshot = await host.stop(params.id);
+							return result(`Graph stopped.\n${await graphStatusTextV3(snapshot, config.runsDir)}`, snapshot);
+						}
+						const snapshot = await host.resume(params.id);
+						return result(`Graph resumed.\n${await graphStatusTextV3(snapshot, config.runsDir)}`, snapshot);
+					}
+				}
 				if (action === "status") {
 					const snapshot = await manager.status(params.id);
-					const config = await loadGraphConfig();
 					return result(graphSummary(snapshot, config.runsDir), snapshot);
 				}
 				if (action === "stop") {
 					const snapshot = await manager.stop(params.id);
-					const config = await loadGraphConfig();
 					return result(graphSummary(snapshot, config.runsDir), snapshot);
 				}
 				const snapshot = await manager.resume(params.id);
-				const config = await loadGraphConfig();
 				return result(`Graph resumed.\n${graphSummary(snapshot, config.runsDir)}`, snapshot);
 			} catch (error) {
 				return result(`pi-graph error: ${error instanceof Error ? error.message : String(error)}`, undefined, true);

@@ -95,6 +95,10 @@ export class V3GraphRunner {
 		return this.options.maxConcurrency ?? this.options.graph.maxConcurrency;
 	}
 
+	get isStopRequested(): boolean {
+		return this.stopRequested;
+	}
+
 	phaseOf(taskId: string): V3NodePhase | undefined {
 		return this.state.get(taskId)?.phase;
 	}
@@ -131,6 +135,12 @@ export class V3GraphRunner {
 				const ready = v3ReadyNodes(this.options.graph, this)
 					.filter((node) => !(this.state.get(node.taskId)?.retryAt !== undefined && this.state.get(node.taskId)!.retryAt! > now));
 				const pending = v3PendingNodes(this.options.graph, this);
+				if (this.stopRequested && running === 0 && pending.length > 0) {
+					// Stop was requested before (or without) any in-flight node settling; mark
+					// every never-started node aborted without dispatching a child.
+					await this.finalizeNonStarted(false);
+					break;
+				}
 				const failFastAborted = this.options.failFast === true && [...this.state.values()].some((s) => s.terminal === "failed" || s.terminal === "needs_attention");
 				if (pending.length === 0 || (failFastAborted && running === 0)) {
 					await this.finalizeNonStarted(failFastAborted);

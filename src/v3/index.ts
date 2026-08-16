@@ -1,6 +1,8 @@
 export { authorizationV4For, compiledGraphProjectionV3, validateAuthorizationV4 } from "./authorization.ts";
 export type { AuthorizationV4Metadata } from "./authorization.ts";
 export { compileGraphSpecV3 } from "./compiler.ts";
+export { V3GraphHost, graphStatusTextV3, isV3GraphError, v3IsGraphSpecV3 } from "./host.ts";
+export type { V3DoctorIssue, V3DoctorReport, V3GraphSummary, V3HostContext, V3StartResult } from "./host.ts";
 export { canonicalDigest, canonicalJson } from "./digests.ts";
 export { GraphV3Error } from "./errors.ts";
 export type { GraphV3ErrorCode, GraphV3ErrorOptions } from "./errors.ts";
