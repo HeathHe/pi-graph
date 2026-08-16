@@ -58,7 +58,7 @@ async function childArguments(mode: Mode, arguments_: string[], guardUrl: string
 		if (arguments_.length > 0) throw new Error("The soak test does not accept positional arguments.");
 		return ["--expose-gc", "--experimental-strip-types", "--import", guardUrl, join(testsDir, "long-task-soak.ts")];
 	}
-	return ["--experimental-strip-types", "--import", guardUrl, "--test", ...await requestedSuiteArguments(arguments_)];
+	return ["--experimental-strip-types", "--import", guardUrl, "--test", "--test-concurrency=4", ...await requestedSuiteArguments(arguments_)];
 }
 
 async function run(): Promise<number> {

@@ -142,7 +142,7 @@ export class V3GraphRunner {
 					break;
 				}
 				const failFastAborted = this.options.failFast === true && [...this.state.values()].some((s) => s.terminal === "failed" || s.terminal === "needs_attention");
-				if (pending.length === 0 || (failFastAborted && running === 0)) {
+				if ((pending.length === 0 && running === 0) || (failFastAborted && running === 0)) {
 					await this.finalizeNonStarted(failFastAborted);
 					break;
 				}

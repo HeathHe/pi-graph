@@ -289,18 +289,20 @@ test("tombstone stops a known outer launcher and then a late inner child", async
 	const now = new Date().toISOString();
 	await writeFile(join(root, "attempt-1", "session", "child-dispatch.json"), JSON.stringify({ schemaVersion: 1, dispatchKey, requestId: `pi-graph-v2-${dispatchKey.slice(0, 40)}`, requestDigest, lineage, phase: "emitting", outerAsyncId, outerAsyncDir, createdAt: now, updatedAt: now }));
 	const abandoning = childRuntime.abandon(lineage, authorizedParams, "operator stop");
-	await waitForFile(join(outerAsyncDir, "control", "stop.json"));
+	const outerStopRequest = await waitForFile(join(outerAsyncDir, "control", "stop.json"));
 	const innerAsyncId = `late-inner-${randomUUID()}`;
 	const innerAsyncDir = join(subagentAsyncRoot(), innerAsyncId);
 	await mkdir(innerAsyncDir, { recursive: true });
 	await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify({ runId: innerAsyncId, state: "running", sessionId: lineage.ownerSessionId, sessionDir: join(lineage.sessionDir, "late") }));
-	await waitForFile(join(innerAsyncDir, "control", "stop.json"));
+	const innerStopRequest = await waitForFile(join(innerAsyncDir, "control", "stop.json"));
 	await writeFile(join(innerAsyncDir, "status.json"), JSON.stringify({ runId: innerAsyncId, state: "stopped", sessionId: lineage.ownerSessionId, sessionDir: join(lineage.sessionDir, "late") }));
 	const abandoned = await abandoning;
 	assert.equal(abandoned.stopped, true);
 	assert.equal(abandoned.identity?.asyncId, innerAsyncId);
-	assert.equal(JSON.parse(await readFile(join(outerAsyncDir, "control", "stop.json"), "utf8")).type, "stop");
-	assert.equal(JSON.parse(await readFile(join(innerAsyncDir, "control", "stop.json"), "utf8")).type, "stop");
+	// Capture the stop request content at observation time; a concurrent runtime may
+	// acknowledge and remove control/stop.json after honoring it.
+	assert.equal(JSON.parse(outerStopRequest).type, "stop");
+	assert.equal(JSON.parse(innerStopRequest).type, "stop");
 	await rm(outerAsyncDir, { recursive: true, force: true });
 	await rm(innerAsyncDir, { recursive: true, force: true });
 });
