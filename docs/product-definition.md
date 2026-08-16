@@ -26,13 +26,13 @@
 - 不强制任务评估、规划复核、模型路由、视觉证据——治理层（planning/routing/visual）退出核心
 - 不承诺 OS 级沙箱；README 与文档禁用 sandbox 措辞
 - 不读取治理配置（model-registry.json / routing-policy.json）；旧配置探测只存在于显式的 `graph doctor` / 迁移命令中
-- 不制造归因证据：影子记录只记可客观核实的事实，缺失记 unknown，代码中无任何读取方消费影子记录做决策
+- 不制造归因证据：影子记录只记可客观核实的事实，缺失字段直接缺省，不写 unknown 占位，代码中无任何读取方消费影子记录做决策
 
 ## V3 契约
 
 ### GraphSpec 节点字段
 
-必填：`taskId`、`agent`、`task`；可选：`dependsOn`、`inputArtifacts`、`outputArtifact`、`timeoutMs`、`retryPolicy.maxAttempts`、`writeScope`、`acceptance`（声明式）、`validationCommands`、`childAcceptance`。
+必填：`taskId`、`agent`、`task`、`sideEffect`；可选：`dependsOn`、`inputArtifacts`、`outputArtifact`、`timeoutMs`、`retryPolicy.{maxAttempts,retryOn,backoffMs}`、`readScope`、`writeScope`、`acceptance`（声明式）、`validationCommands`、`childAcceptance`。
 
 规则：
 - `local_write` 节点必须同时声明非空 `writeScope` 和非空、确定性的 `validationCommands`，否则编译失败；纯读节点豁免（判定依据：声明的 `sideEffect` 与 `writeScope`）。V3 MVP sideEffect 白名单：none / local_read / local_write。
@@ -48,8 +48,8 @@
 
 ### 影子记录（thin shadow）
 
-- 只记录 Graph 运行内部事实：提交者（sessionId）、GraphSpec digest/摘要、节点执行与工具调用事实、验收方式（machine-verified / declared）。
-- schema 显式标记 unverified、append-only、有界保留；生产执行路径可写事件但**不读取事件影响决策**；离线诊断工具可读。
+- 只记录 Graph 运行内部事实：提交者（sessionId）、GraphSpec digest/摘要、节点执行与工具调用事实、验收方式（machine-verified / declared / child-acceptance）。
+- schema 显式标记 `unverified: true`、append-only、有界保留；生产执行路径可写事件但**不读取事件影响决策**；离线诊断工具可读。
 - 不记录规划来源或自由文本归因；缺失事实不推断补全。
 
 ## 兼容矩阵

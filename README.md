@@ -297,9 +297,10 @@ During `session_start`, Pi synchronously adopts only active Graphs owned by the 
 
 ## Verification
 
-- `npm test`: run the deterministic regression suite.
+- `npm test`: run the deterministic regression suite in an isolated temporary directory, so test async-run fixtures never write into Pi's shared runtime directory.
+- `npm test -- tests/runner.integration.test.ts`: run one test file through the same isolation boundary. Use this entry point instead of invoking `node --test` directly.
 - `npm run test:latest-integration`: verify that the installed development copy matches the remote `pi-subagents@latest`, load its public exports, and validate the Agent alias contract in an isolated temporary Agent directory without modifying package source.
-- `npm run test:soak`: run the default 60-second long-task scenario plus suspend/resume and overlapping-writer contention checks.
+- `npm run test:soak`: run the default 60-second long-task scenario plus suspend/resume and overlapping-writer contention checks inside the same temporary-directory isolation boundary.
 - `PI_GRAPH_SOAK_MS=300000 npm run test:soak`: extend the sustained DAG phase to approximately five minutes. The accepted range is 15 seconds to 30 minutes.
 
 The soak test uses deterministic simulated subagents so it can exercise dispatch, persistence, retry, recovery, and locking without consuming model quota. It verifies bounded concurrency, duplicate-dispatch prevention, monotonic events, authoritative reload, event-listener cleanup, source-reservation cleanup, and temporary async-run cleanup.
