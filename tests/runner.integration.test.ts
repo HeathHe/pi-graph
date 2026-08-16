@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,6 +38,16 @@ function observedProcessTerminal(runId: string, exitCode: number | null = 1) {
 		observedAt,
 		instances: [{ processInstanceId, kind: "runner", closeObservedAt: observedAt, exitCode, signal: null }],
 	};
+}
+
+async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
+	const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(temporaryPath, JSON.stringify(value));
+		await rename(temporaryPath, path);
+	} finally {
+		await rm(temporaryPath, { force: true });
+	}
 }
 
 class FakeSubagents implements EventBus {
@@ -160,10 +170,17 @@ class FakeSubagents implements EventBus {
 
 class HangingSubagents implements EventBus {
 	private handlers = new Map<string, Set<(data: unknown) => void>>();
+	private readonly createdAsyncDirs = new Set<string>();
+	private readonly pendingWrites = new Set<Promise<void>>();
 	started = false;
 	stopCalls = 0;
 	private asyncDir?: string;
 	private asyncId?: string;
+	async cleanup(): Promise<void> {
+		while (this.pendingWrites.size > 0) await Promise.allSettled([...this.pendingWrites]);
+		await Promise.all([...this.createdAsyncDirs].map((asyncDir) => rm(asyncDir, { recursive: true, force: true })));
+		this.createdAsyncDirs.clear();
+	}
 	on(channel: string, handler: (data: unknown) => void) { const set = this.handlers.get(channel) ?? new Set(); set.add(handler); this.handlers.set(channel, set); return () => set.delete(handler); }
 	emit(channel: string, data: unknown) {
 		for (const handler of this.handlers.get(channel) ?? []) handler(data);
@@ -176,21 +193,31 @@ class HangingSubagents implements EventBus {
 			return;
 		}
 		if (request.method !== "spawn") return;
+		if (this.asyncDir !== undefined) throw new Error("HangingSubagents supports exactly one synthetic spawn per test instance.");
 		const innerParams = parseGraphChildParams(request.params);
 		const suffix = request.requestId.slice(-24);
 		const usesOuterWorkflow = typeof request.params.workflowScript === "string";
 		const outerAsyncId = `pi-graph-hanging-outer-${suffix}`;
 		const outerAsyncDir = join(subagentAsyncRoot(), outerAsyncId);
-		this.asyncId = `pi-graph-hanging-inner-${suffix}`;
-		this.asyncDir = join(subagentAsyncRoot(), this.asyncId);
-		void (async () => {
+		const innerAsyncId = `pi-graph-hanging-inner-${suffix}`;
+		const innerAsyncDir = join(subagentAsyncRoot(), innerAsyncId);
+		this.asyncId = innerAsyncId;
+		this.asyncDir = innerAsyncDir;
+		this.createdAsyncDirs.add(innerAsyncDir);
+		if (usesOuterWorkflow) this.createdAsyncDirs.add(outerAsyncDir);
+		const pendingWrite = (async () => {
 			if (usesOuterWorkflow) await mkdir(outerAsyncDir, { recursive: true });
-			await mkdir(this.asyncDir!, { recursive: true });
-			await writeFile(join(this.asyncDir!, "status.json"), JSON.stringify({ runId: this.asyncId, state: "running", sessionId: "session", sessionDir: usesOuterWorkflow ? join(innerParams.sessionDir as string, "child") : innerParams.sessionDir }));
-			if (usesOuterWorkflow) await writeFile(join(outerAsyncDir, "status.json"), JSON.stringify({ runId: outerAsyncId, state: "complete", sessionId: "session", sessionDir: request.params.sessionDir, workflow: { value: { runId: this.asyncId, artifactPaths: [this.asyncDir] } } }));
+			await mkdir(innerAsyncDir, { recursive: true });
+			await writeJsonAtomically(join(innerAsyncDir, "status.json"), { runId: innerAsyncId, state: "running", sessionId: "session", sessionDir: usesOuterWorkflow ? join(innerParams.sessionDir as string, "child") : innerParams.sessionDir });
+			if (usesOuterWorkflow) await writeJsonAtomically(join(outerAsyncDir, "status.json"), { runId: outerAsyncId, state: "complete", sessionId: "session", sessionDir: request.params.sessionDir, workflow: { value: { runId: innerAsyncId, artifactPaths: [innerAsyncDir] } } });
 			this.started = true;
-			this.emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: { details: { asyncId: usesOuterWorkflow ? outerAsyncId : this.asyncId, asyncDir: usesOuterWorkflow ? outerAsyncDir : this.asyncDir } } });
+			this.emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: { details: { asyncId: usesOuterWorkflow ? outerAsyncId : innerAsyncId, asyncDir: usesOuterWorkflow ? outerAsyncDir : innerAsyncDir } } });
 		})();
+		this.pendingWrites.add(pendingWrite);
+		void pendingWrite.then(
+			() => this.pendingWrites.delete(pendingWrite),
+			() => this.pendingWrites.delete(pendingWrite),
+		);
 	}
 }
 
@@ -724,7 +751,7 @@ test("a paused child yields waiting_input instead of an endless running graph", 
 	assert.equal(terminal.nodes.after?.status, "blocked");
 });
 
-test("session suspension releases supervision without stopping the child", async () => {
+test("session suspension releases supervision without stopping the child", async (t) => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-runner-"));
 	const runs = join(cwd, "runs");
 	const localConfig = { ...config, runsDir: runs };
@@ -735,6 +762,7 @@ test("session suspension releases supervision without stopping the child", async
 	const store = new GraphStore(runs, graph.graphId);
 	await store.initialize(graph, snapshot);
 	const bus = new HangingSubagents();
+	t.after(() => bus.cleanup());
 	const runner = new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, "leases.json")), localConfig);
 	const running = runner.run();
 	while (!bus.started) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -745,7 +773,7 @@ test("session suspension releases supervision without stopping the child", async
 	assert.equal(bus.stopCalls, 0);
 });
 
-test("a durable stop remains terminal when suspension races the stop Runner", async () => {
+test("a durable stop remains terminal when suspension races the stop Runner", async (t) => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-stop-suspend-race-"));
 	const runs = join(cwd, "runs");
 	const localConfig = { ...config, runsDir: runs };
@@ -756,7 +784,9 @@ test("a durable stop remains terminal when suspension races the stop Runner", as
 	const store = new GraphStore(runs, graph.graphId);
 	await store.initialize(graph, snapshot);
 	await store.recordDesiredState("stopped");
-	const runner = new GraphRunner(graph, snapshot, store, new HangingSubagents(), new LeaseRegistry(join(runs, "leases.json")), localConfig);
+	const bus = new HangingSubagents();
+	t.after(() => bus.cleanup());
+	const runner = new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, "leases.json")), localConfig);
 	const running = runner.run();
 	runner.suspend();
 	const terminal = await running;
@@ -765,7 +795,7 @@ test("a durable stop remains terminal when suspension races the stop Runner", as
 	await rm(cwd, { recursive: true, force: true });
 });
 
-test("a stop intent established before suspension stops an in-flight child", async () => {
+test("a stop intent established before suspension stops an in-flight child", async (t) => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-stop-priority-"));
 	const runs = join(cwd, "runs");
 	const localConfig = { ...config, runsDir: runs };
@@ -776,6 +806,7 @@ test("a stop intent established before suspension stops an in-flight child", asy
 	const store = new GraphStore(runs, graph.graphId);
 	await store.initialize(graph, snapshot);
 	const bus = new HangingSubagents();
+	t.after(() => bus.cleanup());
 	const runner = new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, "leases.json")), localConfig);
 	const running = runner.run();
 	while (!bus.started) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -784,7 +815,7 @@ test("a stop intent established before suspension stops an in-flight child", asy
 	runner.stop();
 	const asyncDir = runner.snapshot.nodes.hang?.attempts[0]?.asyncDir;
 	assert.ok(asyncDir);
-	await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncDir.split("/").at(-1), state: "stopped" }));
+	await writeJsonAtomically(join(asyncDir, "status.json"), { runId: asyncDir.split("/").at(-1), state: "stopped" });
 	const terminal = await running;
 	assert.equal(terminal.status, "stopped");
 	assert.equal(terminal.nodes.hang?.status, "stopped");
@@ -792,7 +823,7 @@ test("a stop intent established before suspension stops an in-flight child", asy
 	await rm(cwd, { recursive: true, force: true });
 });
 
-test("repeated stop preserves the active-node set captured at the first stop boundary", async () => {
+test("repeated stop preserves the active-node set captured at the first stop boundary", async (t) => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-stop-boundary-"));
 	const runs = join(cwd, "runs");
 	const graph = compileGraph({ schemaVersion: 1, graphId: "stop-boundary", goal: "stop", nodes: [
@@ -802,7 +833,9 @@ test("repeated stop preserves the active-node set captured at the first stop bou
 	const snapshot = initialSnapshot(graph, cwd, "session");
 	const store = new GraphStore(runs, graph.graphId);
 	await store.initialize(graph, snapshot);
-	const runner = new GraphRunner(graph, snapshot, store, new HangingSubagents(), new LeaseRegistry(join(runs, "leases.json")), { ...config, runsDir: runs });
+	const bus = new HangingSubagents();
+	t.after(() => bus.cleanup());
+	const runner = new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, "leases.json")), { ...config, runsDir: runs });
 	(runner as any).active.set("first", Promise.resolve());
 	runner.beginStop();
 	(runner as any).active.delete("first");
@@ -812,7 +845,7 @@ test("repeated stop preserves the active-node set captured at the first stop bou
 	await rm(cwd, { recursive: true, force: true });
 });
 
-test("stop after suspension cannot report stopped until the child is terminal", async () => {
+test("stop after suspension cannot report stopped until the child is terminal", async (t) => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-suspend-then-stop-"));
 	const runs = join(cwd, "runs");
 	const graph = compileGraph({ schemaVersion: 1, graphId: "suspend-then-stop", goal: "stop", nodes: [
@@ -822,6 +855,7 @@ test("stop after suspension cannot report stopped until the child is terminal", 
 	const store = new GraphStore(runs, graph.graphId);
 	await store.initialize(graph, snapshot);
 	const bus = new HangingSubagents();
+	t.after(() => bus.cleanup());
 	const runner = new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, "leases.json")), { ...config, runsDir: runs });
 	const running = runner.run();
 	while (!bus.started) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -829,7 +863,7 @@ test("stop after suspension cannot report stopped until the child is terminal", 
 	runner.stop();
 	const asyncDir = runner.snapshot.nodes.hang?.attempts[0]?.asyncDir;
 	assert.ok(asyncDir);
-	await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncDir.split("/").at(-1), state: "stopped" }));
+	await writeJsonAtomically(join(asyncDir, "status.json"), { runId: asyncDir.split("/").at(-1), state: "stopped" });
 	const terminal = await running;
 	assert.equal(terminal.status, "stopped");
 	assert.equal(terminal.nodes.hang?.status, "stopped");
@@ -837,7 +871,7 @@ test("stop after suspension cannot report stopped until the child is terminal", 
 	await rm(cwd, { recursive: true, force: true });
 });
 
-test("deadline completion confirmation is enabled only for sandboxed nodes", async () => {
+test("deadline completion confirmation is enabled only for sandboxed nodes", async (t) => {
 	const cases = [
 		{ suffix: "safe", sideEffect: "none", allowBash: false, expected: true },
 		{ suffix: "external", sideEffect: "external_write", allowBash: false, expected: false },
@@ -871,7 +905,9 @@ test("deadline completion confirmation is enabled only for sandboxed nodes", asy
 		const snapshot = initialSnapshot(graph, cwd, "session");
 		const store = new GraphStore(runs, graph.graphId);
 		await store.initialize(graph, snapshot);
-		const runner = new GraphRunner(graph, snapshot, store, new HangingSubagents(), new LeaseRegistry(join(runs, "leases.json")), { ...config, runsDir: runs });
+		const bus = new HangingSubagents();
+		t.after(() => bus.cleanup());
+		const runner = new GraphRunner(graph, snapshot, store, bus, new LeaseRegistry(join(runs, "leases.json")), { ...config, runsDir: runs });
 		const executor = (runner as unknown as {
 			executor: {
 				stopAndConfirm: (identity: { asyncId: string; asyncDir: string }, acceptComplete?: boolean) => Promise<boolean>;

@@ -52,7 +52,7 @@ interface FileEntry { file: string; tests: TestEntry[]; }
 function collectFileTests(file: string): FileEntry {
 	const output = execFileSync(
 		process.execPath,
-		["--experimental-strip-types", "--test", "--test-reporter=tap", file],
+		["--experimental-strip-types", "tests/run-isolated.ts", "suite", "--test-reporter=tap", file],
 		{ cwd: root, timeout: 600_000, stdio: "pipe", encoding: "utf8" },
 	);
 	const tests: TestEntry[] = [];
@@ -98,7 +98,7 @@ async function main(): Promise<void> {
 	// full-suite 官方统计
 	const fullTap = execFileSync(
 		process.execPath,
-		["--experimental-strip-types", "--test", "--test-reporter=tap", ...testFiles.map((f) => `tests/${f}`)],
+		["--experimental-strip-types", "tests/run-isolated.ts", "suite", "--test-reporter=tap", ...testFiles.map((f) => `tests/${f}`)],
 		{ cwd: root, timeout: 600_000, stdio: "pipe", encoding: "utf8" },
 	);
 	const official = fullTap.match(/^# tests (\d+)$/m);

@@ -268,7 +268,7 @@ test("V3 compiler rejects writeScope on none and local_read nodes", () => {
 
 test("V3 compiler rejects protected control paths in scopes and artifacts", () => {
 	const protectedPaths = [
-		".git", "nested/.git/config", ".pi-graph/runs", ".pi/settings.json", ".pi/agents/worker", ".pi-agents/worker", ".pi-subagents/run",
+		".git", "nested/.GIT/config", ".Pi-Graph/runs", ".PI/Agents/worker", ".Pi-Subagents/run",
 	];
 	for (const path of protectedPaths) {
 		const readInput = validThreeNodeSpec();
@@ -286,6 +286,9 @@ test("V3 compiler rejects protected control paths in scopes and artifacts", () =
 	const normal = validThreeNodeSpec();
 	(normal.nodes as Array<Record<string, unknown>>)[0]!.readScope = [{ kind: "tree", path: ".github/workflows" }];
 	assert.equal(compileGraphSpecV3(normal).nodes[0]?.readScope[0]?.path, ".github/workflows");
+	const nonControlPiPath = validThreeNodeSpec();
+	(nonControlPiPath.nodes as Array<Record<string, unknown>>)[0]!.readScope = [{ kind: "tree", path: ".pi/cache" }];
+	assert.equal(compileGraphSpecV3(nonControlPiPath).nodes[0]?.readScope[0]?.path, ".pi/cache");
 });
 
 test("V3 compiler rejects output artifact ancestor and descendant collisions", () => {
@@ -299,15 +302,39 @@ test("V3 compiler rejects output artifact ancestor and descendant collisions", (
 		],
 	};
 	expectGraphError(() => compileGraphSpecV3(input), "INVALID_ARTIFACT");
+	(input.nodes[1] as Record<string, unknown>).outputArtifact = "FOO/bar";
+	expectGraphError(() => compileGraphSpecV3(input), "INVALID_ARTIFACT");
+	(input.nodes[0] as Record<string, unknown>).outputArtifact = "Straße";
+	(input.nodes[1] as Record<string, unknown>).outputArtifact = "STRASSE/result";
+	expectGraphError(() => compileGraphSpecV3(input), "INVALID_ARTIFACT");
+	(input.nodes[0] as Record<string, unknown>).outputArtifact = "foo";
 	(input.nodes[1] as Record<string, unknown>).outputArtifact = "foobar/result";
 	assert.equal(compileGraphSpecV3(input).nodes.length, 2);
 });
 
-test("V3 compiler enforces the maxConcurrency hard ceiling", () => {
+test("V3 compiler enforces the schema maxConcurrency ceiling", () => {
 	const accepted = validThreeNodeSpec();
-	accepted.maxConcurrency = 64;
-	assert.equal(compileGraphSpecV3(accepted).maxConcurrency, 64);
+	accepted.maxConcurrency = 6;
+	assert.equal(compileGraphSpecV3(accepted).maxConcurrency, 6);
 	const rejected = validThreeNodeSpec();
-	rejected.maxConcurrency = 65;
+	rejected.maxConcurrency = 7;
 	expectGraphError(() => compileGraphSpecV3(rejected), "INVALID_GRAPH_SPEC");
+});
+
+test("V3 compiler treats case-only scope differences as overlapping on portable workspaces", () => {
+	const input = {
+		schemaVersion: 3,
+		goal: "Reject portable path aliases",
+		nodes: [
+			{ taskId: "left", agent: "writer", task: "Write left", sideEffect: "local_write", writeScope: [{ kind: "tree", path: "Output" }], validationCommands: ["npm test"] },
+			{ taskId: "right", agent: "writer", task: "Write right", sideEffect: "local_write", writeScope: [{ kind: "tree", path: "output/nested" }], validationCommands: ["npm test"] },
+		],
+	};
+	expectGraphError(() => compileGraphSpecV3(input), "SCOPE_CONFLICT");
+	(input.nodes[0]!.writeScope[0] as { path: string }).path = "CafÉ";
+	(input.nodes[1]!.writeScope[0] as { path: string }).path = "cafe\u0301/nested";
+	expectGraphError(() => compileGraphSpecV3(input), "SCOPE_CONFLICT");
+	(input.nodes[0]!.writeScope[0] as { path: string }).path = "ΟΣ";
+	(input.nodes[1]!.writeScope[0] as { path: string }).path = "οσ/nested";
+	expectGraphError(() => compileGraphSpecV3(input), "SCOPE_CONFLICT");
 });

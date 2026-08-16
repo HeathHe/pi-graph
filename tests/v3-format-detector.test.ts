@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { detectRunFormat } from "../src/v3/format-detector.ts";
 import { inspectV3Run } from "../src/v3/inspect.ts";
@@ -10,6 +10,10 @@ import type { RunFormatKind } from "../src/v3/types.ts";
 interface AuthorizationVariant {
 	name: string;
 	value?: Record<string, unknown>;
+}
+
+async function canonicalTempRoot(prefix: string): Promise<string> {
+	return realpath(await mkdtemp(join(tmpdir(), prefix)));
 }
 
 const snapshotVariants: Array<{ name: string; value: unknown }> = [
@@ -58,12 +62,12 @@ test("V3 format detector implements the complete legal/invalid version matrix", 
 });
 
 test("V3 inspect classifies snapshot-v1 without authorization as legacy-readonly without writing", async (t) => {
-	const runDir = await mkdtemp(join(tmpdir(), "pi-graph-v3-legacy-v1-"));
+	const runDir = await canonicalTempRoot("pi-graph-v3-legacy-v1-");
 	t.after(() => rm(runDir, { recursive: true, force: true }));
 	const snapshot = JSON.stringify({ schemaVersion: 1, graphId: "legacy-1", status: "complete" });
 	await writeFile(join(runDir, "snapshot.json"), snapshot);
 	const beforeEntries = await readdir(runDir);
-	const inspection = await inspectV3Run(runDir);
+	const inspection = await inspectV3Run(runDir, { trustedRoot: dirname(runDir) });
 	assert.equal(inspection.status, "legacy-readonly");
 	assert.equal(inspection.format.kind, "legacy-readonly");
 	assert.equal(inspection.graphId, "legacy-1");
@@ -73,14 +77,14 @@ test("V3 inspect classifies snapshot-v1 without authorization as legacy-readonly
 
 test("V3 inspect classifies snapshot-v2 with authorization-v2 or v3 as legacy-v2 without writing", async (t) => {
 	for (const authorizationVersion of [2, 3]) {
-		const runDir = await mkdtemp(join(tmpdir(), `pi-graph-v3-legacy-v2-auth${authorizationVersion}-`));
+		const runDir = await canonicalTempRoot(`pi-graph-v3-legacy-v2-auth${authorizationVersion}-`);
 		t.after(() => rm(runDir, { recursive: true, force: true }));
 		const snapshot = JSON.stringify({ schemaVersion: 2, graphId: `legacy-${authorizationVersion}`, runInstanceId: "legacy-run", status: "running" });
 		const authorization = JSON.stringify({ schemaVersion: authorizationVersion, graphId: `legacy-${authorizationVersion}` });
 		await writeFile(join(runDir, "snapshot.json"), snapshot);
 		await writeFile(join(runDir, "authorization.json"), authorization);
 		const beforeEntries = await readdir(runDir);
-		const inspection = await inspectV3Run(runDir);
+		const inspection = await inspectV3Run(runDir, { trustedRoot: dirname(runDir) });
 		assert.equal(inspection.status, "legacy-v2");
 		assert.equal(inspection.format.kind, "legacy-v2");
 		assert.equal(await readFile(join(runDir, "snapshot.json"), "utf8"), snapshot);
@@ -90,13 +94,13 @@ test("V3 inspect classifies snapshot-v2 with authorization-v2 or v3 as legacy-v2
 });
 
 test("V3 inspect treats every mixed legacy/V3 pair as needs_attention without rewriting it", async (t) => {
-	const runDir = await mkdtemp(join(tmpdir(), "pi-graph-v3-mixed-"));
+	const runDir = await canonicalTempRoot("pi-graph-v3-mixed-");
 	t.after(() => rm(runDir, { recursive: true, force: true }));
 	const snapshot = JSON.stringify({ schemaVersion: 3, graphId: "mixed", status: "queued" });
 	const authorization = JSON.stringify({ schemaVersion: 3 });
 	await writeFile(join(runDir, "snapshot.json"), snapshot);
 	await writeFile(join(runDir, "authorization.json"), authorization);
-	const inspection = await inspectV3Run(runDir);
+	const inspection = await inspectV3Run(runDir, { trustedRoot: dirname(runDir) });
 	assert.equal(inspection.status, "needs_attention");
 	assert.equal(inspection.format.kind, "invalid");
 	assert.equal(await readFile(join(runDir, "snapshot.json"), "utf8"), snapshot);
