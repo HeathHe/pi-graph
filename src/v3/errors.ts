@@ -19,6 +19,7 @@ export type GraphV3ErrorCode =
 	| "INITIALIZATION_FAILED"
 	| "INVALID_AUTHORIZATION"
 	| "INVALID_SNAPSHOT"
+	| "INVALID_ATTEMPT"
 	| "RUN_NEEDS_ATTENTION";
 
 export interface GraphV3ErrorOptions {

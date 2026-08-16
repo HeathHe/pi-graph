@@ -1,11 +1,32 @@
 import { validateAuthorizationV4 } from "./authorization.ts";
 import { canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
-import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, SourceIdentityV3, V3RunVerification } from "./types.ts";
+import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, SourceIdentityV3, V3NodePhase, V3NodeProjection, V3NodeTerminal, V3RunVerification } from "./types.ts";
 
 const SNAPSHOT_FIELDS = new Set([
-	"schemaVersion", "runInstanceId", "graphId", "graphDigest", "sourceGraphSpecDigest", "status", "sessionId", "supervisorEpoch", "createdAt", "updatedAt",
+	"schemaVersion", "runInstanceId", "graphId", "graphDigest", "sourceGraphSpecDigest", "status", "sessionId", "supervisorEpoch", "createdAt", "updatedAt", "nodes",
 ]);
+const NODE_PROJECTION_FIELDS = new Set(["phase", "attempt", "terminalStatus"]);
+const NODE_PHASES = new Set<V3NodePhase>(["queued", "prepared", "dispatched", "running", "verifying", "applying", "accepted", "failed", "aborted", "needs_attention"]);
+const NODE_TERMINALS = new Set<V3NodeTerminal>(["accepted", "failed", "aborted", "needs_attention"]);
+
+function validateNodeProjections(nodes: unknown): Record<string, V3NodeProjection> | undefined {
+	if (nodes === undefined) return undefined;
+	if (typeof nodes !== "object" || nodes === null || Array.isArray(nodes)) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 nodes projection must be an object.", { field: "nodes" });
+	const output: Record<string, V3NodeProjection> = {};
+	for (const [taskId, rawProjection] of Object.entries(nodes as Record<string, unknown>)) {
+		if (typeof rawProjection !== "object" || rawProjection === null || Array.isArray(rawProjection)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection for '${taskId}' must be an object.`, { field: "nodes", details: { taskId } });
+		const projection = rawProjection as Record<string, unknown>;
+		for (const field of Object.keys(projection)) {
+			if (!NODE_PROJECTION_FIELDS.has(field)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' contains unknown field '${field}'.`, { field: "nodes", details: { taskId } });
+		}
+		if (typeof projection.phase !== "string" || !NODE_PHASES.has(projection.phase as V3NodePhase)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid phase.`, { field: "nodes", details: { taskId } });
+		if (typeof projection.attempt !== "number" || !Number.isInteger(projection.attempt) || (projection.attempt as number) < 0) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid attempt.`, { field: "nodes", details: { taskId } });
+		if (projection.terminalStatus !== undefined && (typeof projection.terminalStatus !== "string" || !NODE_TERMINALS.has(projection.terminalStatus as V3NodeTerminal))) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid terminalStatus.`, { field: "nodes", details: { taskId } });
+		output[taskId] = { phase: projection.phase as V3NodePhase, attempt: projection.attempt as number, ...(projection.terminalStatus === undefined ? {} : { terminalStatus: projection.terminalStatus as V3NodeTerminal }) };
+	}
+	return output;
+}
 const STATUSES = new Set<GraphRuntimeStatusV3>(["queued", "running", "complete", "failed", "stopped", "paused", "waiting_input", "needs_attention"]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 
@@ -65,6 +86,7 @@ export function validateGraphSnapshotV3(value: unknown): GraphSnapshotV3 {
 	const updatedAt = requireString(value, "updatedAt");
 	if (Number.isNaN(Date.parse(createdAt))) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 createdAt must be an ISO-8601 timestamp.", { field: "createdAt" });
 	if (Number.isNaN(Date.parse(updatedAt))) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 updatedAt must be an ISO-8601 timestamp.", { field: "updatedAt" });
+	const nodes = validateNodeProjections(value.nodes);
 	return {
 		schemaVersion: 3,
 		runInstanceId,
@@ -76,6 +98,7 @@ export function validateGraphSnapshotV3(value: unknown): GraphSnapshotV3 {
 		supervisorEpoch,
 		createdAt,
 		updatedAt,
+		...(nodes ? { nodes } : {}),
 	};
 }
 
@@ -96,6 +119,7 @@ export function verifyV3Run(snapshotValue: unknown, authorizationValue: unknown,
 	if (snapshot && authorization) {
 		if (snapshot.status !== "queued") reasons.push("STATUS_MISMATCH: a V3 admission without attempt evidence must remain queued.");
 		if (snapshot.updatedAt !== snapshot.createdAt) reasons.push("UPDATED_AT_MISMATCH: a V3 admission without attempt evidence must retain its creation timestamp.");
+		if (snapshot.nodes !== undefined && Object.keys(snapshot.nodes).length > 0) reasons.push("NODES_MISMATCH: a V3 admission without attempt evidence must carry an empty nodes projection.");
 		const comparisons: Array<[string, string, string]> = [
 			["runInstanceId", snapshot.runInstanceId, authorization.runInstanceId],
 			["graphId", snapshot.graphId, authorization.graph.graphId],

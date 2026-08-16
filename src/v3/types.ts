@@ -96,6 +96,166 @@ export interface GraphSnapshotV3 {
 	supervisorEpoch: string;
 	createdAt: string;
 	updatedAt: string;
+	/** Rebuildable projection of per-node runtime state derived from attempt evidence. */
+	nodes?: Record<string, V3NodeProjection>;
+}
+
+export interface V3NodeProjection {
+	phase: V3NodePhase;
+	attempt: number;
+	terminalStatus?: V3NodeTerminal;
+}
+
+export type V3NodePhase =
+	| "queued"
+	| "prepared"
+	| "dispatched"
+	| "running"
+	| "verifying"
+	| "applying"
+	| "accepted"
+	| "failed"
+	| "aborted"
+	| "needs_attention";
+
+export type V3NodeTerminal = "accepted" | "failed" | "aborted" | "needs_attention";
+
+export type V3FailureKind =
+	| "task_failed"
+	| "validation"
+	| "timeout"
+	| "workspace_conflict"
+	| "dispatch_unknown"
+	| "child_paused"
+	| "child_stopped"
+	| "internal";
+
+export type V3AcceptanceMethod = "declared" | "machine-verified" | "child-acceptance";
+
+export interface V3ValidationResult {
+	command: string;
+	ok: boolean;
+	exitCode: number | null;
+	signal: string | null;
+	timedOut: boolean;
+	stdout: string;
+	stdoutTruncated: boolean;
+	stderr: string;
+	stderrTruncated: boolean;
+	durationMs: number;
+}
+
+export interface V3FileDigest {
+	path: string;
+	before?: string;
+	after?: string;
+	deleted?: boolean;
+}
+
+export interface V3DispatchBinding {
+	asyncId: string;
+	asyncDir: string;
+	requestDigest: string;
+	dispatchedAt: string;
+}
+
+export interface V3ChildOutcome {
+	terminal: "complete" | "failed" | "stopped" | "paused";
+	output: string;
+	completedAt: string;
+}
+
+export interface V3AttemptEvidence {
+	schemaVersion: typeof V3_ATTEMPT_SCHEMA_VERSION;
+	runInstanceId: string;
+	graphId: string;
+	taskId: string;
+	attempt: number;
+	attemptNonce: string;
+	phase: V3NodePhase;
+	createdAt: string;
+	updatedAt: string;
+	supervisorEpoch: string;
+	dispatch?: V3DispatchBinding;
+	child?: V3ChildOutcome;
+	verification?: { allPassed: boolean; validatedResultDigest: string; verifiedAt: string };
+	applied?: { writes: V3FileDigest[]; appliedAt: string };
+	failure?: { kind: V3FailureKind; message: string; at: string };
+	terminalStatus?: V3NodeTerminal;
+	workspaceDigest?: string;
+	acceptanceDigest?: string;
+}
+
+export interface V3WorkspaceEvidence {
+	schemaVersion: typeof V3_ATTEMPT_SCHEMA_VERSION;
+	runInstanceId: string;
+	graphId: string;
+	taskId: string;
+	attempt: number;
+	workspaceKind: "shadow" | "git";
+	workspaceDir: string;
+	sourceCwd: string;
+	readBaseline: Record<string, string | null>;
+	writeBaseline: Record<string, string | null>;
+	inputBaseline: Record<string, { sourcePath: string; digest: string | null }>;
+	contractDigest: string;
+	createdAt: string;
+}
+
+export interface V3ValidatedResult {
+	schemaVersion: typeof V3_ATTEMPT_SCHEMA_VERSION;
+	runInstanceId: string;
+	graphId: string;
+	taskId: string;
+	attempt: number;
+	validations: V3ValidationResult[];
+	allPassed: boolean;
+	writes: V3FileDigest[];
+	recordedAt: string;
+}
+
+export interface V3AcceptanceEvidence {
+	schemaVersion: typeof V3_ATTEMPT_SCHEMA_VERSION;
+	runInstanceId: string;
+	graphId: string;
+	taskId: string;
+	attempt: number;
+	acceptance?: string;
+	method: V3AcceptanceMethod;
+	verified: boolean;
+	validatedResultDigest: string;
+	attemptDigest: string;
+	recordedAt: string;
+	supervisorEpoch: string;
+}
+
+export interface V3RunLease {
+	schemaVersion: typeof V3_LEASE_SCHEMA_VERSION;
+	runInstanceId: string;
+	pid: number;
+	processIdentity: string;
+	processStartedAt: number;
+	token: string;
+	acquiredAt: string;
+	heartbeatAt: string;
+}
+
+export const V3_ATTEMPT_SCHEMA_VERSION = 1 as const;
+export const V3_LEASE_SCHEMA_VERSION = 1 as const;
+
+export interface V3ShadowEvent {
+	schemaVersion: 1;
+	unverified: true;
+	seq: number;
+	at: string;
+	type: string;
+	runInstanceId: string;
+	graphId: string;
+	graphDigest?: string;
+	taskId?: string;
+	attempt?: number;
+	sessionId?: string;
+	[extra: string]: unknown;
 }
 
 export type SourceRepositoryIdentityV3 =
