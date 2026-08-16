@@ -1,6 +1,6 @@
-# pi-graph V3 技术合同（Phase 1A admission）
+# pi-graph V3 技术合同（Phase 1A admission / 1B runtime kernel / 1C production entry）
 
-> 范围：本文档定义 V3 合同与 Phase 1A admission 实现边界。约束：本阶段只实现编译、初始化持久化与只读检查；禁止接入 child dispatch、修改旧治理执行路径或删除治理代码。
+> 范围：本文档定义 V3 合同与实施阶段边界。§1–§11 为 Phase 1A admission（编译、初始化持久化与只读检查）已实现；§12 定义 Phase 1B 治理无关 V3 durable runtime 内核；§13 定义 Phase 1C 生产入口、恢复与 legacy 兼容。Phase 1B/1C 是实施管理新增的阶段 1 子阶段，边界以本文档为准。
 > 本文档是 V3 的唯一技术合同；`docs/product-definition.md` 是产品合同。二者冲突时以本文档为准，发现冲突必须修订本文档或本条款。
 
 ## 1. 三个版本轴（归一化）
@@ -217,10 +217,108 @@ interface V3Event {
 
 **legacy-compat（V3 新增）**：V1/V2 snapshot/authorization 与旧 PlanningReceipt 的冻结解析器 + §6 冻结 legacy writer；只写允许的终态转换。
 
+**v3 runtime kernel（Phase 1B 新增，见 §12）**：`v3/attempt.ts`、`v3/workspace.ts`、`v3/verify.ts`、`v3/dispatch.ts`、`v3/scheduler.ts`、`v3/runner.ts`、`v3/events.ts`、`v3/projection.ts`；`v3/legacy.ts` 为 legacy-compat 解析器（§13 接线）。
+
 **archive（git 归档，不留在主线）**：`model-routing/`、`subagent-router/`、`model-routing-adapter.ts`、preflight 的路由专属函数段、`recommend.ts`、authority 的治理函数段、`extensions/subagent-model-router.ts`、治理系测试文件（R1 规则机械决定）。
 
 **保留扩展**：`extensions/pi-graph.ts`、`extensions/pi-graph-guard.ts`。
 **保留命令/动作**：`graph { start, status, list, stop, resume, doctor }`；`/graphs` 对应收敛；`assess_task`、`plan_graph`、`review_graph_spec`、`recommend` 随治理移除。
+
+## 12. Phase 1B 边界：治理无关的 V3 durable runtime 内核
+
+范围：在 `src/v3/` 实现 V3 图执行内核，独立于旧治理执行路径；不接入生产入口（Phase 1C），不删除治理代码。内核不读取、不依赖 planning/routing/visual 治理模块。
+
+### 12.1 新增模块（`src/v3/`）
+
+| 模块 | 职责 |
+|---|---|
+| `attempt.ts` | attempt 证据 schema + 原子读写/校验（attempt.json / workspace.json / validated-result.json / acceptance.json） |
+| `workspace.ts` | V3 工作区隔离：writeBaseline/readBaseline/inputBaseline、shadow 隔离、apply + 冲突检测 |
+| `verify.ts` | V3 确定性验证执行器：execFile shell:false、白名单、总超时、stdout/stderr 独立封顶+截断标记、记录 exitCode/signal/timeout |
+| `dispatch.ts` | 仅通过 pi-subagents 公共 RPC 分发：不选择/不替换模型、不评估任务是否需要 Graph、dispatch_unknown → needs_attention |
+| `scheduler.ts` | 拓扑调度：严格依赖序、无冲突节点并行、maxConcurrency；不跨机调度 |
+| `runner.ts` | V3 图运行器：node 状态机 queued/running/verifying/applying/terminal 持久迁移、V3 retryPolicy、leases/fencing 崩溃恢复 |
+| `events.ts` | thin shadow 观测 writer：append-only、单事件/总数/总字节边界、events.truncated.json（§8） |
+| `projection.ts` | snapshot.json 可重建投影（从 authorization + attempt 证据重建；损坏可重建，不做独立裁决） |
+| `legacy.ts` | V1/V2 snapshot/authorization 与旧 PlanningReceipt 冻结解析器 + §6 冻结 legacy writer（Phase 1C 接线使用） |
+
+### 12.2 attempt 生命周期
+
+- node attempt 状态机：`prepared → dispatched → running → verifying → applying → accepted | failed | aborted`。
+- 每次迁移原子写 attempt.json（attemptNonce、phase、requestDigest、terminalStatus、时间戳）；读取方不得信任内存态覆盖持久态。
+- terminal：`accepted`（验证+apply 完成）、`failed`（达到 maxAttempts 或非可重试失败）、`aborted`（stop/中断）。
+- `validated-result.json` 是 acceptance 判定的输入；`acceptance.json` 引用 validated-result digest 与 attempt.json digest（§5 单向 digest 链）。
+
+### 12.3 调度语义
+
+- 严格拓扑依赖；无冲突节点并行；有效并发 = min(spec.maxConcurrency, settings.graph.maxConcurrency)。
+- 单机同仓库，不做跨机调度。
+- 无拓扑依赖且 writeScope 重叠在编译期已拒绝（§4），运行时只按已编译依赖执行。
+- retry 只依据 V3 retryPolicy（retryOn ∈ task_failed/validation/timeout/workspace_conflict；backoffMs）；不存在 provider/model 专用 retry 或模型降级。
+- `failFast: true` 时任一节点 terminal failed → 图进入 failed，在飞节点尽力终止。
+- 所有调度、验收与恢复代码不得读取事件日志做决定（§8）。
+
+### 12.4 child dispatch
+
+- 只通过 pi-subagents 公共 RPC：`SubagentRpcClient.spawn`（`agent`/`task`/`cwd`/`sessionDir` 等公共字段）。
+- 不传 `model` 字段：Agent/模型最终由调用方与 pi-subagents 自身合同决定。
+- 分发前做 agent 存在性 preflight（复用 pi-subagents-preflight 的 resolveManagedAgentDefinition）。
+- dispatch 后绑定 asyncId/asyncDir 并做身份断言（assertAsyncRunIdentity）；绑定关系入 attempt.json。
+- 状态模糊/未知（dispatch_unknown）、证据缺失、身份不明 → 该 attempt 进入 needs_attention；禁止盲目重派。
+- runner 的验证命令能力（§3/§12.5）不得泄漏给子 Agent：子 Agent 无 shell、无验证命令执行入口。
+
+### 12.5 工作区隔离
+
+- 所有节点执行 writeBaseline/readBaseline/inputBaseline 检查（§5 定义在 workspace.json）。
+- `local_write` 节点在隔离 shadow 工作区执行：把源工作区拷贝到 run 目录内临时区，子 Agent 的 `cwd` 指向 shadow。
+- 验证全部通过后才 apply：只回放 writeScope 内的变更到源工作区；apply 逐文件原子写并记录 applying 状态。
+- apply 前重验源工作区 writeBaseline；若源文件被并发修改 → `workspace_conflict`（禁止静默覆盖；按 retryPolicy 决定重试或 needs_attention）。
+- 并发源文件变化必须报告冲突；验证命令白名单与超时（§3）不因实现迁移而放宽。
+
+### 12.6 状态与失败持久化
+
+- run 级状态由 snapshot.json 投影表达；node 级状态由 attempt 证据表达；authorization.json 只承载不可变图级 admission（§5）。
+- authority、锁、租约与 fencing 必须支持崩溃恢复：run lease 记录 pid + process identity + fencing token；陈旧锁必须经过 PID + process identity 验证后才能接管（引用 claims.ts 的 PID 启动身份与防 PID 复用）。
+- 崩溃恢复不得重复 apply（applying 状态原子落盘 + apply 幂等化）、不得盲目重派、不得丢失已验收结果。
+
+### 12.7 验收（Phase 1B 内部）
+
+- V3 内核单元测试覆盖：attempt 生命周期、调度顺序与并发上限、验证执行安全（signal/截断/超时）、工作区 baseline/apply/冲突、事件边界、投影重建。
+- 不要求 E2E（Phase 1C）；`npm run check` 与新增内核测试全绿。
+
+## 13. Phase 1C 边界：生产入口、恢复与 legacy 兼容
+
+范围：把 V3 内核接入生产入口并兼容旧运行。V3 新运行不再走 planning gate / 旧 GraphManager / 模型路由。
+
+### 13.1 `graph start` 对新运行走 V3
+
+- 工具 schema 暴露 GraphSpec V3（schemaVersion 3 + graphId/goal/nodes/maxConcurrency/failFast/workspace）。
+- 新运行写 snapshot-v3 + authorization-v4（runtimeSchemaVersion 3）；不要求 PlanningReceipt；不调用评估/规划/复核/模型路由。
+- V3 图由 V3 runner 驱动；V3 子 Agent 分发走 §12.4。
+
+### 13.2 状态工具理解 V3
+
+- `graph status/list/stop/resume/doctor` 通过 detectRunFormat 分流：v3 走 V3 inspect + 现场验证；legacy-readonly 只读展示；legacy-v2 冻结 writer；invalid → needs_attention。
+
+### 13.3 同机同仓库 V3 恢复
+
+- 每次恢复现场验证：digest、source identity、owner/child identity、runtime capability（引用 §5 现场验证规则）。
+- queued/running 只有证据充分才能续跑；paused/waiting_input 等待显式操作；dispatch_unknown、证据缺失、身份不明 → needs_attention。
+- 陈旧锁必须经过 PID + process identity 验证后才能接管。
+- 恢复不得重复 apply、不得盲目重派、不得丢失已验收结果。
+
+### 13.4 Legacy 冻结
+
+- V1：只读展示，不 resume，不迁移。
+- V2：只允许监控已知 child 与完成合同允许的 validated/applying 终态转换；禁止 legacy 新派发、重路由、模型降级与新 retry。
+- 冻结 legacy writer 与 V3 writer 隔离：legacy 转换只写自己的终态，不触碰 V3 证据。
+
+### 13.5 验收（Phase 1C）
+
+- E2E-1 三节点图：A/B 并行，A+B 完成后 C 执行；验证并发、依赖、验收与产物（产品合同验收清单）。
+- E2E-2 进程中断恢复：覆盖节点间中断与“写节点提交瞬间 SIGKILL”；恢复后不重复 apply、不盲目重派、不丢失已验收结果。
+- E2E-3 零配置安装（Phase 4 复验，见产品合同）。
+- 以上 E2E 全部使用隔离测试启动器与独立 TMPDIR，不写 Pi 共享 async root。
 
 ## 10. 依赖通道
 
