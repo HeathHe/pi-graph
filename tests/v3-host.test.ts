@@ -96,44 +96,56 @@ function killProcessTree(pid: number): void {
 	}
 }
 
-test("E2E-2: V3 host resumes a SIGKILLed run without duplicating n1 and re-runs n2 at most once", async () => {
-	const { sandbox, sourceDir, runsDir } = await fixture();
-	const readyFile = join(sandbox, "ready.txt");
-	const driverScript = resolve(process.cwd(), "tests/helpers/v3-host-crash-driver.ts");
-	const child = spawn(process.execPath, ["--experimental-strip-types", driverScript], {
+function spawnCrashDriver(driver: string, env: Record<string, string>) {
+	const script = resolve(process.cwd(), "tests/helpers", driver);
+	return spawn(process.execPath, ["--experimental-strip-types", script], {
 		cwd: resolve(process.cwd()),
 		stdio: "inherit",
 		detached: process.platform !== "win32",
-		env: {
-			...process.env,
-			V3_E2E_RUNS_DIR: runsDir,
-			V3_E2E_SOURCE_DIR: sourceDir,
-			V3_E2E_READY_FILE: readyFile,
-			V3_E2E_SESSION_ID: "session-crashed",
-			V3_E2E_EPOCH: "epoch-crashed",
-		},
+		env: { ...process.env, ...env },
+	});
+}
+
+async function waitForFile(path: string, needle: string, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			const text = await readFile(path, "utf8");
+			if (text.includes(needle)) return;
+		} catch {
+			/* not yet */
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+	}
+	throw new Error(`Timed out waiting for ${path} to contain ${needle}`);
+}
+
+async function killAndReap(child: ReturnType<typeof spawnCrashDriver>): Promise<void> {
+	killProcessTree(child.pid!);
+	await new Promise<void>((resolveExit) => {
+		child.on("exit", () => resolveExit());
+		child.on("error", () => resolveExit());
+		setTimeout(resolveExit, 10_000).unref();
+	});
+}
+
+test("E2E-2: V3 host resumes a SIGKILLed run without duplicating n1 and re-runs n2 at most once", async () => {
+	const { sandbox, sourceDir, runsDir } = await fixture();
+	const readyFile = join(sandbox, "ready.txt");
+	const child = spawnCrashDriver("v3-host-crash-driver.ts", {
+		V3_E2E_RUNS_DIR: runsDir,
+		V3_E2E_SOURCE_DIR: sourceDir,
+		V3_E2E_READY_FILE: readyFile,
+		V3_E2E_SESSION_ID: "session-crashed",
+		V3_E2E_EPOCH: "epoch-crashed",
 	});
 	try {
 		// Wait for n2 to be mid-run (n1 already applied).
-		const deadline = Date.now() + 20_000;
-		while (Date.now() < deadline) {
-			try {
-				const text = await readFile(readyFile, "utf8");
-				if (text.includes("ready")) break;
-			} catch {
-				/* not yet */
-			}
-			await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-		}
+		await waitForFile(readyFile, "ready", 20_000);
 		// n1's committed side effect is already on disk exactly once before the crash.
 		assert.equal(await readFile(join(sourceDir, "n1.out"), "utf8"), "n1\n");
 		// SIGKILL the driver while n2 is running.
-		killProcessTree(child.pid!);
-		await new Promise<void>((resolveExit) => {
-			child.on("exit", () => resolveExit());
-			child.on("error", () => resolveExit());
-			setTimeout(resolveExit, 10_000).unref();
-		});
+		await killAndReap(child);
 	} finally {
 		killProcessTree(child.pid!);
 	}
@@ -172,6 +184,53 @@ test("E2E-2: V3 host resumes a SIGKILLed run without duplicating n1 and re-runs 
 	// requires the resumed holder to hold a live lease.
 	const doctor = await host.doctor();
 	assert.deepEqual(doctor.issues.filter((issue) => issue.kind === "stale-lease"), [], "stale lease must be gone after takeover");
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
+});
+
+test("E2E-2b: V3 host does not re-dispatch a node whose child completed before the crash (write-commit window)", async () => {
+	const { sandbox, sourceDir, runsDir } = await fixture();
+	const readyFile = join(sandbox, "ready.txt");
+	const child = spawnCrashDriver("v3-host-crash-driver-2.ts", {
+		V3_E2E_RUNS_DIR: runsDir,
+		V3_E2E_SOURCE_DIR: sourceDir,
+		V3_E2E_READY_FILE: readyFile,
+		V3_E2E_SESSION_ID: "session-crashed-2",
+		V3_E2E_EPOCH: "epoch-crashed-2",
+	});
+	try {
+		// The driver kills itself once n2 crosses its post-child-completion boundary.
+		await waitForFile(readyFile, "started", 20_000);
+		await new Promise<void>((resolveExit) => {
+			child.on("exit", () => resolveExit());
+			child.on("error", () => resolveExit());
+			setTimeout(resolveExit, 20_000).unref();
+		});
+	} finally {
+		killProcessTree(child.pid!);
+	}
+
+	const mock = new MockSubagents();
+	mock.behaviors.set("N1", (input) => completeChild({ ...input, writes: [{ path: "n1.out", content: "n1\n" }] }));
+	mock.behaviors.set("N2", (input) => completeChild({ ...input, writes: [{ path: "n2.out", content: "n2\n" }] }));
+	mock.behaviors.set("N3", (input) => completeChild({ ...input, output: "n3-output" }));
+	mock.start();
+	const host = hostFor(runsDir, mock, "session-restarted-2", "epoch-restarted-2");
+	const graphId = (await host.adoptCrashedRuns())[0]!.graphId;
+	const snapshot = await host.waitForCompletion(graphId);
+	assert.equal(snapshot.status, "complete");
+	const runDir = host.runDirFor(graphId);
+	// n2 must NOT be re-dispatched: its child had already completed, so resume continues
+	// verification/apply and accepts attempt 1 without a duplicate dispatch.
+	const n2 = (await readLatestV3Attempt(runDir, "n2"))!.evidence;
+	assert.equal(n2.phase, "accepted");
+	assert.equal(n2.attempt, 1, "n2 must not re-run after its child completed");
+	assert.equal(await readFile(join(sourceDir, "n2.out"), "utf8"), "n2\n");
+	const n1 = (await readLatestV3Attempt(runDir, "n1"))!.evidence;
+	assert.equal(n1.attempt, 1);
+	assert.equal(await readFile(join(sourceDir, "n1.out"), "utf8"), "n1\n");
+	const n3 = (await readLatestV3Attempt(runDir, "n3"))!.evidence;
+	assert.equal(n3.phase, "accepted");
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
 });

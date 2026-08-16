@@ -240,6 +240,8 @@ interface V3Event {
 | `runner.ts` | V3 图运行器：node 状态机 queued/running/verifying/applying/terminal 持久迁移、V3 retryPolicy、leases/fencing 崩溃恢复 |
 | `events.ts` | thin shadow 观测 writer：append-only、单事件/总数/总字节边界、events.truncated.json（§8） |
 | `projection.ts` | snapshot.json 可重建投影（从 authorization + attempt 证据重建；损坏可重建，不做独立裁决） |
+| `format-detector.ts` | V1/V2/V3 冻结解析器：按 snapshot/authorization/runtime 版本组合分类 legacy-readonly / legacy-v2 / v3 / invalid（§1 合法组合矩阵）；冻结 legacy 解析只读，不改写任何运行字节 |
+| `host.ts` | 生产入口适配器：V3GraphHost 承载 runsDir 监督集，start/status/stop/resume/list/doctor/adoptCrashedRuns 全部现场验证；新 V3 运行绝不走 planning gate / 旧 GraphManager / 模型路由 |
 | `legacy.ts` | V1/V2 snapshot/authorization 与旧 PlanningReceipt 冻结解析器 + §6 冻结 legacy writer（Phase 1C 接线使用） |
 
 ### 12.2 attempt 生命周期
@@ -312,6 +314,7 @@ interface V3Event {
 - V1：只读展示，不 resume，不迁移。
 - V2：只允许监控已知 child 与完成合同允许的 validated/applying 终态转换；禁止 legacy 新派发、重路由、模型降级与新 retry。
 - 冻结 legacy writer 与 V3 writer 隔离：legacy 转换只写自己的终态，不触碰 V3 证据。
+- **实现注记（Phase 1C 定稿）**：legacy 冻结 writer 由旧 executor 的 `runtimeV2Dispatch` 门控强制执行（默认 `false`；需要新派发/新 child identity 时返回 stale + "Graph Runtime v2 dispatch is gated"，转为 needs_attention/停滞而非重派）。V3 运行由 `host.ts` 监督，绝不经过旧 executor；旧 executor 只处理 legacy-v2 运行。冻结解析器由 `format-detector.ts`（§12.1）承担，只读分类不写任何字节。新 V3 运行不再签发/校验/写入 PlanningReceipt。
 
 ### 13.5 验收（Phase 1C）
 
