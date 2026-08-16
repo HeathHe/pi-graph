@@ -99,8 +99,8 @@ export interface GraphSnapshotV3 {
 }
 
 export type SourceRepositoryIdentityV3 =
-	| { kind: "git"; root: string; head: string }
-	| { kind: "directory"; root: string };
+	| { kind: "git"; root: string; gitDir: string; device: string; inode: string }
+	| { kind: "directory"; root: string; device: string; inode: string };
 
 export interface SourceIdentityV3 {
 	sourceCwd: string;

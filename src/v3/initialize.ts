@@ -6,12 +6,15 @@ import { basename, dirname, join, resolve } from "node:path";
 import { authorizationV4For } from "./authorization.ts";
 import { canonicalJson } from "./digests.ts";
 import { GraphV3Error } from "./errors.ts";
+import { captureTrustedDirectoryAnchor, unsafeDirectoryComponent } from "./path-safety.ts";
+import type { TrustedDirectoryAnchor } from "./path-safety.ts";
 import { graphSnapshotV3For } from "./snapshot.ts";
 import { resolveSourceIdentityV3 } from "./source-identity.ts";
-import type { AuthorizationV4, CompiledGraphV3, GraphSnapshotV3 } from "./types.ts";
+import type { AuthorizationV4, CompiledGraphV3, GraphSnapshotV3, SourceIdentityV3 } from "./types.ts";
 
 const INITIALIZATION_LOCK_SCHEMA_VERSION = 1;
 const LOCK_OWNER_FILE = "owner.json";
+const INCOMPLETE_LOCK_RECOVERY_MS = 5 * 60_000;
 let currentProcessIdentity: Promise<string | undefined> | undefined;
 
 interface DirectoryIdentity {
@@ -30,6 +33,7 @@ interface InitializationLockOwner {
 interface HeldInitializationLock {
 	lockDir: string;
 	owner: InitializationLockOwner;
+	identity: DirectoryIdentity;
 }
 
 interface ReadInitializationLock {
@@ -38,6 +42,7 @@ interface ReadInitializationLock {
 }
 
 export interface InitializeV3RunOptions {
+	trustedRoot: string;
 	runDir: string;
 	graph: CompiledGraphV3;
 	sessionId: string;
@@ -54,8 +59,10 @@ export interface InitializeV3RunResult {
 }
 
 export interface V3InitializationDependencies {
-	atomicRename?: (source: string, destination: string) => Promise<void>;
+	beforePublish?: () => Promise<void>;
+	beforeOwnerlessLockCleanup?: (lockDir: string) => Promise<void>;
 	processIdentityForPid?: (pid: number) => Promise<string | undefined>;
+	sourceIdentityFor?: (sourceCwd: string) => Promise<SourceIdentityV3>;
 	syncDirectory?: (path: string) => Promise<void>;
 }
 
@@ -125,17 +132,57 @@ async function directoryIdentity(path: string): Promise<DirectoryIdentity | unde
 	}
 }
 
+async function regularFileIdentity(path: string): Promise<DirectoryIdentity | undefined> {
+	try {
+		const stat = await lstat(path);
+		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+		return { dev: stat.dev, ino: stat.ino };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
 function sameDirectoryIdentity(left: DirectoryIdentity | undefined, right: DirectoryIdentity | undefined): boolean {
 	return left !== undefined && right !== undefined && left.dev === right.dev && left.ino === right.ino;
 }
 
-async function durableWrite(path: string, value: unknown): Promise<void> {
-	await writeFile(path, `${canonicalJson(value)}\n`, { encoding: "utf8", flag: "wx" });
+async function durableWrite(path: string, value: unknown): Promise<string> {
+	const contents = `${canonicalJson(value)}\n`;
+	await writeFile(path, contents, { encoding: "utf8", flag: "wx" });
 	const handle = await open(path, "r");
 	try {
 		await handle.sync();
 	} finally {
 		await handle.close();
+	}
+	return contents;
+}
+
+async function regularFileMatches(path: string, expectedIdentity: DirectoryIdentity, expectedContents: string): Promise<boolean> {
+	let handle;
+	try {
+		const pathBefore = await lstat(path);
+		if (pathBefore.isSymbolicLink() || !pathBefore.isFile() || !sameDirectoryIdentity(pathBefore, expectedIdentity)) return false;
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const opened = await handle.stat();
+		if (!opened.isFile() || !sameDirectoryIdentity(opened, expectedIdentity)) return false;
+		const contents = await handle.readFile("utf8");
+		const [finished, pathAfter] = await Promise.all([handle.stat(), lstat(path)]);
+		return contents === expectedContents
+			&& finished.isFile()
+			&& !pathAfter.isSymbolicLink()
+			&& pathAfter.isFile()
+			&& sameDirectoryIdentity(finished, expectedIdentity)
+			&& sameDirectoryIdentity(pathAfter, expectedIdentity)
+			&& finished.size === opened.size
+			&& finished.mtimeMs === opened.mtimeMs
+			&& pathAfter.size === finished.size
+			&& pathAfter.mtimeMs === finished.mtimeMs;
+	} catch {
+		return false;
+	} finally {
+		await handle?.close().catch(() => undefined);
 	}
 }
 
@@ -145,6 +192,57 @@ async function syncDirectory(path: string): Promise<void> {
 		await handle.sync();
 	} finally {
 		await handle.close();
+	}
+}
+
+async function syncOwnedDirectory(path: string, expected: DirectoryIdentity, override?: (path: string) => Promise<void>): Promise<void> {
+	if (!sameDirectoryIdentity(await directoryIdentity(path), expected)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 claimed run directory changed before it was synced.", { field: "runDir" });
+	if (override) {
+		await override(path);
+	} else {
+		const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const opened = await handle.stat();
+			if (!opened.isDirectory() || !sameDirectoryIdentity({ dev: opened.dev, ino: opened.ino }, expected)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 claimed run directory changed while it was opened for sync.", { field: "runDir" });
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	}
+	if (!sameDirectoryIdentity(await directoryIdentity(path), expected)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 claimed run directory changed while it was synced.", { field: "runDir" });
+}
+
+async function ensureDurableDirectory(path: string, anchor: TrustedDirectoryAnchor, sync: (path: string) => Promise<void>): Promise<void> {
+	const missing: string[] = [];
+	let cursor = path;
+	while (true) {
+		try {
+			const stat = await lstat(cursor);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new GraphV3Error("INITIALIZATION_FAILED", `V3 run parent contains a symbolic link or non-directory: ${cursor}`, { field: "runDir" });
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			if (cursor === anchor.root) throw new GraphV3Error("INITIALIZATION_FAILED", `V3 trusted root disappeared during parent creation: ${anchor.root}`, { field: "trustedRoot" });
+			missing.push(cursor);
+			const parent = dirname(cursor);
+			if (parent === cursor) throw new GraphV3Error("INITIALIZATION_FAILED", `Could not find an existing parent for V3 run directory: ${path}`, { field: "runDir" });
+			cursor = parent;
+		}
+	}
+	for (const directory of missing.reverse()) {
+		if (await unsafeDirectoryComponent(dirname(directory), anchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed before creating a missing directory.", { field: "runDir" });
+		try {
+			await mkdir(directory);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		const stat = await lstat(directory);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new GraphV3Error("INITIALIZATION_FAILED", `V3 run parent contains a symbolic link or non-directory: ${directory}`, { field: "runDir" });
+		if (await unsafeDirectoryComponent(directory, anchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while creating a missing directory.", { field: "runDir" });
+		await sync(directory);
+		if (await unsafeDirectoryComponent(directory, anchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while syncing a new directory.", { field: "runDir" });
+		await sync(dirname(directory));
+		if (await unsafeDirectoryComponent(directory, anchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while syncing a new directory parent.", { field: "runDir" });
 	}
 }
 
@@ -158,9 +256,58 @@ async function cleanupOwnedDirectory(path: string, expected: DirectoryIdentity |
 		throw error;
 	}
 	if (!sameDirectoryIdentity(await directoryIdentity(quarantine), expected)) {
-		await rename(quarantine, path).catch(() => undefined);
+		// Preserve the raced directory in quarantine. Restoring with POSIX rename
+		// could overwrite a newer empty target that appeared at the original path.
 		return false;
 	}
+	await rm(quarantine, { recursive: true, force: true });
+	return true;
+}
+
+async function cleanupExpiredInvalidLock(lockDir: string, trustedAnchor: TrustedDirectoryAnchor, beforeCleanup?: (lockDir: string) => Promise<void>): Promise<boolean> {
+	const lockStat = await lstat(lockDir).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (!lockStat || !lockStat.isDirectory() || lockStat.isSymbolicLink()) return false;
+	const ownerStat = await lstat(join(lockDir, LOCK_OWNER_FILE)).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	// Only a lock abandoned before owner publication is safe to recover by age.
+	// Once owner.json exists, malformed ownership evidence must remain fail-closed.
+	if (ownerStat) return false;
+	if (Date.now() - lockStat.mtimeMs < INCOMPLETE_LOCK_RECOVERY_MS) return false;
+	await beforeCleanup?.(lockDir);
+	await assertTrustedLockParent(lockDir, trustedAnchor, "V3 trusted root or run parent changed while an ownerless initialization lock was inspected.");
+	const confirmedLockStat = await lstat(lockDir).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (!confirmedLockStat
+		|| confirmedLockStat.isSymbolicLink()
+		|| !confirmedLockStat.isDirectory()
+		|| !sameDirectoryIdentity(confirmedLockStat, lockStat)
+		|| confirmedLockStat.mtimeMs !== lockStat.mtimeMs) return false;
+	const confirmedOwner = await lstat(join(lockDir, LOCK_OWNER_FILE)).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (confirmedOwner) return false;
+	const quarantine = `${lockDir}.ownerless-${randomUUID()}`;
+	try {
+		await rename(lockDir, quarantine);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+	const quarantinedStat = await lstat(quarantine).catch(() => undefined);
+	if (!quarantinedStat || quarantinedStat.isSymbolicLink() || !quarantinedStat.isDirectory() || !sameDirectoryIdentity(quarantinedStat, lockStat)) return false;
+	const publishedOwner = await lstat(join(quarantine, LOCK_OWNER_FILE)).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return undefined;
+		throw error;
+	});
+	if (publishedOwner || quarantinedStat.mtimeMs !== lockStat.mtimeMs) return false;
 	await rm(quarantine, { recursive: true, force: true });
 	return true;
 }
@@ -193,28 +340,78 @@ async function readLockOwner(lockDir: string): Promise<ReadInitializationLock> {
 		throw error;
 	});
 	if (!ownerStat || !ownerStat.isFile() || ownerStat.isSymbolicLink()) throw new GraphV3Error("INVALID_INITIALIZATION_LOCK", "V3 initialization lock owner.json is missing or is not a regular file.");
-	let value: unknown;
+	let handle;
 	try {
-		value = JSON.parse(await readFile(ownerPath, "utf8")) as unknown;
+		handle = await open(ownerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const openedOwner = await handle.stat();
+		if (!openedOwner.isFile() || !sameDirectoryIdentity(ownerStat, openedOwner)) throw new GraphV3Error("INVALID_INITIALIZATION_LOCK", "V3 initialization lock owner.json changed while being opened.");
+		const contents = await handle.readFile("utf8");
+		const [finishedOwner, currentOwner, currentLock] = await Promise.all([handle.stat(), lstat(ownerPath), lstat(lockDir)]);
+		if (!finishedOwner.isFile()
+			|| currentOwner.isSymbolicLink()
+			|| !currentOwner.isFile()
+			|| currentLock.isSymbolicLink()
+			|| !currentLock.isDirectory()
+			|| !sameDirectoryIdentity(ownerStat, finishedOwner)
+			|| !sameDirectoryIdentity(ownerStat, currentOwner)
+			|| !sameDirectoryIdentity(identity, currentLock)
+			|| finishedOwner.size !== openedOwner.size
+			|| finishedOwner.mtimeMs !== openedOwner.mtimeMs
+			|| currentOwner.size !== finishedOwner.size
+			|| currentOwner.mtimeMs !== finishedOwner.mtimeMs) {
+			throw new GraphV3Error("INVALID_INITIALIZATION_LOCK", "V3 initialization lock or owner.json changed while being read.");
+		}
+		return { owner: validateLockOwner(JSON.parse(contents) as unknown), identity };
 	} catch (error) {
+		if (error instanceof GraphV3Error) throw error;
 		throw new GraphV3Error("INVALID_INITIALIZATION_LOCK", `V3 initialization lock owner.json is invalid: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	} finally {
+		await handle?.close().catch(() => undefined);
 	}
-	return { owner: validateLockOwner(value), identity };
 }
 
-async function acquireInitializationLock(lockDir: string, runDir: string, dependencies: V3InitializationDependencies): Promise<HeldInitializationLock> {
+function sameLockOwner(left: InitializationLockOwner, right: InitializationLockOwner): boolean {
+	return left.schemaVersion === right.schemaVersion
+		&& left.pid === right.pid
+		&& left.processIdentity === right.processIdentity
+		&& left.token === right.token
+		&& left.createdAt === right.createdAt;
+}
+
+async function initializationLockIsHeld(lock: HeldInitializationLock): Promise<boolean> {
+	try {
+		const observed = await readLockOwner(lock.lockDir);
+		return sameDirectoryIdentity(observed.identity, lock.identity) && sameLockOwner(observed.owner, lock.owner);
+	} catch {
+		return false;
+	}
+}
+
+async function assertTrustedLockParent(lockDir: string, anchor: TrustedDirectoryAnchor, message: string): Promise<void> {
+	const unsafe = await unsafeDirectoryComponent(dirname(lockDir), anchor);
+	if (unsafe) throw new GraphV3Error("INITIALIZATION_FAILED", message, { field: "trustedRoot", details: { unsafe } });
+}
+
+async function acquireInitializationLock(lockDir: string, runDir: string, trustedAnchor: TrustedDirectoryAnchor, dependencies: V3InitializationDependencies): Promise<HeldInitializationLock> {
 	const identityResolver = dependencies.processIdentityForPid ?? processIdentityForPidV3;
 	const processIdentity = await identityResolver(process.pid);
 	if (!processIdentity) throw new GraphV3Error("INITIALIZATION_FAILED", "The current process start identity is unavailable; refusing PID-only V3 initialization ownership.");
 	for (let attempt = 0; attempt < 8; attempt += 1) {
+		await assertTrustedLockParent(lockDir, trustedAnchor, "V3 trusted root or run parent changed before initialization lock creation.");
 		try {
 			await mkdir(lockDir);
 			const ownedIdentity = await directoryIdentity(lockDir);
+			if (!ownedIdentity) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization lock identity is unavailable after creation.");
 			const owner: InitializationLockOwner = { schemaVersion: 1, pid: process.pid, processIdentity, token: randomUUID(), createdAt: new Date().toISOString() };
 			try {
 				await durableWrite(join(lockDir, LOCK_OWNER_FILE), owner);
 				await (dependencies.syncDirectory ?? syncDirectory)(lockDir);
-				return { lockDir, owner };
+				await assertTrustedLockParent(lockDir, trustedAnchor, "V3 trusted root or run parent changed while the initialization lock was synced.");
+				const publishedLock = await readLockOwner(lockDir);
+				if (!sameDirectoryIdentity(publishedLock.identity, ownedIdentity) || !sameLockOwner(publishedLock.owner, owner)) {
+					throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization lock changed while its owner was published.");
+				}
+				return { lockDir, owner, identity: ownedIdentity };
 			} catch (error) {
 				await cleanupOwnedDirectory(lockDir, ownedIdentity).catch(() => undefined);
 				throw error;
@@ -227,11 +424,30 @@ async function acquireInitializationLock(lockDir: string, runDir: string, depend
 			observedLock = await readLockOwner(lockDir);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			if (error instanceof GraphV3Error && error.code === "INVALID_INITIALIZATION_LOCK" && await cleanupExpiredInvalidLock(lockDir, trustedAnchor, dependencies.beforeOwnerlessLockCleanup)) continue;
 			throw error;
 		}
 		const { owner } = observedLock;
-		const observedIdentity = await identityResolver(owner.pid);
-		if (observedIdentity === owner.processIdentity) throw new GraphV3Error("RUN_ALREADY_EXISTS", `V3 run initialization is already in progress: ${runDir}`, { details: { runDir, pid: owner.pid } });
+		if (isProcessAlive(owner.pid)) {
+			let observedIdentity: string | undefined;
+			try {
+				observedIdentity = await identityResolver(owner.pid);
+			} catch (error) {
+				throw new GraphV3Error("INVALID_INITIALIZATION_LOCK", "The live V3 initialization lock owner identity could not be inspected safely.", { cause: error, details: { runDir, pid: owner.pid } });
+			}
+			await assertTrustedLockParent(lockDir, trustedAnchor, "V3 trusted root or run parent changed while the initialization lock owner identity was inspected.");
+			if (!observedIdentity) throw new GraphV3Error("INVALID_INITIALIZATION_LOCK", "The V3 initialization lock owner is alive, but its process identity is unavailable; refusing stale takeover.", { details: { runDir, pid: owner.pid } });
+			if (observedIdentity === owner.processIdentity) throw new GraphV3Error("RUN_ALREADY_EXISTS", `V3 run initialization is already in progress: ${runDir}`, { details: { runDir, pid: owner.pid } });
+		}
+		await assertTrustedLockParent(lockDir, trustedAnchor, "V3 trusted root or run parent changed before stale initialization lock takeover.");
+		let confirmedLock: ReadInitializationLock;
+		try {
+			confirmedLock = await readLockOwner(lockDir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		if (!sameDirectoryIdentity(confirmedLock.identity, observedLock.identity) || !sameLockOwner(confirmedLock.owner, observedLock.owner)) continue;
 		const staleDir = `${lockDir}.stale-${randomUUID()}`;
 		try {
 			await rename(lockDir, staleDir);
@@ -240,12 +456,7 @@ async function acquireInitializationLock(lockDir: string, runDir: string, depend
 			throw error;
 		}
 		if (!sameDirectoryIdentity(await directoryIdentity(staleDir), observedLock.identity)) {
-			try {
-				await rename(staleDir, lockDir);
-			} catch (error) {
-				throw new GraphV3Error("INITIALIZATION_FAILED", "A live V3 initialization lock changed during stale takeover and could not be restored.", { cause: error });
-			}
-			continue;
+			throw new GraphV3Error("INITIALIZATION_FAILED", "A V3 initialization lock changed during stale takeover and was preserved in quarantine to avoid overwriting a newer lock.", { details: { quarantine: staleDir } });
 		}
 		await rm(staleDir, { recursive: true, force: true });
 	}
@@ -260,7 +471,7 @@ async function releaseInitializationLock(lock: HeldInitializationLock): Promise<
 		return;
 	}
 	const { owner } = observedLock;
-	if (owner.token !== lock.owner.token || owner.pid !== lock.owner.pid || owner.processIdentity !== lock.owner.processIdentity) return;
+	if (!sameDirectoryIdentity(observedLock.identity, lock.identity) || !sameLockOwner(owner, lock.owner)) return;
 	const releaseDir = `${lock.lockDir}.release-${lock.owner.token}`;
 	try {
 		await rename(lock.lockDir, releaseDir);
@@ -269,55 +480,115 @@ async function releaseInitializationLock(lock: HeldInitializationLock): Promise<
 		throw error;
 	}
 	if (!sameDirectoryIdentity(await directoryIdentity(releaseDir), observedLock.identity)) {
-		await rename(releaseDir, lock.lockDir).catch(() => undefined);
+		// Preserve the raced directory rather than risking replacement of a newer lock.
 		return;
 	}
 	await rm(releaseDir, { recursive: true, force: true });
 }
 
 export async function initializeV3Run(options: InitializeV3RunOptions, dependencies: V3InitializationDependencies = {}): Promise<InitializeV3RunResult> {
+	const trustedRoot = resolve(options.trustedRoot);
 	const runDir = resolve(options.runDir);
+	const sourceCwd = options.sourceCwd ?? process.cwd();
+	const sessionId = options.sessionId;
+	const supervisorEpoch = options.supervisorEpoch;
+	const admittedGraph = JSON.parse(canonicalJson(options.graph)) as CompiledGraphV3;
 	const parentDir = dirname(runDir);
 	const runName = basename(runDir);
 	if (!runName || runDir === parentDir) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 runDir must identify a child directory.", { field: "runDir" });
 	const createdAt = options.createdAt ?? new Date().toISOString();
 	const runInstanceId = options.runInstanceId ?? randomUUID();
+	const trustedAnchor = await captureTrustedDirectoryAnchor(trustedRoot).catch((error) => {
+		throw new GraphV3Error("INITIALIZATION_FAILED", `Could not capture V3 trusted root identity: ${error instanceof Error ? error.message : String(error)}`, { field: "trustedRoot", cause: error });
+	});
 	let sourceIdentity;
 	try {
-		sourceIdentity = await resolveSourceIdentityV3(options.sourceCwd ?? process.cwd());
+		sourceIdentity = await (dependencies.sourceIdentityFor ?? resolveSourceIdentityV3)(sourceCwd);
 	} catch (error) {
 		throw new GraphV3Error("INITIALIZATION_FAILED", `Could not resolve V3 source repository identity: ${error instanceof Error ? error.message : String(error)}`, { field: "sourceCwd", cause: error });
 	}
-	const metadata = { runInstanceId, sessionId: options.sessionId, supervisorEpoch: options.supervisorEpoch, createdAt, ...sourceIdentity };
-	const authorization = authorizationV4For(options.graph, metadata);
-	const snapshot = graphSnapshotV3For(options.graph, metadata);
+	const metadata = { runInstanceId, sessionId, supervisorEpoch, createdAt, ...sourceIdentity };
+	const authorization = authorizationV4For(admittedGraph, metadata);
+	const snapshot = graphSnapshotV3For(admittedGraph, metadata);
 	const lockDir = join(parentDir, `.${runName}.initialize-lock`);
 	let tempDir: string | undefined;
 	let stagingIdentity: DirectoryIdentity | undefined;
+	let ownedRunIdentity: DirectoryIdentity | undefined;
 	let heldLock: HeldInitializationLock | undefined;
 	try {
-		await mkdir(parentDir, { recursive: true });
+		const unsafeParent = await unsafeDirectoryComponent(parentDir, trustedAnchor);
+		if (unsafeParent) throw new GraphV3Error("INITIALIZATION_FAILED", `V3 run parent is outside its canonical trusted root or contains a symbolic link/non-directory: ${unsafeParent}`, { field: "runDir" });
+		await ensureDurableDirectory(parentDir, trustedAnchor, dependencies.syncDirectory ?? syncDirectory);
+		const unsafeCreatedParent = await unsafeDirectoryComponent(parentDir, trustedAnchor);
+		if (unsafeCreatedParent) throw new GraphV3Error("INITIALIZATION_FAILED", `V3 run parent became unsafe or escaped its trusted root during creation: ${unsafeCreatedParent}`, { field: "runDir" });
 		if (await pathExists(runDir)) throw new GraphV3Error("RUN_ALREADY_EXISTS", `V3 run directory already exists: ${runDir}`, { details: { runDir } });
-		heldLock = await acquireInitializationLock(lockDir, runDir, dependencies);
+		heldLock = await acquireInitializationLock(lockDir, runDir, trustedAnchor, dependencies);
+		if (!await initializationLockIsHeld(heldLock)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization lock ownership was lost immediately after acquisition.");
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while the initialization lock was acquired.", { field: "runDir" });
 		if (await pathExists(runDir)) throw new GraphV3Error("RUN_ALREADY_EXISTS", `V3 run directory already exists: ${runDir}`, { details: { runDir } });
 		tempDir = await mkdtemp(join(parentDir, `.${runName}.tmp-`));
 		stagingIdentity = await directoryIdentity(tempDir);
 		if (!stagingIdentity) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization staging directory identity is unavailable.");
-		await durableWrite(join(tempDir, "authorization.json"), authorization);
-		await durableWrite(join(tempDir, "snapshot.json"), snapshot);
+		const expectedAuthorization = await durableWrite(join(tempDir, "authorization.json"), authorization);
+		const expectedSnapshot = await durableWrite(join(tempDir, "snapshot.json"), snapshot);
+		const stagingAuthorizationIdentity = await regularFileIdentity(join(tempDir, "authorization.json"));
+		const stagingSnapshotIdentity = await regularFileIdentity(join(tempDir, "snapshot.json"));
+		if (!stagingAuthorizationIdentity || !stagingSnapshotIdentity) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 staging authority file identity is unavailable.");
 		await (dependencies.syncDirectory ?? syncDirectory)(tempDir);
-		await (dependencies.atomicRename ?? rename)(tempDir, runDir);
-		await (dependencies.syncDirectory ?? syncDirectory)(runDir);
-		await (dependencies.syncDirectory ?? syncDirectory)(parentDir);
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while the staging directory was synced.", { field: "runDir" });
+		await dependencies.beforePublish?.();
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed at the publication boundary.", { field: "runDir" });
+		if (!await initializationLockIsHeld(heldLock)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization lock ownership was lost before run publication.");
+		if (!sameDirectoryIdentity(await directoryIdentity(tempDir), stagingIdentity)
+			|| !await regularFileMatches(join(tempDir, "authorization.json"), stagingAuthorizationIdentity, expectedAuthorization)
+			|| !await regularFileMatches(join(tempDir, "snapshot.json"), stagingSnapshotIdentity, expectedSnapshot)) {
+			throw new GraphV3Error("INITIALIZATION_FAILED", "V3 staging directory or authority files changed before run publication.");
+		}
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed before run publication.", { field: "runDir" });
+		await mkdir(runDir);
+		ownedRunIdentity = await directoryIdentity(runDir);
+		if (!ownedRunIdentity) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 claimed run directory identity is unavailable.");
+		if (!sameDirectoryIdentity(await directoryIdentity(runDir), ownedRunIdentity)
+			|| !sameDirectoryIdentity(await directoryIdentity(tempDir), stagingIdentity)
+			|| !await regularFileMatches(join(tempDir, "authorization.json"), stagingAuthorizationIdentity, expectedAuthorization)) {
+			throw new GraphV3Error("INITIALIZATION_FAILED", "V3 staging authorization changed before publication.");
+		}
+		await rename(join(tempDir, "authorization.json"), join(runDir, "authorization.json"));
+		if (!sameDirectoryIdentity(await directoryIdentity(runDir), ownedRunIdentity)
+			|| !await regularFileMatches(join(runDir, "authorization.json"), stagingAuthorizationIdentity, expectedAuthorization)
+			|| !sameDirectoryIdentity(await directoryIdentity(tempDir), stagingIdentity)
+			|| !await regularFileMatches(join(tempDir, "snapshot.json"), stagingSnapshotIdentity, expectedSnapshot)) {
+			throw new GraphV3Error("INITIALIZATION_FAILED", "V3 staging snapshot or published authorization changed during publication.");
+		}
+		await rename(join(tempDir, "snapshot.json"), join(runDir, "snapshot.json"));
+		if (!sameDirectoryIdentity(await directoryIdentity(runDir), ownedRunIdentity)
+			|| !await regularFileMatches(join(runDir, "authorization.json"), stagingAuthorizationIdentity, expectedAuthorization)
+			|| !await regularFileMatches(join(runDir, "snapshot.json"), stagingSnapshotIdentity, expectedSnapshot)) {
+			throw new GraphV3Error("INITIALIZATION_FAILED", "V3 claimed run directory or authority files changed while they were published.", { field: "runDir" });
+		}
+		if (!await cleanupOwnedDirectory(tempDir, stagingIdentity)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 staging directory changed before cleanup.");
 		tempDir = undefined;
 		stagingIdentity = undefined;
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed during run publication.", { field: "runDir" });
+		await syncOwnedDirectory(runDir, ownedRunIdentity, dependencies.syncDirectory);
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while the published run was synced.", { field: "runDir" });
+		await (dependencies.syncDirectory ?? syncDirectory)(parentDir);
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed while the published run parent was synced.", { field: "runDir" });
+		if (!sameDirectoryIdentity(await directoryIdentity(runDir), ownedRunIdentity)
+			|| !await regularFileMatches(join(runDir, "authorization.json"), stagingAuthorizationIdentity, expectedAuthorization)
+			|| !await regularFileMatches(join(runDir, "snapshot.json"), stagingSnapshotIdentity, expectedSnapshot)) {
+			throw new GraphV3Error("INITIALIZATION_FAILED", "V3 claimed run directory or authority bytes changed before initialization completed.", { field: "runDir" });
+		}
+		if (!await initializationLockIsHeld(heldLock)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization lock ownership was lost before initialization completed.");
+		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed before initialization completed.", { field: "runDir" });
 		return { runDir, authorization, snapshot };
 	} catch (error) {
+		const targetExists = await pathExists(runDir).catch(() => false);
 		const targetIdentity = await directoryIdentity(runDir).catch(() => undefined);
-		const targetIsOwned = sameDirectoryIdentity(targetIdentity, stagingIdentity);
+		const targetIsOwned = sameDirectoryIdentity(targetIdentity, ownedRunIdentity);
 		if (tempDir) await cleanupOwnedDirectory(tempDir, stagingIdentity).catch(() => undefined);
-		if (targetIsOwned) await cleanupOwnedDirectory(runDir, stagingIdentity).catch(() => undefined);
-		if (!(error instanceof GraphV3Error) && targetIdentity && !targetIsOwned) {
+		if (targetIsOwned) await cleanupOwnedDirectory(runDir, ownedRunIdentity).catch(() => undefined);
+		if (!(error instanceof GraphV3Error) && targetExists && !targetIsOwned) {
 			throw new GraphV3Error("RUN_ALREADY_EXISTS", `A competing V3 run directory appeared during initialization: ${runDir}`, { details: { runDir }, cause: error });
 		}
 		if (error instanceof GraphV3Error) throw error;

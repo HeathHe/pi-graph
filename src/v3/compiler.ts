@@ -32,11 +32,15 @@ const SIDE_EFFECTS = new Set<SideEffectV3>(["none", "local_read", "local_write"]
 const RETRY_REASONS = new Set<RetryReasonV3>(["task_failed", "validation", "timeout", "workspace_conflict"]);
 const WORKSPACES = new Set<WorkspaceModeV3>(["auto", "shadow", "git"]);
 const TASK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u;
-const MAX_CONCURRENCY_V3 = 64;
-const PROTECTED_CONTROL_SEGMENTS = new Set([".git", ".pi-graph", ".pi", ".pi-agents", ".pi-subagents"]);
+const MAX_CONCURRENCY_V3 = 6;
+const PROTECTED_CONTROL_SEGMENTS = new Set([".git", ".pi-graph", ".pi-subagents"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function portablePathKey(value: string): string {
+	return value.normalize("NFKC").toUpperCase().toLowerCase().normalize("NFC");
 }
 
 function taskIdFromRecord(value: Record<string, unknown>): string | undefined {
@@ -103,7 +107,12 @@ function normalizeRelativePath(value: string, field: string, taskId: string, all
 	if (!normalized || (!allowDot && normalized === ".")) {
 		graphV3Error(errorCode, `${field} must identify a non-empty relative path.`, { taskId, field, details: { path: value } });
 	}
-	const protectedSegment = normalized.split("/").find((segment) => PROTECTED_CONTROL_SEGMENTS.has(segment));
+	const segments = normalized.split("/");
+	const protectedSegment = segments.find((segment, index) => {
+		const folded = portablePathKey(segment);
+		return PROTECTED_CONTROL_SEGMENTS.has(folded)
+			|| (folded === ".pi" && segments[index + 1] !== undefined && portablePathKey(segments[index + 1]!) === "agents");
+	});
 	if (protectedSegment) {
 		graphV3Error(errorCode, `${field} may not target protected control path '${protectedSegment}'.`, { taskId, field, details: { path: value, protectedSegment } });
 	}
@@ -124,13 +133,15 @@ function normalizeScopes(value: unknown, field: "readScope" | "writeScope", task
 		const path = requiredString(entry, "path", `${field}[${index}]`, taskId);
 		return { kind: entry.kind, path: normalizeRelativePath(path, field, taskId, entry.kind === "tree") } satisfies ScopeEntryV3;
 	});
-	scopes.sort((left, right) => left.path.localeCompare(right.path) || left.kind.localeCompare(right.kind));
+	scopes.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : left.kind < right.kind ? -1 : left.kind > right.kind ? 1 : 0);
 	return scopes;
 }
 
 function scopeContains(scope: ScopeEntryV3, path: string): boolean {
-	if (scope.kind === "file") return scope.path === path;
-	return scope.path === "." || scope.path === path || path.startsWith(`${scope.path}/`);
+	const scopePath = portablePathKey(scope.path);
+	const candidatePath = portablePathKey(path);
+	if (scope.kind === "file") return scopePath === candidatePath;
+	return scopePath === "." || scopePath === candidatePath || candidatePath.startsWith(`${scopePath}/`);
 }
 
 function scopesOverlap(left: ScopeEntryV3, right: ScopeEntryV3): boolean {
@@ -243,7 +254,9 @@ function ancestorMap(nodes: ReadonlyArray<CompiledGraphNodeV3>, order: string[])
 }
 
 function artifactPathsOverlap(left: string, right: string): boolean {
-	return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+	const foldedLeft = portablePathKey(left);
+	const foldedRight = portablePathKey(right);
+	return foldedLeft === foldedRight || foldedLeft.startsWith(`${foldedRight}/`) || foldedRight.startsWith(`${foldedLeft}/`);
 }
 
 function validateArtifacts(nodes: CompiledGraphNodeV3[], ancestors: Map<string, Set<string>>): void {

@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { compileGraphSpecV3 } from "./compiler.ts";
 import { canonicalDigest, canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
@@ -13,7 +13,7 @@ const FORBIDDEN_AUTHORIZATION_FIELDS = new Set([
 	"resolvedModel", "modelFamily", "providerDomain", "attemptedModels", "modelCandidates", "evidenceComplete",
 ]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
-const GIT_OBJECT_PATTERN = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u;
+const FILE_SYSTEM_ID_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -55,32 +55,41 @@ function requireCanonicalAbsolutePath(record: Record<string, unknown>, field: st
 	return value;
 }
 
+function requireFileSystemId(record: Record<string, unknown>, field: string): string {
+	const value = requireString(record, field);
+	if (!FILE_SYSTEM_ID_PATTERN.test(value)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 sourceRepository.${field} must be a decimal file-system identity.`, { field });
+	return value;
+}
+
 function validateSourceRepository(value: unknown, sourceCwd: string): SourceRepositoryIdentityV3 {
 	if (!isRecord(value)) graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 sourceRepository must be an object.", { field: "sourceRepository" });
 	if (value.kind === "git") {
 		for (const field of Object.keys(value)) {
-			if (!["kind", "root", "head"].includes(field)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 sourceRepository contains unknown field '${field}'.`, { field });
+			if (!["kind", "root", "gitDir", "device", "inode"].includes(field)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 sourceRepository contains unknown field '${field}'.`, { field });
 		}
 		const root = requireCanonicalAbsolutePath(value, "root");
-		const head = requireString(value, "head");
-		if (!GIT_OBJECT_PATTERN.test(head)) graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 sourceRepository.head must be a Git SHA-1 or SHA-256 object identity.", { field: "head" });
+		const gitDir = requireCanonicalAbsolutePath(value, "gitDir");
+		const device = requireFileSystemId(value, "device");
+		const inode = requireFileSystemId(value, "inode");
 		const pathFromRoot = relative(root, sourceCwd);
-		if (pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot)) graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 sourceCwd must be inside sourceRepository.root.", { field: "sourceCwd" });
-		return { kind: "git", root, head };
+		if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 sourceCwd must be inside sourceRepository.root.", { field: "sourceCwd" });
+		return { kind: "git", root, gitDir, device, inode };
 	}
 	if (value.kind === "directory") {
 		for (const field of Object.keys(value)) {
-			if (!["kind", "root"].includes(field)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 sourceRepository contains unknown field '${field}'.`, { field });
+			if (!["kind", "root", "device", "inode"].includes(field)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 sourceRepository contains unknown field '${field}'.`, { field });
 		}
 		const root = requireCanonicalAbsolutePath(value, "root");
+		const device = requireFileSystemId(value, "device");
+		const inode = requireFileSystemId(value, "inode");
 		if (root !== sourceCwd) graphV3Error("INVALID_AUTHORIZATION", "Directory sourceRepository.root must equal sourceCwd.", { field: "sourceRepository" });
-		return { kind: "directory", root };
+		return { kind: "directory", root, device, inode };
 	}
 	graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 sourceRepository.kind must be 'git' or 'directory'.", { field: "sourceRepository" });
 }
 
 export function compiledGraphProjectionV3(graph: CompiledGraphV3): CompiledGraphProjectionV3 {
-	return {
+	const projection: CompiledGraphProjectionV3 = {
 		schemaVersion: graph.schemaVersion,
 		graphId: graph.graphId,
 		goal: graph.goal,
@@ -90,6 +99,7 @@ export function compiledGraphProjectionV3(graph: CompiledGraphV3): CompiledGraph
 		failFast: graph.failFast,
 		workspace: graph.workspace,
 	};
+	return JSON.parse(canonicalJson(projection)) as CompiledGraphProjectionV3;
 }
 
 export interface AuthorizationV4Metadata extends SourceIdentityV3 {
@@ -171,6 +181,6 @@ export function validateAuthorizationV4(value: unknown): AuthorizationV4 {
 		sessionId,
 		supervisorEpoch,
 		createdAt,
-		graph: value.graph as unknown as CompiledGraphProjectionV3,
+		graph: projection,
 	};
 }
