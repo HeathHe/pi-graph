@@ -6,10 +6,8 @@ import { V3GraphHost, graphStatusTextV3, v3IsGraphSpecV3 } from "../src/v3/host.
 import type { GraphSpecV3 } from "../src/v3/types.ts";
 import { SubagentRpcClient as V3SubagentRpcClient } from "../src/v3/rpc.ts";
 import { doctorGraphRuns, formatDoctorReport } from "../src/doctor.ts";
-import { recommendGraphConfig, formatRecommendReport } from "../src/recommend.ts";
 import { loadGraphConfig } from "../src/config.ts";
 import { SubagentRpcClient } from "../src/rpc.ts";
-import { canonicalGraphSpec, planningGate } from "../src/subagent-router/planning-gate.ts";
 import {
 	compactRun,
 	cancelPrunePlan,
@@ -26,7 +24,6 @@ import {
 	updateHistoryFlag,
 	DEFAULT_HISTORY_CONFIG,
 } from "../src/retention.ts";
-import type { GraphSpec } from "../src/types.ts";
 
 export const ScopeEntrySchema = Type.Object({
 	kind: Type.String({ enum: ["file", "tree"], description: "Use 'file' for one file or 'tree' for a directory tree." }),
@@ -237,10 +234,10 @@ export const GraphSpecV3Schema = Type.Object({
 	description: "GraphSpec v3: governance-free DAG executed by the V3 kernel. Strict validation happens in the compiler; this schema only routes.",
 });
 
-const Parameters = Type.Object({
-	action: Type.Optional(Type.String({ enum: ["start", "status", "list", "stop", "resume", "doctor", "recommend"], description: "Operation. Omit for start." })),
+export const Parameters = Type.Object({
+	action: Type.Optional(Type.String({ enum: ["start", "status", "list", "stop", "resume", "doctor"], description: "Operation. Omit for start." })),
 	id: Type.Optional(Type.String({ description: "Graph id for status, stop, or resume." })),
-	spec: Type.Optional(Type.Union([GraphSpecSchema, GraphSpecV3Schema])),
+	spec: Type.Optional(GraphSpecV3Schema),
 }, { additionalProperties: false });
 
 function result(text: string, details?: unknown, isError = false) {
@@ -258,15 +255,6 @@ function commandSessionId(ctx: { sessionManager?: { getSessionId: () => string }
 		return trustedSessionId(ctx as { sessionManager: { getSessionId: () => string } });
 	} catch {
 		return "graph-command";
-	}
-}
-
-function resetPlanningSession(ctx: { sessionManager: { getSessionId: () => string } }): void {
-	try {
-		planningGate.resetSession(trustedSessionId(ctx));
-	} catch {
-		// A planning receipt is optional during lifecycle cleanup. Manager startup,
-		// suspension, and recovery must not depend on this convenience cleanup.
 	}
 }
 
@@ -289,7 +277,6 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		startExecutions.clear();
-		resetPlanningSession(ctx);
 		supervisorEpochV3 = `v3-${Date.now()}`;
 		await manager.initialize(ctx);
 		// Recover any V3 runs left mid-flight by a crashed/previous supervisor.
@@ -303,24 +290,19 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		startExecutions.clear();
-		resetPlanningSession(ctx);
 		await manager.suspendAll();
 		v3Host?.suspendAll();
 	});
 	pi.registerCommand("graphs", {
 		description: "Inspect, maintain, restore, or remove pi-graph runs",
 		getArgumentCompletions: (prefix) => {
-			const commands = ["doctor", "recommend", "list", "storage", "maintain", "pin", "unpin", "archive", "unarchive", "acknowledge", "compact", "delete", "trash", "restore", "purge", "discard-trash", "discard-staging", "discard-control"];
+			const commands = ["doctor", "list", "storage", "maintain", "pin", "unpin", "archive", "unarchive", "acknowledge", "compact", "delete", "trash", "restore", "purge", "discard-trash", "discard-staging", "discard-control"];
 			const matches = commands.filter((command) => command.startsWith(prefix.trim()));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
 			handler: async (args, ctx) => {
 				const [command = "doctor", ...argumentParts] = args.trim().split(/\s+/);
 				const id = argumentParts.join(" ") || undefined;
-			if (command === "recommend") {
-				ctx.ui.notify(formatRecommendReport(await recommendGraphConfig({ rpc })), "info");
-				return;
-			}
 			const config = await loadGraphConfig();
 			const host = ensureV3Host(config, commandSessionId(ctx));
 			if (command === "doctor") {
@@ -365,7 +347,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (!id) {
-				ctx.ui.notify(`Usage: /graphs recommend or /graphs ${command} <graph-or-trash-id>`, "warning");
+				ctx.ui.notify(`Usage: /graphs ${command} <graph-or-trash-id>`, "warning");
 				return;
 			}
 			if (["pin", "unpin", "archive", "unarchive"].includes(command)) {
@@ -421,7 +403,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Discarded ${await discardControlQuarantine(config.runsDir, id)}.`, "warning");
 					return;
 				}
-				ctx.ui.notify("Usage: /graphs doctor|recommend|list|storage|maintain|pin|unpin|archive|unarchive|acknowledge|compact|delete|trash|restore|purge|discard-trash|discard-staging|discard-control", "warning");
+				ctx.ui.notify("Usage: /graphs doctor|list|storage|maintain|pin|unpin|archive|unarchive|acknowledge|compact|delete|trash|restore|purge|discard-trash|discard-staging|discard-control", "warning");
 		},
 	});
 	pi.registerTool({
@@ -436,42 +418,19 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				if (action === "start") {
 					if (!params.spec) return result("graph start requires spec.", undefined, true);
 					const spec = params.spec;
+					if (!v3IsGraphSpecV3(spec)) return result("Graph start now requires GraphSpec v3 (schemaVersion: 3). Legacy GraphSpec v1 starts are retired with the planning gate.", undefined, true);
 					const sessionId = trustedSessionId(ctx);
-					if (v3IsGraphSpecV3(spec)) {
-						const signature = JSON.stringify({ sessionId, cwd: ctx.cwd, v3: spec });
-						const existing = startExecutions.get(toolCallId);
-						if (existing) {
-							if (existing.signature !== signature) return result("A graph start toolCallId cannot be reused with a different GraphSpec.", undefined, true);
-							return existing.promise;
-						}
-						const promise = (async () => {
-							const config = await loadGraphConfig();
-							const host = ensureV3Host(config, sessionId);
-							const started = await host.start(spec as GraphSpecV3, ctx.cwd);
-							return result(`Graph accepted for asynchronous V3 execution.\n${await graphStatusTextV3(started.snapshot, config.runsDir)}`, started.snapshot);
-						})();
-						startExecutions.set(toolCallId, { signature, promise });
-						return promise;
-					}
-					const legacySpec = spec as GraphSpec;
-					const signature = JSON.stringify({ sessionId, cwd: ctx.cwd, spec: canonicalGraphSpec(legacySpec) });
+					const signature = JSON.stringify({ sessionId, cwd: ctx.cwd, v3: spec });
 					const existing = startExecutions.get(toolCallId);
 					if (existing) {
 						if (existing.signature !== signature) return result("A graph start toolCallId cannot be reused with a different GraphSpec.", undefined, true);
 						return existing.promise;
 					}
 					const promise = (async () => {
-						const configDigest = await planningGate.currentConfigDigest();
-						const reservedReceipt = planningGate.reserveStart({ sessionId, cwd: ctx.cwd, configDigest, spec: legacySpec, toolCallId });
-						try {
-							const snapshot = await manager.start(legacySpec, reservedReceipt);
-							const receipt = planningGate.commitStart({ sessionId, cwd: ctx.cwd, toolCallId, runId: snapshot.graphId });
-							const config = await loadGraphConfig();
-							return result(`Graph accepted for asynchronous execution.\n${graphSummary(snapshot, config.runsDir)}`, { ...snapshot, planningReceipt: receipt });
-						} catch (error) {
-							planningGate.releaseStart({ sessionId, cwd: ctx.cwd, toolCallId });
-							throw error;
-						}
+						const config = await loadGraphConfig();
+						const host = ensureV3Host(config, sessionId);
+						const started = await host.start(spec as GraphSpecV3, ctx.cwd);
+						return result(`Graph accepted for asynchronous V3 execution.\n${await graphStatusTextV3(started.snapshot, config.runsDir)}`, started.snapshot);
 					})();
 					startExecutions.set(toolCallId, { signature, promise });
 					return promise;
@@ -496,10 +455,6 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					const v3Lines = v3Doctor.issues.map((issue) => `Graph: ${issue.runId ?? "<unknown>"}\nV3 ${issue.kind}: ${issue.detail}`);
 					const text = `${formatDoctorReport(report)}${v3Lines.length ? `\n\nV3 issues:\n${v3Lines.join("\n")}` : ""}`;
 					return result(text, { legacy: report, v3: v3Doctor }, report.protected > 0 || v3Doctor.issues.length > 0);
-				}
-				if (action === "recommend") {
-					const report = await recommendGraphConfig({ rpc });
-					return result(formatRecommendReport(report), report);
 				}
 				if (!params.id) return result(`graph ${action} requires id.`, undefined, true);
 				const config = await loadGraphConfig();

@@ -27,8 +27,7 @@
   "pi": {
     "extensions": [
       "./extensions/pi-graph.ts",
-      "./extensions/pi-graph-guard.ts",
-      "./extensions/subagent-model-router.ts"
+      "./extensions/pi-graph-guard.ts"
     ]
   },
   "dependencies": {

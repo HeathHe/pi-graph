@@ -896,12 +896,11 @@ test("visual evidence prompt resumes capability routing instead of ordering the 
 	assert.doesNotMatch(prompt, /Answer the original request from this evidence/);
 });
 
-test("the model router is autoloaded after the real E2E recovery gate is cleared", async () => {
+test("D2: only the retained pi extensions are autoloaded", async () => {
 	const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { pi?: { extensions?: string[] } };
 	assert.deepEqual(packageJson.pi?.extensions, [
 		"./extensions/pi-graph.ts",
 		"./extensions/pi-graph-guard.ts",
-		"./extensions/subagent-model-router.ts",
 	]);
-	assert.equal(packageJson.pi?.extensions?.includes("./extensions/subagent-model-router.ts"), true);
+	assert.equal(packageJson.pi?.extensions?.includes("./extensions/subagent-model-router.ts"), false);
 });

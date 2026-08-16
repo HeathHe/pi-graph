@@ -6,6 +6,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
 
+test("D3: graph tool exposes only the retained governance-free action set", () => {
+	const jiti = createJiti(import.meta.url);
+	const { GraphSpecV3Schema, Parameters } = jiti(new URL("../extensions/pi-graph.ts", import.meta.url).href) as {
+		GraphSpecV3Schema: unknown;
+		Parameters: { properties: { action?: { enum?: string[] }; spec?: unknown } };
+	};
+	const actions = Parameters.properties.action?.enum;
+	assert.deepEqual(actions, ["start", "status", "list", "stop", "resume", "doctor"]);
+	assert.equal(actions?.includes("recommend"), false);
+	assert.ok(GraphSpecV3Schema, "the tool must expose the GraphSpec v3 schema");
+});
+
 test("graph tool schema exposes strict nested GraphSpec fields and read-only guidance", () => {
 	const jiti = createJiti(import.meta.url);
 	const { GraphSpecSchema } = jiti(new URL("../extensions/pi-graph.ts", import.meta.url).href) as { GraphSpecSchema: unknown };
