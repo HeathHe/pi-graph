@@ -6,9 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { compileGraph } from "../src/compile.ts";
 import { assertRedispatchAllowed, assertRoutingReevaluationPreDispatch, GraphManager, legacySessionIdentity, loadValidatedGraph, sessionIdentity, waitingInputResumeAction } from "../src/manager.ts";
-import { evaluateRoutingPolicy } from "../src/model-routing/evaluate-routing-policy.ts";
-import type { ModelRoutingConfig, RoutingDecision } from "../src/model-routing/types.ts";
-import { graphRoutingTaskBinding } from "../src/model-routing-adapter.ts";
+import type { RoutingDecision } from "../src/types.ts";
 import { LeaseRegistry } from "../src/leases.ts";
 import { subagentAsyncRoot, type EventBus } from "../src/rpc.ts";
 import { GraphRunner, initialSnapshot } from "../src/runner.ts";
@@ -398,20 +396,19 @@ test("manual resume re-evaluates a childless L3 route as a new attempt and new s
 			{ model: "ark/glm-pro", family: "glm", provider: "ark", providerDomain: "volcengine", thinkingLevels: ["high" as const] },
 		],
 	};
-	const oldRoutingConfig: ModelRoutingConfig = {
-		registry: routingRegistry,
-		policy: { schemaVersion: 1, enforcement: "require", profiles: { route: { candidates: [{ model: "openai/gpt-pro", thinking: "high", level: "L2" }] } } },
-		configDigest: "1".repeat(64),
-	};
 	const graph = compileGraph({ schemaVersion: 1, graphId: "l3-manual-resume", goal: "resume routing", workspace: "shadow", nodes: [
 		{ taskId: "node", agent: "worker", task: "work", routingProfile: "route", taskRisk: "high", outputArtifact: "node.md", sideEffect: "none", retryPolicy: { maxAttempts: 2 } },
 	] } as GraphSpec, cwd);
-	const decision = evaluateRoutingPolicy(oldRoutingConfig, {
-		taskBinding: graphRoutingTaskBinding({ graphId: graph.graphId, taskId: "node", task: "work" }),
-		routingProfile: "route",
-		taskRisk: "high",
-	});
-	assert.equal(decision.fallbackLevel, "L3");
+	// D1: the core treats a legacy sealed routing decision as opaque; build the fixture locally so
+	// this core test does not import the archived governance modules (R1: removable import stays mainline).
+	const decision: RoutingDecision = {
+		decisionId: randomUUID(),
+		createdAt: new Date().toISOString(),
+		sealedAt: new Date().toISOString(),
+		reason: "frozen legacy L3 fixture",
+		fallbackLevel: "L3",
+		configDigest: "1".repeat(64),
+	};
 	const snapshot = initialSnapshot(graph, cwd, "session-id");
 	const store = new GraphStore(runs, graph.graphId);
 	const attemptRoot = store.path("nodes", "node", "attempt-1");
@@ -559,25 +556,18 @@ test("manual resume re-evaluates a childless preflight drift without reusing its
 			{ model: "ark/glm-pro", family: "glm", provider: "ark", providerDomain: "volcengine", thinkingLevels: ["high" as const] },
 		],
 	};
-	const oldRoutingConfig: ModelRoutingConfig = {
-		registry: routingRegistry,
-		policy: { schemaVersion: 1, enforcement: "require", profiles: { route: { candidates: [
-			{ model: "openai/gpt-pro", thinking: "high", level: "L0" },
-			{ model: "ark/glm-pro", thinking: "high", level: "L1" },
-		] } } },
-		configDigest: "1".repeat(64),
-	};
 	const graph = compileGraph({ schemaVersion: 1, graphId: "routing-drift-resume", goal: "resume routing drift", workspace: "shadow", nodes: [
 		{ taskId: "node", agent: "worker", task: "work", routingProfile: "route", taskRisk: "high", outputArtifact: "node.md", sideEffect: "none", retryPolicy: { maxAttempts: 2 } },
 	] } as GraphSpec, cwd);
-	const decision = evaluateRoutingPolicy(oldRoutingConfig, {
-		taskBinding: graphRoutingTaskBinding({ graphId: graph.graphId, taskId: "node", task: "work" }),
-		routingProfile: "route",
-		taskRisk: "high",
-		availableModels: [{ provider: "openai", id: "gpt-pro", reasoning: true }],
-		requireAvailableModels: true,
-	});
-	assert.equal(decision.fallbackLevel, "L0");
+	// D1: opaque legacy routing fixture; core only checks presence + digest stability (see test above).
+	const decision: RoutingDecision = {
+		decisionId: randomUUID(),
+		createdAt: new Date().toISOString(),
+		sealedAt: new Date().toISOString(),
+		reason: "frozen preflight-drift fixture",
+		fallbackLevel: "L0",
+		configDigest: "1".repeat(64),
+	};
 	const snapshot = initialSnapshot(graph, cwd, "session-id");
 	const store = new GraphStore(runs, graph.graphId);
 	const attemptRoot = store.path("nodes", "node", "attempt-1");
@@ -633,19 +623,18 @@ test("manual L3 resume stops at the routing re-evaluation budget", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-manager-l3-budget-"));
 	const runs = join(cwd, "runs");
 	const graphConfig: GraphConfig = { enabled: true, runsDir: runs, maxConcurrency: 1, readOnlyBurst: 1, maxSpawnBudget: 4, rpcTimeoutMs: 100, validationTimeoutMs: 100, notifyOnComplete: false, runtimeV2Dispatch: false };
-	const routingConfig: ModelRoutingConfig = {
-		registry: { schemaVersion: 1, models: [{ model: "openai/gpt-pro", family: "gpt", provider: "openai", providerDomain: "openai" }] },
-		policy: { schemaVersion: 1, enforcement: "require", profiles: { route: { candidates: [{ model: "openai/gpt-pro", level: "L2" }] } } },
-		configDigest: "2".repeat(64),
-	};
 	const graph = compileGraph({ schemaVersion: 1, graphId: "l3-budget", goal: "budget", nodes: [
 		{ taskId: "node", agent: "worker", task: "work", routingProfile: "route", taskRisk: "high", outputArtifact: "node.md", sideEffect: "none", retryPolicy: { maxAttempts: 2 } },
 	] } as GraphSpec, cwd);
-	const decision = evaluateRoutingPolicy(routingConfig, {
-		taskBinding: graphRoutingTaskBinding({ graphId: graph.graphId, taskId: "node", task: "work" }),
-		routingProfile: "route",
-		taskRisk: "high",
-	});
+	// D1: opaque legacy routing fixture (see test above).
+	const decision: RoutingDecision = {
+		decisionId: randomUUID(),
+		createdAt: new Date().toISOString(),
+		sealedAt: new Date().toISOString(),
+		reason: "frozen L3-budget fixture",
+		fallbackLevel: "L2",
+		configDigest: "2".repeat(64),
+	};
 	const snapshot = initialSnapshot(graph, cwd, "session-id");
 	const store = new GraphStore(runs, graph.graphId);
 	snapshot.status = "needs_attention";

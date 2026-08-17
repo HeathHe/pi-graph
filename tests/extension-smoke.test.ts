@@ -6,6 +6,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
 
+test("D2: only the retained pi extensions are autoloaded", async () => {
+	const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { pi?: { extensions?: string[] } };
+	assert.deepEqual(packageJson.pi?.extensions, [
+		"./extensions/pi-graph.ts",
+		"./extensions/pi-graph-guard.ts",
+	]);
+	assert.equal(packageJson.pi?.extensions?.includes("./extensions/subagent-model-router.ts"), false);
+});
+
 test("D3: graph tool exposes only the retained governance-free action set", () => {
 	const jiti = createJiti(import.meta.url);
 	const { GraphSpecV3Schema, Parameters } = jiti(new URL("../extensions/pi-graph.ts", import.meta.url).href) as {
