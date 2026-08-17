@@ -20,7 +20,6 @@
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types tests/run-isolated.ts suite",
     "test:soak": "node --experimental-strip-types tests/run-isolated.ts soak",
-    "routing:shadow-report": "node --experimental-strip-types scripts/routing-shadow-report.ts",
     "test:latest-integration": "node --experimental-strip-types tests/pi-subagents-latest-integration.ts",
     "pack:check": "npm pack --dry-run"
   },

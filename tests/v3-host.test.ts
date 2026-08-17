@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -286,4 +286,98 @@ test("V3 host list, status, and doctor classify runs by on-site format", async (
 	assert.deepEqual(doctor.issues.filter((issue) => issue.kind === "invalid-run"), []);
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
+});
+
+test("E2E-3: a zero-config clean install has no governance files and E2E-1 passes from the packed layout", async () => {
+	// Pack the package exactly as it ships (npm pack = the install artifact).
+	const sandbox = await realpath(await mkdtemp(join(tmpdir(), "pi-graph-e2e3-")));
+	const packDir = join(sandbox, "pack");
+	const unpackDir = join(sandbox, "unpack");
+	await mkdir(packDir, { recursive: true });
+	await mkdir(unpackDir, { recursive: true });
+	const repoRoot = resolve(new URL("..", import.meta.url).pathname);
+	const pack = spawnSync("npm", ["pack", "--json", "--pack-destination", packDir], { cwd: repoRoot, encoding: "utf8" });
+	assert.equal(pack.status, 0, pack.stderr || pack.stdout);
+	const packed = (JSON.parse(pack.stdout) as Array<{ filename: string; files?: Array<{ path: string }> }>)[0]!;
+	const tarball = join(packDir, packed.filename);
+	const extract = spawnSync("tar", ["-xzf", tarball, "-C", unpackDir], { encoding: "utf8" });
+	assert.equal(extract.status, 0, extract.stderr || extract.stdout);
+	const pkgRoot = join(unpackDir, "package");
+
+	// Governance config files and governance modules must not exist anywhere in the install.
+	async function collectFiles(dir: string): Promise<string[]> {
+		const out: string[] = [];
+		for (const entry of await readdir(dir, { withFileTypes: true })) {
+			const p = join(dir, entry.name);
+			if (entry.isDirectory()) out.push(...await collectFiles(p));
+			else out.push(p);
+		}
+		return out;
+	}
+	const installedFiles = (await collectFiles(pkgRoot)).map((p) => p.slice(pkgRoot.length + 1));
+	const governanceNames = ["model-registry.json", "routing-policy.json", "planning.json"];
+	const governanceHits = installedFiles.filter((p) =>
+		governanceNames.some((name) => p.endsWith(name))
+		|| /^(?:src\/)?(?:model-routing|subagent-router)\//u.test(p)
+		|| p.endsWith("model-routing-adapter.ts") || p.endsWith("recommend.ts")
+		|| p.endsWith("subagent-model-router.ts") || p.endsWith("routing-shadow-report.ts")
+		|| p.endsWith("shadow-report.ts"),
+	);
+	assert.deepEqual(governanceHits, [], `zero-config install must contain no governance artifacts: ${governanceHits.join(", ")}`);
+
+	// Extension load manifest == retained set.
+	const installedPackageJson = JSON.parse(await readFile(join(pkgRoot, "package.json"), "utf8")) as { pi?: { extensions?: string[] } };
+	assert.deepEqual(installedPackageJson.pi?.extensions, ["./extensions/pi-graph.ts", "./extensions/pi-graph-guard.ts"]);
+
+	// Provide the single runtime dependency exactly like `npm install` would, then run E2E-1
+	// against the installed layout (clean fixture, zero governance config) and confirm it passes.
+	await mkdir(join(pkgRoot, "node_modules"), { recursive: true });
+	await symlink(join(repoRoot, "node_modules", "jiti"), join(pkgRoot, "node_modules", "jiti"), "dir");
+	const { V3GraphHost: InstalledV3GraphHost } = await import(join(pkgRoot, "src/v3/host.ts")) as typeof import("../src/v3/host.ts");
+	const { readLatestV3Attempt: installedReadAttempt } = await import(join(pkgRoot, "src/v3/attempt.ts")) as typeof import("../src/v3/attempt.ts");
+	const { validateGraphSnapshotV3: installedValidateSnapshot } = await import(join(pkgRoot, "src/v3/snapshot.ts")) as typeof import("../src/v3/snapshot.ts");
+	const { validateAuthorizationV4: installedValidateAuth } = await import(join(pkgRoot, "src/v3/authorization.ts")) as typeof import("../src/v3/authorization.ts");
+
+	const fixtureDir = join(sandbox, "fixture");
+	const sourceDir = join(fixtureDir, "source");
+	const runsDir = join(fixtureDir, "runs");
+	await mkdir(sourceDir, { recursive: true });
+	await mkdir(runsDir, { recursive: true });
+	await writeFile(join(sourceDir, "input.txt"), "seed\n", "utf8");
+	const mock = new MockSubagents();
+	mock.behaviors.set("NODE_A", (input) => completeChild({ ...input, writes: [{ path: "out-a.txt", content: "a\n" }] }));
+	mock.behaviors.set("NODE_B", (input) => completeChild({ ...input, writes: [{ path: "out-b.txt", content: "b\n" }] }));
+	mock.behaviors.set("NODE_C", (input) => completeChild({ ...input, output: "c-output" }));
+	mock.start();
+	const installedHost = new InstalledV3GraphHost({ rpc: new SubagentRpcClient(mock), runsDir, sessionId: "session-e2e3", supervisorEpoch: "epoch-e2e3", preflightAgent: async () => undefined });
+	const installedResult = await installedHost.start({
+		schemaVersion: 3,
+		goal: "write a and b then c",
+		nodes: [
+			{ taskId: "node-a", agent: "test-agent", task: "NODE_A write out-a.txt", sideEffect: "local_write", writeScope: [{ kind: "file", path: "out-a.txt" }], validationCommands: ["test -f out-a.txt"] },
+			{ taskId: "node-b", agent: "test-agent", task: "NODE_B write out-b.txt", sideEffect: "local_write", writeScope: [{ kind: "file", path: "out-b.txt" }], validationCommands: ["test -f out-b.txt"] },
+			{ taskId: "node-c", agent: "test-agent", task: "NODE_C depends on both", dependsOn: ["node-a", "node-b"], sideEffect: "local_read", readScope: [{ kind: "file", path: "input.txt" }] },
+		],
+	}, sourceDir);
+	const installedSnapshot = await installedHost.waitForCompletion(installedResult.graphId);
+	assert.equal(installedSnapshot.status, "complete");
+	assert.equal(await readFile(join(sourceDir, "out-a.txt"), "utf8"), "a\n");
+	assert.equal(await readFile(join(sourceDir, "out-b.txt"), "utf8"), "b\n");
+	const installedC = (await installedReadAttempt(installedResult.runDir, "node-c"))!.evidence;
+	const installedA = (await installedReadAttempt(installedResult.runDir, "node-a"))!.evidence;
+	const installedB = (await installedReadAttempt(installedResult.runDir, "node-b"))!.evidence;
+	assert.equal(installedA.phase, "accepted");
+	assert.equal(installedB.phase, "accepted");
+	assert.equal(installedC.phase, "accepted");
+	assert.ok(Date.parse(installedC.dispatch!.dispatchedAt) >= Date.parse(installedA.child!.completedAt));
+	assert.ok(Date.parse(installedC.dispatch!.dispatchedAt) >= Date.parse(installedB.child!.completedAt));
+	const persistedSnapshot = installedValidateSnapshot(JSON.parse(await readFile(join(installedResult.runDir, "snapshot.json"), "utf8")));
+	const persistedAuthorization = installedValidateAuth(JSON.parse(await readFile(join(installedResult.runDir, "authorization.json"), "utf8")));
+	assert.equal(persistedSnapshot.status, "complete");
+	assert.equal(persistedSnapshot.graphDigest, persistedAuthorization.graphDigest);
+	for (const name of governanceNames) {
+		await assert.rejects(readFile(join(fixtureDir, name)), { code: "ENOENT" }, `governance file must not exist in the E2E-3 fixture: ${name}`);
+	}
+	await mock.dispose();
+	await rm(sandbox, { recursive: true, force: true });
 });
