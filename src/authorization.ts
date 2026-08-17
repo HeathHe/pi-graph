@@ -1,9 +1,47 @@
 import { createHash } from "node:crypto";
 import type { CompiledGraph, GraphSnapshot, ValidationResult } from "./types.ts";
-import type { RoutingDecision } from "./model-routing/types.ts";
-import { canonicalJson, PLANNING_ASSESSOR_MODEL, type PlanningReceipt } from "./subagent-router/planning-gate.ts";
 
 export const ROUTING_DRIFT_RESUME_TERMINAL_ERROR = "The routing decision was explicitly resumed for a fresh capability-bound policy evaluation.";
+
+/**
+ * Frozen legacy planning-receipt shape (contract §9 legacy-compat).
+ *
+ * The V3 mainline no longer validates planning admission: it never issues,
+ * verifies or writes a new PlanningReceipt, and the hardcoded assessor/planner
+ * model table that admission used is archived with the governance modules.
+ * Core only parses the historical bytes it may encounter in a legacy
+ * authorization.json, so the type is intentionally opaque and the only checks
+ * performed are the generic structural / digest / binding / identity ones in
+ * `validateLegacyAuthorizationEnvelope`. Nothing on the V3 mainline acts on
+ * the contents of this record.
+ */
+export interface LegacyPlanningReceipt {
+	schemaVersion: 2;
+	receiptId: string;
+	parentModel: unknown;
+	planner: unknown;
+	reviewer: unknown;
+	promptDigest: string;
+	lockedContextDigest: string;
+	configDigest: string;
+	flashAssessmentDigest: string;
+	parentDraftDigest: string;
+	plannerOutputDigest: string;
+	finalGraphSpecDigest: string;
+	lineageDigest: string;
+	effectiveTier: string;
+	effectiveRiskClass: string;
+	flashProposedTier: string;
+	flashProposedRisk: string;
+	preHardFloor: string;
+	postHardFloor: string;
+	preRiskFloor: string;
+	postRiskFloor: string;
+	planningProfile: string;
+	consumedByRunId: string;
+	cwd: string;
+	sessionId?: string;
+}
 
 export interface AuthorizationRecord {
 	schemaVersion: 2 | 3;
@@ -17,7 +55,7 @@ export interface AuthorizationRecord {
 	sessionId?: string;
 	supervisorEpoch: string;
 	createdAt: string;
-	planningReceipt?: PlanningReceipt;
+	planningReceipt?: LegacyPlanningReceipt;
 	planningReceiptDigest?: string;
 	planningBindingDigest?: string;
 	planningAdmissionId?: string;
@@ -33,7 +71,7 @@ export interface AttemptRecord {
 	phase: "prepared" | "dispatching" | "running" | "collecting" | "validated" | "applying" | "accepted" | "terminal";
 	supervisorEpoch: string;
 	fencingGeneration: number;
-	routingDecision?: RoutingDecision;
+	routingDecision?: unknown;
 	requestDigest?: string;
 	launchContractDigest?: string;
 	extensionContentDigest?: string;
@@ -111,7 +149,40 @@ export function canonicalDigest(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-export function validateAuthorizedPlanningReceipt(record: Pick<AuthorizationRecord, "schemaVersion" | "runInstanceId" | "graphId" | "graphDigest" | "sourceCwd" | "sourceGraphSpecDigest" | "sessionId" | "planningReceipt" | "planningReceiptDigest" | "planningBindingDigest" | "planningAdmissionId">): void {
+/** Canonical JSON: object keys sorted recursively. Frozen legacy parser helper (§9 legacy-compat). */
+export function canonicalJson(value: unknown): string {
+	return JSON.stringify(canonicalValue(value));
+}
+
+/** Frozen legacy graphSpec digest: sha256 of the canonical-JSON serialization (§9 legacy-compat). */
+export function graphSpecDigest(spec: unknown): string {
+	return createHash("sha256").update(canonicalJson(spec)).digest("hex");
+}
+
+function canonicalValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalValue);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, child]) => [key, canonicalValue(child)]));
+}
+
+function isHexDigest(value: unknown): value is string {
+	return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+/**
+ * Frozen legacy authorization envelope check (contract §9 legacy-compat).
+ *
+ * Validates only the generic structural / digest / binding / identity
+ * consistency of a persisted legacy authorization.json so a read-only legacy
+ * run is never presented with a self-inconsistent envelope. It deliberately
+ * does NOT re-validate planning admission: the hardcoded assessor/planner
+ * model table and the independent-reviewer model assertions moved to the
+ * governance archive. Legacy runs are frozen — nothing on the V3 mainline
+ * re-admits or re-routes them.
+ */
+export function validateLegacyAuthorizationEnvelope(record: Pick<AuthorizationRecord, "schemaVersion" | "runInstanceId" | "graphId" | "graphDigest" | "sourceCwd" | "sourceGraphSpecDigest" | "sessionId" | "planningReceipt" | "planningReceiptDigest" | "planningBindingDigest" | "planningAdmissionId">): void {
 	const receipt = record.planningReceipt;
 	if (record.schemaVersion === 2) {
 		if (receipt || record.planningReceiptDigest || record.planningBindingDigest || record.planningAdmissionId) throw new Error("Legacy planning authorization v2 must not contain partial or downgraded planning admission fields.");
@@ -120,27 +191,12 @@ export function validateAuthorizedPlanningReceipt(record: Pick<AuthorizationReco
 	if (!receipt || !record.planningReceiptDigest || !record.planningBindingDigest || !record.sourceGraphSpecDigest || !record.planningAdmissionId) throw new Error("Planning authorization v3 is missing its mandatory durable receipt binding.");
 	if (!receipt || receipt.schemaVersion !== 2 || record.planningReceiptDigest !== canonicalDigest(receipt)) throw new Error("Invalid durable planning receipt digest.");
 	if (record.planningAdmissionId !== receipt.receiptId) throw new Error("Durable planning admission identity does not match its receipt.");
-	if (receipt.parentModel.resolvedModel !== PLANNING_ASSESSOR_MODEL || receipt.parentModel.modelFamily !== "deepseek" || receipt.parentModel.providerDomain !== "deepseek" || !["runtime_reported", "verified"].includes(receipt.parentModel.identityConfidence)) {
-		throw new Error(`Durable planning receipt does not attest the required assessor '${PLANNING_ASSESSOR_MODEL}'.`);
-	}
-	const requiredPlanner = receipt.effectiveRiskClass === "R3"
-		? { resolvedModel: "wisdomrouter/gpt-5.6-sol:xhigh", modelFamily: "gpt", providerDomain: "wisdomrouter" }
-		: receipt.effectiveTier === "tactical"
-			? { resolvedModel: "kimi-coding/k3:high", modelFamily: "kimi", providerDomain: "moonshot" }
-			: { resolvedModel: "wisdomrouter/gpt-5.6-sol:high", modelFamily: "gpt", providerDomain: "wisdomrouter" };
-	if (receipt.planner.resolvedModel !== requiredPlanner.resolvedModel || receipt.planner.modelFamily !== requiredPlanner.modelFamily || receipt.planner.providerDomain !== requiredPlanner.providerDomain) {
-		throw new Error(`Durable planning receipt planner does not match the mandatory ${receipt.effectiveTier}/${receipt.effectiveRiskClass} model '${requiredPlanner.resolvedModel}'.`);
-	}
-	for (const [label, evidence] of [["planner", receipt.planner], ["reviewer", receipt.reviewer]] as const) {
-		if (!Array.isArray(evidence.attemptedModels) || evidence.attemptedModels.length === 0 || evidence.attemptedModels.some((model) => model !== evidence.resolvedModel)) {
-			throw new Error(`Durable planning receipt ${label} attempted-model provenance is missing or contains a different model.`);
-		}
-	}
-	if (receipt.consumedByRunId !== record.graphId || receipt.cwd !== record.sourceCwd || (record.sessionId && receipt.sessionId !== record.sessionId)) throw new Error("Durable planning receipt identity does not match the Graph authorization.");
 	for (const digest of [receipt.promptDigest, receipt.lockedContextDigest, receipt.configDigest, receipt.flashAssessmentDigest, receipt.parentDraftDigest, receipt.plannerOutputDigest, receipt.finalGraphSpecDigest, receipt.lineageDigest]) {
-		if (!/^[a-f0-9]{64}$/u.test(digest)) throw new Error("Durable planning receipt contains an invalid digest.");
+		if (!isHexDigest(digest)) throw new Error("Durable planning receipt contains an invalid digest.");
 	}
 	if (record.sourceGraphSpecDigest !== receipt.finalGraphSpecDigest) throw new Error("Durable planning receipt is not bound to the admitted source GraphSpec.");
+	const parentModel = (receipt.parentModel ?? {}) as Record<string, unknown>;
+	const planner = (receipt.planner ?? {}) as Record<string, unknown>;
 	const expectedLineage = createHash("sha256").update(canonicalJson({
 		configDigest: receipt.configDigest,
 		effectiveRiskClass: receipt.effectiveRiskClass,
@@ -150,17 +206,17 @@ export function validateAuthorizedPlanningReceipt(record: Pick<AuthorizationReco
 		lockedContextDigest: receipt.lockedContextDigest,
 		parentDraftDigest: receipt.parentDraftDigest,
 		parentModel: {
-			identityConfidence: receipt.parentModel.identityConfidence,
-			modelFamily: receipt.parentModel.modelFamily,
-			providerDomain: receipt.parentModel.providerDomain,
-			resolvedModel: receipt.parentModel.resolvedModel,
+			identityConfidence: parentModel.identityConfidence,
+			modelFamily: parentModel.modelFamily,
+			providerDomain: parentModel.providerDomain,
+			resolvedModel: parentModel.resolvedModel,
 		},
 		planner: {
-			decisionId: receipt.planner.decisionId,
-			attemptedModels: receipt.planner.attemptedModels,
-			modelFamily: receipt.planner.modelFamily,
-			providerDomain: receipt.planner.providerDomain,
-			resolvedModel: receipt.planner.resolvedModel,
+			decisionId: planner.decisionId,
+			attemptedModels: planner.attemptedModels,
+			modelFamily: planner.modelFamily,
+			providerDomain: planner.providerDomain,
+			resolvedModel: planner.resolvedModel,
 		},
 		plannerOutputDigest: receipt.plannerOutputDigest,
 		planningProfile: receipt.planningProfile,
@@ -171,7 +227,6 @@ export function validateAuthorizedPlanningReceipt(record: Pick<AuthorizationReco
 		promptDigest: receipt.promptDigest,
 	})).digest("hex");
 	if (receipt.lineageDigest !== expectedLineage) throw new Error("Durable planning receipt lineage is invalid.");
-	if (receipt.planner.modelFamily === receipt.reviewer.modelFamily || receipt.planner.providerDomain === receipt.reviewer.providerDomain) throw new Error("Durable planning receipt does not contain an independent reviewer.");
 	const tier = ["direct", "tactical", "strategic"];
 	const risk = ["R0", "R1", "R2", "R3"];
 	if (tier.indexOf(receipt.effectiveTier) < Math.max(tier.indexOf(receipt.flashProposedTier), tier.indexOf(receipt.preHardFloor), tier.indexOf(receipt.postHardFloor))
@@ -180,7 +235,7 @@ export function validateAuthorizedPlanningReceipt(record: Pick<AuthorizationReco
 	if (record.planningBindingDigest !== expectedBinding) throw new Error("Durable planning receipt binding is invalid.");
 }
 
-export function authorizationFor(graph: CompiledGraph, snapshot: GraphSnapshot, planningReceipt?: PlanningReceipt, sourceGraphSpecDigest?: string): AuthorizationRecord {
+export function authorizationFor(graph: CompiledGraph, snapshot: GraphSnapshot, planningReceipt?: LegacyPlanningReceipt, sourceGraphSpecDigest?: string): AuthorizationRecord {
 	if (snapshot.schemaVersion !== 2) throw new Error("Authority records require a Graph Runtime v2 snapshot.");
 	const boundReceipt = planningReceipt ? { ...planningReceipt, consumedByRunId: graph.graphId } : undefined;
 	if (boundReceipt && (!sourceGraphSpecDigest || sourceGraphSpecDigest !== boundReceipt.finalGraphSpecDigest)) throw new Error("Planning receipt does not authorize the exact source GraphSpec.");
@@ -201,6 +256,6 @@ export function authorizationFor(graph: CompiledGraph, snapshot: GraphSnapshot, 
 		...(boundReceipt ? { planningReceipt: boundReceipt, planningReceiptDigest, planningBindingDigest: canonicalDigest({ graphDigest, planningReceiptDigest, runInstanceId: snapshot.runInstanceId, sourceGraphSpecDigest }) } : {}),
 		...(boundReceipt ? { planningAdmissionId: boundReceipt.receiptId } : {}),
 	};
-	validateAuthorizedPlanningReceipt(record);
+	validateLegacyAuthorizationEnvelope(record);
 	return record;
 }

@@ -6,8 +6,7 @@ import { assertGraphScopesOutsideProtectedRoots, validateGraphId } from "./compi
 import { compareClaims, contentionWindow, createClaim, liveClaims, markClaimHeld, releaseClaim, withExclusiveKeyedClaim, type CreatedClaim } from "./claims.ts";
 import { appendDurable, atomicWriteJson, createDurableFile, createDurableJson, syncDirectory } from "./durable.ts";
 import { encodeSnapshot, isTerminalGraphStatus, validateAndDecodeSnapshot } from "./snapshot.ts";
-import { authorizationFor, canonicalDigest, validateAuthorizedPlanningReceipt, type AcceptanceRecord, type AttemptRecord, type AttemptRecoveryRecord, type AuthorizationRecord, type ValidatedResultRecord, type WorkspaceRecord } from "./authority.ts";
-import type { PlanningReceipt } from "./subagent-router/planning-gate.ts";
+import { authorizationFor, canonicalDigest, validateLegacyAuthorizationEnvelope, type AcceptanceRecord, type AttemptRecord, type AttemptRecoveryRecord, type AuthorizationRecord, type LegacyPlanningReceipt, type ValidatedResultRecord, type WorkspaceRecord } from "./authorization.ts";
 import type { ChildLineage } from "./child-runtime.ts";
 export { isProcessAlive } from "./claims.ts";
 
@@ -36,7 +35,7 @@ export class GraphStore {
 		return join(this.root, ...parts);
 	}
 
-	async initialize(graph: CompiledGraph, snapshot: GraphSnapshot, planningReceipt?: PlanningReceipt, sourceGraphSpecDigest?: string): Promise<void> {
+	async initialize(graph: CompiledGraph, snapshot: GraphSnapshot, planningReceipt?: LegacyPlanningReceipt, sourceGraphSpecDigest?: string): Promise<void> {
 		assertGraphScopesOutsideProtectedRoots(graph, [this.runsRoot]);
 		await mkdir(this.runsRoot, { recursive: true });
 		const runsRootInfo = await lstat(this.runsRoot);
@@ -111,13 +110,13 @@ export class GraphStore {
 		const projection = JSON.parse(await readFile(this.path("graph.json"), "utf8")) as CompiledGraph;
 		try {
 			await this.assertManagedFilePath(this.path("authorization.json"), "Graph authorization");
-			const authorization = JSON.parse(await readFile(this.path("authorization.json"), "utf8")) as Parameters<typeof validateAuthorizedPlanningReceipt>[0] & { schemaVersion?: unknown; graph?: CompiledGraph };
+			const authorization = JSON.parse(await readFile(this.path("authorization.json"), "utf8")) as Parameters<typeof validateLegacyAuthorizationEnvelope>[0] & { schemaVersion?: unknown; graph?: CompiledGraph };
 			const persistedSnapshot = JSON.parse(await readFile(this.path("snapshot.json"), "utf8")) as { planningAdmissionId?: unknown };
 			const comparableProjection = { ...projection } as Omit<CompiledGraph, "projectionVersion"> & { projectionVersion?: 1 };
 			if (authorization.graph && !("projectionVersion" in authorization.graph)) delete comparableProjection.projectionVersion;
 			if (authorization.graph && !("spawnBudget" in authorization.graph)) delete comparableProjection.spawnBudget;
 			if (![2, 3].includes(authorization.schemaVersion as number) || !authorization.graph || authorization.graphDigest !== canonicalDigest(authorization.graph) || canonicalDigest(comparableProjection) !== authorization.graphDigest) throw new Error("Invalid graph authorization record.");
-			validateAuthorizedPlanningReceipt(authorization as Parameters<typeof validateAuthorizedPlanningReceipt>[0]);
+			validateLegacyAuthorizationEnvelope(authorization as Parameters<typeof validateLegacyAuthorizationEnvelope>[0]);
 			if ((authorization.schemaVersion === 3 || persistedSnapshot.planningAdmissionId !== undefined)
 				&& (authorization.schemaVersion !== 3 || typeof persistedSnapshot.planningAdmissionId !== "string" || authorization.planningAdmissionId !== persistedSnapshot.planningAdmissionId)) {
 				throw new Error("Graph planning admission marker does not match its authorization schema and receipt.");
@@ -133,7 +132,7 @@ export class GraphStore {
 		await this.assertManagedFilePath(this.path("authorization.json"), "Graph authorization");
 		const authorization = JSON.parse(await readFile(this.path("authorization.json"), "utf8")) as AuthorizationRecord;
 		if (![2, 3].includes(authorization.schemaVersion) || !authorization.graph || authorization.graphDigest !== canonicalDigest(authorization.graph)) throw new Error("Invalid graph authorization record.");
-		validateAuthorizedPlanningReceipt(authorization);
+		validateLegacyAuthorizationEnvelope(authorization);
 		return authorization;
 	}
 

@@ -1,4 +1,11 @@
-import type { MaxAuthorization, ModelExecution, RoutingDecision, TaskRisk } from "./model-routing/types.ts";
+// ── Frozen legacy model-routing fields (contract §9 legacy-compat) ──────────
+// The V3 mainline never selects, seals or validates routes; these fields only
+// survive as opaque historical bytes in read-only legacy runs. Core passes them
+// through without acting on their governance semantics.
+export type TaskRisk = string;
+export type MaxAuthorization = object;
+export type ModelExecution = object;
+export type RoutingDecision = object;
 
 export const GRAPH_SPEC_VERSION = 1 as const;
 export const GRAPH_RESULT_VERSION = 1 as const;

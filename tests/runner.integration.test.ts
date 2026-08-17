@@ -11,7 +11,7 @@ import { GraphStore } from "../src/store.ts";
 import { loadValidatedRun } from "../src/reconciler.ts";
 import { subagentAsyncRoot, type EventBus } from "../src/rpc.ts";
 import { prepareWorkspace } from "../src/workspace.ts";
-import { canonicalDigest } from "../src/authority.ts";
+import { canonicalDigest } from "../src/authorization.ts";
 import { childAcceptanceFor, taskPrompt } from "../src/executor.ts";
 import type { GraphConfig, GraphSpec } from "../src/types.ts";
 import { auditManagedLaunchContracts } from "../src/pi-subagents-preflight.ts";

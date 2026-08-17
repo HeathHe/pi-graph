@@ -176,7 +176,9 @@ test("thinking overrides require an explicit unsuffixed model", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-graph-compile-"));
 	assert.throws(() => compileGraph({ schemaVersion: 1, goal: "thinking", nodes: [node("a", { thinking: "high" })] } as GraphSpec, cwd), /requires an explicit model/);
 	assert.throws(() => compileGraph({ schemaVersion: 1, goal: "thinking", nodes: [node("a", { model: "openai-codex/gpt-5.6-sol:max", thinking: "high" })] } as GraphSpec, cwd), /not both/);
-	assert.throws(() => compileGraph({ schemaVersion: 1, graphId: "thinking-max", goal: "thinking", nodes: [node("a", { model: "openai-codex/gpt-5.6-sol", thinking: "max" })] } as GraphSpec, cwd), /structured authorization/);
+	// D1: max-authorization admission (model-table "structured authorization" validation) moved to the
+	// governance archive; a legacy `thinking: "max"` spec compiles as frozen pass-through instead.
+	assert.doesNotThrow(() => compileGraph({ schemaVersion: 1, graphId: "thinking-max", goal: "thinking", nodes: [node("a", { model: "openai-codex/gpt-5.6-sol", thinking: "max" })] } as GraphSpec, cwd));
 	assert.doesNotThrow(() => compileGraph({ schemaVersion: 1, goal: "thinking", nodes: [node("a", { model: "openai-codex/gpt-5.6-sol", thinking: "high" })] } as GraphSpec, cwd));
 });
 

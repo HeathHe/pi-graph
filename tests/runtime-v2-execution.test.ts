@@ -10,7 +10,7 @@ import { GraphRunner, initialSnapshot } from "../src/runner.ts";
 import { GraphStore } from "../src/store.ts";
 import { subagentAsyncRoot, type EventBus } from "../src/rpc.ts";
 import { loadOrRebuildValidatedRun, loadValidatedRun } from "../src/reconciler.ts";
-import { canonicalDigest } from "../src/authority.ts";
+import { canonicalDigest } from "../src/authorization.ts";
 import { createPrunePlan, executePrunePlan, listTrashInventory, restoreTrash } from "../src/retention.ts";
 import type { GraphConfig, GraphSpec } from "../src/types.ts";
 import { prepareWorkspace } from "../src/workspace.ts";

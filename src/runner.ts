@@ -6,8 +6,6 @@ import { NodeExecutor, type TransitionOptions } from "./executor.ts";
 import { SubagentRpcClient, type EventBus } from "./rpc.ts";
 import { reopenWorkspace } from "./workspace.ts";
 import { loadValidatedRun } from "./reconciler.ts";
-import type { ModelRoutingConfig } from "./model-routing/types.ts";
-import type { AvailableModelSnapshot } from "./pi-subagents-preflight.ts";
 
 const NODE_TERMINAL = new Set(["accepted", "blocked", "failed", "stale", "stopped", "waiting_input"]);
 const ATTEMPT_STATUSES = new Set(["leased", "dispatching", "dispatch_unknown", "running", "collecting", "verifying", "accepted", "waiting_input", "stale", "failed", "stopped"]);
@@ -78,8 +76,6 @@ export class GraphRunner {
 		leases: LeaseRegistry,
 		config: GraphConfig,
 		onTerminal?: (snapshot: GraphSnapshot) => void,
-		routingConfig?: ModelRoutingConfig,
-		availableModels?: ReadonlyArray<AvailableModelSnapshot> | (() => ReadonlyArray<AvailableModelSnapshot> | undefined),
 		ownerSessionFile?: string,
 		orchestratorIntercomTarget?: string,
 	) {
@@ -101,9 +97,6 @@ export class GraphRunner {
 			snapshot.sessionId,
 			snapshot.schemaVersion === 2 ? { runInstanceId: snapshot.runInstanceId, fencingGeneration: snapshot.fencingGeneration, ownerSessionFile, orchestratorIntercomTarget } : {},
 			this.transition.bind(this),
-			routingConfig,
-			undefined,
-			availableModels,
 		);
 	}
 
@@ -330,10 +323,9 @@ export class GraphRunner {
 
 	private retryFailureCount(state: NodeRuntimeState, result: NodeExecutionResult): number {
 		const retryKind = result.retryKind ?? "failed";
-		const currentDecision = state.attempts.at(-1)?.routingDecision;
 		const matches = (attempt: NodeRuntimeState["attempts"][number]) => {
 			const attemptKind = attempt.failure?.retryKind ?? "failed";
-			if (retryKind === "provider") return attemptKind === "provider" && (!currentDecision || attempt.routingDecision?.selectedModel === currentDecision.selectedModel);
+			if (retryKind === "provider") return attemptKind === "provider";
 			if (retryKind === "model_degrade") return attemptKind === "model_degrade";
 			return attemptKind !== "provider" && attemptKind !== "model_degrade";
 		};
@@ -348,11 +340,10 @@ export class GraphRunner {
 		const used = this.retryFailureCount(state, result);
 		if (retryKind === "provider") {
 			if (state.attempts.at(-1)?.providerDispatches?.length) return false;
-			return used <= (state.attempts.at(-1)?.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0);
+			return used <= (node.retryPolicy.maxProviderRetries ?? 0);
 		}
 		if (retryKind === "model_degrade") {
-			const decision = state.attempts.at(-1)?.routingDecision;
-			return Boolean(decision && decision.candidateIndex !== undefined && decision.candidateIndex + 1 < decision.eligibleCandidates.length && used <= decision.budget.modelDegradations);
+			return false;
 		}
 		const retryOn = node.retryPolicy.retryOn ?? ["dispatch", "timeout", "failed", "validation"];
 		return retryOn.includes(retryKind as "dispatch" | "timeout" | "failed" | "validation") && used < node.retryPolicy.maxAttempts;

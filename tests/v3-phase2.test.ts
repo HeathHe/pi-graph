@@ -64,7 +64,7 @@ test("D4: a legacy GraphSpec v1 start is rejected instead of entering a planning
 	await rm(sandbox, { recursive: true, force: true });
 });
 
-test("D1: the production entry layer has zero governance imports (core edges reported, not asserted)", async () => {
+test("D1: the production entry layer and the full core have zero governance imports", async () => {
 	const entryFiles = ["extensions/pi-graph.ts", "extensions/pi-graph-guard.ts"];
 	const found: string[] = [];
 	for (const file of entryFiles) {
@@ -74,17 +74,21 @@ test("D1: the production entry layer has zero governance imports (core edges rep
 		}
 	}
 	assert.deepEqual(found, [], "retained extensions must not import governance modules");
-	// Report (not assert) the remaining core edges so D1 progress is measurable.
-	const coreFiles = (await readdir("src")).filter((name) => name.endsWith(".ts") && !name.startsWith("v3"));
+	// Assert (was reported in the D1 probe) that every retained core source file has
+	// zero imports into the archived governance module set. Imports inside the
+	// governance module set itself are governance-internal and go to archive together.
+	const coreFiles = (await readdir("src", { recursive: true })).filter((name) => typeof name === "string" && name.endsWith(".ts"))
+		.filter((name) => !name.startsWith("model-routing/") && !name.startsWith("subagent-router/") && name !== "model-routing-adapter.ts" && name !== "recommend.ts");
 	const coreEdges: string[] = [];
 	for (const name of coreFiles) {
 		const source = await readFile(resolve("src", name), "utf8");
 		for (const line of source.split("\n")) {
-			if (/from\s+"\.\/(subagent-router|model-routing|model-routing-adapter|recommend)/u.test(line)) coreEdges.push(`${name}: ${line.trim()}`);
+			if (/from\s+"\.\.?\/(subagent-router|model-routing|model-routing-adapter|recommend)/u.test(line)) coreEdges.push(`${name}: ${line.trim()}`);
 		}
 	}
 	console.log(`D1 report: remaining core->governance import edges = ${coreEdges.length}`);
 	for (const edge of coreEdges) console.log(`  D1 ${edge}`);
+	assert.deepEqual(coreEdges, [], "the full core must have zero imports into the archived governance module set");
 });
 
 test("D5: loading the extension in an empty session produces zero graph activity", { timeout: 45_000 }, async () => {

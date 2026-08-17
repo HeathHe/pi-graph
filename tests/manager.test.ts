@@ -7,8 +7,7 @@ import test from "node:test";
 import { compileGraph } from "../src/compile.ts";
 import { assertRedispatchAllowed, assertRoutingReevaluationPreDispatch, GraphManager, legacySessionIdentity, loadValidatedGraph, sessionIdentity, waitingInputResumeAction } from "../src/manager.ts";
 import { evaluateRoutingPolicy } from "../src/model-routing/evaluate-routing-policy.ts";
-import { loadModelRoutingConfig } from "../src/model-routing/config.ts";
-import type { ModelRegistry, ModelRoutingConfig, RoutingPolicy } from "../src/model-routing/types.ts";
+import type { ModelRoutingConfig, RoutingDecision } from "../src/model-routing/types.ts";
 import { graphRoutingTaskBinding } from "../src/model-routing-adapter.ts";
 import { LeaseRegistry } from "../src/leases.ts";
 import { subagentAsyncRoot, type EventBus } from "../src/rpc.ts";
@@ -17,7 +16,7 @@ import { GraphStore } from "../src/store.ts";
 import type { GraphConfig, GraphSpec } from "../src/types.ts";
 import { loadValidatedRun } from "../src/reconciler.ts";
 import { auditManagedLaunchContracts } from "../src/pi-subagents-preflight.ts";
-import { canonicalDigest, isRoutingDriftResumeTerminal, ROUTING_DRIFT_RESUME_TERMINAL_ERROR, type AttemptRecord } from "../src/authority.ts";
+import { canonicalDigest, isRoutingDriftResumeTerminal, ROUTING_DRIFT_RESUME_TERMINAL_ERROR, type AttemptRecord } from "../src/authorization.ts";
 import { prepareWorkspace } from "../src/workspace.ts";
 import { childAcceptanceFor, taskPrompt } from "../src/executor.ts";
 
@@ -437,24 +436,11 @@ test("manual resume re-evaluates a childless L3 route as a new attempt and new s
 	try {
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		manager = managerFor(bus, graphConfig, cwd);
-		const resumed = await manager.resume(graph.graphId);
-		assert.equal(resumed.nodes.node?.attempts[0]?.status, "failed");
-		const deadline = Date.now() + 10_000;
-		let terminal = await store.loadSnapshot();
-		while (["queued", "running"].includes(terminal.status) && Date.now() < deadline) {
-			await new Promise((resolve) => setTimeout(resolve, 25));
-			terminal = await store.loadSnapshot();
-		}
-		assert.equal(terminal.status, "complete", JSON.stringify(terminal));
-		assert.equal(terminal.nodes.node?.attempt, 2);
-		assert.equal(terminal.nodes.node?.attempts[0]?.routingDecision?.decisionId, decision.decisionId);
-		assert.notEqual(terminal.nodes.node?.attempts[1]?.routingDecision?.decisionId, decision.decisionId);
-		assert.equal(terminal.nodes.node?.attempts[1]?.routingDecision?.fallbackLevel, "L0");
-		assert.equal(bus.spawns, 1);
-		const managerDeadline = Date.now() + 5_000;
-		while (manager.listActiveWork().length > 0 && Date.now() < managerDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
-		assert.equal(manager.listActiveWork().length, 0);
-		await manager.runMaintenance();
+		// D1 frozen writer contract: a childless waiting-input attempt that still carries a
+		// legacy sealed routing decision cannot be re-evaluated or re-routed in Runtime v3;
+		// the frozen resume rejects instead of minting a new attempt and a new sealed decision.
+		await assert.rejects(manager.resume(graph.graphId), /frozen in Runtime v3/i);
+		assert.equal(bus.spawns, 0);
 	} finally {
 		await manager?.suspendAll();
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -630,20 +616,10 @@ test("manual resume re-evaluates a childless preflight drift without reusing its
 	try {
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		manager = managerFor(bus, graphConfig, cwd, recoveredModels);
-		const resumed = await manager.resume(graph.graphId);
-		assert.equal(resumed.nodes.node?.attempts[0]?.status, "failed");
-		const deadline = Date.now() + 10_000;
-		let terminal = await store.loadSnapshot();
-		while (["queued", "running"].includes(terminal.status) && Date.now() < deadline) {
-			await new Promise((resolve) => setTimeout(resolve, 25));
-			terminal = await store.loadSnapshot();
-		}
-		assert.equal(terminal.status, "complete", JSON.stringify(terminal));
-		assert.equal(terminal.nodes.node?.attempt, 2);
-		assert.equal(terminal.nodes.node?.attempts[0]?.routingDecision?.decisionId, decision.decisionId);
-		assert.notEqual(terminal.nodes.node?.attempts[1]?.routingDecision?.decisionId, decision.decisionId);
-		assert.equal(terminal.nodes.node?.attempts[1]?.routingDecision?.selectedModel, "ark/glm-pro:high");
-		assert.equal(bus.spawns, 1);
+		// D1 frozen writer contract: routing_preflight_drift re-evaluation is frozen in Runtime v3;
+		// the sealed decision is never reused for a re-route and no new attempt is dispatched.
+		await assert.rejects(manager.resume(graph.graphId), /frozen in Runtime v3/i);
+		assert.equal(bus.spawns, 0);
 	} finally {
 		await manager?.suspendAll();
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -684,7 +660,9 @@ test("manual L3 resume stops at the routing re-evaluation budget", async () => {
 	};
 	await store.initialize(graph, snapshot);
 	try {
-		await assert.rejects(() => managerFor(new ControllableBus(), graphConfig, cwd).resume(graph.graphId), /exhausted its routing re-evaluation budget/);
+		// D1 frozen writer contract: L3 routing re-evaluation has no governance budget anymore;
+		// the frozen resume rejects before any new attempt instead of counting re-evaluation spend.
+		await assert.rejects(() => managerFor(new ControllableBus(), graphConfig, cwd).resume(graph.graphId), /frozen in Runtime v3/i);
 		const persisted = await store.loadSnapshot();
 		assert.equal(persisted.nodes.node?.status, "waiting_input");
 		assert.equal(persisted.nodes.node?.attempt, 2);
@@ -697,17 +675,6 @@ test("current and legacy Pi session identities remain distinct during migration"
 	const context = { sessionManager: { getSessionId: () => "session-id", getSessionFile: () => "/tmp/session.jsonl" } } as any;
 	assert.equal(sessionIdentity(context), "session-id");
 	assert.equal(legacySessionIdentity(context), "/tmp/session.jsonl");
-});
-
-test("Manager binds execution and recovery to the reviewed routing config digest", async () => {
-	const registry: ModelRegistry = { schemaVersion: 1, models: [{ model: "openai/gpt-pro", family: "gpt", provider: "openai", providerDomain: "openai", thinkingLevels: ["high"] }] };
-	const policy: RoutingPolicy = { schemaVersion: 1, profiles: { route: { enforcement: "require", candidates: [{ model: "openai/gpt-pro", thinking: "high", level: "L0" }], budget: { providerRetries: 0, modelDegradations: 0 } } } };
-	const input = { registry, policy };
-	const configured = await loadModelRoutingConfig(input);
-	const graph = compileGraph({ schemaVersion: 1, graphId: "config-bound", goal: "bound", nodes: [{ taskId: "node", agent: "worker", routingProfile: "route", task: "work", outputArtifact: "out.md", sideEffect: "none" }] }, "/tmp");
-	const manager = new GraphManager({ events: new ControllableBus(), sendMessage() {} } as any, { routingConfigInput: input });
-	assert.equal((await (manager as any).routingConfigFor(graph, undefined, { configDigest: configured.configDigest })).configDigest, configured.configDigest);
-	await assert.rejects(() => (manager as any).routingConfigFor(graph, undefined, { configDigest: "f".repeat(64) }), /sealed routing config/);
 });
 
 test("new graphs bind to Pi's session id instead of the session file path", async () => {
@@ -759,10 +726,13 @@ test("session shutdown aborts an admitted Graph start before any child launch", 
 	let routingStarted!: () => void;
 	const routingReady = new Promise<void>((resolve) => { routingStarted = resolve; });
 	const routingGate = new Promise<void>((resolve) => { releaseRouting = resolve; });
-	(manager as any).routingConfigFor = async () => {
+	// D1: the pre-launch admission gate no longer runs through routingConfigFor (removed);
+	// gate the durable Supervisor claim that every admitted start takes before launch instead.
+	const originalAcquire = GraphStore.prototype.acquireSupervisor;
+	(GraphStore.prototype as any).acquireSupervisor = async function (this: GraphStore, epoch: string) {
 		routingStarted();
 		await routingGate;
-		return undefined;
+		return originalAcquire.call(this, epoch);
 	};
 	const starting = manager.start({
 		schemaVersion: 1,
@@ -774,6 +744,7 @@ test("session shutdown aborts an admitted Graph start before any child launch", 
 	const shutdown = manager.suspendAll();
 	releaseRouting();
 	await shutdown;
+	(GraphStore.prototype as any).acquireSupervisor = originalAcquire;
 	await assert.rejects(starting, /session changed/i);
 	assert.equal(bus.spawns, 0);
 	assert.deepEqual(manager.listActiveWork(), []);
@@ -837,16 +808,20 @@ test("session shutdown aborts Graph resume before any recovered child launch", a
 	let routingStarted!: () => void;
 	const routingReady = new Promise<void>((resolve) => { routingStarted = resolve; });
 	const routingGate = new Promise<void>((resolve) => { releaseRouting = resolve; });
-	(manager as any).routingConfigFor = async () => {
+	// D1: the resume admission gate no longer runs through routingConfigFor (removed);
+	// gate the durable Supervisor claim that every admitted resume takes before any recovered launch.
+	const originalAcquire = GraphStore.prototype.acquireSupervisor;
+	(GraphStore.prototype as any).acquireSupervisor = async function (this: GraphStore, epoch: string) {
 		routingStarted();
 		await routingGate;
-		return undefined;
+		return originalAcquire.call(this, epoch);
 	};
 	const resuming = manager.resume(graph.graphId);
 	await routingReady;
 	const shutdown = manager.suspendAll();
 	releaseRouting();
 	await shutdown;
+	(GraphStore.prototype as any).acquireSupervisor = originalAcquire;
 	await assert.rejects(resuming, /session changed/i);
 	assert.equal(bus.spawns, 0);
 	assert.deepEqual(manager.listActiveWork(), []);
@@ -1084,13 +1059,9 @@ test("Manager refreshes the Pi model registry for each routed Graph node", async
 			await new Promise((resolve) => setTimeout(resolve, 25));
 			terminal = await store.loadSnapshot();
 		}
-		assert.equal(terminal.status, "complete", JSON.stringify(terminal));
-		assert.deepEqual(bus.models, ["openai/gpt-pro:high", "kimi/k-pro:high"]);
-		assert.ok(registryReads >= 6, `expected repeated model registry reads, observed ${registryReads}`);
-		assert.notEqual(
-			terminal.nodes.first?.attempts[0]?.routingDecision?.availableModelsDigest,
-			terminal.nodes.second?.attempts[0]?.routingDecision?.availableModelsDigest,
-		);
+		assert.equal(terminal.status, "needs_attention", JSON.stringify(terminal));
+		assert.deepEqual(bus.models, []);
+		assert.equal(bus.spawns, 0);
 	} finally {
 		await manager.suspendAll();
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

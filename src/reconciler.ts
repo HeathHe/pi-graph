@@ -2,13 +2,11 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { compileGraph } from "./compile.ts";
-import { canonicalDigest, isRoutingDriftResumeTerminal, validateAuthorizedPlanningReceipt, type AcceptanceRecord, type AttemptRecord, type AttemptRecoveryRecord, type AuthorizationRecord, type ValidatedResultRecord, type WorkspaceRecord } from "./authority.ts";
+import { canonicalDigest, isRoutingDriftResumeTerminal, validateLegacyAuthorizationEnvelope, type AcceptanceRecord, type AttemptRecord, type AttemptRecoveryRecord, type AuthorizationRecord, type ValidatedResultRecord, type WorkspaceRecord } from "./authorization.ts";
 import { GraphStore } from "./store.ts";
 import { digestFile } from "./workspace.ts";
 import type { CompiledGraph, GraphSnapshot, GraphSpec, ResultManifest, ValidationResult } from "./types.ts";
-import { canonicalDigest as routingCanonicalDigest } from "./authority.ts";
-import { validateRoutingDecision } from "./model-routing/validate-routing-decision.ts";
-import { routingAttemptBudget } from "./model-routing-adapter.ts";
+import { canonicalDigest as routingCanonicalDigest } from "./authorization.ts";
 
 export interface ValidatedRun {
 	graph: CompiledGraph;
@@ -57,7 +55,9 @@ function validateAttemptAuthority(authority: AttemptRecord, snapshot: { runInsta
 	assert(/^[a-f0-9-]{36}$/i.test(authority.attemptNonce) && typeof authority.supervisorEpoch === "string" && authority.supervisorEpoch.length > 0, `Invalid attempt authority nonce or Supervisor epoch for ${taskId}/${attemptNumber}.`);
 	assert(Number.isInteger(authority.fencingGeneration) && authority.fencingGeneration >= 0, `Invalid attempt authority fence for ${taskId}/${attemptNumber}.`);
 	assert(validIsoTimestamp(authority.updatedAt), `Invalid attempt authority timestamp for ${taskId}/${attemptNumber}.`);
-	if (authority.routingDecision !== undefined) validateRoutingDecision(authority.routingDecision);
+	if (authority.routingDecision !== undefined && (authority.routingDecision === null || typeof authority.routingDecision !== "object")) {
+		assert(false, `Attempt authority carries a malformed opaque routing decision for ${taskId}/${attemptNumber}.`);
+	}
 	if (authority.requestDigest !== undefined) assertDigest(authority.requestDigest, `Invalid request digest for ${taskId}/${attemptNumber}.`);
 	if (authority.launchContractDigest !== undefined) assertDigest(authority.launchContractDigest, `Invalid launch contract digest for ${taskId}/${attemptNumber}.`);
 	if (authority.extensionContentDigest !== undefined) assertDigest(authority.extensionContentDigest, `Invalid Extension content digest for ${taskId}/${attemptNumber}.`);
@@ -220,7 +220,7 @@ async function hasAuthorizedProviderWorkspaceReset(
 		const last = dispatches.at(-1);
 		if (!last) return false;
 		const nextDispatch = reset.nextDispatch as number;
-		const providerBudget = attempt.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0;
+		const providerBudget = node.retryPolicy.maxProviderRetries ?? 0;
 		if (nextDispatch > providerBudget + 1) return false;
 		if (last.dispatch === nextDispatch) return ["prepared", "dispatching", "dispatch_unknown", "running"].includes(last.status);
 		return last.dispatch + 1 === nextDispatch && last.status === "failed" && last.failure?.retryKind === "provider";
@@ -233,13 +233,12 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 	if (snapshot.schemaVersion !== 2) return;
 	const authorization = await readAuthority<AuthorizationRecord>(store, store.path("authorization.json"), "Invalid authorization");
 	assert([2, 3].includes(authorization.schemaVersion) && authorization.runInstanceId === snapshot.runInstanceId && authorization.graphId === snapshot.graphId, "Authorization identity does not match the v2 snapshot.");
-	validateAuthorizedPlanningReceipt(authorization);
+	validateLegacyAuthorizationEnvelope(authorization);
 	assert(
 		(authorization.schemaVersion === 2 && snapshot.planningAdmissionId === undefined)
 		|| (authorization.schemaVersion === 3 && typeof snapshot.planningAdmissionId === "string" && snapshot.planningAdmissionId === authorization.planningAdmissionId),
 		"Snapshot planning admission marker does not match the durable authorization.",
 	);
-	const sealedPlanningConfigDigest = authorization.planningReceipt?.configDigest;
 	assert(validIsoTimestamp(authorization.createdAt), "Invalid authorization timestamp.");
 	assert(authorization.compilerProjectionVersion === undefined || authorization.compilerProjectionVersion === 1, "Unsupported authorization compiler projection version.");
 	const strictFailureProjection = authorization.compilerProjectionVersion === 1;
@@ -250,7 +249,7 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 	assert(authorization.sourceCwd === snapshot.sourceCwd, "Authorization source root does not match the v2 snapshot.");
 	for (const node of graph.nodes) {
 		const state = snapshot.nodes[node.taskId]!;
-		assert(state.attempts.length <= routingAttemptBudget(node, state), `Snapshot exceeds retry authorization for ${node.taskId}.`);
+		assert(state.attempts.length <= node.retryPolicy.maxAttempts, `Snapshot exceeds retry authorization for ${node.taskId}.`);
 		const providerFailures = new Map<string, number>();
 		let modelDegradations = 0;
 		let businessFailures = 0;
@@ -262,7 +261,6 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 			validateAttemptAuthority(authority, snapshot, node.taskId, attempt.attempt, attempt.attemptNonce);
 			if (node.routingProfile) {
 				assert(Boolean(attempt.routingDecision && authority.routingDecision && routingCanonicalDigest(attempt.routingDecision) === routingCanonicalDigest(authority.routingDecision)), `RoutingDecision projection mismatch for ${node.taskId}/${attempt.attempt}.`);
-				if (sealedPlanningConfigDigest) assert(attempt.routingDecision!.configDigest === sealedPlanningConfigDigest, `RoutingDecision config digest does not match the reviewed planning authorization for ${node.taskId}/${attempt.attempt}.`);
 			}
 			if (attempt.status === "failed" && authority.phase === "terminal" && authority.terminalStatus === "failed") {
 				if (strictFailureProjection) assert(attempt.failure?.retryKind !== undefined, `Snapshot failed attempt is missing its retry kind for ${node.taskId}/${attempt.attempt}.`);
@@ -289,13 +287,11 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 			if (index < state.attempts.length - 1) {
 				const retryKind = authority.terminalRetryKind!;
 				if (retryKind === "provider") {
-					const key = attempt.routingDecision?.selectedModel ?? "legacy";
-					const used = (providerFailures.get(key) ?? 0) + 1;
-					providerFailures.set(key, used);
-					assert(used <= (attempt.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0), `Historical provider retry exceeds authorization for ${node.taskId}/${attempt.attempt}.`);
+					const used = (providerFailures.get("legacy") ?? 0) + 1;
+					providerFailures.set("legacy", used);
+					assert(used <= (node.retryPolicy.maxProviderRetries ?? 0), `Historical provider retry exceeds authorization for ${node.taskId}/${attempt.attempt}.`);
 				} else if (retryKind === "model_degrade") {
 					modelDegradations += 1;
-					assert(modelDegradations <= (attempt.routingDecision?.budget.modelDegradations ?? 0), `Historical model degradation exceeds authorization for ${node.taskId}/${attempt.attempt}.`);
 				} else {
 					businessFailures += 1;
 					const retryOn = node.retryPolicy.retryOn ?? ["dispatch", "timeout", "failed", "validation"];
@@ -306,13 +302,11 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 			if (state.status === "retry_wait" && index === state.attempts.length - 1 && attempt.status === "failed") {
 				const retryKind = authority.terminalRetryKind!;
 				if (retryKind === "provider") {
-					const key = attempt.routingDecision?.selectedModel ?? "legacy";
-					const used = (providerFailures.get(key) ?? 0) + 1;
-					providerFailures.set(key, used);
-					assert(used <= (attempt.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0), `Retry-wait provider projection exceeds retry authorization for ${node.taskId}/${attempt.attempt}.`);
+					const used = (providerFailures.get("legacy") ?? 0) + 1;
+					providerFailures.set("legacy", used);
+					assert(used <= (node.retryPolicy.maxProviderRetries ?? 0), `Retry-wait provider projection exceeds retry authorization for ${node.taskId}/${attempt.attempt}.`);
 				} else if (retryKind === "model_degrade") {
 					modelDegradations += 1;
-					assert(modelDegradations <= (attempt.routingDecision?.budget.modelDegradations ?? 0), `Retry-wait model degradation exceeds retry authorization for ${node.taskId}/${attempt.attempt}.`);
 				} else {
 					businessFailures += 1;
 					const retryOn = node.retryPolicy.retryOn ?? ["dispatch", "timeout", "failed", "validation"];
@@ -352,7 +346,7 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 			if (attempt.providerDispatches?.length) {
 				const dispatches = attempt.providerDispatches;
 				let provenPreparedPreEmitRollback = false;
-				const providerBudget = attempt.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0;
+				const providerBudget = node.retryPolicy.maxProviderRetries ?? 0;
 				assert(dispatches.length <= providerBudget + 1, `Provider dispatch budget exceeded for ${node.taskId}/${attempt.attempt}.`);
 				for (const [dispatchIndex, dispatch] of dispatches.entries()) {
 					const number = dispatchIndex + 1;
@@ -361,9 +355,7 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 					if (attempt.status === "accepted" && dispatchIndex === dispatches.length - 1) {
 						assert(Boolean(dispatch.launchContractDigest && dispatch.runtimeLaunchContractDigest && dispatch.launchContractDigest === dispatch.runtimeLaunchContractDigest), `Accepted controlled provider dispatch has no matching launch contract evidence for ${node.taskId}/${attempt.attempt}/${number}.`);
 						assert(Boolean(dispatch.extensionContentDigest), `Accepted provider dispatch has no Extension content seal for ${node.taskId}/${attempt.attempt}/${number}.`);
-						if (attempt.routingDecision?.enforcement === "require") assert(Boolean(dispatch.modelExecution && attempt.modelExecution), `Accepted controlled provider dispatch has no verified runtime model provenance for ${node.taskId}/${attempt.attempt}/${number}.`);
 					}
-					if (attempt.routingDecision?.enforcement === "require" && dispatch.modelExecution?.routingViolations?.length) assert(false, `Controlled provider dispatch violated its sealed route for ${node.taskId}/${attempt.attempt}/${number}.`);
 					if (!dispatch.requestDigest) continue;
 					const ledger = await readAuthority<Record<string, unknown>>(store, join(dirname(dispatch.sessionDir), "child-dispatch.json"), `Invalid child dispatch ledger for ${node.taskId}/${attempt.attempt}/${number}`);
 					const lineage = ledger.lineage as Record<string, unknown> | undefined;
@@ -417,10 +409,6 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 					}
 				}
 				assert(authority.requestDigest === dispatches[0]?.requestDigest || provenPreparedPreEmitRollback, `Attempt authority does not bind the first provider dispatch for ${node.taskId}/${attempt.attempt}.`);
-				if (attempt.routingDecision?.enforcement === "require") {
-					assert(Boolean(authority.launchContractDigest && dispatches.every((dispatch) => dispatch.launchContractDigest === authority.launchContractDigest)), `Attempt authority does not bind the controlled launch contract for ${node.taskId}/${attempt.attempt}.`);
-					assert(Boolean(authority.extensionContentDigest && dispatches.every((dispatch) => dispatch.extensionContentDigest === authority.extensionContentDigest)), `Attempt authority does not bind the controlled Extension content seal for ${node.taskId}/${attempt.attempt}.`);
-				}
 			}
 			if (["validated", "applying", "accepted"].includes(authority.phase)) {
 				const validated = await readAuthority<ValidatedResultRecord>(store, join(root, "validated-result.json"), `Invalid validated result for ${node.taskId}/${attempt.attempt}`);
@@ -456,14 +444,8 @@ async function validateV2Evidence(store: GraphStore, graph: CompiledGraph, snaps
 			}
 		}
 	}
-	const worstCaseSpawns = graph.nodes.reduce((sum, node) => {
-		const firstDecision = snapshot.nodes[node.taskId]?.attempts.find((attempt) => attempt.routingDecision)?.routingDecision;
-		const providerRetries = Math.max(node.retryPolicy.maxProviderRetries ?? 0, firstDecision?.budget.providerRetries ?? 0);
-		const modelDegradations = firstDecision?.budget.modelDegradations ?? 0;
-		return sum + (node.retryPolicy.maxAttempts + modelDegradations) * (1 + providerRetries);
-	}, 0);
 	const maxSpawnBudget = options.maxSpawnBudget ?? Number.MAX_SAFE_INTEGER;
-	assert(worstCaseSpawns <= maxSpawnBudget, `Persisted routed worst-case ${worstCaseSpawns} child launches exceed spawn budget ${maxSpawnBudget}.`);
+	assert(graph.spawnBudget === undefined || graph.spawnBudget <= maxSpawnBudget, `Persisted spawn budget ${graph.spawnBudget} exceeds the admitted spawn budget ${maxSpawnBudget}.`);
 }
 
 export async function loadValidatedRun(store: GraphStore, maxSpawnBudget: number, options: ValidatedRunOptions = {}): Promise<ValidatedRun> {
@@ -484,7 +466,7 @@ export async function loadValidatedRun(store: GraphStore, maxSpawnBudget: number
 export async function rebuildTerminalSnapshotProjection(store: GraphStore, maxSpawnBudget: number): Promise<ValidatedRun> {
 	const authorization = await readAuthority<AuthorizationRecord>(store, store.path("authorization.json"), "Snapshot rebuild requires valid authorization");
 	assert([2, 3].includes(authorization.schemaVersion) && authorization.graphDigest === canonicalDigest(authorization.graph), "Snapshot rebuild authorization digest is invalid.");
-	validateAuthorizedPlanningReceipt(authorization);
+	validateLegacyAuthorizationEnvelope(authorization);
 	assert(validIsoTimestamp(authorization.createdAt), "Snapshot rebuild authorization timestamp is invalid.");
 	assert(authorization.compilerProjectionVersion === undefined || authorization.compilerProjectionVersion === 1, "Unsupported authorization compiler projection version.");
 	const admittedSpawnBudget = typeof authorization.graph.spawnBudget === "number" ? authorization.graph.spawnBudget : Number.MAX_SAFE_INTEGER;
@@ -525,14 +507,11 @@ export async function rebuildTerminalSnapshotProjection(store: GraphStore, maxSp
 				assert(attempt.phase === "terminal" && attempt.terminalStatus === "failed", `Snapshot rebuild prior attempt is not retryable for ${node.taskId}/${attemptNumber}.`);
 				const retryKind = attempt.terminalRetryKind!;
 				if (retryKind === "provider") {
-					const key = attempt.routingDecision?.selectedModel ?? "legacy";
-					const used = (providerFailures.get(key) ?? 0) + 1;
-					providerFailures.set(key, used);
-					assert(used <= (attempt.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0), `Snapshot rebuild provider retry exceeds authorization for ${node.taskId}/${attemptNumber}.`);
+					const used = (providerFailures.get("legacy") ?? 0) + 1;
+					providerFailures.set("legacy", used);
+					assert(used <= (node.retryPolicy.maxProviderRetries ?? 0), `Snapshot rebuild provider retry exceeds authorization for ${node.taskId}/${attemptNumber}.`);
 				} else if (retryKind === "model_degrade") {
-					assert(Boolean(attempt.routingDecision), `Snapshot rebuild model degradation is missing its RoutingDecision for ${node.taskId}/${attemptNumber}.`);
 					modelDegradations += 1;
-					assert(modelDegradations <= (attempt.routingDecision?.budget.modelDegradations ?? 0), `Snapshot rebuild model degradation exceeds authorization for ${node.taskId}/${attemptNumber}.`);
 				} else {
 					businessFailures += 1;
 					const retryOn = node.retryPolicy.retryOn ?? ["dispatch", "timeout", "failed", "validation"];
@@ -599,7 +578,7 @@ export async function rebuildTerminalSnapshotProjection(store: GraphStore, maxSp
 			attempt: rebuiltAttempts.length,
 			attempts: rebuiltAttempts,
 		};
-		assert(rebuiltAttempts.length <= routingAttemptBudget(node, rebuiltState), `Snapshot rebuild exceeds retry authorization for ${node.taskId}.`);
+		assert(rebuiltAttempts.length <= node.retryPolicy.maxAttempts, `Snapshot rebuild exceeds retry authorization for ${node.taskId}.`);
 		nodes[node.taskId] = rebuiltState;
 	}
 	const terminalAt = acceptedAt.sort().at(-1) ?? authorization.createdAt;

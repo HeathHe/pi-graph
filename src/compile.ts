@@ -11,8 +11,6 @@ import type {
 	SubagentAcceptanceConfig,
 	SubagentAcceptanceInput,
 } from "./types.ts";
-import { graphRoutingTaskBinding } from "./model-routing-adapter.ts";
-import { validateMaxAuthorization } from "./model-routing/runtime-state.ts";
 import { isReadOnlyRemoteToolName } from "./remote-tools.ts";
 import { validateValidationCommand } from "./validation.ts";
 
@@ -268,10 +266,8 @@ export function compileGraph(spec: GraphSpec, sourceCwd: string, maxSpawnBudget 
 		const explicitModel = node.model ? (node.thinking ? `${node.model}:${node.thinking}` : node.model) : undefined;
 		if (explicitModel && /(?:^|:)max$/.test(explicitModel)) {
 			assert(Boolean(spec.graphId), `${node.taskId}: max authorization requires an explicit graphId for stable task binding.`);
-			validateMaxAuthorization(node.maxAuthorization, {
-				taskBinding: graphRoutingTaskBinding({ graphId, taskId: node.taskId, task: node.task }),
-				model: explicitModel,
-			});
+			// Frozen legacy: max-authorization admission was archived with the governance modules;
+			// the compiled node simply carries maxAuthorization through for read-only legacy runs.
 		}
 		const output = normalizeOutput(node.output, `${node.taskId}.output`);
 		assert(node.outputArtifact !== undefined || output !== undefined, `${node.taskId}: outputArtifact or typed output is required.`);

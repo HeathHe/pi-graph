@@ -12,6 +12,7 @@ import type {
 	NodeRuntimeState,
 	ProviderDispatchState,
 	ResultManifest,
+	RoutingDecision,
 	SubagentAcceptanceInput,
 } from "./types.ts";
 import { GRAPH_RESULT_VERSION } from "./types.ts";
@@ -21,16 +22,11 @@ import { digestFile, prepareWorkspace, reopenWorkspace, WorkspaceConflictError, 
 import { recoverRunBySessionDir, RpcPreEmitError, RpcRejectedError, RpcTimeoutError, SubagentRpcClient, type EventBus } from "./rpc.ts";
 import { AsyncRunDeadlineError, readAsyncRunState, requestAsyncStop, waitForAsyncRun, waitForConfirmedStop, waitForObservedProcessTerminal, type AsyncTerminal } from "./lifecycle.ts";
 import { runValidations } from "./validation.ts";
-import { canonicalDigest, type AttemptRecord, type ValidatedResultRecord } from "./authority.ts";
+import { canonicalDigest, type AttemptRecord, type ValidatedResultRecord } from "./authorization.ts";
 import { SourceReservationBusyError, SourceReservationRegistry } from "./reservations.ts";
 import { ChildPreparePreEmitError, ChildRuntime, type ChildLineage } from "./child-runtime.ts";
 import { classifyChildFailure } from "./failure.ts";
-import { authorizeLegacyMax, blockGraphRoutingDecision, resolveGraphRoutingDecision } from "./model-routing-adapter.ts";
-import { availableModelsDigest } from "./model-routing/evaluate-routing-policy.ts";
-import { createModelExecution } from "./model-routing/model-execution.ts";
-import { defaultMaxAuthorizationStore } from "./model-routing/runtime-state.ts";
-import type { MaxAuthorizationStore, ModelRoutingConfig } from "./model-routing/types.ts";
-import { auditManagedLaunchContracts, type AvailableModelSnapshot } from "./pi-subagents-preflight.ts";
+import { auditManagedLaunchContracts } from "./pi-subagents-preflight.ts";
 import { Check } from "typebox/value";
 
 export interface TransitionOptions {
@@ -305,9 +301,6 @@ export class NodeExecutor {
 	dispose(options: { preserveReapers?: boolean } = {}): boolean {
 		return this.childRuntime.dispose(options);
 	}
-	private readonly routingConfig?: ModelRoutingConfig;
-	private readonly maxAuthorizationStore: MaxAuthorizationStore;
-	private readonly availableModels?: ReadonlyArray<AvailableModelSnapshot> | (() => ReadonlyArray<AvailableModelSnapshot> | undefined);
 	private readonly orchestratorIntercomTarget?: string;
 	constructor(
 		graph: CompiledGraph,
@@ -320,9 +313,6 @@ export class NodeExecutor {
 		ownerSessionId: string | undefined,
 		runtimeIdentity: { runInstanceId?: string; fencingGeneration?: number; ownerSessionFile?: string; orchestratorIntercomTarget?: string },
 		transition: Transition,
-		routingConfig?: ModelRoutingConfig,
-		maxAuthorizationStore: MaxAuthorizationStore = defaultMaxAuthorizationStore,
-		availableModels?: ReadonlyArray<AvailableModelSnapshot> | (() => ReadonlyArray<AvailableModelSnapshot> | undefined),
 	) {
 		this.graph = graph;
 		this.store = store;
@@ -336,9 +326,6 @@ export class NodeExecutor {
 		this.fencingGeneration = runtimeIdentity.fencingGeneration ?? 0;
 		this.transition = transition;
 		this.childRuntime = new ChildRuntime(rpc, 2_000, 24 * 60 * 60_000, 20, 250, 30_000, runtimeIdentity.ownerSessionFile);
-		this.routingConfig = routingConfig;
-		this.maxAuthorizationStore = maxAuthorizationStore;
-		this.availableModels = availableModels;
 		this.orchestratorIntercomTarget = runtimeIdentity.orchestratorIntercomTarget;
 	}
 
@@ -347,10 +334,6 @@ export class NodeExecutor {
 			graphWorkspaceKind: workspaceKind,
 			...(this.orchestratorIntercomTarget ? { orchestratorIntercomTarget: this.orchestratorIntercomTarget } : {}),
 		};
-	}
-
-	private currentAvailableModels(): ReadonlyArray<AvailableModelSnapshot> | undefined {
-		return typeof this.availableModels === "function" ? this.availableModels() : this.availableModels;
 	}
 
 	setSupervisorIdentity(epoch: string, ownerSessionId?: string, fencingGeneration?: number): void {
@@ -379,9 +362,7 @@ export class NodeExecutor {
 
 	private childParams(node: CompiledNode, workspace: PreparedWorkspace, attempt: NodeAttemptState, providerDispatch?: ProviderDispatchState): Record<string, unknown> {
 		const lineage = this.lineage(node, attempt, providerDispatch);
-		const selectedModel = attempt.routingDecision?.enforcement === "require"
-			? attempt.routingDecision.selectedModel
-			: modelOverride(node);
+		const selectedModel = modelOverride(node);
 		return {
 			agent: node.agent,
 			task: taskPrompt(this.graph, node, workspace, lineage),
@@ -435,7 +416,7 @@ export class NodeExecutor {
 					workspaceDir: workspace.cwd,
 					workspaceKind: workspace.kind,
 					outputPath: this.store.path("nodes", node.taskId, `attempt-${number}`, "output", node.outputArtifact),
-					...(orphaned.routingDecision ? { routingDecision: orphaned.routingDecision } : {}),
+					...(orphaned.routingDecision ? { routingDecision: orphaned.routingDecision as RoutingDecision } : {}),
 					...(orphaned.launchContractDigest && orphaned.extensionContentDigest ? { providerDispatches: [{
 						dispatch: 1,
 						status: "prepared",
@@ -461,18 +442,9 @@ export class NodeExecutor {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot recover authority prepared before its snapshot projection: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
-		let routingModels = this.currentAvailableModels();
-		let routingDecision = await resolveGraphRoutingDecision({
-			graph: this.graph,
-			node,
-			state,
-			store: this.store,
-			config: this.routingConfig,
-			authorizationStore: this.maxAuthorizationStore,
-			availableModels: routingModels,
-			consumeMaxAuthorization: false,
-		});
-		if (!routingDecision) await authorizeLegacyMax(this.graph, node, this.routingConfig, this.maxAuthorizationStore);
+		if (node.routingProfile) {
+			throw new Error(`Node '${node.taskId}' requests controlled routing profile '${node.routingProfile}', which is frozen in Runtime v3. Re-plan the legacy graph without routing profiles or start a new graph.`);
+		}
 		const attemptDir = this.store.path("nodes", node.taskId, `attempt-${number}`);
 		const sessionDir = join(attemptDir, "session");
 		const artifacts = (node.inputArtifacts ?? []).map((name) => ({ name, source: this.artifactPath(name) }));
@@ -524,72 +496,22 @@ export class NodeExecutor {
 			workspaceDir: workspace.cwd,
 			workspaceKind: workspace.kind,
 			outputPath: join(attemptDir, "output", node.outputArtifact),
-			...(routingDecision ? { routingDecision } : {}),
 		};
-		const preflightModels = this.currentAvailableModels();
-		if (routingDecision?.enforcement === "require" && routingDecision.availableModelsDigest !== availableModelsDigest(preflightModels)) {
-			routingModels = preflightModels;
-			routingDecision = await resolveGraphRoutingDecision({
-				graph: this.graph,
-				node,
-				state,
-				store: this.store,
-				config: this.routingConfig,
-				authorizationStore: this.maxAuthorizationStore,
-				availableModels: routingModels,
-				consumeMaxAuthorization: false,
-			});
-			if (routingDecision) attempt.routingDecision = routingDecision;
-			else delete attempt.routingDecision;
-		}
-		const controlledRouting = routingDecision?.enforcement === "require" && Boolean(routingDecision.selectedModel);
-		const requiresRuntimeGuardSeal = Boolean(this.runInstanceId) && this.config.runtimeV2Dispatch === true && routingDecision?.fallbackLevel !== "L3";
-		if (controlledRouting || requiresRuntimeGuardSeal) {
+		const requiresRuntimeGuardSeal = Boolean(this.runInstanceId) && this.config.runtimeV2Dispatch === true;
+		if (requiresRuntimeGuardSeal) {
 			const providerDispatch: ProviderDispatchState = { dispatch: 1, status: "prepared", sessionDir, startedAt: new Date().toISOString() };
 			const params = this.childParams(node, workspace, attempt, providerDispatch);
-			const audit = await auditManagedLaunchContracts({ tasks: [params], cwd: node.cwd, ...(controlledRouting ? { availableModels: routingModels } : {}), requireExtensionSeal: true, requireModelSeal: controlledRouting, ...this.managedLaunchAuditInput(workspace.kind) });
+			const audit = await auditManagedLaunchContracts({ tasks: [params], cwd: node.cwd, requireExtensionSeal: true, requireModelSeal: false, ...this.managedLaunchAuditInput(workspace.kind) });
 			const expectedLaunchContractDigest = audit.contracts[0]?.launchContractDigest;
 			const expectedExtensionContentDigest = audit.contracts[0]?.extensionContentDigest;
 			if (!audit.ok || !expectedLaunchContractDigest || !expectedExtensionContentDigest) {
 				const reason = audit.issues.join(" ") || "the launch contract or Extension content digest is missing";
-				if (controlledRouting) {
-					routingDecision = blockGraphRoutingDecision(routingDecision!, `Controlled Graph routing preflight failed before authorization consumption: ${reason}`);
-					attempt.routingDecision = routingDecision;
-				} else {
-					attempt.error = `Graph Runtime v2 guard preflight failed before dispatch: ${reason}`;
-					attempt.failure = { kind: "routing_preflight_drift", retryKind: "failed" };
-				}
+				attempt.error = `Graph Runtime v2 guard preflight failed before dispatch: ${reason}`;
+				attempt.failure = { kind: "routing_preflight_drift", retryKind: "failed" };
 			} else {
 				providerDispatch.launchContractDigest = expectedLaunchContractDigest;
 				providerDispatch.extensionContentDigest = expectedExtensionContentDigest;
 				attempt.providerDispatches = [providerDispatch];
-				if (controlledRouting && node.maxAuthorization && routingDecision!.selectedModel!.endsWith(":max")) {
-					const authorizationModels = this.currentAvailableModels();
-					if (availableModelsDigest(authorizationModels) !== routingDecision!.availableModelsDigest) {
-						routingDecision = blockGraphRoutingDecision(routingDecision!, "The active Pi model registry changed before max authorization could be consumed.");
-						attempt.routingDecision = routingDecision;
-						delete attempt.providerDispatches;
-					} else {
-						const committedDecision = await resolveGraphRoutingDecision({
-							graph: this.graph,
-							node,
-							state,
-							store: this.store,
-							config: this.routingConfig,
-							authorizationStore: this.maxAuthorizationStore,
-							availableModels: authorizationModels,
-							consumeMaxAuthorization: true,
-						});
-						if (!committedDecision || committedDecision.fallbackLevel === "L3" || committedDecision.selectedModel !== routingDecision!.selectedModel) {
-							routingDecision = blockGraphRoutingDecision(routingDecision!, "Controlled Graph routing changed while finalizing max authorization.");
-							attempt.routingDecision = routingDecision;
-							delete attempt.providerDispatches;
-						} else {
-							routingDecision = committedDecision;
-							attempt.routingDecision = committedDecision;
-						}
-					}
-				}
 			}
 		}
 		await this.store.ensureManagedSubdirectory(relative(this.store.root, dirname(attempt.outputPath!)), "Attempt output directory");
@@ -1035,8 +957,8 @@ export class NodeExecutor {
 			const attempt = prepared.attempt;
 			attemptForPartial = attempt;
 			workspace = prepared.workspace;
-			if (attempt.routingDecision?.fallbackLevel === "L3") {
-				const error = attempt.routingDecision.reason;
+			if (attempt.routingDecision) {
+				const error = "This node carries a legacy sealed routing decision; controlled routing is frozen in Runtime v3 and cannot be re-dispatched. Reconcile the node and start a new graph for additional work.";
 				await this.transition(node.taskId, "waiting_input", { status: "waiting_input", endedAt: new Date().toISOString(), error }, error);
 				return { status: "waiting_input", error };
 			}
@@ -1108,7 +1030,7 @@ export class NodeExecutor {
 				attempt.providerDispatches = providerDispatches;
 				await this.transition(node.taskId, state.status, { providerDispatches });
 			}
-			if (existing && (this.runInstanceId || attempt.routingDecision?.enforcement === "require")) {
+			if (existing && this.runInstanceId) {
 				const authorityMatchesSeals = Boolean(
 					recoveredAuthority?.launchContractDigest
 					&& recoveredAuthority.extensionContentDigest
@@ -1135,34 +1057,13 @@ export class NodeExecutor {
 				if (!identity) {
 					const params = this.childParams(node, workspace, attempt, providerDispatch);
 					if (this.runInstanceId && this.config.runtimeV2Dispatch !== true) return { status: "stale", error: "Graph Runtime v2 dispatch is gated until the ChildRuntime protocol is available." };
-					const dispatchDecision = attempt.routingDecision;
-					const controlledDispatch = dispatchDecision?.enforcement === "require" && Boolean(dispatchDecision.selectedModel);
-					const dispatchModels = this.currentAvailableModels();
-					if (controlledDispatch) {
-						if (!dispatchDecision!.availableModelsDigest) {
-							const error = "Controlled Graph routing preflight failed: the sealed decision is not bound to an active model registry snapshot.";
-							await this.transition(node.taskId, "waiting_input", { status: "waiting_input", endedAt: new Date().toISOString(), error }, error);
-							return { status: "waiting_input", error };
-						}
-						if (!dispatchModels) {
-							const error = "Controlled Graph routing preflight failed: the active Pi model registry snapshot is unavailable.";
-							await this.transition(node.taskId, "waiting_input", { status: "waiting_input", endedAt: new Date().toISOString(), error }, error);
-							return { status: "waiting_input", error };
-						}
-						if (availableModelsDigest(dispatchModels) !== dispatchDecision!.availableModelsDigest) {
-							const error = "Controlled Graph routing preflight failed: the active Pi model registry changed after the routing decision was sealed.";
-							const failure: FailureDetails = { kind: "routing_preflight_drift", retryKind: "failed" };
-							await this.transition(node.taskId, "waiting_input", { status: "waiting_input", endedAt: new Date().toISOString(), error, failure }, error, { statePatch: { failure } });
-							return { status: "waiting_input", error, failure };
-						}
-					}
-					if (this.runInstanceId || controlledDispatch) {
+					const controlledDispatch = false;
+					if (this.runInstanceId) {
 						const audit = await auditManagedLaunchContracts({
 							tasks: [params],
 							cwd: node.cwd,
-							...(controlledDispatch ? { availableModels: dispatchModels } : {}),
 							requireExtensionSeal: true,
-							requireModelSeal: controlledDispatch,
+							requireModelSeal: false,
 							...this.managedLaunchAuditInput(workspace.kind),
 						});
 						const expectedLaunchContractDigest = audit.contracts[0]?.launchContractDigest;
@@ -1174,7 +1075,7 @@ export class NodeExecutor {
 							|| providerDispatch.launchContractDigest !== expectedLaunchContractDigest
 							|| !providerDispatch.extensionContentDigest
 							|| providerDispatch.extensionContentDigest !== expectedExtensionContentDigest) {
-							const error = `${controlledDispatch ? "Controlled Graph routing" : "Graph Runtime v2 guard"} preflight failed: ${audit.issues.join(" ") || "the launch contract or Extension contents changed after they were sealed"}`;
+							const error = `Graph Runtime v2 guard preflight failed: ${audit.issues.join(" ") || "the launch contract or Extension contents changed after they were sealed"}`;
 							const failure: FailureDetails = { kind: "routing_preflight_drift", retryKind: "failed" };
 							await this.transition(node.taskId, "waiting_input", { status: "waiting_input", endedAt: new Date().toISOString(), error, failure }, error, { statePatch: { failure } });
 							return { status: "waiting_input", error, failure };
@@ -1192,13 +1093,7 @@ export class NodeExecutor {
 							...(providerDispatch!.extensionContentDigest ? { extensionContentDigest: providerDispatch!.extensionContentDigest } : {}),
 						} : {});
 					};
-					const verifyLiveRoutingSnapshot = () => {
-						if (attempt.routingDecision?.enforcement !== "require") return;
-						const finalModels = this.currentAvailableModels();
-						if (!attempt.routingDecision.availableModelsDigest || availableModelsDigest(finalModels) !== attempt.routingDecision.availableModelsDigest) {
-							throw new Error("The active Pi model registry changed at the final Graph dispatch boundary.");
-						}
-					};
+					const verifyLiveRoutingSnapshot = () => { /* frozen legacy: no live routing snapshot to verify. */ };
 					const lineage = this.lineage(node, attempt, providerDispatch);
 					if (!lineage) await commitPreparedDispatch();
 					try {
@@ -1277,13 +1172,13 @@ export class NodeExecutor {
 					if (!await this.stopAttemptAndConfirm(node, attempt, workspace, providerDispatch, identity!, "child monitoring failed before termination was confirmed")) return { status: "stale", error: `Child monitoring failed and stop could not be confirmed; durable tombstone enforcement remains active: ${error instanceof Error ? error.message : String(error)}` };
 					return { status: "stale", error: `Child monitoring failed after the child was stopped: ${error instanceof Error ? error.message : String(error)}` };
 				}
-				const guardAttestationRequired = Boolean(this.runInstanceId) || attempt.routingDecision?.enforcement === "require";
+				const guardAttestationRequired = Boolean(this.runInstanceId);
 				if (guardAttestationRequired) {
 					const terminalAudit = await auditManagedLaunchContracts({
 						tasks: [this.childParams(node, workspace, attempt, providerDispatch)],
 						cwd: node.cwd,
 						requireExtensionSeal: true,
-						requireModelSeal: attempt.routingDecision?.enforcement === "require",
+						requireModelSeal: false,
 						...this.managedLaunchAuditInput(workspace.kind),
 					});
 					if (!terminalAudit.ok
@@ -1319,27 +1214,15 @@ export class NodeExecutor {
 					await this.transition(node.taskId, "running", { providerDispatches: attempt.providerDispatches });
 					return this.collectPartial(node, attempt, workspace, { status: "waiting_input", error: `Graph Runtime guard violation: ${providerDispatch.error}` }, terminal.output);
 				}
-				const execution = createModelExecution({ terminal, decision: attempt.routingDecision, legacyRequestedModel: modelOverride(node), config: this.routingConfig });
-				if (execution) {
-					attempt.modelExecution = execution;
-					providerDispatch.modelExecution = execution;
-				}
-				if (attempt.routingDecision?.enforcement === "require" && (!execution || execution.routingViolations?.length)) {
-					providerDispatch.status = "failed";
-					providerDispatch.endedAt = new Date().toISOString();
-					providerDispatch.error = execution?.routingViolations?.join(" ") || "The runtime did not report verifiable model and thinking provenance.";
-					await this.transition(node.taskId, "running", { ...(execution ? { modelExecution: execution } : {}), providerDispatches: attempt.providerDispatches });
-					return this.collectPartial(node, attempt, workspace, { status: "waiting_input", error: `Controlled routing violation: ${providerDispatch.error}` }, terminal.output);
-				}
 				if (terminal.state !== "complete") {
 					const error = typeof terminal.status.error === "string" ? terminal.status.error : `Subagent ended in state ${terminal.state}.`;
 					if (terminal.state === "paused") { Object.assign(providerDispatch, { status: "paused", endedAt: new Date().toISOString(), error }); return this.collectPartial(node, attempt, workspace, { status: "waiting_input", error }, terminal.output); }
 					if (terminal.state === "stopped") { Object.assign(providerDispatch, { status: "stopped", endedAt: new Date().toISOString(), error }); return this.collectPartial(node, attempt, workspace, { status: "stopped", error, failure: { kind: "cancelled" } }, terminal.output); }
 					const failure = classifyChildFailure(terminal.status, error);
 					Object.assign(providerDispatch, { status: "failed", endedAt: new Date().toISOString(), error, failure });
-					await this.transition(node.taskId, "running", { modelExecution: execution, providerDispatches: attempt.providerDispatches });
+					await this.transition(node.taskId, "running", { providerDispatches: attempt.providerDispatches });
 					const providerFailures = providerDispatches.filter((entry) => entry.failure?.retryKind === "provider").length;
-					const providerBudget = attempt.routingDecision?.budget.providerRetries ?? node.retryPolicy.maxProviderRetries ?? 0;
+					const providerBudget = node.retryPolicy.maxProviderRetries ?? 0;
 					if (failure.retryKind === "provider" && providerFailures <= providerBudget) {
 						await delay(Math.max(node.retryPolicy.providerBackoffMs ?? 5_000, failure.retryAfterMs ?? 0));
 						if (!identity || !await waitForObservedProcessTerminal(identity.asyncId, identity.asyncDir, 30_000)) {
@@ -1349,21 +1232,12 @@ export class NodeExecutor {
 						workspace = await this.resetProviderWorkspace(node, attempt, workspace, dispatchNumber);
 						if (attempt.outputPath) await this.removeManagedFileIfPresent(attempt.outputPath, "Provider retry output artifact");
 						const nextDispatch: ProviderDispatchState = { dispatch: dispatchNumber, status: "prepared", sessionDir: join(dirname(attempt.sessionDir), `provider-dispatch-${dispatchNumber}`, "session"), startedAt: new Date().toISOString() };
-						const controlledRetry = attempt.routingDecision?.enforcement === "require" && Boolean(attempt.routingDecision.selectedModel);
-						const retryModels = this.currentAvailableModels();
-						if (controlledRetry) {
-							if (!retryModels || availableModelsDigest(retryModels) !== attempt.routingDecision!.availableModelsDigest) {
-								const drift = "Controlled Graph provider retry preflight found that the active Pi model registry changed after the routing decision was sealed.";
-								return this.collectPartial(node, attempt, workspace, { status: "stale", error: drift, failure: { kind: "routing_preflight_drift", retryKind: "failed" } }, terminal.output);
-							}
-						}
-						if (this.runInstanceId || controlledRetry) {
+						if (this.runInstanceId) {
 							const audit = await auditManagedLaunchContracts({
 								tasks: [this.childParams(node, workspace, attempt, nextDispatch)],
 								cwd: node.cwd,
-								...(controlledRetry ? { availableModels: retryModels } : {}),
 								requireExtensionSeal: true,
-								requireModelSeal: controlledRetry,
+								requireModelSeal: false,
 								...this.managedLaunchAuditInput(workspace.kind),
 							});
 							const launchContractDigest = audit.contracts[0]?.launchContractDigest;
@@ -1385,16 +1259,11 @@ export class NodeExecutor {
 						await this.removeManagedFileIfPresent(this.providerWorkspaceResetPath(node, attempt), "Completed provider workspace reset journal");
 						continue;
 					}
-					const decision = attempt.routingDecision;
-					const canDegrade = failure.retryKind === "provider"
-						&& decision?.candidateIndex !== undefined
-						&& decision.candidateIndex + 1 < decision.eligibleCandidates.length
-						&& decision.degradationIndex < decision.budget.modelDegradations;
-					const terminalFailure = canDegrade ? { ...failure, retryKind: "model_degrade" as const } : failure;
+					const terminalFailure = failure;
 					return this.collectPartial(node, attempt, workspace, { status: "failed", error, retryKind: terminalFailure.retryKind, failure: terminalFailure }, terminal.output);
 				}
 				Object.assign(providerDispatch, { status: "complete", endedAt: new Date().toISOString() });
-				await this.transition(node.taskId, "running", { modelExecution: execution, providerDispatches: attempt.providerDispatches });
+				await this.transition(node.taskId, "running", { providerDispatches: attempt.providerDispatches });
 				terminalOutput = terminal.output;
 				break;
 			}

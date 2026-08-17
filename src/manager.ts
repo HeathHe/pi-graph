@@ -14,12 +14,7 @@ import type { CompiledNode, GraphConfig, GraphSnapshot, GraphSpec, NodeRuntimeSt
 import { loadOrRebuildValidatedRun, loadValidatedRun, recordProtectedIncident } from "./reconciler.ts";
 import { prepareAttentionResume, runRetentionMaintenance, type RetentionReport } from "./retention.ts";
 import { ChildRuntime, type ChildLineage } from "./child-runtime.ts";
-import { loadModelRoutingConfig, type ModelRoutingConfigInput } from "./model-routing/config.ts";
-import type { ModelRoutingConfig } from "./model-routing/types.ts";
-import { routingAttemptBudget } from "./model-routing-adapter.ts";
-import type { AvailableModelSnapshot } from "./pi-subagents-preflight.ts";
-import { isRoutingDriftResumeTerminal, ROUTING_DRIFT_RESUME_TERMINAL_ERROR } from "./authority.ts";
-import { graphSpecDigest, type PlanningReceipt } from "./subagent-router/planning-gate.ts";
+import { graphSpecDigest, type LegacyPlanningReceipt } from "./authorization.ts";
 
 interface RunningGraph {
 	runner: GraphRunner;
@@ -33,7 +28,6 @@ interface BackgroundEntry {
 }
 
 export interface GraphManagerOptions {
-	routingConfigInput?: ModelRoutingConfigInput;
 }
 
 function graphSummary(snapshot: GraphSnapshot, runsDir = "~/.pi/agent/graph-runs"): string {
@@ -303,7 +297,7 @@ export class GraphManager {
 			snapshot.supervisorEpoch = randomUUID();
 			await store.saveSnapshot(snapshot);
 			if (!this.isCurrent(generation, ctx) || signal.aborted) return;
-			const routingConfig = await this.routingConfigFor(validated.graph, store);
+			const routingConfig = undefined;
 			if (!this.isCurrent(generation, ctx) || signal.aborted) return;
 			this.launch(validated.graph, snapshot, store, releaseSupervisor, routingConfig, generation, ctx);
 			releaseSupervisor = undefined;
@@ -367,45 +361,7 @@ export class GraphManager {
 		return { config: this.config, context: this.context };
 	}
 
-	private availableModels(ctx = this.context): AvailableModelSnapshot[] | undefined {
-		return ctx?.modelRegistry.getAvailable().map((model) => ({
-			provider: model.provider,
-			id: model.id,
-			reasoning: model.reasoning,
-			input: model.input,
-		}));
-	}
-
-	private async routingConfigFor(graph: ReturnType<typeof compileGraph>, store?: GraphStore, planningReceipt?: PlanningReceipt): Promise<ModelRoutingConfig | undefined> {
-		let durableReceipt = planningReceipt;
-		if (!durableReceipt && store) {
-			try {
-				durableReceipt = (await store.loadAuthorization()).planningReceipt;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				// Runtime v1 fixtures and pre-authorization legacy runs have no
-				// authorization.json. They cannot claim a sealed planning config.
-			}
-		}
-		if (!durableReceipt && !graph.nodes.some((node) => Boolean(node.routingProfile))) return undefined;
-		const routingConfig = await loadModelRoutingConfig(this.options.routingConfigInput);
-		if (durableReceipt && routingConfig.configDigest !== durableReceipt.configDigest) {
-			throw new Error(`Graph planning authorization sealed routing config '${durableReceipt.configDigest}', but execution loaded '${routingConfig.configDigest}'. Re-plan and re-review under the active configuration.`);
-		}
-		for (const node of graph.nodes) if (node.routingProfile && !routingConfig.policy.profiles[node.routingProfile]) throw new Error(`Unknown routingProfile '${node.routingProfile}'.`);
-		const worstCaseSpawns = graph.nodes.reduce((sum, node) => {
-			const profile = node.routingProfile ? routingConfig.policy.profiles[node.routingProfile] : undefined;
-			const providerRetries = Math.max(node.retryPolicy.maxProviderRetries ?? 0, profile?.budget?.providerRetries ?? 0);
-			const modelDegradations = profile ? (profile.budget?.modelDegradations ?? Math.max(0, profile.candidates.length - 1)) : 0;
-			return sum + (node.retryPolicy.maxAttempts + modelDegradations) * (1 + providerRetries);
-		}, 0);
-		if (graph.nodes.some((node) => node.routingProfile) && graph.spawnBudget === undefined) throw new Error("Controlled-routing Graph authorization predates durable spawn-budget sealing; re-plan this run before execution.");
-		const admittedSpawnBudget = graph.spawnBudget ?? this.config?.maxSpawnBudget ?? Number.MAX_SAFE_INTEGER;
-		if (worstCaseSpawns > admittedSpawnBudget) throw new Error(`Routed worst-case ${worstCaseSpawns} child launches exceed admitted spawn budget ${admittedSpawnBudget}.`);
-		return routingConfig;
-	}
-
-	private launch(graph: ReturnType<typeof compileGraph>, snapshot: GraphSnapshot, store: GraphStore, releaseSupervisor?: () => Promise<void>, routingConfig?: ModelRoutingConfig, generation = this.lifecycleGeneration, ctx = this.context): void {
+	private launch(graph: ReturnType<typeof compileGraph>, snapshot: GraphSnapshot, store: GraphStore, releaseSupervisor?: () => Promise<void>, routingConfig?: undefined, generation = this.lifecycleGeneration, ctx = this.context): void {
 		if (!ctx || !this.isCurrent(generation, ctx) || this.runners.has(graph.graphId)) {
 			void releaseSupervisor?.();
 			return;
@@ -427,7 +383,7 @@ export class GraphManager {
 				ctx.ui.notify(`pi-graph '${graph.graphId}' stopped.`, "info");
 			}
 			void this.maintain(config, ctx, generation).catch(() => undefined);
-		}, routingConfig, () => this.isCurrent(generation, ctx) ? this.availableModels(ctx) : undefined, ownerSessionFile(ctx), orchestratorIntercomTarget(this.pi, ctx));
+		}, ownerSessionFile(ctx), orchestratorIntercomTarget(this.pi, ctx));
 		const promise = runner.run(releaseSupervisor).catch(async (error) => {
 			if (error instanceof GraphAlreadySupervisedError) {
 				if (this.isCurrent(generation, ctx)) ctx.ui.notify(`pi-graph '${graph.graphId}' is already supervised by another active Pi process.`, "warning");
@@ -466,17 +422,16 @@ export class GraphManager {
 		this.runners.set(graph.graphId, { runner, promise });
 	}
 
-	async start(spec: GraphSpec, planningReceipt?: PlanningReceipt): Promise<GraphSnapshot> {
+	async start(spec: GraphSpec, planningReceipt?: LegacyPlanningReceipt): Promise<GraphSnapshot> {
 		const { config, context } = this.requireReady();
 		const generation = this.lifecycleGeneration;
 		return this.runBackground(generation, (signal) => this.startGeneration(spec, planningReceipt, config, context, generation, signal));
 	}
 
-	private async startGeneration(spec: GraphSpec, planningReceipt: PlanningReceipt | undefined, config: GraphConfig, context: ExtensionContext, generation: number, signal: AbortSignal): Promise<GraphSnapshot> {
+	private async startGeneration(spec: GraphSpec, planningReceipt: LegacyPlanningReceipt | undefined, config: GraphConfig, context: ExtensionContext, generation: number, signal: AbortSignal): Promise<GraphSnapshot> {
 		if (!this.isCurrent(generation, context) || signal.aborted) throw new Error("Pi session changed before Graph start began.");
 		if (!planningReceipt && !this.allowUnplannedStartForTests) throw new Error("GraphManager.start requires a reviewed planning receipt. Unplanned Runtime v2 admission is disabled.");
 		const graph = compileGraph(spec, context.cwd, config.maxSpawnBudget, 2, [config.runsDir]);
-		const routingConfig = await this.routingConfigFor(graph, undefined, planningReceipt);
 		if (!this.isCurrent(generation, context) || signal.aborted) throw new Error("Pi session changed during Graph start admission.");
 		const store = new GraphStore(config.runsDir, graph.graphId);
 		const snapshot = initialSnapshot(graph, context.cwd, sessionIdentity(context), 2);
@@ -489,7 +444,7 @@ export class GraphManager {
 		try {
 			const authoritative = await store.loadSnapshot();
 			if (!this.isCurrent(generation, context) || signal.aborted) throw new Error("Pi session changed before Graph execution launch.");
-			this.launch(graph, authoritative, store, releaseSupervisor, routingConfig, generation, context);
+			this.launch(graph, authoritative, store, releaseSupervisor, undefined, generation, context);
 			return authoritative;
 		} catch (error) {
 			await releaseSupervisor();
@@ -594,9 +549,9 @@ export class GraphManager {
 				}
 			if (["queued", "running"].includes(snapshot.status)) {
 				const graph = await loadValidatedGraph(store, snapshot, config.maxSpawnBudget, true);
-				const routingConfig = await this.routingConfigFor(graph, store);
+				const routingConfig = undefined;
 				if (!this.isCurrent(generation, context) || signal.aborted) throw new Error("Pi session changed before durable Graph stop recovery launched.");
-				const runner = new GraphRunner(graph, snapshot, store, this.pi.events, new LeaseRegistry(join(config.runsDir, ".control", "leases")), config, undefined, routingConfig, () => this.availableModels(), ownerSessionFile(context), orchestratorIntercomTarget(this.pi, context));
+				const runner = new GraphRunner(graph, snapshot, store, this.pi.events, new LeaseRegistry(join(config.runsDir, ".control", "leases")), config, undefined, ownerSessionFile(context), orchestratorIntercomTarget(this.pi, context));
 				const claimed = releaseSupervisor;
 				releaseSupervisor = undefined;
 				const promise = runner.run(claimed).finally(() => {
@@ -850,46 +805,11 @@ export class GraphManager {
 						}
 					}
 					const childState = asyncId && asyncDir ? await readAsyncRunState(asyncId, asyncDir) : undefined;
-					const routingPreflightDrift = attempt?.failure?.kind === "routing_preflight_drift";
-					const routingNeedsFreshAttempt = attempt?.routingDecision?.fallbackLevel === "L3"
-						|| routingPreflightDrift
-						|| (attempt?.routingDecision?.enforcement === "require" && !attempt.routingDecision.availableModelsDigest);
-					if (!childState && routingNeedsFreshAttempt) {
-						const node = nodeById.get(state.taskId)!;
-						if (state.attempt >= routingAttemptBudget(node, state)) throw new Error(`Node '${state.taskId}' exhausted its routing re-evaluation budget.`);
-						try { assertRoutingReevaluationPreDispatch(attempt, providerDispatch); }
-						catch { throw new Error(`Node '${state.taskId}' cannot re-evaluate routing because the blocked attempt may already have dispatched or committed writes.`); }
-						if (routingPreflightDrift && (
-							!providerDispatch
-							|| providerDispatch.status !== "prepared"
-						)) throw new Error(`Node '${state.taskId}' cannot re-evaluate routing because the blocked attempt may already have dispatched or committed writes.`);
-							if (snapshot.schemaVersion === 2) {
-								const authority = await store.readAttemptRecord(state.taskId, attempt.attempt);
-								const preparedWithoutDispatch = authority.phase === "prepared" && authority.requestDigest === undefined && authority.asyncId === undefined;
-								const completedRoutingResume = isRoutingDriftResumeTerminal(authority)
-									&& authority.attemptNonce === attempt.attemptNonce
-									&& authority.routingDecision?.decisionId === attempt.routingDecision?.decisionId
-									&& authority.routingDecision?.seal.digest === attempt.routingDecision?.seal.digest;
-								if (!preparedWithoutDispatch && !completedRoutingResume) {
-									throw new Error(`Node '${state.taskId}' cannot re-evaluate routing because its durable attempt authority may already have dispatched.`);
-								}
-								if (!completedRoutingResume) {
-									await store.writeAttemptRecord(state.taskId, attempt.attempt, {
-										...authority,
-										phase: "terminal",
-										terminalStatus: "failed",
-										terminalError: ROUTING_DRIFT_RESUME_TERMINAL_ERROR,
-										terminalRetryKind: "failed",
-										updatedAt: new Date().toISOString(),
-									});
-								}
-							}
-						attempt.status = "failed";
-						attempt.failure = { kind: routingPreflightDrift ? "routing_preflight_drift" : "task_failed", retryKind: "failed" };
-						attempt.endedAt = new Date().toISOString();
-						state.status = "pending";
-						state.error = undefined;
-						continue;
+					const legacyRoutingBlocked = Boolean(attempt?.routingDecision)
+						|| attempt?.failure?.kind === "routing_preflight_drift"
+						|| Boolean(nodeById.get(state.taskId)?.routingProfile);
+					if (!childState && legacyRoutingBlocked) {
+						throw new Error(`Node '${state.taskId}' requires legacy controlled-routing re-evaluation, which is frozen in Runtime v3. pi-graph will not re-route or re-dispatch it; reconcile the run manually or start a new graph.`);
 					}
 					waitingInputResumeAction(childState, state.taskId);
 					state.status = "running";
@@ -949,7 +869,7 @@ export class GraphManager {
 			snapshot.sessionId = sessionIdentity(context);
 			snapshot.supervisorEpoch = randomUUID();
 			await store.saveSnapshot(snapshot);
-			const routingConfig = await this.routingConfigFor(graph, store);
+			const routingConfig = undefined;
 			if (!this.isCurrent(generation, context) || signal.aborted) throw new Error("Pi session changed before resumed Graph execution launch.");
 			this.launch(graph, snapshot, store, releaseSupervisor, routingConfig, generation, context);
 			return snapshot;
@@ -975,28 +895,23 @@ export function assertRedispatchAllowed(node: CompiledNode, state: NodeRuntimeSt
 		throw new Error(`Node '${node.taskId}' has ambient or external write authority and cannot be re-dispatched. Start a new graph only after reconciling its side effects.`);
 	}
 	const current = state.attempts.at(-1);
-	const currentModel = current?.routingDecision?.selectedModel;
 	const matchingFailures = state.attempts.filter((attempt) => {
 		if (attempt.status !== "failed") return false;
 		const attemptKind = attempt.failure?.retryKind ?? "failed";
 		return retryKind === "provider"
-			? attemptKind === "provider" && (!currentModel || attempt.routingDecision?.selectedModel === currentModel)
+			? attemptKind === "provider"
 			: retryKind === "model_degrade" ? attemptKind === "model_degrade" : attemptKind !== "provider" && attemptKind !== "model_degrade";
 	}).length;
 	const currentKind = current?.failure?.retryKind ?? "failed";
 	const currentIncluded = current?.status === "failed" && (retryKind === "provider"
-		? currentKind === "provider" && (!currentModel || current.routingDecision?.selectedModel === currentModel)
+		? currentKind === "provider"
 		: retryKind === "model_degrade" ? currentKind === "model_degrade" : currentKind !== "provider" && currentKind !== "model_degrade");
 	let used = matchingFailures + (currentIncluded ? 0 : 1);
 	if (retryKind === "provider") {
 		throw new Error(`Node '${node.taskId}' cannot create a new attempt for a provider retry; provider retries must remain inside the original attempt. Start a new graph after reconciling the terminal failure.`);
 	}
 	if (retryKind === "model_degrade") {
-		const decision = current?.routingDecision;
-		if (!decision || used > decision.budget.modelDegradations || decision.candidateIndex === undefined || decision.candidateIndex + 1 >= decision.eligibleCandidates.length) {
-			throw new Error(`Node '${node.taskId}' exhausted its declared model degradation budget.`);
-		}
-		return;
+		throw new Error(`Node '${node.taskId}' model degradation re-dispatch is frozen in Runtime v3; legacy degrade retries cannot be re-dispatched. Start a new graph after reconciling the terminal failure.`);
 	}
 	const classifiedProviderAttempts = state.attempts.filter((attempt) => ["provider", "model_degrade"].includes(attempt.failure?.retryKind ?? "")).length;
 	used = Math.max(used, state.attempt - classifiedProviderAttempts);

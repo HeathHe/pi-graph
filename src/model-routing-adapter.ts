@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { AcceptanceRecord } from "./authority.ts";
+import type { AcceptanceRecord } from "./authorization.ts";
 import type { CompiledGraph, CompiledNode, GraphSnapshot, NodeRuntimeState, ResultManifest } from "./types.ts";
 import type { GraphStore } from "./store.ts";
 import { evaluateRoutingPolicy } from "./model-routing/evaluate-routing-policy.ts";
 import { loadModelRoutingConfig, type ModelRoutingConfigInput } from "./model-routing/config.ts";
 import { defaultMaxAuthorizationStore, validateMaxAuthorization } from "./model-routing/runtime-state.ts";
-import type { MaxAuthorizationStore, ModelRoutingConfig, ProducerModelExecution, RoutingAvailableModel, RoutingDecision } from "./model-routing/types.ts";
+import type { MaxAuthorization, MaxAuthorizationStore, ModelExecution, ModelRoutingConfig, ProducerModelExecution, RoutingAvailableModel, RoutingDecision, TaskRisk } from "./model-routing/types.ts";
 import { baseModel } from "./model-routing/model-execution.ts";
 import { digestFile } from "./workspace.ts";
 import { sealRoutingDecision } from "./model-routing/validate-routing-decision.ts";
@@ -53,14 +53,15 @@ async function producerExecutions(
 			if (authority.phase !== "accepted" || authority.taskId !== taskId || authority.attempt !== attemptNumber || authority.attemptNonce !== acceptance.attemptNonce) throw new Error("producer authority identity is not accepted");
 			if (acceptance.graphId !== graph.graphId || acceptance.taskId !== taskId || acceptance.attempt !== attemptNumber || await digestFile(manifestPath) !== acceptance.manifestDigest) throw new Error("producer acceptance evidence does not match the manifest");
 			if (manifest.graphId !== graph.graphId || manifest.taskId !== taskId || manifest.attempt !== attemptNumber || manifest.status !== "complete" || !manifest.modelExecution) throw new Error("accepted producer manifest has no valid modelExecution provenance");
-			const registry = config.registry.models.find((entry) => entry.model === baseModel(manifest.modelExecution!.resolvedModel) || entry.aliases?.includes(baseModel(manifest.modelExecution!.resolvedModel)));
-			if (!registry || manifest.modelExecution.routingViolations?.length) throw new Error("producer model identity is unregistered or violated its sealed route");
+			const execution = manifest.modelExecution as ModelExecution;
+			const registry = config.registry.models.find((entry) => entry.model === baseModel(execution.resolvedModel) || entry.aliases?.includes(baseModel(execution.resolvedModel)));
+			if (!registry || execution.routingViolations?.length) throw new Error("producer model identity is unregistered or violated its sealed route");
 			output.push({
 				taskId,
-				resolvedModel: manifest.modelExecution.resolvedModel,
+				resolvedModel: execution.resolvedModel,
 				modelFamily: registry.family,
 				providerDomain: registry.providerDomain,
-				identityConfidence: manifest.modelExecution.identityConfidence,
+				identityConfidence: execution.identityConfidence,
 			});
 		} catch {
 			output.push({ taskId, resolvedModel: "", modelFamily: "", providerDomain: "", identityConfidence: "unknown" });
@@ -85,9 +86,10 @@ export async function resolveGraphRoutingDecision(input: GraphRoutingInput): Pro
 	if (!input.node.routingProfile) return undefined;
 	const config = input.config ?? await loadModelRoutingConfig(input.configInput);
 	const previousAttempt = input.state.attempts.at(-1);
-	const previousDecision = previousAttempt?.routingDecision?.fallbackLevel === "L3" || previousAttempt?.failure?.kind === "routing_preflight_drift"
+	const previousDecisionBytes = previousAttempt?.routingDecision as RoutingDecision | undefined;
+	const previousDecision = previousDecisionBytes?.fallbackLevel === "L3" || previousAttempt?.failure?.kind === "routing_preflight_drift"
 		? undefined
-		: previousAttempt?.routingDecision;
+		: previousDecisionBytes;
 	const previousRetryKind = previousAttempt?.failure?.retryKind;
 	const retryKind = previousDecision
 		? previousRetryKind === "provider" ? "provider"
@@ -98,10 +100,10 @@ export async function resolveGraphRoutingDecision(input: GraphRoutingInput): Pro
 		taskBinding: graphRoutingTaskBinding({ graphId: input.graph.graphId, taskId: input.node.taskId, task: input.node.task }),
 		agent: input.node.agent,
 		routingProfile: input.node.routingProfile,
-		taskRisk: input.node.taskRisk,
+		taskRisk: input.node.taskRisk as TaskRisk | undefined,
 		requestedModel: legacyModel(input.node),
 		producerExecutions: await producerExecutions(input.graph, input.node, input.store, config),
-		maxAuthorization: input.node.maxAuthorization,
+		maxAuthorization: input.node.maxAuthorization as MaxAuthorization | undefined,
 		authorizationStore: input.authorizationStore ?? defaultMaxAuthorizationStore,
 		consumeMaxAuthorization: input.consumeMaxAuthorization ?? true,
 		previousDecision,
@@ -144,16 +146,16 @@ export async function authorizeLegacyMax(
 	if (!model || !/(?:^|:)max$/.test(model)) return;
 	const taskBinding = graphRoutingTaskBinding({ graphId: graph.graphId, taskId: node.taskId, task: node.task });
 	const effectiveConfig = config ?? await loadModelRoutingConfig();
-	validateMaxAuthorization(node.maxAuthorization, {
+	validateMaxAuthorization(node.maxAuthorization as MaxAuthorization | undefined, {
 		taskBinding,
 		model,
 		trustedIssuers: effectiveConfig.policy.maxAuthorizationIssuers ?? {},
 	});
-	store.consume(node.maxAuthorization!, { taskBinding, model });
+	store.consume(node.maxAuthorization! as MaxAuthorization, { taskBinding, model });
 }
 
 export function routingAttemptBudget(node: CompiledNode, snapshot: GraphSnapshot["nodes"][string]): number {
-	const decisions = snapshot.attempts.map((attempt) => attempt.routingDecision).filter((decision): decision is RoutingDecision => Boolean(decision));
+	const decisions = snapshot.attempts.map((attempt) => attempt.routingDecision as RoutingDecision | undefined).filter((decision): decision is RoutingDecision => Boolean(decision));
 	if (decisions.length === 0) return node.retryPolicy.maxAttempts;
 	const initial = decisions[0]!;
 	return node.retryPolicy.maxAttempts + initial.budget.modelDegradations;
