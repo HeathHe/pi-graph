@@ -1,14 +1,14 @@
 import { validateAuthorizationV4 } from "./authorization.ts";
 import { canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
-import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, SourceIdentityV3, V3NodePhase, V3NodeProjection, V3NodeTerminal, V3RunVerification } from "./types.ts";
+import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, SourceIdentityV3, V3NodeProjection, V3NodeProjectionPhase, V3NodeProjectionTerminal, V3RunVerification } from "./types.ts";
 
 const SNAPSHOT_FIELDS = new Set([
-	"schemaVersion", "runInstanceId", "graphId", "graphDigest", "sourceGraphSpecDigest", "status", "sessionId", "supervisorEpoch", "createdAt", "updatedAt", "nodes",
+	"schemaVersion", "runInstanceId", "graphId", "graphDigest", "sourceGraphSpecDigest", "status", "sessionId", "supervisorEpoch", "createdAt", "updatedAt", "topology", "revision", "sealed", "nodes",
 ]);
 const NODE_PROJECTION_FIELDS = new Set(["phase", "attempt", "terminalStatus"]);
-const NODE_PHASES = new Set<V3NodePhase>(["queued", "prepared", "dispatched", "running", "verifying", "applying", "accepted", "failed", "aborted", "needs_attention"]);
-const NODE_TERMINALS = new Set<V3NodeTerminal>(["accepted", "failed", "aborted", "needs_attention"]);
+const NODE_PHASES = new Set<V3NodeProjectionPhase>(["queued", "prepared", "dispatched", "running", "verifying", "applying", "accepted", "failed", "aborted", "needs_attention", "skipped", "blocked", "cancelled"]);
+const NODE_TERMINALS = new Set<V3NodeProjectionTerminal>(["accepted", "failed", "aborted", "needs_attention", "skipped", "blocked", "cancelled"]);
 
 function validateNodeProjections(nodes: unknown): Record<string, V3NodeProjection> | undefined {
 	if (nodes === undefined) return undefined;
@@ -20,14 +20,14 @@ function validateNodeProjections(nodes: unknown): Record<string, V3NodeProjectio
 		for (const field of Object.keys(projection)) {
 			if (!NODE_PROJECTION_FIELDS.has(field)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' contains unknown field '${field}'.`, { field: "nodes", details: { taskId } });
 		}
-		if (typeof projection.phase !== "string" || !NODE_PHASES.has(projection.phase as V3NodePhase)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid phase.`, { field: "nodes", details: { taskId } });
+		if (typeof projection.phase !== "string" || !NODE_PHASES.has(projection.phase as V3NodeProjectionPhase)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid phase.`, { field: "nodes", details: { taskId } });
 		if (typeof projection.attempt !== "number" || !Number.isInteger(projection.attempt) || (projection.attempt as number) < 0) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid attempt.`, { field: "nodes", details: { taskId } });
-		if (projection.terminalStatus !== undefined && (typeof projection.terminalStatus !== "string" || !NODE_TERMINALS.has(projection.terminalStatus as V3NodeTerminal))) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid terminalStatus.`, { field: "nodes", details: { taskId } });
-		output[taskId] = { phase: projection.phase as V3NodePhase, attempt: projection.attempt as number, ...(projection.terminalStatus === undefined ? {} : { terminalStatus: projection.terminalStatus as V3NodeTerminal }) };
+		if (projection.terminalStatus !== undefined && (typeof projection.terminalStatus !== "string" || !NODE_TERMINALS.has(projection.terminalStatus as V3NodeProjectionTerminal))) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid terminalStatus.`, { field: "nodes", details: { taskId } });
+		output[taskId] = { phase: projection.phase as V3NodeProjectionPhase, attempt: projection.attempt as number, ...(projection.terminalStatus === undefined ? {} : { terminalStatus: projection.terminalStatus as V3NodeProjectionTerminal }) };
 	}
 	return output;
 }
-const STATUSES = new Set<GraphRuntimeStatusV3>(["queued", "running", "complete", "failed", "stopped", "paused", "waiting_input", "needs_attention"]);
+const STATUSES = new Set<GraphRuntimeStatusV3>(["queued", "running", "idle", "stopping", "complete", "failed", "stopped", "paused", "waiting_input", "needs_attention"]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -87,6 +87,10 @@ export function validateGraphSnapshotV3(value: unknown): GraphSnapshotV3 {
 	if (Number.isNaN(Date.parse(createdAt))) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 createdAt must be an ISO-8601 timestamp.", { field: "createdAt" });
 	if (Number.isNaN(Date.parse(updatedAt))) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 updatedAt must be an ISO-8601 timestamp.", { field: "updatedAt" });
 	const nodes = validateNodeProjections(value.nodes);
+	if (value.topology !== undefined && value.topology !== "open" && value.topology !== "sealed") graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 topology must be 'open' or 'sealed'.", { field: "topology" });
+	if (value.revision !== undefined && (typeof value.revision !== "number" || !Number.isSafeInteger(value.revision) || value.revision < 0)) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 revision must be a non-negative safe integer.", { field: "revision" });
+	if (value.sealed !== undefined && typeof value.sealed !== "boolean") graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 sealed must be a boolean.", { field: "sealed" });
+	if ((value.revision === undefined) !== (value.sealed === undefined) || (value.revision === undefined) !== (value.topology === undefined)) graphV3Error("INVALID_SNAPSHOT", "Snapshot V3 dynamic topology fields must be present together.");
 	return {
 		schemaVersion: 3,
 		runInstanceId,
@@ -98,6 +102,7 @@ export function validateGraphSnapshotV3(value: unknown): GraphSnapshotV3 {
 		supervisorEpoch,
 		createdAt,
 		updatedAt,
+		...(value.topology === undefined ? {} : { topology: value.topology as "open" | "sealed", revision: value.revision as number, sealed: value.sealed as boolean }),
 		...(nodes ? { nodes } : {}),
 	};
 }

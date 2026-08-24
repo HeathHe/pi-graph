@@ -91,6 +91,18 @@ test("D1: the production entry layer and the full core have zero governance impo
 	assert.deepEqual(coreEdges, [], "the full core must have zero imports into the archived governance module set");
 });
 
+test("D1: production extensions import only the V3 core", async () => {
+	const violations: string[] = [];
+	for (const file of ["extensions/pi-graph.ts", "extensions/pi-graph-guard.ts"]) {
+		const source = await readFile(resolve(file), "utf8");
+		for (const line of source.split("\n")) {
+			const match = /from\s+"\.\.\/src\/(.+?)"/u.exec(line);
+			if (match && !match[1]?.startsWith("v3/")) violations.push(`${file}: ${line.trim()}`);
+		}
+	}
+	assert.deepEqual(violations, [], "production extensions must not retain the legacy GraphManager/runtime stack");
+});
+
 test("D5: loading the extension in an empty session produces zero graph activity", { timeout: 45_000 }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-graph-phase2-d5-"));
 	const agentDir = join(root, "agent");

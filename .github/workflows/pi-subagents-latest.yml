@@ -19,4 +19,3 @@ jobs:
       - run: npm install --no-save pi-subagents@latest
       - run: npm run check
       - run: npm test
-      - run: npm run test:latest-integration

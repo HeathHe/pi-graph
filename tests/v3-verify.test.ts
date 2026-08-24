@@ -40,6 +40,23 @@ test("V3 verify caps per-stream output and flags truncation", async () => {
 	assert.equal(result.ok, true);
 });
 
+test("V3 verify applies stream caps to UTF-8 bytes rather than JavaScript characters", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
+	await writeFile(join(cwd, "unicode.js"), "process.stdout.write('界'.repeat(100));\n");
+	const result = await runV3Validation("node unicode.js", cwd, { streamLimitBytes: 16, timeoutMs: 10_000 });
+	assert.equal(result.stdoutTruncated, true);
+	assert.ok(Buffer.byteLength(result.stdout, "utf8") <= 16);
+	assert.equal(result.ok, true);
+});
+
+test("V3 verify marks output beyond an exactly filled stream cap as truncated", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
+	await writeFile(join(cwd, "exact.js"), "process.stdout.write('12345678'); setImmediate(() => process.stdout.write('9'));\n");
+	const result = await runV3Validation("node exact.js", cwd, { streamLimitBytes: 8, timeoutMs: 10_000 });
+	assert.equal(result.stdout, "12345678");
+	assert.equal(result.stdoutTruncated, true);
+});
+
 test("V3 verify enforces the total timeout and records timedOut", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
 	await writeFile(join(cwd, "slow.js"), "setTimeout(() => {}, 60000);\n");

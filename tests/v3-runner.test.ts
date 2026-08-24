@@ -5,8 +5,8 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { compileGraphSpecV3 } from "../src/v3/compiler.ts";
 import { initializeV3Run } from "../src/v3/initialize.ts";
-import { readLatestV3Attempt } from "../src/v3/attempt.ts";
-import { readV3AcceptanceEvidence, readV3ValidatedResult, readV3WorkspaceEvidence } from "../src/v3/attempt.ts";
+import { readLatestV3Attempt, readV3AcceptanceEvidence, readV3ValidatedResult, readV3WorkspaceEvidence, verifyV3AcceptedAttemptChain } from "../src/v3/attempt.ts";
+import { v3DispatchChild, v3StopChild } from "../src/v3/dispatch.ts";
 import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import { V3GraphRunner } from "../src/v3/runner.ts";
 import type { GraphSpecV3 } from "../src/v3/types.ts";
@@ -58,7 +58,7 @@ async function launch(
 	return { graph, init, snapshot, runDir };
 }
 
-test("V3 runner executes a three-node A/B-parallel-then-C graph end to end", async () => {
+test("V3 runner serializes local_write transactions before their fan-in", async () => {
 	const sandboxInfo = await setupRun();
 	await writeFile(join(sandboxInfo.sourceDir, "input.txt"), "seed\n", "utf8");
 	const mock = new MockSubagents();
@@ -96,16 +96,19 @@ test("V3 runner executes a three-node A/B-parallel-then-C graph end to end", asy
 	assert.ok(aAcceptance);
 	assert.equal(aAcceptance.method, "machine-verified");
 	assert.ok(aAcceptance.attemptDigest);
+	assert.equal((await verifyV3AcceptedAttemptChain(runDir, "node-a", aAttempt.attempt, { method: "machine-verified" })).ok, true);
+	assert.equal((await verifyV3AcceptedAttemptChain(runDir, "node-c", 1, { method: "declared" })).ok, true);
+	assert.equal(await readFile(join(runDir, "artifacts", "node-a", "attempt-1.txt"), "utf8"), JSON.stringify({ taskId: "node-a", output: aAttempt.evidence.child!.output }));
+	assert.equal(await readFile(join(runDir, "artifacts", "node-a.txt"), "utf8"), JSON.stringify({ taskId: "node-a", output: aAttempt.evidence.child!.output }));
 	// C must have been dispatched after both A and B were accepted.
 	const cDispatch = (await readLatestV3Attempt(runDir, "node-c"))!.evidence.dispatch!;
 	const aDispatch = (await readLatestV3Attempt(runDir, "node-a"))!.evidence.dispatch!;
 	const bDispatch = (await readLatestV3Attempt(runDir, "node-b"))!.evidence.dispatch!;
 	assert.ok(Date.parse(cDispatch.dispatchedAt) >= Date.parse(aDispatch.dispatchedAt));
 	assert.ok(Date.parse(cDispatch.dispatchedAt) >= Date.parse(bDispatch.dispatchedAt));
-	// A and B were both in flight at some point (parallel launch).
-	const aStart = Date.parse(aDispatch.dispatchedAt);
-	const bStart = Date.parse(bDispatch.dispatchedAt);
-	assert.ok(Math.abs(aStart - bStart) < 2_000, "A and B dispatched near-simultaneously");
+	// A and B are independent roots, but Graph-wide local_write transaction
+	// serialization prevents B from dispatching until A is durably accepted.
+	assert.ok(Date.parse(bDispatch.dispatchedAt) >= Date.parse(aAcceptance.recordedAt));
 	// Events written as unverified shadow lines.
 	const events = await readFile(join(runDir, "events.jsonl"), "utf8");
 	const lines = events.trim().split("\n").filter(Boolean);
@@ -154,6 +157,47 @@ test("V3 runner retries a failed local_write node per retryPolicy", async () => 
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
 });
 
+test("V3 runner failFast stops new independent dispatches while admitted work finishes", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.behaviors.set("FAIL_FAST_FAIL", (input) => failChild(input));
+	mock.behaviors.set("FAIL_FAST_IN_FLIGHT", async (input) => {
+		// Hold this admitted branch until the failure is durably observed. This
+		// makes the dispatch-gate assertion independent of machine/test load.
+		for (let index = 0; index < 500; index += 1) {
+			if ((await readLatestV3Attempt(sandboxInfo.runDir, "failing"))?.evidence.phase === "failed") break;
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+		}
+		await completeChild({ ...input, output: "in-flight-finished" });
+	});
+	mock.behaviors.set("FAIL_FAST_NEVER", (input) => completeChild({ ...input, output: "must-not-run" }));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "fail fast across independent branches",
+		failFast: true,
+		maxConcurrency: 2,
+		nodes: [
+			{ taskId: "failing", agent: "test-agent", task: "FAIL_FAST_FAIL", sideEffect: "local_read" },
+			{ taskId: "in-flight", agent: "test-agent", task: "FAIL_FAST_IN_FLIGHT", sideEffect: "local_read" },
+			{ taskId: "never-start", agent: "test-agent", task: "FAIL_FAST_NEVER", sideEffect: "local_read" },
+		],
+	};
+	const { snapshot, runDir } = await launch(sandboxInfo, spec, mock, { failFast: true, preflightAgent: async () => undefined });
+	assert.equal(snapshot.status, "failed");
+	assert.equal((await readLatestV3Attempt(runDir, "failing"))!.evidence.phase, "failed");
+	assert.equal((await readLatestV3Attempt(runDir, "in-flight"))!.evidence.phase, "accepted", "already admitted work may finish");
+	const neverStarted = (await readLatestV3Attempt(runDir, "never-start"))!.evidence;
+	assert.equal(neverStarted.phase, "failed", "failFast records an explicit no-dispatch terminal state");
+	assert.equal(neverStarted.dispatch, undefined);
+	assert.match(neverStarted.failure?.message ?? "", /failed fast before this node started/u);
+	assert.equal(snapshot.nodes?.["never-start"]?.phase, "failed");
+	const spawnedTasks = mock.spawned.map((entry) => String(entry.params.task));
+	assert.equal(spawnedTasks.some((task) => task.includes("FAIL_FAST_NEVER")), false, `unexpected dispatches: ${spawnedTasks.join(" | ")}`);
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
 test("V3 runner enters needs_attention on ambiguous child identity", async () => {
 	const sandboxInfo = await setupRun();
 	const mock = new MockSubagents();
@@ -177,6 +221,142 @@ test("V3 runner enters needs_attention on ambiguous child identity", async () =>
 	assert.equal(latest!.evidence.failure!.kind, "dispatch_unknown");
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("needs_attention closes the whole dispatch gate even when failFast is false", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.behaviors.set("AMBIG_GATE", async (input) => {
+		await writeFile(join(input.asyncDir, "status.json"), JSON.stringify({ runId: "wrong-id", state: "complete", sessionDir: join(input.asyncDir, "session"), mode: "single" }));
+	});
+	mock.behaviors.set("MUST_NOT_DISPATCH", (input) => completeChild({ ...input, output: "unexpected" }));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "needs attention gates independent work",
+		maxConcurrency: 1,
+		nodes: [
+			{ taskId: "ambiguous", agent: "test-agent", task: "AMBIG_GATE", sideEffect: "local_read" },
+			{ taskId: "independent", agent: "test-agent", task: "MUST_NOT_DISPATCH", sideEffect: "local_read" },
+		],
+	};
+	const { snapshot, runDir } = await launch(sandboxInfo, spec, mock, { preflightAgent: async () => undefined });
+	assert.equal(snapshot.status, "needs_attention");
+	assert.equal((await readLatestV3Attempt(runDir, "ambiguous"))?.evidence.phase, "needs_attention");
+	assert.equal(await readLatestV3Attempt(runDir, "independent"), undefined);
+	assert.equal(mock.spawned.some((entry) => String(entry.params.task).includes("MUST_NOT_DISPATCH")), false);
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("resume verifies accepted evidence and does not redispatch a tampered immutable artifact", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.behaviors.set("CHAIN_ROOT", (input) => completeChild({ ...input, output: "trusted-output" }));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "accepted chain recovery",
+		nodes: [{ taskId: "root", agent: "test-agent", task: "CHAIN_ROOT", sideEffect: "local_read" }],
+	};
+	const launched = await launch(sandboxInfo, spec, mock, { preflightAgent: async () => undefined });
+	assert.equal(launched.snapshot.status, "complete");
+	await writeFile(join(launched.runDir, "artifacts", "root", "attempt-1.txt"), "tampered", "utf8");
+	const before = mock.spawned.length;
+	const resumed = new V3GraphRunner({
+		rpc: new SubagentRpcClient(mock),
+		runDir: launched.runDir,
+		graph: launched.graph,
+		authorization: launched.init.authorization,
+		sourceCwd: sandboxInfo.sourceDir,
+		sessionId: "session-test",
+		supervisorEpoch: "epoch-2",
+		preflightAgent: async () => undefined,
+	});
+	await resumed.initializeForResume();
+	assert.equal((await resumed.run()).status, "needs_attention");
+	assert.equal(mock.spawned.length, before, "tampered accepted evidence must never be redispatched automatically");
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("a tampered accepted dependency stops an explicit descendant retry before dispatch", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.behaviors.set("CHAIN_A", (input) => completeChild({ ...input, output: "a-output" }));
+	mock.behaviors.set("CHAIN_B", (input) => completeChild({ ...input, output: "b-output" }));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "dependency chain retry",
+		nodes: [
+			{ taskId: "a", agent: "test-agent", task: "CHAIN_A", sideEffect: "local_read" },
+			{ taskId: "b", agent: "test-agent", task: "CHAIN_B", dependsOn: ["a"], sideEffect: "local_read" },
+		],
+	};
+	const launched = await launch(sandboxInfo, spec, mock, { preflightAgent: async () => undefined });
+	const workspacePath = join(launched.runDir, "nodes", "a", "attempts", "1", "workspace.json");
+	const workspace = JSON.parse(await readFile(workspacePath, "utf8"));
+	workspace.createdAt = new Date(Date.parse(workspace.createdAt) + 1_000).toISOString();
+	await writeFile(workspacePath, JSON.stringify(workspace), "utf8");
+	const before = mock.spawned.length;
+	const resumed = new V3GraphRunner({
+		rpc: new SubagentRpcClient(mock), runDir: launched.runDir, graph: launched.graph,
+		authorization: launched.init.authorization, sourceCwd: sandboxInfo.sourceDir,
+		sessionId: "session-test", supervisorEpoch: "epoch-2", retryBaselines: { b: 1 },
+		preflightAgent: async () => undefined,
+	});
+	await resumed.initializeForResume();
+	assert.equal((await resumed.run()).status, "needs_attention");
+	assert.equal(mock.spawned.length, before);
+	assert.equal((await readLatestV3Attempt(launched.runDir, "b"))?.attempt, 1);
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("downstream retries consume immutable Attempt artifacts instead of the mutable alias", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.behaviors.set("ARTIFACT_A", (input) => completeChild({ ...input, output: "immutable-output" }));
+	mock.behaviors.set("ARTIFACT_B", (input) => completeChild({ ...input, output: "consumer-output" }));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "immutable artifact handoff",
+		nodes: [
+			{ taskId: "a", agent: "test-agent", task: "ARTIFACT_A", sideEffect: "local_read", outputArtifact: "result.txt" },
+			{ taskId: "b", agent: "test-agent", task: "ARTIFACT_B", dependsOn: ["a"], sideEffect: "local_read", inputArtifacts: ["result.txt"] },
+		],
+	};
+	const launched = await launch(sandboxInfo, spec, mock, { preflightAgent: async () => undefined });
+	await writeFile(join(launched.runDir, "artifacts", "a.txt"), "mutable-alias-tamper", "utf8");
+	const resumed = new V3GraphRunner({
+		rpc: new SubagentRpcClient(mock), runDir: launched.runDir, graph: launched.graph,
+		authorization: launched.init.authorization, sourceCwd: sandboxInfo.sourceDir,
+		sessionId: "session-test", supervisorEpoch: "epoch-2", retryBaselines: { b: 1 },
+		preflightAgent: async () => undefined,
+	});
+	await resumed.initializeForResume();
+	assert.equal((await resumed.run()).status, "complete");
+	const workspace = await readV3WorkspaceEvidence(launched.runDir, "b", 2);
+	assert.equal(workspace?.inputBaseline["result.txt"]?.sourcePath, join(launched.runDir, "artifacts", "a", "attempt-1.txt"));
+	assert.equal(await readFile(join(launched.runDir, "artifacts", "a", "attempt-1.txt"), "utf8"), "immutable-output");
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("v3StopChild does not treat paused as confirmed termination", async () => {
+	const mock = new MockSubagents();
+	mock.stopBehavior = "ignore";
+	mock.behaviors.set("PAUSED_STOP", (input) => pauseChild(input));
+	mock.start();
+	const rpc = new SubagentRpcClient(mock);
+	const binding = await v3DispatchChild(rpc, {
+		agent: "test-agent", task: "PAUSED_STOP", cwd: process.cwd(), sessionDir: "", agentScope: "project",
+	});
+	await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+	await assert.rejects(v3StopChild(rpc, binding, { timeoutMs: 150 }), /could not be confirmed/u);
+	await mock.dispose();
 });
 
 test("V3 runner reports workspace conflict instead of silently overwriting concurrent edits", async () => {
@@ -238,7 +418,7 @@ test("V3 runner reports workspace conflict instead of silently overwriting concu
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
 });
 
-test("V3 runner requestStop aborts in-flight nodes and marks remaining aborted", async () => {
+test("V3 runner requestStop aborts in-flight nodes and leaves blocked dependents Attempt-free", async () => {
 	const sandboxInfo = await setupRun();
 	const mock = new MockSubagents();
 	const hang = new Promise<void>(() => undefined);
@@ -264,7 +444,8 @@ test("V3 runner requestStop aborts in-flight nodes and marks remaining aborted",
 	const slow = await readLatestV3Attempt(sandboxInfo.runDir, "slow");
 	assert.equal(slow!.evidence.phase, "aborted");
 	const later = await readLatestV3Attempt(sandboxInfo.runDir, "later");
-	assert.equal(later!.evidence.phase, "aborted");
+	assert.equal(snapshot.nodes?.later?.phase, "blocked");
+	assert.equal(later, undefined, "a dependency-blocked node must not fabricate an Attempt");
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
 });
@@ -286,6 +467,80 @@ test("V3 runner marks a paused child as child_paused without resuming it", async
 	const latest = await readLatestV3Attempt(runDir, "paused");
 	assert.equal(latest!.evidence.failure!.kind, "child_paused");
 	assert.equal(latest!.evidence.child!.terminal, "paused");
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("V3 node timeout is one wall-clock deadline and an unconfirmed child stop needs attention", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.stopBehavior = "ignore";
+	mock.behaviors.set("DEADLINE", () => new Promise<void>(() => undefined));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "deadline",
+		nodes: [{ taskId: "deadline", agent: "test-agent", task: "DEADLINE node", sideEffect: "local_read", timeoutMs: 750 }],
+	};
+	const graph = compileGraphSpecV3(spec);
+	const rpc = new SubagentRpcClient(mock);
+	const init = await initializeV3Run({ trustedRoot: resolve(sandboxInfo.runsDir), runDir: sandboxInfo.runDir, graph, sessionId: "session-test", supervisorEpoch: "epoch-1", sourceCwd: sandboxInfo.sourceDir, runInstanceId: sandboxInfo.runInstanceId });
+	const runner = new V3GraphRunner({ rpc, runDir: sandboxInfo.runDir, graph, authorization: init.authorization, sourceCwd: sandboxInfo.sourceDir, sessionId: "session-test", supervisorEpoch: "epoch-1", childStopTimeoutMs: 200, preflightAgent: async () => undefined });
+	const snapshot = await runner.run();
+	assert.equal(snapshot.status, "needs_attention");
+	const attempt = (await readLatestV3Attempt(sandboxInfo.runDir, "deadline"))!.evidence;
+	assert.equal(attempt.phase, "needs_attention");
+	assert.equal(attempt.failure!.kind, "dispatch_unknown");
+	assert.ok(attempt.deadlineAt, "the original absolute deadline is durable");
+	await mock.dispose();
+	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+test("V3 runner requestStop uses the configured child-stop confirmation timeout", async () => {
+	const sandboxInfo = await setupRun();
+	const mock = new MockSubagents();
+	mock.stopBehavior = "ignore";
+	mock.behaviors.set("STOP_TIMEOUT", () => new Promise<void>(() => undefined));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "bounded stop confirmation",
+		nodes: [{ taskId: "stubborn", agent: "test-agent", task: "STOP_TIMEOUT", sideEffect: "local_read" }],
+	};
+	const graph = compileGraphSpecV3(spec);
+	const rpc = new SubagentRpcClient(mock);
+	const init = await initializeV3Run({ trustedRoot: resolve(sandboxInfo.runsDir), runDir: sandboxInfo.runDir, graph, sessionId: "session-test", supervisorEpoch: "epoch-1", sourceCwd: sandboxInfo.sourceDir, runInstanceId: sandboxInfo.runInstanceId });
+	const runner = new V3GraphRunner({
+		rpc,
+		runDir: sandboxInfo.runDir,
+		graph,
+		authorization: init.authorization,
+		sourceCwd: sandboxInfo.sourceDir,
+		sessionId: "session-test",
+		supervisorEpoch: "epoch-1",
+		childStopTimeoutMs: 150,
+		preflightAgent: async () => undefined,
+	});
+	const runPromise = runner.run();
+	let running = false;
+	for (let index = 0; index < 300; index += 1) {
+		const latest = await readLatestV3Attempt(sandboxInfo.runDir, "stubborn");
+		if (latest?.evidence.phase === "running") {
+			running = true;
+			break;
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+	}
+	assert.equal(running, true, "the child must be running before requestStop exercises its stop path");
+	const stopStartedAt = Date.now();
+	runner.requestStop();
+	const snapshot = await runPromise;
+	const elapsedMs = Date.now() - stopStartedAt;
+	assert.equal(snapshot.status, "needs_attention");
+	assert.ok(elapsedMs < 2_000, `configured 150ms stop timeout must not fall back to 30s (elapsed ${elapsedMs}ms)`);
+	const attempt = (await readLatestV3Attempt(sandboxInfo.runDir, "stubborn"))!.evidence;
+	assert.equal(attempt.phase, "needs_attention");
+	assert.equal(attempt.failure?.kind, "dispatch_unknown");
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
 });

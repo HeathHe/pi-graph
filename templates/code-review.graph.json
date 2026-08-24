@@ -1,0 +1,70 @@
+{
+  "manifest": {
+    "name": "code-review",
+    "version": "1.0.0",
+    "description": "Read-only code review pipeline: scout → review → synthesize."
+  },
+  "source": {
+    "type": "graph-spec",
+    "spec": {
+      "schemaVersion": 3,
+      "goal": "Review {{target}} for {{focus}}, against requirements: {{requirements}}",
+      "nodes": [
+        {
+          "taskId": "scout",
+          "agent": "code-scout",
+          "task": "Perform read-only reconnaissance of {{target}}: identify affected files and key symbols, including entry points, functions, and call chains. Return a compact file/symbol map.",
+          "sideEffect": "local_read",
+          "readScope": [{ "kind": "tree", "path": "." }],
+          "timeoutMs": 300000
+        },
+        {
+          "taskId": "review",
+          "agent": "code-reviewer",
+          "task": "Review {{target}} without modifying files. Focus on {{focus}}. Cite file:line evidence and severity for every finding. Check against these requirements: {{requirements}}.",
+          "dependsOn": ["scout"],
+          "sideEffect": "local_read",
+          "readScope": [{ "kind": "tree", "path": "." }],
+          "timeoutMs": 600000
+        },
+        {
+          "taskId": "synthesize",
+          "agent": "code-reviewer",
+          "task": "Synthesize the review into a final report: one-paragraph summary, findings ordered by severity with file:line evidence, and open questions. Do not modify files.",
+          "dependsOn": ["review"],
+          "sideEffect": "none",
+          "timeoutMs": 300000
+        }
+      ]
+    }
+  },
+  "intent": "Inspect a code target without modifying it and return an evidence-backed review.",
+  "inputs": {
+    "target": {
+      "type": "string",
+      "required": true,
+      "description": "Files or directories to review."
+    },
+    "focus": {
+      "type": "string",
+      "required": false,
+      "default": "correctness, regressions, unsafe behavior, missing tests",
+      "description": "Review focus areas."
+    },
+    "requirements": {
+      "type": "string",
+      "required": false,
+      "default": "Not supplied",
+      "description": "Requirements or acceptance criteria to review against."
+    }
+  },
+  "requires": {
+    "readOnly": true,
+    "toolFilter": ["read", "grep", "find"]
+  },
+  "provenance": {
+    "created": "2026-08-24",
+    "author": "pi-graph",
+    "source": "builtin:code-review"
+  }
+}

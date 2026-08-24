@@ -1,0 +1,70 @@
+{
+  "manifest": {
+    "name": "doc-write",
+    "version": "1.0.0",
+    "description": "Document authoring pipeline: outline → write → review, with validation."
+  },
+  "source": {
+    "type": "graph-spec",
+    "spec": {
+      "schemaVersion": 3,
+      "goal": "Write a document about {{subject}} to {{doc_path}} in style: {{style}}",
+      "nodes": [
+        {
+          "taskId": "outline",
+          "agent": "document-writer",
+          "task": "Draft a section outline for a document about {{subject}} in this style: {{style}}. Return the outline only.",
+          "sideEffect": "none",
+          "timeoutMs": 300000
+        },
+        {
+          "taskId": "write",
+          "agent": "document-writer",
+          "task": "Write the document to {{doc_path}}, following the supplied outline and using this style: {{style}}.",
+          "dependsOn": ["outline"],
+          "sideEffect": "local_write",
+          "writeScope": [{ "kind": "file", "path": "{{doc_path}}" }],
+          "validationCommands": ["test -s \"{{doc_path}}\""],
+          "timeoutMs": 600000
+        },
+        {
+          "taskId": "review",
+          "agent": "code-reviewer",
+          "task": "Read {{doc_path}} and review it against the outline. Check internal consistency, completeness, and whether it matches this style: {{style}}. Return a checklist verdict and required fixes.",
+          "dependsOn": ["write"],
+          "sideEffect": "local_read",
+          "readScope": [{ "kind": "file", "path": "{{doc_path}}" }],
+          "timeoutMs": 300000
+        }
+      ]
+    }
+  },
+  "intent": "Author a document in the workspace, validate that it exists, and review the result.",
+  "inputs": {
+    "doc_path": {
+      "type": "string",
+      "required": true,
+      "description": "Workspace-relative output document path."
+    },
+    "subject": {
+      "type": "string",
+      "required": true,
+      "description": "What the document is about."
+    },
+    "style": {
+      "type": "string",
+      "required": false,
+      "default": "technical, concise, Markdown",
+      "description": "Tone, length, and format guidance."
+    }
+  },
+  "requires": {
+    "readOnly": false,
+    "toolFilter": ["read", "write", "edit"]
+  },
+  "provenance": {
+    "created": "2026-08-24",
+    "author": "pi-graph",
+    "source": "builtin:doc-write"
+  }
+}

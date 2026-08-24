@@ -1,99 +1,147 @@
-# pi-graph 产品定义 v3（定稿）
+# pi-graph 产品定义：纯 DAG V3
 
-> 状态：第 0 阶段定稿。本文档是后续重构的合同，任何偏离必须先修改本文档。
-> 基线：main @ d64c87f（tag `v1-governed`），pi-subagents 0.49.0，tsc 通过，519/519 测试全绿。
+> 状态：当前产品合同。本文描述已经投入生产入口的 V3，而不是迁移计划或双内核过渡方案。字段、持久化格式和错误语义以 [v3-technical-contract.md](v3-technical-contract.md) 为准。
 
 ## 一句话定义
 
-**pi-graph 是默认不干预普通会话、仅由调用方显式提交 GraphSpec 创建运行的单机持久化 DAG 执行器。它按依赖执行节点、隔离工作区、验证本地写入并持久化执行证据；证据充分时可在同机同仓库安全恢复，否则进入 needs_attention。它不判断是否使用 Graph、不拆解任务、不选择模型，也不观察普通 turn 或 subagent。**
+**pi-graph 是 Pi 生态中的单机持久化 DAG 执行器：调用方显式提交 GraphSpec V3，它负责编译拓扑、调度 `pi-subagents`、隔离与验证本地写入、持久化 Attempt 证据，并在证据充分时恢复执行。**
 
-## 目标（做什么）
+调用方决定为什么使用图、图里有哪些节点、每个节点使用哪个 Agent。pi-graph 只执行已经给定的图。
 
-| 职责 | 精确含义 |
-|---|---|
-| 编译 | GraphSpec → 校验后的 DAG（拓扑排序、环检测、依赖/产物检查）；非法输入给结构化错误 |
-| 调度 | 按拓扑依赖执行，遵守并发上限与重试策略；不承诺配额、优先级或跨机调度 |
-| 隔离 | 工作区隔离：节点在声明范围内写入，writeBaseline 差分检查覆盖全部节点；这是 Pi 工具边界，**不是 OS 级安全沙箱** |
-| 验证 | 本地写入节点必须配置确定性验证命令（白名单可执行、shell:false、总超时、字节级输出上限、signal/终止原因可观测）；纯读节点只需执行成功；自然语言 acceptance 默认仅作声明，不参与判定，除非显式配置机器验证或 childAcceptance |
-| 持久化 | 每次状态迁移落盘（原子写）；运行事件 append-only 记录执行事实 |
-| 恢复 | 证据完整、进程身份可确认、版本兼容时同机同仓库安全恢复；否则停止并进入 needs_attention。**不承诺任何崩溃自动续跑，不是 exactly-once** |
-| 守护 | Guard 限制 Pi 工具边界（文件/工具白名单）；子 Agent shell 继续禁用；runner 验证命令使用窄能力白名单 exec |
+## 产品边界
 
-## 非目标（不做，且代码中不存在）
+| 负责 | 不负责 |
+| --- | --- |
+| 严格编译 GraphSpec V3 | 判断任务是否值得使用 Graph |
+| 拓扑排序、环检测、依赖与产物检查 | 自动拆解目标或生成计划 |
+| 按依赖和并发上限调度节点 | 计划审核、任务风险分级或准入门 |
+| OPEN/SEALED 动态拓扑 | 模型选择、模型路由、降级或 provider 策略 |
+| `when accepted|failed` 条件分支 | 要求截图、视觉证据或视觉审核 |
+| shadow workspace、Guard、验证与原子 apply | OS 级安全沙箱或远程执行平台 |
+| Attempt、journal、lease 与恢复 | 跨机器分布式调度或 exactly-once 承诺 |
+| pause/resume/stop/retry 运维 | 普通 Pi turn 的旁路观察或自动介入 |
 
-- 不判断是否使用 Graph、不拆解任务、不选择模型（这些是调用方职责）
-- 不观察普通 turn 或 subagent——普通会话中 pi-graph 零工具调用、零日志、零网络
-- 不强制任务评估、规划复核、模型路由、视觉证据——治理层（planning/routing/visual）退出核心
-- 不承诺 OS 级沙箱；README 与文档禁用 sandbox 措辞
-- 不读取治理配置（model-registry.json / routing-policy.json）；旧配置探测只存在于显式的 `graph doctor` / 迁移命令中
-- 不制造归因证据：影子记录只记可客观核实的事实，缺失字段直接缺省，不写 unknown 占位，代码中无任何读取方消费影子记录做决策
+V3 没有治理层、规划门、routing policy、model registry、visual evidence 管线或 legacy 执行内核。相关字段不是“被忽略”，而是由编译器递归拒绝，避免它们重新进入执行合同。
 
-## V3 契约
+## 用户价值
 
-### GraphSpec 节点字段
+### 1. 可预测的执行
 
-必填：`taskId`、`agent`、`task`、`sideEffect`；可选：`dependsOn`、`inputArtifacts`、`outputArtifact`、`timeoutMs`、`retryPolicy.{maxAttempts,retryOn,backoffMs}`、`readScope`、`writeScope`、`acceptance`（声明式）、`validationCommands`、`childAcceptance`。
+同一 GraphSpec 经过确定性规范化后得到稳定的拓扑顺序和 digest。普通下游只在依赖 `accepted` 后解锁；失败分支必须显式写 `when.status: "failed"`，不会发生隐藏条件或隐式路由。
 
-规则：
-- `local_write` 节点必须同时声明非空 `writeScope` 和非空、确定性的 `validationCommands`，否则编译失败；纯读节点豁免（判定依据：声明的 `sideEffect` 与 `writeScope`）。V3 MVP sideEffect 白名单：none / local_read / local_write。
-- `childAcceptance` 只能作为 `validationCommands` 之外的附加语义复核层，不能替代机器验证命令。
-- 无拓扑依赖且 `writeScope` 重叠的节点必须在编译期拒绝；存在拓扑依赖时允许按依赖顺序执行。
-- 自然语言 acceptance 默认仅声明（declared），机器验证通过时才标 verified。
+### 2. 可安全审查的本地写入
 
-### 持久化与恢复语义
+子 Agent 不直接修改源工作区。它在每个 Attempt 的隔离 shadow workspace 中工作；同图写 Attempt 由 FIFO 写锁整段串行。Supervisor 记录读写 baseline、检查实际变更、运行确定性验证，再在源文件没有并发漂移时执行原子 apply。发生冲突时报告 `workspace_conflict`，不静默覆盖。
 
-- 新 V3 运行：snapshot schemaVersion 3 + authorization schemaVersion 4（runtimeSchemaVersion 3）；authorization 只承载不可变图级 admission，attempt 级状态由 attempt.json / workspace.json / validated-result.json / acceptance.json 承载。
-- 旧 V2/V3 证据保持原样，由冻结的 legacy 兼容层处理：V1 不 resume；V2 只允许监控已知 child、完成 validated/applying；禁止新派发、重路由、模型降级、新 retry；其余 needs_attention。
-- 恢复判定只来自现场验证（digest、owner/child 身份、版本、runtime 能力），不信任持久化的完整性标记。
+### 3. 可恢复、可解释
 
-### 影子记录（thin shadow）
+运行的关键事实不只存在内存里：Graph admission、拓扑 mutation、控制意图、派发身份、child 结果、验证结果、apply 结果、验收记录和产物都持久化。恢复时读取这些事实并重新构建投影；身份或证据不能确认时进入 `needs_attention`，不猜测、不盲目重复派发。
 
-- 只记录 Graph 运行内部事实：提交者（sessionId）、GraphSpec digest/摘要、节点执行与工具调用事实、验收方式（machine-verified / declared / child-acceptance）。
-- schema 显式标记 `unverified: true`、append-only、有界保留；生产执行路径可写事件但**不读取事件影响决策**；离线诊断工具可读。
-- 不记录规划来源或自由文本归因；缺失事实不推断补全。
+### 4. 可生长的图
 
-## 兼容矩阵
+固定任务直接使用默认 SEALED 图。探索型或增量型任务可以创建 OPEN 图：以 revision CAS 追加新节点、取消未开始分支，最后显式 seal。OPEN 图队列暂空时保持 `idle`，不会被误报为完成。
 
-| 运行版本 | 处理 | 说明 |
-|---|---|---|
-| V1 run（旧目录格式） | 只读展示，**不支持 resume** | 不迁移 |
-| V2 run（含治理收据） | 冻结 legacy 策略：监控已知 child、完成 validated/applying；禁止新派发/重路由/降级/新 retry | PlanningReceipt 保持原样，不清空 |
-| V3 run（snapshot v3 + auth v4） | 新 Graph 使用；现场验证后才恢复 | 恢复语义按技术合同 §6 |
+### 5. Pi 原生接入
 
-## 验收清单
+每个节点精确引用一个项目 Agent，通过 `pi-subagents` 公共 RPC 异步执行。Agent 定义在 admission 时冻结，pending 节点不会因为磁盘中的 Agent 文件后来变化而偷偷换角色。`agents` action 只暴露名称、描述与别名，不泄露模型或内部路由配置。
 
-### 端到端测试（必须新增）
+## 核心产品语义
 
-- **E2E-1 三节点图**：临时目录、真实 store/快照、不 mock；目录中不放任何治理配置文件。断言：退出码 0；产物字节级正确；依赖序满足（n2.start ≥ n1.end）；日志零次读取治理配置路径。
-- **E2E-2 杀进程恢复**：三节点链，n2 延时；n1 completed 且 n2 running 时 SIGKILL；重启后断言 n1 副作用恰好一次、n2 至多重跑一次、全图 completed、store 完整性校验通过、无残留 lease 阻塞（陈旧锁接管）。
-- **E2E-3 零配置安装**：干净目录 clone + `npm install`（node ≥22.19.0）；断言治理配置文件不存在、E2E-1 通过、运行期零治理配置读取（负向探针）、扩展加载清单 == 保留集。
+### Graph 与节点
 
-### 职责与依赖消失判据
+- Graph 最多 512 个节点；一次 `append` 最多 64 个。
+- 图并发范围为 1..6，默认 2；节点完成后立即解锁自己的下游，没有整批 barrier。
+- 节点 `sideEffect` 只允许 `none`、`local_read`、`local_write`。
+- `local_write` 必须有明确 `writeScope` 和至少一条确定性 `validationCommands`。
+- 编译器拒绝无依赖顺序却发生读写/写写 scope 重叠的节点；调用方可以用显式依赖建立合法顺序。
+- `readOnly: true` 的图不能包含 `local_write`；Guard 同时拒绝写工具。
+- `toolFilter` 是精确图级 allow-list，而不是 Agent 或模型选择器。
 
-- D1 import 图：核心对归档模块集引用数为 0（tsc + 依赖图工具，覆盖 src/ 与 extensions/）。
-- D2 扩展加载：`pi.extensions` 仅含保留入口，运行时加载清单逐项相等。
-- D3 工具动作：注册动作集合与预期保留清单精确相等，无 routing/policy/recommend/gate 类动作。
-- D4 门禁死亡探针：无规划凭据、无治理配置的提交上任务第一步不因门禁失败。
-- D5 空会话隐形探针：加载扩展但不调用 graph 的空会话中，工具调用/日志/网络均为 0。
+### 条件分支
 
-### 测试保留规则
+`when` 只支持一个直接依赖和两个终态：
 
-- R1：测试随治理归档走当且仅当其 import 命中归档模块集；可移除 import 而不改变被测对象的核心测试留主线。
-- R2：每个保留 src 文件至少被一个保留测试覆盖。
-- R3：移除测试与被移除职责一一映射，映射表进 PR 可评审。
-- R4：归档 tag 点 `npm test` 全绿；测试数量只报数、不断言。
+```json
+{ "node": "review", "status": "accepted" }
+```
 
-### 遥测（不进验收门）
+```json
+{ "node": "review", "status": "failed" }
+```
 
-- 行数仅报告：核心落在 9–11k 属正常；≥15k 提示治理残留；≤6k 提示误删恢复/锁/隔离。
-- 提交策略：禁止 +19k 行级单提交。
+条件来源必须同时出现在 `dependsOn`。匹配时节点照常运行；条件不匹配时投影为 `skipped`，不创建 Attempt。其他失败依赖会把下游投影为 `blocked`。失败分支成功也不会抹除原始失败证据，因此 SEALED 图仍会如实反映失败。
 
-## 阶段计划
+### 上游数据交接
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| 0（本阶段） | 文档定稿、基线建立、冻结 v1-governed | 本文档 + 基线记录 |
-| 1 | V3 旁路内核：新 Graph 走 V3，旧运行兼容恢复 | 兼容矩阵 + E2E-1/2 首版 |
-| 2 | 治理退出核心：门禁拆除、依赖清零（authority 拆函数、claims 保留核心） | D1–D5 全绿 |
-| 3 | 治理代码 Git tag/分支归档（不留主分支 archive/ 目录） | R1–R4 + tag 点可构建可测试 |
-| 4 | 文档收口：README、graph-architecture.md 重写与非目标对齐 | 文档与代码一致 |
+`dependsOn` 既表示顺序，也表示直接上游输出的显式交接。每个直接依赖最多贡献 12,000 个 JSON 序列化字符，全部直接依赖合计最多 32,000；扇入时公平分配预算并保留具名条目。交接内容被标注为“不可信 JSON 数据”，不能把上游输出中的指令当作当前节点指令。
+
+`inputArtifacts` 另行把已发布的上游产物复制到当前 shadow workspace 的受保护输入目录。编译器要求每个输入产物恰好由祖先节点的 `outputArtifact` 产生。
+
+### 验收与产物
+
+- 非写节点：child 正常完成后使用 `declared` 方法验收；自然语言 `acceptance` 只作为说明记录。
+- 写节点：所有验证命令成功、变更检查通过并 apply 完成后，使用 `machine-verified` 方法验收。
+- 每次成功 Attempt 先写不可变 `artifacts/<taskId>/attempt-<N>.txt`，再更新 `artifacts/<taskId>.txt` latest 别名；终态验收只引用已经发布的产物。
+
+### Attempt、deadline 与 retry
+
+每次真实节点执行都有独立 Attempt 证据。`skipped`、`blocked`、`cancelled` 是可重建投影，不伪造 Attempt。
+
+节点声明 `timeoutMs` 时，deadline 从 Attempt 创建开始固定，覆盖输入解析、workspace 准备、Agent preflight、child 派发与监控、验证、apply 和产物/验收发布；崩溃恢复继续使用原 deadline，不重新计时。
+
+自动重试由节点的 `retryPolicy` 控制，单次 GraphSpec 允许 1..5 个 Attempt。显式 `retry` 会重跑目标节点以及所有未取消下游，并把 admission 时的 Attempt baseline 写入 append-only retry journal。自动重试和显式重试共享每节点 100 Attempt 的终身上限。
+
+### 控制与恢复
+
+- `pause`：先持久化 `desiredState: "paused"`，停止启动新节点，等待已运行节点收尾后形成 `paused` 投影。
+- `resume`：持久化 `running` 意图并重新监督未完成证据；已经 `accepted` 的节点不会重做。
+- `stop`：持久化 `stopped` 意图，要求活跃 child 停止，并把未开始节点安全终止。
+- Pi session shutdown：对本 session 正在监督的图先提交 pause，而不是把它们伪装成失败。
+- session start：扫描非终态 V3 run；持久意图允许时恢复，暂停意图保持不动。
+
+如果 stop 或 timeout 后无法确认 child 已终止，节点进入 `needs_attention`。如果 RPC emit 边界之后无法找回同一 stable request ID 对应的 child，也进入 `needs_attention`；系统不会盲目派发第二个 child。
+
+## 公开操作面
+
+`graph` 工具只提供以下 14 个 action：
+
+```text
+start  load  status  list  doctor  pause  resume  stop
+templates  agents  retry  append  cancel  seal
+```
+
+不存在 `assess`、`plan`、`review`、`route`、`recommend`、`gate` 或任何模型管理 action。
+
+输入来源有三种，并且每次 `start`/源 `load` 必须恰选一种：
+
+1. 内联 `spec`；
+2. 从当前工作目录解析的 `.graph.json` capsule 路径；
+3. 内置模板及 `overrides`。
+
+内置模板：
+
+| 模板 | 拓扑 | 执行约束 |
+| --- | --- | --- |
+| `research-report` | research → verify → draft | `readOnly`; `read` + 只读研究工具 |
+| `code-review` | scout → review → synthesize | `readOnly`; 文件读取工具 |
+| `doc-write` | outline → write → review | 文档写节点带 file scope 与存在性验证 |
+
+## 成功标准
+
+一次 V3 重写只有同时满足以下条件，才算产品完成：
+
+- 新 Graph 只经过 V3 compiler、host、runner 和证据层；不存在第二条旧执行路径。
+- GraphSpec V3 的拒绝规则、OPEN/SEALED、when、控制和 retry 在真实入口可用。
+- `local_write` 未通过验证或遇到 source baseline 冲突时，源工作区不被错误覆盖。
+- 崩溃后能从 durable intent 和 Attempt 证据继续；不能确定时 fail closed 到 `needs_attention`。
+- timeout/stop 必须确认 child 终止，不能确认时不宣布安全停止。
+- tarball 只包含 V3 源码、两个扩展入口、模板和 README，不携带旧内核或治理实现。
+- 普通 Pi 会话如果没有调用 `graph`，pi-graph 不评估、规划或路由用户任务。
+
+## 明示限制
+
+- 单机、单文件系统运行；不是分布式工作流服务。
+- Guard 是 Pi 工具层控制，不是 OS 沙箱；同一 OS 用户下的恶意进程不在保证范围内。
+- `workspace` 当前只允许 `shadow`；V3 不宣称提供 git worktree 或其他 workspace 模式。
+- 外部写工具不在 V3 副作用合同内。被 `toolFilter` 允许的非文件工具仍必须被 Guard 识别为只读，否则 fail closed。
+- GraphSpec 和验证命令是无人值守执行输入，必须来自受信调用方。

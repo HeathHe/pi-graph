@@ -9,18 +9,13 @@
   },
   "files": [
     "extensions/",
-    "scripts/",
-    "src/",
-    "tests/assert-isolated-temp.ts",
-    "tests/long-task-soak.ts",
-    "tests/run-isolated.ts",
+    "src/v3/",
+    "templates/",
     "README.md"
   ],
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types tests/run-isolated.ts suite",
-    "test:soak": "node --experimental-strip-types tests/run-isolated.ts soak",
-    "test:latest-integration": "node --experimental-strip-types tests/pi-subagents-latest-integration.ts",
     "pack:check": "npm pack --dry-run"
   },
   "pi": {
@@ -38,7 +33,7 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.81.0",
     "@earendil-works/pi-coding-agent": ">=0.81.0",
-    "pi-subagents": ">=0.40.0",
+    "pi-subagents": "^0.49.0",
     "typebox": ">=1.0.0"
   },
   "devDependencies": {

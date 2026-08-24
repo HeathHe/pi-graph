@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,9 +10,12 @@ import {
 	readV3ValidatedResult,
 	readV3WorkspaceEvidence,
 	validateV3Attempt,
+	verifyV3AcceptedAttemptChain,
+	v3AcceptedAttemptBasis,
 	v3AttemptEvidenceDigest,
 	writeV3AcceptanceEvidence,
 	writeV3AttemptEvidence,
+	V3_MAX_ATTEMPTS_PER_NODE,
 	writeV3ValidatedResult,
 	writeV3WorkspaceEvidence,
 } from "../src/v3/attempt.ts";
@@ -52,10 +55,13 @@ test("V3 attempt evidence round-trips and validates terminal invariants", async 
 	assert.throws(() => validateV3Attempt({ ...evidence("a", 1, "prepared"), terminalStatus: "accepted" as const }), GraphV3Error);
 	// Unknown fields are rejected.
 	assert.throws(() => validateV3Attempt({ ...evidence("a", 1, "prepared"), extra: 1 }), GraphV3Error);
+	assert.equal(V3_MAX_ATTEMPTS_PER_NODE, 100);
+	assert.throws(() => validateV3Attempt({ ...evidence("a", 1, "prepared"), attempt: 101 }), GraphV3Error);
 });
 
 test("V3 attempt evidence digest chain links workspace, validated-result, and acceptance", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "v3-attempt-"));
+	const now = new Date().toISOString();
 	const attempt = evidence("a", 1, "accepted");
 	const workspace: V3WorkspaceEvidence = {
 		schemaVersion: 1,
@@ -69,8 +75,8 @@ test("V3 attempt evidence digest chain links workspace, validated-result, and ac
 		readBaseline: {},
 		writeBaseline: { "/tmp/source/out.txt": null },
 		inputBaseline: {},
-		contractDigest: "c",
-		createdAt: new Date().toISOString(),
+		contractDigest: "c".repeat(64),
+		createdAt: now,
 	};
 	const workspaceDigest = await writeV3WorkspaceEvidence(dir, "a", 1, workspace);
 	const validated = {
@@ -82,11 +88,20 @@ test("V3 attempt evidence digest chain links workspace, validated-result, and ac
 		validations: [{ command: "test -f out.txt", ok: true, exitCode: 0, signal: null, timedOut: false, stdout: "", stdoutTruncated: false, stderr: "", stderrTruncated: false, durationMs: 1 }],
 		allPassed: true,
 		writes: [],
-		recordedAt: new Date().toISOString(),
+		recordedAt: now,
 	};
 	const validatedDigest = await writeV3ValidatedResult(dir, "a", 1, validated);
-	const withLinks = { ...attempt, phase: "accepted" as const, terminalStatus: "accepted" as const, workspaceDigest, verification: { allPassed: true, validatedResultDigest: validatedDigest, verifiedAt: new Date().toISOString() } };
-	const attemptDigest = await writeV3AttemptEvidence(dir, "a", 1, withLinks);
+	const finalBasis = validateV3Attempt({
+		...attempt,
+		phase: "accepted" as const,
+		terminalStatus: "accepted" as const,
+		updatedAt: now,
+		workspaceDigest,
+		child: { terminal: "complete", output: "done", completedAt: now },
+		verification: { allPassed: true, validatedResultDigest: validatedDigest, verifiedAt: now },
+		applied: { writes: [], appliedAt: now },
+	});
+	const attemptDigest = v3AttemptEvidenceDigest(finalBasis);
 	const acceptance = {
 		schemaVersion: 1 as const,
 		runInstanceId: "r1",
@@ -98,10 +113,13 @@ test("V3 attempt evidence digest chain links workspace, validated-result, and ac
 		verified: true,
 		validatedResultDigest: validatedDigest,
 		attemptDigest,
-		recordedAt: new Date().toISOString(),
+		recordedAt: now,
 		supervisorEpoch: "epoch",
 	};
-	await writeV3AcceptanceEvidence(dir, "a", 1, acceptance);
+	const acceptanceDigest = await writeV3AcceptanceEvidence(dir, "a", 1, acceptance);
+	await writeV3AttemptEvidence(dir, "a", 1, { ...finalBasis, acceptanceDigest });
+	await mkdir(join(dir, "artifacts", "a"), { recursive: true });
+	await writeFile(join(dir, "artifacts", "a", "attempt-1.txt"), JSON.stringify({ taskId: "a", output: "done" }));
 	assert.ok(await readV3WorkspaceEvidence(dir, "a", 1));
 	assert.ok(await readV3ValidatedResult(dir, "a", 1));
 	assert.ok(await readV3AcceptanceEvidence(dir, "a", 1));
@@ -110,6 +128,15 @@ test("V3 attempt evidence digest chain links workspace, validated-result, and ac
 	assert.equal(latest!.evidence.terminalStatus, "accepted");
 	assert.equal(latest!.evidence.workspaceDigest, workspaceDigest);
 	assert.equal(latest!.evidence.verification!.validatedResultDigest, validatedDigest);
+	assert.deepEqual(v3AcceptedAttemptBasis(latest!.evidence), finalBasis);
+	const chain = await verifyV3AcceptedAttemptChain(dir, "a", 1, { runInstanceId: "r1", graphId: "g1", method: "machine-verified" });
+	assert.deepEqual(chain.reasons, []);
+	assert.equal(chain.ok, true);
+
+	await writeFile(join(dir, "artifacts", "a", "attempt-1.txt"), "tampered");
+	const tampered = await verifyV3AcceptedAttemptChain(dir, "a", 1, { method: "machine-verified" });
+	assert.equal(tampered.ok, false);
+	assert.ok(tampered.reasons.some((reason) => reason.startsWith("ARTIFACT_CONTENT_MISMATCH")));
 });
 
 function graph(over: Partial<CompiledGraphV3> = {}): CompiledGraphV3 {
@@ -125,7 +152,7 @@ function graph(over: Partial<CompiledGraphV3> = {}): CompiledGraphV3 {
 		topologicalOrder: ["a", "b", "c"],
 		maxConcurrency: 2,
 		failFast: false,
-		workspace: "auto",
+		workspace: "shadow",
 		sourceGraphSpec: { schemaVersion: 3, goal: "g", nodes: [] },
 		sourceGraphSpecDigest: "0".repeat(64),
 		graphDigest: "1".repeat(64),

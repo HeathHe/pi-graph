@@ -4,9 +4,9 @@ import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { subagentAsyncRoot } from "../src/rpc.ts";
+import { subagentAsyncRoot } from "../src/v3/rpc.ts";
 
-type Mode = "suite" | "soak";
+type Mode = "suite";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = dirname(testsDir);
@@ -53,17 +53,13 @@ async function requestedSuiteArguments(arguments_: string[]): Promise<string[]> 
 	return [...testRunnerArguments, ...await requestedTestFiles(fileArguments)];
 }
 
-async function childArguments(mode: Mode, arguments_: string[], guardUrl: string): Promise<string[]> {
-	if (mode === "soak") {
-		if (arguments_.length > 0) throw new Error("The soak test does not accept positional arguments.");
-		return ["--expose-gc", "--experimental-strip-types", "--import", guardUrl, join(testsDir, "long-task-soak.ts")];
-	}
-	return ["--experimental-strip-types", "--import", guardUrl, "--test", "--test-concurrency=4", ...await requestedSuiteArguments(arguments_)];
+async function childArguments(_mode: Mode, arguments_: string[], guardUrl: string): Promise<string[]> {
+  return ["--experimental-strip-types", "--import", guardUrl, "--test", "--test-concurrency=4", ...await requestedSuiteArguments(arguments_)];
 }
 
 async function run(): Promise<number> {
 	const mode = process.argv[2];
-	assert.ok(mode === "suite" || mode === "soak", "Usage: run-isolated.ts <suite|soak> [tests/example.test.ts ...]");
+  assert.equal(mode, "suite", "Usage: run-isolated.ts suite [tests/example.test.ts ...]");
 	const hostAsyncRoot = subagentAsyncRoot();
 	const hostTempRoot = resolve(tmpdir());
 	const sandboxRoot = await mkdtemp(join(hostTempRoot, "pi-graph-test-sandbox-"));

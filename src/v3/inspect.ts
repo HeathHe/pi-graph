@@ -148,25 +148,10 @@ export async function inspectV3Run(runDirectory: string, options: InspectV3RunOp
 	if (await runBoundaryChanged(runDir, runStat, trustedAnchor)) {
 		return unsafeRunRoot(runDir, "UNSAFE_RUN_DIRECTORY: run root changed while it was being inspected.");
 	}
-	const format = detectRunFormat(snapshotRead.value, authorizationRead.present ? authorizationRead.value : undefined);
-	const metadata = basicMetadata(snapshotRead.value);
-	const readIssues = [snapshotRead.issue, authorizationRead.issue].filter((issue): issue is string => issue !== undefined);
-	if (format.kind === "legacy-readonly" || format.kind === "legacy-v2") {
-		const relevantIssues = readIssues.filter((issue) => !(format.kind === "legacy-readonly" && issue === "MISSING_FILE: authorization.json is missing."));
-		if (relevantIssues.length > 0) {
-			return { status: "needs_attention", format: { ...format, kind: "invalid", reason: relevantIssues.join(" ") }, runDir, ...metadata, reasons: relevantIssues, snapshot: snapshotRead.value, ...(authorizationRead.present ? { authorization: authorizationRead.value } : {}) };
-		}
-		return {
-			status: format.kind,
-			format,
-			runDir,
-			...metadata,
-			reasons: [],
-			snapshot: snapshotRead.value,
-			...(authorizationRead.present ? { authorization: authorizationRead.value } : {}),
-		};
-	}
-	if (format.kind !== "v3") {
+  const format = detectRunFormat(snapshotRead.value, authorizationRead.present ? authorizationRead.value : undefined);
+  const metadata = basicMetadata(snapshotRead.value);
+  const readIssues = [snapshotRead.issue, authorizationRead.issue].filter((issue): issue is string => issue !== undefined);
+  if (format.kind !== "v3") {
 		const reasons = [...readIssues, format.reason ?? "INVALID_FORMAT: run format is not supported."];
 		return { status: "needs_attention", format, runDir, ...metadata, reasons, ...(snapshotRead.present ? { snapshot: snapshotRead.value } : {}), ...(authorizationRead.present ? { authorization: authorizationRead.value } : {}) };
 	}

@@ -1,7 +1,8 @@
-import { readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { atomicWriteJson } from "./durable.ts";
-import { canonicalDigest } from "./digests.ts";
+import { canonicalDigest, canonicalJson } from "./digests.ts";
 import { graphV3Error } from "./errors.ts";
 import type {
 	V3AcceptanceEvidence,
@@ -22,12 +23,16 @@ export interface V3RunPaths {
 	snapshotPath: string;
 	eventsPath: string;
 	eventsTruncatedPath: string;
+	controlPath: string;
 	leasePath: string;
 	artifactsDir: string;
 	shadowDir: string;
 	nodesDir: string;
 	sessionsDir: string;
 }
+
+/** Absolute lifetime cap across automatic retries and explicit future retry APIs. */
+export const V3_MAX_ATTEMPTS_PER_NODE = 100;
 
 export function v3RunPaths(runDir: string): V3RunPaths {
 	const root = resolve(runDir);
@@ -37,6 +42,7 @@ export function v3RunPaths(runDir: string): V3RunPaths {
 		snapshotPath: join(root, "snapshot.json"),
 		eventsPath: join(root, "events.jsonl"),
 		eventsTruncatedPath: join(root, "events.truncated.json"),
+		controlPath: join(root, "control.json"),
 		leasePath: join(root, "lease.json"),
 		artifactsDir: join(root, "artifacts"),
 		shadowDir: join(root, "shadow"),
@@ -61,7 +67,7 @@ export function v3NodeEvidencePaths(runDir: string, taskId: string, attempt: num
 
 const ATTEMPT_FIELDS = new Set([
 	"schemaVersion", "runInstanceId", "graphId", "taskId", "attempt", "attemptNonce", "phase", "createdAt", "updatedAt", "supervisorEpoch",
-	"dispatch", "child", "verification", "applied", "failure", "terminalStatus", "workspaceDigest", "acceptanceDigest",
+	"deadlineAt", "dispatchIntent", "dispatch", "child", "verification", "applied", "failure", "terminalStatus", "workspaceDigest", "acceptanceDigest",
 ]);
 const PHASES = new Set<V3NodePhase>(["queued", "prepared", "dispatched", "running", "verifying", "applying", "accepted", "failed", "aborted", "needs_attention"]);
 const TERMINALS = new Set<V3NodeTerminal>(["accepted", "failed", "aborted", "needs_attention"]);
@@ -102,7 +108,9 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 	const graphId = requireString(value, "graphId");
 	const taskId = requireString(value, "taskId");
 	const attemptValue = value.attempt;
-	if (typeof attemptValue !== "number" || !Number.isInteger(attemptValue) || attemptValue < 1) graphV3Error("INVALID_ATTEMPT", "V3 attempt number must be a positive integer.", { field: "attempt" });
+	if (typeof attemptValue !== "number" || !Number.isInteger(attemptValue) || attemptValue < 1 || attemptValue > V3_MAX_ATTEMPTS_PER_NODE) {
+		graphV3Error("INVALID_ATTEMPT", `V3 attempt number must be an integer from 1 through ${V3_MAX_ATTEMPTS_PER_NODE}.`, { field: "attempt" });
+	}
 	const attemptNonce = requireString(value, "attemptNonce");
 	if (typeof value.phase !== "string" || !PHASES.has(value.phase as V3NodePhase)) graphV3Error("INVALID_ATTEMPT", "V3 attempt phase is invalid.", { field: "phase" });
 	if (value.terminalStatus !== undefined && (typeof value.terminalStatus !== "string" || !TERMINALS.has(value.terminalStatus as V3NodeTerminal))) graphV3Error("INVALID_ATTEMPT", "V3 attempt terminalStatus is invalid.", { field: "terminalStatus" });
@@ -110,6 +118,25 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 	const terminalStatus = value.terminalStatus as V3NodeTerminal | undefined;
 	if (PHASE_IS_TERMINAL[phase] && terminalStatus === undefined) graphV3Error("INVALID_ATTEMPT", `V3 terminal phase '${phase}' requires terminalStatus.`, { field: "terminalStatus" });
 	if (!PHASE_IS_TERMINAL[phase] && terminalStatus !== undefined) graphV3Error("INVALID_ATTEMPT", `V3 non-terminal phase '${phase}' must omit terminalStatus.`, { field: "terminalStatus" });
+	const deadlineAt = value.deadlineAt === undefined ? undefined : requireIso(value, "deadlineAt");
+	let dispatchIntent: V3AttemptEvidence["dispatchIntent"];
+	if (value.dispatchIntent !== undefined) {
+		if (!isRecord(value.dispatchIntent)) graphV3Error("INVALID_ATTEMPT", "V3 attempt dispatchIntent must be an object.", { field: "dispatchIntent" });
+		const requestId = requireString(value.dispatchIntent, "requestId");
+		if (!/^[^\r\n]{1,256}$/u.test(requestId)) graphV3Error("INVALID_ATTEMPT", "V3 dispatch requestId must be a single non-empty line of at most 256 characters.", { field: "dispatchIntent" });
+		if (typeof value.dispatchIntent.requestDigest !== "string" || !/^[a-f0-9]{64}$/u.test(value.dispatchIntent.requestDigest)) graphV3Error("INVALID_ATTEMPT", "V3 dispatch intent requestDigest must be a SHA-256 digest.", { field: "dispatchIntent" });
+		if (value.dispatchIntent.state !== "prepared" && value.dispatchIntent.state !== "emitting") graphV3Error("INVALID_ATTEMPT", "V3 dispatch intent state must be prepared or emitting.", { field: "dispatchIntent" });
+		const emittedAt = value.dispatchIntent.emittedAt === undefined ? undefined : requireIso(value.dispatchIntent, "emittedAt");
+		if (value.dispatchIntent.state === "prepared" && emittedAt !== undefined) graphV3Error("INVALID_ATTEMPT", "A prepared V3 dispatch intent must not contain emittedAt.", { field: "dispatchIntent" });
+		if (value.dispatchIntent.state === "emitting" && emittedAt === undefined) graphV3Error("INVALID_ATTEMPT", "An emitting V3 dispatch intent requires emittedAt.", { field: "dispatchIntent" });
+		dispatchIntent = {
+			requestId,
+			requestDigest: value.dispatchIntent.requestDigest,
+			state: value.dispatchIntent.state,
+			preparedAt: requireIso(value.dispatchIntent, "preparedAt"),
+			...(emittedAt ? { emittedAt } : {}),
+		};
+	}
 	let dispatch: V3AttemptEvidence["dispatch"];
 	if (value.dispatch !== undefined) {
 		if (!isRecord(value.dispatch)) graphV3Error("INVALID_ATTEMPT", "V3 attempt dispatch must be an object.", { field: "dispatch" });
@@ -122,6 +149,7 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 			dispatchedAt: requireIso(value.dispatch, "dispatchedAt"),
 		};
 	}
+	if (dispatch && dispatchIntent && dispatch.requestDigest !== dispatchIntent.requestDigest) graphV3Error("INVALID_ATTEMPT", "V3 dispatch binding does not match its durable request intent.", { field: "dispatch" });
 	const child = validateChildOutcome(value.child);
 	let verification: V3AttemptEvidence["verification"];
 	if (value.verification !== undefined) {
@@ -156,6 +184,8 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 		createdAt: requireIso(value, "createdAt"),
 		updatedAt: requireIso(value, "updatedAt"),
 		supervisorEpoch: requireString(value, "supervisorEpoch"),
+		...(deadlineAt ? { deadlineAt } : {}),
+		...(dispatchIntent ? { dispatchIntent } : {}),
 		...(dispatch ? { dispatch } : {}),
 		...(child ? { child } : {}),
 		...(verification ? { verification } : {}),
@@ -251,7 +281,7 @@ export function validateV3WorkspaceEvidence(value: unknown): V3WorkspaceEvidence
 	for (const field of ["runInstanceId", "graphId", "taskId", "workspaceKind", "workspaceDir", "sourceCwd", "readBaseline", "writeBaseline", "inputBaseline", "contractDigest", "createdAt"]) {
 		if (!(field in value)) graphV3Error("INVALID_ATTEMPT", `V3 workspace evidence is missing '${field}'.`, { field });
 	}
-	if (typeof value.workspaceKind !== "string" || !["shadow", "git"].includes(value.workspaceKind)) graphV3Error("INVALID_ATTEMPT", "V3 workspace kind must be shadow or git.", { field: "workspaceKind" });
+	if (value.workspaceKind !== "shadow") graphV3Error("INVALID_ATTEMPT", "V3 workspace kind must be shadow.", { field: "workspaceKind" });
 	if (!isRecord(value.readBaseline) || !isRecord(value.writeBaseline) || !isRecord(value.inputBaseline)) graphV3Error("INVALID_ATTEMPT", "V3 workspace baselines must be objects.", { field: "baselines" });
 	return value as unknown as V3WorkspaceEvidence;
 }
@@ -287,10 +317,203 @@ export function validateV3AcceptanceEvidence(value: unknown): V3AcceptanceEviden
 	for (const field of ["runInstanceId", "graphId", "taskId", "method", "verified", "validatedResultDigest", "attemptDigest", "recordedAt", "supervisorEpoch"]) {
 		if (!(field in value)) graphV3Error("INVALID_ATTEMPT", `V3 acceptance evidence is missing '${field}'.`, { field });
 	}
-	if (typeof value.method !== "string" || !["declared", "machine-verified", "child-acceptance"].includes(value.method)) graphV3Error("INVALID_ATTEMPT", "V3 acceptance method is invalid.", { field: "method" });
+	if (typeof value.method !== "string" || !["declared", "machine-verified"].includes(value.method)) graphV3Error("INVALID_ATTEMPT", "V3 acceptance method is invalid.", { field: "method" });
 	return value as unknown as V3AcceptanceEvidence;
 }
 
 export function v3AttemptEvidenceDigest(evidence: V3AttemptEvidence): string {
 	return canonicalDigest(evidence);
+}
+
+/**
+ * Acceptance cannot directly hash the final Attempt because that Attempt also
+ * stores the acceptance digest. The stable basis is therefore the exact final
+ * Attempt with only `acceptanceDigest` omitted.
+ */
+export function v3AcceptedAttemptBasis(evidence: V3AttemptEvidence): V3AttemptEvidence {
+	const { acceptanceDigest: _acceptanceDigest, ...basis } = evidence;
+	return basis;
+}
+
+export interface V3AcceptedAttemptChainExpectations {
+	runInstanceId?: string;
+	graphId?: string;
+	method?: V3AcceptanceEvidence["method"];
+}
+
+export interface V3AcceptedAttemptChainVerification {
+	ok: boolean;
+	reasons: string[];
+	attempt?: V3AttemptEvidence;
+	workspace?: V3WorkspaceEvidence;
+	validatedResult?: V3ValidatedResult;
+	acceptance?: V3AcceptanceEvidence;
+	artifactPath: string;
+	artifactContents?: string;
+}
+
+interface StableFileRead {
+	contents: string;
+}
+
+function sameFileIdentity(
+	left: { dev: number; ino: number },
+	right: { dev: number; ino: number },
+): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+/** Read an immutable artifact without following a link or accepting a read race. */
+async function readStableSingleFile(path: string): Promise<StableFileRead> {
+	const before = await lstat(path);
+	if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+		throw new Error("must be a single regular non-symbolic-link file");
+	}
+	let handle;
+	try {
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const opened = await handle.stat();
+		if (!opened.isFile() || opened.nlink !== 1 || !sameFileIdentity(before, opened)) {
+			throw new Error("changed identity while being opened");
+		}
+		const contents = await handle.readFile("utf8");
+		const [finished, current] = await Promise.all([handle.stat(), lstat(path)]);
+		if (!sameFileIdentity(opened, finished)
+			|| !sameFileIdentity(opened, current)
+			|| finished.nlink !== 1
+			|| current.nlink !== 1
+			|| finished.size !== opened.size
+			|| finished.mtimeMs !== opened.mtimeMs) {
+			throw new Error("changed while being read");
+		}
+		return { contents };
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
+function pushIdentityReasons(
+	reasons: string[],
+	label: string,
+	value: { runInstanceId: string; graphId: string; taskId: string; attempt: number },
+	expected: { runInstanceId: string; graphId: string; taskId: string; attempt: number },
+): void {
+	for (const field of ["runInstanceId", "graphId", "taskId", "attempt"] as const) {
+		if (value[field] !== expected[field]) reasons.push(`${label.toUpperCase()}_IDENTITY_MISMATCH: ${label}.${field} does not match the accepted Attempt.`);
+	}
+}
+
+/**
+ * Rebuild and verify every durable link required to trust an accepted Attempt.
+ * This intentionally ignores the mutable `artifacts/<taskId>.txt` convenience
+ * alias; downstream execution must consume the immutable Attempt artifact.
+ */
+export async function verifyV3AcceptedAttemptChain(
+	runDir: string,
+	taskId: string,
+	attemptNumber: number,
+	expectations: V3AcceptedAttemptChainExpectations = {},
+): Promise<V3AcceptedAttemptChainVerification> {
+	const artifactPath = join(v3RunPaths(runDir).artifactsDir, taskId, `attempt-${attemptNumber}.txt`);
+	const reasons: string[] = [];
+	let attempt: V3AttemptEvidence | undefined;
+	let workspace: V3WorkspaceEvidence | undefined;
+	let validatedResult: V3ValidatedResult | undefined;
+	let acceptance: V3AcceptanceEvidence | undefined;
+	let artifactContents: string | undefined;
+
+	try {
+		attempt = await readV3AttemptEvidence(runDir, taskId, attemptNumber);
+	} catch (error) {
+		reasons.push(`INVALID_ATTEMPT: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!attempt) reasons.push("MISSING_ATTEMPT: accepted Attempt evidence is missing.");
+	if (attempt) {
+		if (attempt.phase !== "accepted" || attempt.terminalStatus !== "accepted") reasons.push("ATTEMPT_NOT_ACCEPTED: Attempt is not durably terminal accepted.");
+		if (attempt.failure !== undefined) reasons.push("ATTEMPT_FAILURE_CONFLICT: an accepted Attempt must not retain failure evidence.");
+		if (attempt.child?.terminal !== "complete") reasons.push("CHILD_NOT_COMPLETE: an accepted Attempt requires a complete Child outcome.");
+		if (!attempt.workspaceDigest) reasons.push("MISSING_WORKSPACE_DIGEST: accepted Attempt does not bind workspace.json.");
+		if (!attempt.acceptanceDigest) reasons.push("MISSING_ACCEPTANCE_DIGEST: accepted Attempt does not bind acceptance.json.");
+		if (expectations.runInstanceId !== undefined && attempt.runInstanceId !== expectations.runInstanceId) reasons.push("RUN_IDENTITY_MISMATCH: Attempt belongs to a different runInstanceId.");
+		if (expectations.graphId !== undefined && attempt.graphId !== expectations.graphId) reasons.push("GRAPH_IDENTITY_MISMATCH: Attempt belongs to a different graphId.");
+		if (attempt.taskId !== taskId || attempt.attempt !== attemptNumber) reasons.push("ATTEMPT_IDENTITY_MISMATCH: Attempt path and payload identity disagree.");
+	}
+
+	try {
+		workspace = await readV3WorkspaceEvidence(runDir, taskId, attemptNumber);
+	} catch (error) {
+		reasons.push(`INVALID_WORKSPACE: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!workspace) reasons.push("MISSING_WORKSPACE: workspace.json is missing.");
+
+	try {
+		acceptance = await readV3AcceptanceEvidence(runDir, taskId, attemptNumber);
+	} catch (error) {
+		reasons.push(`INVALID_ACCEPTANCE: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!acceptance) reasons.push("MISSING_ACCEPTANCE: acceptance.json is missing.");
+
+	if (attempt && workspace) {
+		pushIdentityReasons(reasons, "workspace", workspace, attempt);
+		if (canonicalDigest(workspace) !== attempt.workspaceDigest) reasons.push("WORKSPACE_DIGEST_MISMATCH: workspace.json no longer matches the digest bound by Attempt.");
+	}
+	if (attempt && acceptance) {
+		pushIdentityReasons(reasons, "acceptance", acceptance, attempt);
+		if (canonicalDigest(acceptance) !== attempt.acceptanceDigest) reasons.push("ACCEPTANCE_DIGEST_MISMATCH: acceptance.json no longer matches the digest bound by Attempt.");
+		if (canonicalDigest(v3AcceptedAttemptBasis(attempt)) !== acceptance.attemptDigest) reasons.push("ATTEMPT_DIGEST_MISMATCH: acceptance.json does not bind the final accepted Attempt basis.");
+		if (acceptance.supervisorEpoch !== attempt.supervisorEpoch) reasons.push("SUPERVISOR_EPOCH_MISMATCH: acceptance and Attempt were not published by the same Supervisor epoch.");
+		if (expectations.method !== undefined && acceptance.method !== expectations.method) reasons.push("ACCEPTANCE_METHOD_MISMATCH: acceptance method does not match the compiled node side effect.");
+
+		if (acceptance.method === "machine-verified") {
+			if (!acceptance.verified) reasons.push("ACCEPTANCE_NOT_VERIFIED: machine verification must be recorded as verified.");
+			if (!attempt.verification?.allPassed) reasons.push("VERIFICATION_NOT_PASSED: machine-verified acceptance requires a passing Attempt verification.");
+			if (!attempt.applied) reasons.push("MISSING_APPLY_EVIDENCE: machine-verified acceptance requires durable apply evidence.");
+			try {
+				validatedResult = await readV3ValidatedResult(runDir, taskId, attemptNumber);
+			} catch (error) {
+				reasons.push(`INVALID_VALIDATED_RESULT: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			if (!validatedResult) {
+				reasons.push("MISSING_VALIDATED_RESULT: machine-verified acceptance requires validated-result.json.");
+			} else {
+				pushIdentityReasons(reasons, "validated-result", validatedResult, attempt);
+				const validatedDigest = canonicalDigest(validatedResult);
+				if (validatedDigest !== attempt.verification?.validatedResultDigest
+					|| validatedDigest !== acceptance.validatedResultDigest) {
+					reasons.push("VALIDATED_RESULT_DIGEST_MISMATCH: validated-result.json is not bound by both Attempt and acceptance.");
+				}
+				if (!validatedResult.allPassed) reasons.push("VALIDATED_RESULT_FAILED: accepted validation evidence contains a failed command.");
+				if (attempt.applied && canonicalJson(attempt.applied.writes) !== canonicalJson(validatedResult.writes)) {
+					reasons.push("APPLIED_WRITES_MISMATCH: applied writes do not match the machine-validated workspace writes.");
+				}
+			}
+		} else {
+			if (acceptance.verified) reasons.push("DECLARED_ACCEPTANCE_VERIFIED: declared acceptance must not claim machine verification.");
+			if (acceptance.validatedResultDigest !== "") reasons.push("UNEXPECTED_VALIDATED_RESULT: declared acceptance must not bind machine-validation evidence.");
+			if (attempt.verification !== undefined || attempt.applied !== undefined) reasons.push("UNEXPECTED_MACHINE_EVIDENCE: declared acceptance carries machine-only evidence.");
+		}
+	}
+
+	try {
+		artifactContents = (await readStableSingleFile(artifactPath)).contents;
+	} catch (error) {
+		reasons.push(`INVALID_ARTIFACT: immutable Attempt artifact ${error instanceof Error ? error.message : String(error)}.`);
+	}
+	if (attempt?.child && acceptance && artifactContents !== undefined) {
+		const expectedContents = acceptance.method === "machine-verified"
+			? JSON.stringify({ taskId, output: attempt.child.output })
+			: attempt.child.output;
+		if (artifactContents !== expectedContents) reasons.push("ARTIFACT_CONTENT_MISMATCH: immutable Attempt artifact does not match the accepted Child output.");
+	}
+
+	return {
+		ok: reasons.length === 0,
+		reasons,
+		...(attempt ? { attempt } : {}),
+		...(workspace ? { workspace } : {}),
+		...(validatedResult ? { validatedResult } : {}),
+		...(acceptance ? { acceptance } : {}),
+		artifactPath,
+		...(artifactContents === undefined ? {} : { artifactContents }),
+	};
 }

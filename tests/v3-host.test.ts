@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -10,7 +10,7 @@ import { V3GraphHost } from "../src/v3/host.ts";
 import { validateGraphSnapshotV3 } from "../src/v3/snapshot.ts";
 import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import type { GraphSpecV3 } from "../src/v3/types.ts";
-import { MockSubagents, completeChild } from "./helpers/mock-subagents.ts";
+import { MockSubagents, completeChild, failChild } from "./helpers/mock-subagents.ts";
 
 async function fixture() {
 	const sandbox = await realpath(await mkdtemp(join(tmpdir(), "v3-host-")));
@@ -80,6 +80,81 @@ test("E2E-1: V3 host runs a three-node A/B-parallel-then-C graph end to end", as
 	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
 });
 
+test("V3 host propagates failFast and never dispatches a later independent branch", async () => {
+	const { sandbox, sourceDir, runsDir } = await fixture();
+	const mock = new MockSubagents();
+	mock.behaviors.set("HOST_FAIL_FAST_FAIL", (input) => failChild(input));
+	mock.behaviors.set("HOST_FAIL_FAST_NEVER", (input) => completeChild({ ...input, output: "must-not-run" }));
+	mock.start();
+	const spec: GraphSpecV3 = {
+		schemaVersion: 3,
+		goal: "host failFast",
+		failFast: true,
+		maxConcurrency: 1,
+		nodes: [
+			{ taskId: "failing", agent: "test-agent", task: "HOST_FAIL_FAST_FAIL", sideEffect: "local_read" },
+			{ taskId: "independent", agent: "test-agent", task: "HOST_FAIL_FAST_NEVER", sideEffect: "local_read" },
+		],
+	};
+	const host = hostFor(runsDir, mock);
+	const result = await host.start(spec, sourceDir);
+	const snapshot = await host.waitForCompletion(result.graphId);
+	assert.equal(snapshot.status, "failed");
+	assert.equal((await readLatestV3Attempt(result.runDir, "failing"))!.evidence.phase, "failed");
+	const independent = (await readLatestV3Attempt(result.runDir, "independent"))!.evidence;
+	assert.equal(independent.phase, "failed");
+	assert.equal(independent.dispatch, undefined, "failFast terminal evidence must never imply a child dispatch");
+	assert.equal(snapshot.nodes?.independent?.phase, "failed");
+	assert.equal(mock.spawned.some((entry) => String(entry.params.task).includes("HOST_FAIL_FAST_NEVER")), false);
+	assert.equal((await host.status(result.graphId)).status, "failed", "fresh Host projection must not revive failFast work as queued");
+	await mock.dispose();
+	await rm(sandbox, { recursive: true, force: true });
+});
+
+test("V3 Host rejects resume and append after the admitted source directory identity is replaced", async () => {
+	const { sandbox, sourceDir, runsDir } = await fixture();
+	const mock = new MockSubagents();
+	mock.behaviors.set("SOURCE_ID", (input) => completeChild({ ...input, output: "done" }));
+	mock.start();
+	const host = hostFor(runsDir, mock);
+	const handle = await host.start({
+		schemaVersion: 3, graphId: "source-identity-drift", goal: "source identity",
+		nodes: [{ taskId: "root", agent: "test-agent", task: "SOURCE_ID", sideEffect: "none" }],
+	}, sourceDir);
+	await host.waitForCompletion(handle.graphId);
+	await rename(sourceDir, `${sourceDir}-original`);
+	await mkdir(sourceDir);
+	await assert.rejects(host.resume(handle.graphId), /source directory or repository identity has changed/u);
+	await assert.rejects(host.append(handle.graphId, [], 0), /source directory or repository identity has changed/u);
+	await mock.dispose();
+	await rm(sandbox, { recursive: true, force: true });
+});
+
+test("V3 Host refuses symbolic-link run roots and authority files", async () => {
+	const { sandbox, sourceDir, runsDir } = await fixture();
+	const mock = new MockSubagents();
+	mock.behaviors.set("SAFE_AUTH", (input) => completeChild({ ...input, output: "done" }));
+	mock.start();
+	const host = hostFor(runsDir, mock);
+	const handle = await host.start({
+		schemaVersion: 3, graphId: "safe-authority", goal: "safe authority",
+		nodes: [{ taskId: "root", agent: "test-agent", task: "SAFE_AUTH", sideEffect: "none" }],
+	}, sourceDir);
+	await host.waitForCompletion(handle.graphId);
+	const authorization = join(handle.runDir, "authorization.json");
+	const saved = join(handle.runDir, "authorization.saved.json");
+	await rename(authorization, saved);
+	await symlink(saved, authorization);
+	await assert.rejects(host.status(handle.graphId), /authorization\.json must be a single regular non-symbolic-link file/u);
+	await rm(authorization);
+	await rename(saved, authorization);
+	const alias = join(runsDir, "run-root-alias");
+	await symlink(handle.runDir, alias, "dir");
+	await assert.rejects(host.loadRun(alias), /run root must be a direct, canonical, non-symbolic-link child/u);
+	await mock.dispose();
+	await rm(sandbox, { recursive: true, force: true });
+});
+
 function killProcessTree(pid: number): void {
 	try {
 		if (process.platform === "win32") {
@@ -129,7 +204,7 @@ async function killAndReap(child: ReturnType<typeof spawnCrashDriver>): Promise<
 	});
 }
 
-test("E2E-2: V3 host resumes a SIGKILLed run without duplicating n1 and re-runs n2 at most once", async () => {
+test("E2E-2: V3 host resumes a SIGKILLed run fail-closed when stale child termination cannot be confirmed", async () => {
 	const { sandbox, sourceDir, runsDir } = await fixture();
 	const readyFile = join(sandbox, "ready.txt");
 	const child = spawnCrashDriver("v3-host-crash-driver.ts", {
@@ -162,7 +237,7 @@ test("E2E-2: V3 host resumes a SIGKILLed run without duplicating n1 and re-runs 
 	assert.equal(adopted[0]!.graphId, (await host.list())[0]!.graphId);
 	const graphId = adopted[0]!.graphId;
 	const snapshot = await host.waitForCompletion(graphId);
-	assert.equal(snapshot.status, "complete");
+	assert.equal(snapshot.status, "needs_attention");
 	const runDir = host.runDirFor(graphId);
 
 	// n1 committed exactly once: accepted attempt 1, side effect unchanged.
@@ -170,13 +245,14 @@ test("E2E-2: V3 host resumes a SIGKILLed run without duplicating n1 and re-runs 
 	assert.equal(n1.phase, "accepted");
 	assert.equal(n1.attempt, 1);
 	assert.equal(await readFile(join(sourceDir, "n1.out"), "utf8"), "n1\n");
-	// n2 re-ran at most once: the stale child timed out (retry), then the retried attempt completed.
+	// The killed Mock process owned the child. A new RPC bridge cannot confirm its
+	// termination, so timeout must fail closed instead of dispatching a duplicate.
 	const n2 = (await readLatestV3Attempt(runDir, "n2"))!.evidence;
-	assert.equal(n2.phase, "accepted");
-	assert.ok(n2.attempt <= 2, `n2 must re-run at most once, got attempt ${n2.attempt}`);
-	assert.equal(await readFile(join(sourceDir, "n2.out"), "utf8"), "n2\n");
-	const n3 = (await readLatestV3Attempt(runDir, "n3"))!.evidence;
-	assert.equal(n3.phase, "accepted");
+	assert.equal(n2.phase, "needs_attention");
+	assert.equal(n2.attempt, 1);
+	assert.equal(n2.failure!.kind, "dispatch_unknown");
+	assert.equal(await readLatestV3Attempt(runDir, "n3"), undefined);
+	assert.equal(snapshot.nodes?.n3?.phase, "blocked");
 	// Store integrity re-validates after recovery.
 	validateGraphSnapshotV3(JSON.parse(await readFile(join(runDir, "snapshot.json"), "utf8")));
 	validateAuthorizationV4(JSON.parse(await readFile(join(runDir, "authorization.json"), "utf8")));
@@ -235,7 +311,41 @@ test("E2E-2b: V3 host does not re-dispatch a node whose child completed before t
 	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
 });
 
-test("V3 host stop marks a fresh run stopped without dispatching children", async () => {
+test("E2E-2c: SIGKILL after spawn but before dispatch binding recovers the stable request without re-dispatch", async () => {
+	const { sandbox, sourceDir, runsDir } = await fixture();
+	const readyFile = join(sandbox, "dispatch-window-ready.txt");
+	const child = spawnCrashDriver("v3-dispatch-window-crash-driver.ts", {
+		V3_E2E_RUNS_DIR: runsDir,
+		V3_E2E_SOURCE_DIR: sourceDir,
+		V3_E2E_READY_FILE: readyFile,
+	});
+	try {
+		await waitForFile(readyFile, "spawned-before-binding", 20_000);
+		// Give the detached mock Child time to publish terminal status while the
+		// caller remains suspended before returning the spawn binding.
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+		await killAndReap(child);
+	} finally {
+		killProcessTree(child.pid!);
+	}
+	const mock = new MockSubagents();
+	mock.behaviors.set("DISPATCH_WINDOW", (input) => completeChild({ ...input, output: "duplicate" }));
+	mock.start();
+	const host = hostFor(runsDir, mock, "dispatch-window-restarted", "dispatch-window-restarted");
+	const adopted = await host.adoptCrashedRuns();
+	assert.equal(adopted.length, 1);
+	const snapshot = await host.waitForCompletion(adopted[0]!.graphId);
+	assert.equal(snapshot.status, "complete");
+	const attempt = (await readLatestV3Attempt(host.runDirFor(adopted[0]!.graphId), "window"))!.evidence;
+	assert.equal(attempt.attempt, 1);
+	assert.equal(attempt.phase, "accepted");
+	assert.equal(attempt.child!.output, "durable-child-output");
+	assert.equal(mock.spawned.length, 0, "recovery must bind the original stable request instead of spawning a replacement");
+	await mock.dispose();
+	await rm(sandbox, { recursive: true, force: true });
+});
+
+test("V3 host stop marks a fresh run stopped without dispatching downstream children", async () => {
 	const { sandbox, sourceDir, runsDir } = await fixture();
 	const mock = new MockSubagents();
 	mock.behaviors.set("STOP", () => new Promise<void>(() => undefined));
@@ -255,9 +365,10 @@ test("V3 host stop marks a fresh run stopped without dispatching children", asyn
 	assert.equal(snapshot.status, "stopped");
 	const slow = (await readLatestV3Attempt(result.runDir, "slow"))!.evidence;
 	assert.equal(slow.phase, "aborted");
-	const later = (await readLatestV3Attempt(result.runDir, "later"))!.evidence;
-	assert.equal(later.phase, "aborted");
-	assert.equal(mock.spawned.length, 1, "only the first node was dispatched before stop");
+	assert.equal(snapshot.nodes?.later?.phase, "blocked");
+	const later = await readLatestV3Attempt(result.runDir, "later");
+	assert.equal(later, undefined, "a dependency-blocked node must not fabricate an Attempt");
+	assert.ok(mock.spawned.length <= 1, "only the first node may be dispatched before stop");
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
 });
@@ -324,15 +435,18 @@ test("E2E-3: a zero-config clean install has no governance files and E2E-1 passe
 		|| p.endsWith("shadow-report.ts"),
 	);
 	assert.deepEqual(governanceHits, [], `zero-config install must contain no governance artifacts: ${governanceHits.join(", ")}`);
+	const legacyCore = installedFiles.filter((path) => path.startsWith("src/") && !path.startsWith("src/v3/"));
+	assert.deepEqual(legacyCore, [], `the installed package must ship only the V3 execution core: ${legacyCore.join(", ")}`);
 
 	// Extension load manifest == retained set.
 	const installedPackageJson = JSON.parse(await readFile(join(pkgRoot, "package.json"), "utf8")) as { pi?: { extensions?: string[] } };
 	assert.deepEqual(installedPackageJson.pi?.extensions, ["./extensions/pi-graph.ts", "./extensions/pi-graph-guard.ts"]);
 
-	// Provide the single runtime dependency exactly like `npm install` would, then run E2E-1
+	// Provide runtime and peer dependencies exactly like `npm install` would, then run E2E-1
 	// against the installed layout (clean fixture, zero governance config) and confirm it passes.
 	await mkdir(join(pkgRoot, "node_modules"), { recursive: true });
 	await symlink(join(repoRoot, "node_modules", "jiti"), join(pkgRoot, "node_modules", "jiti"), "dir");
+	await symlink(join(repoRoot, "node_modules", "pi-subagents"), join(pkgRoot, "node_modules", "pi-subagents"), "dir");
 	const { V3GraphHost: InstalledV3GraphHost } = await import(join(pkgRoot, "src/v3/host.ts")) as typeof import("../src/v3/host.ts");
 	const { readLatestV3Attempt: installedReadAttempt } = await import(join(pkgRoot, "src/v3/attempt.ts")) as typeof import("../src/v3/attempt.ts");
 	const { validateGraphSnapshotV3: installedValidateSnapshot } = await import(join(pkgRoot, "src/v3/snapshot.ts")) as typeof import("../src/v3/snapshot.ts");

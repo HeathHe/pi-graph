@@ -19,16 +19,31 @@ export interface V3RunVerificationOptions extends Partial<V3VerificationLimits> 
 }
 
 interface CappedStream {
-	value: string;
+	bytes: Buffer;
 	truncated: boolean;
 }
 
 function appendCapped(current: CappedStream, chunk: Buffer | string, limitBytes: number): CappedStream {
-	if (current.truncated || current.value.length >= limitBytes) return current;
-	const incoming = chunk.toString();
-	const remaining = limitBytes - current.value.length;
-	if (incoming.length <= remaining) return { value: current.value + incoming, truncated: false };
-	return { value: current.value + incoming.slice(0, remaining), truncated: true };
+	if (current.truncated) return current;
+	const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+	const remaining = Math.max(0, limitBytes - current.bytes.length);
+	if (incoming.length <= remaining) {
+		return { bytes: Buffer.concat([current.bytes, incoming]), truncated: false };
+	}
+	return {
+		bytes: remaining === 0 ? current.bytes : Buffer.concat([current.bytes, incoming.subarray(0, remaining)]),
+		truncated: true,
+	};
+}
+
+/** Decode captured bytes without letting an incomplete UTF-8 tail exceed the byte budget. */
+function cappedText(stream: CappedStream, limitBytes: number): string {
+	let value = stream.bytes.toString("utf8");
+	while (Buffer.byteLength(value, "utf8") > limitBytes && value.length > 0) {
+		const codePoint = value.codePointAt(value.length - 1);
+		value = value.slice(0, codePoint !== undefined && codePoint > 0xffff ? -2 : -1);
+	}
+	return value;
 }
 
 function killTree(pid: number | undefined, signal: NodeJS.Signals): void {
@@ -45,8 +60,8 @@ export async function runV3Validation(command: string, cwd: string, options: V3R
 	const limits: V3VerificationLimits = { ...V3_VERIFY_DEFAULTS, ...options };
 	const started = Date.now();
 	return new Promise((resolvePromise) => {
-		let stdout: CappedStream = { value: "", truncated: false };
-		let stderr: CappedStream = { value: "", truncated: false };
+		let stdout: CappedStream = { bytes: Buffer.alloc(0), truncated: false };
+		let stderr: CappedStream = { bytes: Buffer.alloc(0), truncated: false };
 		let timedOut = false;
 		let aborted = false;
 		let childExitCode: number | null = null;
@@ -97,9 +112,9 @@ export async function runV3Validation(command: string, cwd: string, options: V3R
 				exitCode: childExitCode,
 				signal: childSignal,
 				timedOut,
-				stdout: stdout.value,
+				stdout: cappedText(stdout, limits.streamLimitBytes),
 				stdoutTruncated: stdout.truncated,
-				stderr: stderr.value,
+				stderr: cappedText(stderr, limits.streamLimitBytes),
 				stderrTruncated: stderr.truncated,
 				durationMs: Date.now() - started,
 			});

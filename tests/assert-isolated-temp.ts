@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { subagentAsyncRoot } from "../src/rpc.ts";
+import { subagentAsyncRoot } from "../src/v3/rpc.ts";
 
 const sandboxRoot = process.env.PI_GRAPH_TEST_SANDBOX_ROOT;
 const hostAsyncRoot = process.env.PI_GRAPH_TEST_HOST_ASYNC_ROOT;

@@ -1,7 +1,7 @@
 import { watch, type FSWatcher } from "node:fs";
-import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { assertAsyncRunDirectory, assertAsyncRunIdentity, type EventBus } from "./rpc.ts";
+import { assertAsyncRunDirectory, assertAsyncRunIdentity, subagentAsyncRoot, type EventBus } from "./rpc.ts";
 
 export const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 
@@ -37,6 +37,26 @@ function completionSummary(value: Record<string, unknown> | undefined): string {
 	if (!value) return "";
 	const results = Array.isArray(value.results) ? value.results as Array<Record<string, unknown>> : [];
 	return results.map((result) => typeof result.summary === "string" ? result.summary : "").filter(Boolean).join("\n\n");
+}
+
+/**
+ * pi-subagents 0.49 may persist a structured workflow result directly in
+ * status.json instead of publishing a top-level outputFile. Read only the
+ * documented text projections; never follow a path found inside workflow data.
+ */
+function durableStatusOutput(status: Record<string, unknown>): string {
+	const workflow = status.workflow;
+	if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) return "";
+	const value = (workflow as Record<string, unknown>).value;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+	const record = value as Record<string, unknown>;
+	if (typeof record.output === "string" && record.output.length > 0) return record.output;
+	const results = Array.isArray(record.results) ? record.results as Array<Record<string, unknown>> : [];
+	return results.map((result) => {
+		if (typeof result.finalOutput === "string" && result.finalOutput.length > 0) return result.finalOutput;
+		if (typeof result.output === "string" && result.output.length > 0) return result.output;
+		return typeof result.summary === "string" ? result.summary : "";
+	}).filter(Boolean).join("\n\n");
 }
 
 function within(root: string, target: string): boolean {
@@ -95,6 +115,7 @@ export async function waitForAsyncRun(input: {
 				if (state !== "complete" && state !== "failed" && state !== "stopped" && state !== "paused") return;
 				const outputFile = typeof status.outputFile === "string" ? status.outputFile : undefined;
 				const fileOutput = !input.preferCompletionFinalOutput && outputFile ? await readSafeOutput(outputFile, input.asyncDir) : "";
+				const statusOutput = durableStatusOutput(status);
 				if (state === "complete" && input.preferCompletionFinalOutput && !completion) {
 					if (completionGraceExpired) {
 						throw new Error(`Subagent completion event for ${input.asyncId} was not observed within ${completionEventGraceMs}ms of terminal status.`);
@@ -115,8 +136,8 @@ export async function waitForAsyncRun(input: {
 					throw new Error(`Subagent completion event for ${input.asyncId} did not include usable final output.`);
 				}
 				const output = input.preferCompletionFinalOutput
-					? finalOutput || summary
-					: fileOutput || finalOutput || summary;
+					? finalOutput || summary || statusOutput
+					: fileOutput || statusOutput || finalOutput || summary;
 				finish(() => resolvePromise({ state, status, completion, output }));
 			} catch (error) {
 				finish(() => reject(error));
@@ -159,10 +180,49 @@ export async function waitForAsyncRun(input: {
 	});
 }
 
-export async function readAsyncRunState(asyncId: string, asyncDir: string): Promise<string | undefined> {
+export async function readAsyncRunState(asyncId: string, asyncDir: string, expectedToolCallId?: string): Promise<string | undefined> {
 	assertAsyncRunIdentity(asyncId, asyncDir);
 	const status = await readJson(join(asyncDir, "status.json"));
+	if (status && status.runId !== asyncId) throw new Error(`Subagent status identity does not match ${asyncId}.`);
+	if (status && expectedToolCallId !== undefined && status.toolCallId !== expectedToolCallId) throw new Error(`Subagent tool-call identity does not match ${expectedToolCallId}.`);
 	return typeof status?.state === "string" ? status.state : undefined;
+}
+
+/** Resolve the opaque async UUID durably bound to a public RPC tool-call id. */
+export async function findAsyncRunByToolCallId(
+	toolCallId: string,
+	asyncRoot = subagentAsyncRoot(),
+): Promise<{ asyncId: string; asyncDir: string } | undefined> {
+	let entries;
+	try {
+		entries = await readdir(asyncRoot, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	const matches: Array<{ asyncId: string; asyncDir: string }> = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const asyncId = entry.name;
+		// pi-subagents also keeps internal directories such as .active-runs here;
+		// only public async ids are eligible dispatch identities.
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u.test(asyncId)) continue;
+		const asyncDir = join(asyncRoot, asyncId);
+		try {
+			assertAsyncRunIdentity(asyncId, asyncDir, asyncRoot);
+			const info = await lstat(asyncDir);
+			if (!info.isDirectory() || info.isSymbolicLink()) continue;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		const status = await readJson(join(asyncDir, "status.json"));
+		if (!status || status.toolCallId !== toolCallId) continue;
+		if (status.runId !== asyncId) throw new Error(`Subagent run bound to tool-call ${toolCallId} has a mismatched durable run identity.`);
+		matches.push({ asyncId, asyncDir });
+	}
+	if (matches.length > 1) throw new Error(`Subagent tool-call identity ${toolCallId} is ambiguous across ${matches.length} async runs.`);
+	return matches[0];
 }
 
 export async function requestAsyncStop(asyncDir: string): Promise<void> {

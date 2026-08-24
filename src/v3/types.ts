@@ -5,7 +5,9 @@ export const AUTHORIZATION_V4_SCHEMA_VERSION = 4 as const;
 export type SideEffectV3 = "none" | "local_read" | "local_write";
 export type ScopeKindV3 = "file" | "tree";
 export type RetryReasonV3 = "task_failed" | "validation" | "timeout" | "workspace_conflict";
-export type WorkspaceModeV3 = "auto" | "shadow" | "git";
+export type WorkspaceModeV3 = "shadow";
+export type GraphTopologyModeV3 = "sealed" | "open";
+export type GraphWhenStatusV3 = "accepted" | "failed";
 
 export interface ScopeEntryV3 {
 	kind: ScopeKindV3;
@@ -18,8 +20,9 @@ export interface RetryPolicyV3 {
 	backoffMs: number;
 }
 
-export interface ChildAcceptanceV3 {
-	criteria: string[];
+export interface GraphWhenV3 {
+	node: string;
+	status: GraphWhenStatusV3;
 }
 
 export interface GraphNodeSpecV3 {
@@ -27,6 +30,7 @@ export interface GraphNodeSpecV3 {
 	agent: string;
 	task: string;
 	dependsOn?: string[];
+	when?: GraphWhenV3;
 	inputArtifacts?: string[];
 	outputArtifact?: string;
 	readScope?: ScopeEntryV3[];
@@ -36,7 +40,6 @@ export interface GraphNodeSpecV3 {
 	retryPolicy?: Partial<RetryPolicyV3>;
 	acceptance?: string;
 	validationCommands?: string[];
-	childAcceptance?: ChildAcceptanceV3;
 }
 
 export interface GraphSpecV3 {
@@ -47,6 +50,12 @@ export interface GraphSpecV3 {
 	maxConcurrency?: number;
 	failFast?: boolean;
 	workspace?: WorkspaceModeV3;
+	/** Graph-wide execution ceiling. It constrains tools; it never selects a model or Agent. */
+	readOnly?: boolean;
+	/** Optional exact allow-list enforced by the child Guard for every node. */
+	toolFilter?: string[];
+	/** Static/sealed remains the default when omitted. Open graphs may start empty and accept revision-CAS mutations. */
+	mode?: GraphTopologyModeV3;
 }
 
 export interface CompiledGraphNodeV3 {
@@ -54,6 +63,7 @@ export interface CompiledGraphNodeV3 {
 	agent: string;
 	task: string;
 	dependsOn: string[];
+	when?: GraphWhenV3;
 	inputArtifacts: string[];
 	outputArtifact: string;
 	readScope: ScopeEntryV3[];
@@ -63,7 +73,9 @@ export interface CompiledGraphNodeV3 {
 	retryPolicy: RetryPolicyV3;
 	acceptance?: string;
 	validationCommands: string[];
-	childAcceptance?: ChildAcceptanceV3;
+	/** Mechanically enforced graph-wide execution constraints. */
+	readOnly?: true;
+	toolFilter?: string[];
 }
 
 export interface CompiledGraphProjectionV3 {
@@ -78,12 +90,14 @@ export interface CompiledGraphProjectionV3 {
 }
 
 export interface CompiledGraphV3 extends CompiledGraphProjectionV3 {
+	/** Omitted for the historical sealed/static projection so existing graph digests remain stable. */
+	mode?: GraphTopologyModeV3;
 	sourceGraphSpec: GraphSpecV3;
 	sourceGraphSpecDigest: string;
 	graphDigest: string;
 }
 
-export type GraphRuntimeStatusV3 = "queued" | "running" | "complete" | "failed" | "stopped" | "paused" | "waiting_input" | "needs_attention";
+export type GraphRuntimeStatusV3 = "queued" | "running" | "idle" | "stopping" | "complete" | "failed" | "stopped" | "paused" | "waiting_input" | "needs_attention";
 
 export interface GraphSnapshotV3 {
 	schemaVersion: typeof SNAPSHOT_V3_SCHEMA_VERSION;
@@ -96,15 +110,28 @@ export interface GraphSnapshotV3 {
 	supervisorEpoch: string;
 	createdAt: string;
 	updatedAt: string;
+	/** Present for dynamic/open topology projections; authorization digests remain bound to the immutable base graph. */
+	topology?: GraphTopologyModeV3;
+	revision?: number;
+	sealed?: boolean;
 	/** Rebuildable projection of per-node runtime state derived from attempt evidence. */
 	nodes?: Record<string, V3NodeProjection>;
 }
 
 export interface V3NodeProjection {
-	phase: V3NodePhase;
+	phase: V3NodeProjectionPhase;
 	attempt: number;
-	terminalStatus?: V3NodeTerminal;
+	terminalStatus?: V3NodeProjectionTerminal;
 }
+
+/**
+ * Projection-only states are rebuilt from immutable topology, the mutation
+ * journal, and Attempt evidence. They deliberately are not Attempt phases:
+ * skipping, blocking, and cancellation must never invent child execution.
+ */
+export type V3NodeSyntheticPhase = "skipped" | "blocked" | "cancelled";
+export type V3NodeProjectionPhase = V3NodePhase | V3NodeSyntheticPhase;
+export type V3NodeProjectionTerminal = V3NodeTerminal | V3NodeSyntheticPhase;
 
 export type V3NodePhase =
 	| "queued"
@@ -130,7 +157,7 @@ export type V3FailureKind =
 	| "child_stopped"
 	| "internal";
 
-export type V3AcceptanceMethod = "declared" | "machine-verified" | "child-acceptance";
+export type V3AcceptanceMethod = "declared" | "machine-verified";
 
 export interface V3ValidationResult {
 	command: string;
@@ -159,6 +186,14 @@ export interface V3DispatchBinding {
 	dispatchedAt: string;
 }
 
+export interface V3DispatchIntent {
+	requestId: string;
+	requestDigest: string;
+	state: "prepared" | "emitting";
+	preparedAt: string;
+	emittedAt?: string;
+}
+
 export interface V3ChildOutcome {
 	terminal: "complete" | "failed" | "stopped" | "paused";
 	output: string;
@@ -176,6 +211,10 @@ export interface V3AttemptEvidence {
 	createdAt: string;
 	updatedAt: string;
 	supervisorEpoch: string;
+	/** One immutable wall-clock deadline for the entire Attempt, including recovery. */
+	deadlineAt?: string;
+	/** Durable spawn intent. `emitting` means the RPC emit boundary may have been crossed. */
+	dispatchIntent?: V3DispatchIntent;
 	dispatch?: V3DispatchBinding;
 	child?: V3ChildOutcome;
 	verification?: { allPassed: boolean; validatedResultDigest: string; verifiedAt: string };
@@ -192,7 +231,7 @@ export interface V3WorkspaceEvidence {
 	graphId: string;
 	taskId: string;
 	attempt: number;
-	workspaceKind: "shadow" | "git";
+	workspaceKind: "shadow";
 	workspaceDir: string;
 	sourceCwd: string;
 	readBaseline: Record<string, string | null>;
@@ -280,7 +319,7 @@ export interface AuthorizationV4 extends SourceIdentityV3 {
 	graph: CompiledGraphProjectionV3;
 }
 
-export type RunFormatKind = "legacy-readonly" | "legacy-v2" | "v3" | "invalid";
+export type RunFormatKind = "v3" | "invalid";
 
 export interface RunFormatDetection {
 	kind: RunFormatKind;
@@ -298,7 +337,7 @@ export interface V3RunVerification {
 }
 
 export interface V3RunInspection {
-	status: "ok" | "legacy-readonly" | "legacy-v2" | "needs_attention";
+  status: "ok" | "needs_attention";
 	format: RunFormatDetection;
 	runDir: string;
 	graphId?: string;

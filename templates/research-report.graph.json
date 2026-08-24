@@ -1,0 +1,68 @@
+{
+  "manifest": {
+    "name": "research-report",
+    "version": "1.0.0",
+    "description": "Evidence-backed research pipeline: research → verify → draft."
+  },
+  "source": {
+    "type": "graph-spec",
+    "spec": {
+      "schemaVersion": 3,
+      "goal": "Research {{topic}} at {{depth}} depth for a {{audience}}",
+      "nodes": [
+        {
+          "taskId": "research",
+          "agent": "researcher",
+          "task": "Research {{topic}} using current primary sources. Collect key facts, viewpoints, and source URLs at {{depth}} depth. Return a structured evidence brief.",
+          "sideEffect": "none",
+          "timeoutMs": 600000
+        },
+        {
+          "taskId": "verify",
+          "agent": "code-reviewer",
+          "task": "Independently verify the most load-bearing claims about {{topic}}: check source authority, recency, and contradictions. Mark each claim verified, partially verified, or unverified with reasons.",
+          "dependsOn": ["research"],
+          "sideEffect": "none",
+          "timeoutMs": 600000
+        },
+        {
+          "taskId": "draft",
+          "agent": "document-writer",
+          "task": "Draft a report on {{topic}} for a {{audience}}: include a one-paragraph summary, structured findings, and a source list. Include only claims that survived verification and mark uncertainty explicitly.",
+          "dependsOn": ["verify"],
+          "sideEffect": "none",
+          "timeoutMs": 600000
+        }
+      ]
+    }
+  },
+  "intent": "Research a topic, independently verify the evidence, and produce a concise report.",
+  "inputs": {
+    "topic": {
+      "type": "string",
+      "required": true,
+      "description": "The research topic or question."
+    },
+    "depth": {
+      "type": "string",
+      "required": false,
+      "default": "moderate",
+      "description": "Research depth: quick / moderate / thorough."
+    },
+    "audience": {
+      "type": "string",
+      "required": false,
+      "default": "technical reader",
+      "description": "Who the report is written for."
+    }
+  },
+  "requires": {
+    "readOnly": true,
+    "toolFilter": ["read", "web_search", "fetch_content", "get_search_content"]
+  },
+  "provenance": {
+    "created": "2026-08-24",
+    "author": "pi-graph",
+    "source": "builtin:research-report"
+  }
+}

@@ -1,32 +1,130 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, readdir, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { validateAuthorizationV4 } from "./authorization.ts";
 import { readLatestV3Attempt, v3NodeAttemptDir, v3RunPaths } from "./attempt.ts";
 import { compileGraphSpecV3 } from "./compiler.ts";
+import {
+	initializeV3RunControl,
+	updateV3RunControl,
+	type V3ControlMutationOptions,
+	type V3DesiredState,
+	type V3RunControl,
+} from "./control.ts";
 import { v3PreflightAgent } from "./dispatch.ts";
 import { graphV3Error, GraphV3Error } from "./errors.ts";
 import { detectRunFormat } from "./format-detector.ts";
 import { initializeV3Run } from "./initialize.ts";
-import { readV3RunLease, validateV3RunLease } from "./lease.ts";
+import { acquireV3RunLease, readV3RunLease, validateV3RunLease, type V3LeaseHandle } from "./lease.ts";
+import {
+	appendV3GraphNodes,
+	cancelV3GraphNodes,
+	readV3MutationJournal,
+	sealV3Graph,
+	type V3GraphMutationState,
+	type V3MutationCapability,
+	type V3MutationNodeStateView,
+	V3RevisionConflictError,
+} from "./mutations.ts";
+import { commitV3RetryIntent, latestV3RetryBaselines, pendingV3RetryBaselines } from "./retry.ts";
 import { buildV3SnapshotProjection } from "./projection.ts";
-import { V3GraphRunner, resumeV3GraphRun } from "./runner.ts";
+import { mutationCapabilityForLease, V3GraphRunner, V3RunnerCapabilityUnavailableError } from "./runner.ts";
 import { validateGraphSnapshotV3 } from "./snapshot.ts";
+import { canonicalJson } from "./digests.ts";
+import { resolveSourceIdentityV3 } from "./source-identity.ts";
+import {
+	freezeV3GraphAgents,
+	removeV3OrphanAgentProfiles,
+	removeV3UncommittedAgentProfiles,
+	withV3AgentProfileTransaction,
+} from "./workspace.ts";
 import type { SubagentRpcClient } from "./rpc.ts";
 import type {
 	AuthorizationV4,
 	CompiledGraphV3,
 	GraphRuntimeStatusV3,
 	GraphSnapshotV3,
+	GraphNodeSpecV3,
 	GraphSpecV3,
 } from "./types.ts";
 
-const TERMINAL_STATUSES: ReadonlySet<GraphRuntimeStatusV3> = new Set(["complete", "failed", "stopped", "needs_attention"]);
+const TERMINAL_STATUSES: ReadonlySet<GraphRuntimeStatusV3> = new Set(["complete", "failed", "stopped", "paused", "needs_attention"]);
+
+interface StableJsonObservation {
+	value: unknown;
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	contents: string;
+}
+
+function sameStableObservation(left: StableJsonObservation, right: StableJsonObservation): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+		&& left.mtimeMs === right.mtimeMs && left.contents === right.contents;
+}
+
+async function readStableJson(path: string, label: string): Promise<StableJsonObservation> {
+	const before = await lstat(path);
+	if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+		graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} must be a single regular non-symbolic-link file.`);
+	}
+	let handle;
+	try {
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const opened = await handle.stat();
+		if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino) {
+			graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} changed identity while it was opened.`);
+		}
+		const contents = await handle.readFile("utf8");
+		const [finished, current] = await Promise.all([handle.stat(), lstat(path)]);
+		if (finished.dev !== opened.dev || finished.ino !== opened.ino
+			|| current.dev !== opened.dev || current.ino !== opened.ino
+			|| finished.nlink !== 1 || current.nlink !== 1
+			|| finished.size !== opened.size || finished.mtimeMs !== opened.mtimeMs) {
+			graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} changed while it was read.`);
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(contents) as unknown;
+		} catch (error) {
+			graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} is not valid JSON.`, { cause: error });
+		}
+		return { value, dev: finished.dev, ino: finished.ino, size: finished.size, mtimeMs: finished.mtimeMs, contents };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ELOOP") graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} became a symbolic link while it was opened.`);
+		throw error;
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
+/** snapshot.json is a mutable rebuildable cache; tolerate an atomic publication
+ * that wins the read race, while still rejecting links and unstable contents. */
+async function readStableSnapshot(path: string, attempts = 5): Promise<StableJsonObservation> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < attempts; attempt += 1) {
+		try {
+			return await readStableJson(path, "snapshot.json");
+		} catch (error) {
+			lastError = error;
+			const retryable = error instanceof GraphV3Error
+				&& error.code === "RUN_NEEDS_ATTENTION"
+				&& (error.message.includes("changed identity") || error.message.includes("changed while it was read"));
+			if (!retryable || attempt === attempts - 1) throw error;
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+		}
+	}
+	throw lastError;
+}
 
 export interface V3HostContext {
 	rpc: SubagentRpcClient;
 	runsDir: string;
 	sessionId: string;
 	supervisorEpoch: string;
+	/** Notify the Pi background-work provider after an authoritative snapshot publication. */
+	onStateChange?: (snapshot: GraphSnapshotV3) => void;
 	/** Injectable agent preflight; defaults to pi-subagents public preflight. */
 	preflightAgent?: (spec: { agent: string; cwd: string; sessionId?: string }) => Promise<void>;
 }
@@ -56,8 +154,57 @@ export interface V3StartResult {
 	snapshot: GraphSnapshotV3;
 }
 
+/**
+ * Process-local facade for a durable V3 run. Control methods acknowledge once
+ * control.json has been committed; use wait() when terminal execution evidence
+ * is required. A handle remains useful after its original Supervisor exits.
+ */
+export class V3GraphRunHandle implements V3StartResult {
+	readonly graph: CompiledGraphV3;
+	readonly runDir: string;
+	readonly graphId: string;
+	readonly snapshot: GraphSnapshotV3;
+	private readonly host: V3GraphHost;
+
+	constructor(host: V3GraphHost, result: V3StartResult) {
+		this.host = host;
+		this.graph = result.graph;
+		this.runDir = result.runDir;
+		this.graphId = result.graphId;
+		this.snapshot = result.snapshot;
+	}
+
+	status(): Promise<GraphSnapshotV3> {
+		return this.host.status(this.graphId);
+	}
+
+	wait(): Promise<GraphSnapshotV3> {
+		return this.host.waitForCompletion(this.graphId);
+	}
+
+	control(): Promise<V3RunControl> {
+		return this.host.control(this.graphId);
+	}
+
+	stop(options: V3ControlMutationOptions = {}): Promise<V3RunControl> {
+		return this.host.requestDesiredState(this.graphId, "stopped", options);
+	}
+
+	pause(options: V3ControlMutationOptions = {}): Promise<V3RunControl> {
+		return this.host.requestDesiredState(this.graphId, "paused", options);
+	}
+
+	resume(options: V3ControlMutationOptions = {}): Promise<V3RunControl> {
+		return this.host.requestDesiredState(this.graphId, "running", options);
+	}
+}
+
 export interface LoadedV3Run {
+	/** Immutable admission authority used to validate the mutation journal. */
+	baseGraph: CompiledGraphV3;
+	/** Effective graph rebuilt from baseGraph plus every committed mutation. */
 	graph: CompiledGraphV3;
+	mutation: V3GraphMutationState;
 	authorization: AuthorizationV4;
 	runDir: string;
 }
@@ -68,7 +215,7 @@ export interface LoadedV3Run {
  * lease, source identity) instead of trusting persisted integrity markers.
  */
 export class V3GraphHost {
-	private readonly supervised = new Map<string, { runner: V3GraphRunner; promise: Promise<GraphSnapshotV3> }>();
+	private readonly supervised = new Map<string, { runner: V3GraphRunner; promise: Promise<GraphSnapshotV3>; sessionId: string }>();
 	readonly context: V3HostContext;
 
 	constructor(context: V3HostContext) {
@@ -81,9 +228,18 @@ export class V3GraphHost {
 		this.context.supervisorEpoch = supervisorEpoch;
 	}
 
-	/** Request a graceful stop for every run this process supervises (session shutdown). */
-	suspendAll(): void {
-		for (const { runner } of this.supervised.values()) runner.requestStop();
+	/**
+	 * Session shutdown is recoverable: commit paused intent for every supervised
+	 * run before nudging local loops to quiesce. It must not convert pending work
+	 * into aborted Attempts merely because the owning Pi session closed.
+	 */
+	async suspendAll(): Promise<V3RunControl[]> {
+		const entries = [...this.supervised.entries()];
+		return Promise.all(entries.map(async ([graphId, supervised]) => {
+			const control = await this.requestDesiredState(graphId, "paused");
+			supervised.runner.requestPause();
+			return control;
+		}));
 	}
 
 	get runsDir(): string {
@@ -98,48 +254,316 @@ export class V3GraphHost {
 		return this.context.preflightAgent ?? ((spec) => v3PreflightAgent({ agent: spec.agent }, spec.cwd, spec.sessionId));
 	}
 
-	private runnerOptions(runDir: string, graph: CompiledGraphV3, authorization: AuthorizationV4, sourceCwd: string): ConstructorParameters<typeof V3GraphRunner>[0] {
+	private runnerOptions(runDir: string, graph: CompiledGraphV3, authorization: AuthorizationV4, sourceCwd: string, baseGraph = graph): ConstructorParameters<typeof V3GraphRunner>[0] {
 		return {
 			rpc: this.context.rpc,
 			runDir,
 			graph,
+			baseGraph,
 			authorization,
 			sourceCwd,
 			sessionId: authorization.sessionId,
 			supervisorEpoch: authorization.supervisorEpoch,
+			failFast: graph.failFast,
 			preflightAgent: this.preflight(),
+			...(this.context.onStateChange ? { onSnapshot: this.context.onStateChange } : {}),
 		};
 	}
 
-	/** Rebuild the compiled graph from the stored authorization source spec and verify its digests on site. */
+	private supervise(graphId: string, runner: V3GraphRunner): Promise<GraphSnapshotV3> {
+		const promise = runner.run();
+		this.supervised.set(graphId, { runner, promise, sessionId: runner.options.sessionId });
+		void promise.finally(() => {
+			if (this.supervised.get(graphId)?.promise === promise) this.supervised.delete(graphId);
+		}).catch(() => undefined);
+		return promise;
+	}
+
+	private async superviseResumedRun(
+		graphId: string,
+		runDir: string,
+		graph: CompiledGraphV3,
+		authorization: AuthorizationV4,
+	): Promise<void> {
+		const alreadySupervised = this.supervised.get(graphId);
+		if (alreadySupervised) return;
+		const baseGraph = compileGraphSpecV3(authorization.sourceGraphSpec);
+		const retryMutation = await readV3MutationJournal(runDir, baseGraph);
+		const retryBaselines = await pendingV3RetryBaselines(
+			runDir,
+			authorization.runInstanceId,
+			graph.graphId,
+			graph,
+			retryMutation.cancelledTaskIds,
+		);
+		const runner = new V3GraphRunner({
+			...this.runnerOptions(runDir, graph, authorization, authorization.sourceCwd, baseGraph),
+			...(retryBaselines ? { retryBaselines } : {}),
+		});
+		await runner.initializeForResume();
+		const raced = this.supervised.get(graphId);
+		if (raced) return;
+		this.supervise(graphId, runner);
+	}
+
+	private dynamicProjection(mutation: V3GraphMutationState): Pick<Parameters<typeof buildV3SnapshotProjection>[0], "topology" | "revision" | "sealed" | "cancelledTaskIds" | "topologyUpdatedAt"> {
+		if (mutation.graph.mode !== "open") return {};
+		return {
+			topology: mutation.sealed ? "sealed" : "open",
+			revision: mutation.revision,
+			sealed: mutation.sealed,
+			cancelledTaskIds: mutation.cancelledTaskIds,
+			...(mutation.mutations.at(-1)?.at ? { topologyUpdatedAt: mutation.mutations.at(-1)!.at } : {}),
+		};
+	}
+
+	private continueAfterPausedSupervisor(
+		graphId: string,
+		runDir: string,
+		graph: CompiledGraphV3,
+		authorization: AuthorizationV4,
+		promise: Promise<GraphSnapshotV3>,
+	): void {
+		void promise.then(async (snapshot) => {
+			if (snapshot.status !== "paused" || this.supervised.has(graphId)) return;
+			const latestControl = await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+			if (latestControl.desiredState === "running") {
+				await this.superviseResumedRun(graphId, runDir, graph, authorization);
+			}
+		}).catch(() => undefined);
+	}
+
+	private async withTopologySupervisor<T>(
+		graphId: string,
+		runDir: string,
+		authorization: AuthorizationV4,
+		operation: (capability: V3MutationCapability) => Promise<T>,
+	): Promise<T> {
+		const supervised = this.supervised.get(graphId);
+		if (supervised) {
+			try {
+				return await supervised.runner.withMutationCapability(operation);
+			} catch (error) {
+				const releasedDuringQuiescence = error instanceof V3RunnerCapabilityUnavailableError
+					|| (error instanceof GraphV3Error && error.code === "RUN_NEEDS_ATTENTION");
+				if (!releasedDuringQuiescence) throw error;
+				// The process-local entry can briefly outlive its lease while the idle
+				// promise/finally callbacks drain. Wait for that exact Runner before
+				// acquiring a fresh standalone capability; a genuinely live competing
+				// process will still be rejected by acquireV3RunLease below.
+				await supervised.promise.catch(() => undefined);
+				await Promise.resolve();
+			}
+		}
+		const lease = await acquireV3RunLease(v3RunPaths(runDir).leasePath, authorization.runInstanceId);
+		try {
+			return await operation(mutationCapabilityForLease(lease));
+		} finally {
+			await lease.release();
+		}
+	}
+
+	private async wakeAfterTopologyMutation(graphId: string): Promise<void> {
+		if (this.supervised.has(graphId)) return;
+		const runDir = this.runDirFor(graphId);
+		const { baseGraph, graph, authorization } = await this.loadRun(runDir, graphId);
+		const control = await initializeV3RunControl(runDir, authorization.runInstanceId, graphId);
+		if (control.desiredState !== "running") return;
+		const runner = new V3GraphRunner(this.runnerOptions(runDir, graph, authorization, authorization.sourceCwd, baseGraph));
+		await runner.initializeForResume();
+		if (!this.supervised.has(graphId)) this.supervise(graphId, runner);
+	}
+
+	/** Append immutable nodes under revision CAS and wake an idle OPEN graph. */
+	async append(graphId: string, nodes: readonly GraphNodeSpecV3[], expectedRevision: number): Promise<V3GraphMutationState> {
+		const runDir = this.runDirFor(graphId);
+		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
+		const state = await this.withTopologySupervisor(graphId, runDir, authorization, async (capability) =>
+			withV3AgentProfileTransaction(runDir, async () => {
+				const mutation = await readV3MutationJournal(runDir, baseGraph);
+				if (mutation.revision !== expectedRevision) throw new V3RevisionConflictError(expectedRevision, mutation.revision);
+				// Compile before freezing so invalid topology cannot leave profile files.
+				const candidate = compileGraphSpecV3({
+					...mutation.graph.sourceGraphSpec,
+					graphId: baseGraph.graphId,
+					mode: "open",
+					nodes: [...mutation.graph.sourceGraphSpec.nodes, ...nodes],
+				});
+				const appendedIds = new Set(nodes.map((node) => node.taskId));
+				const appended = candidate.nodes.filter((node) => appendedIds.has(node.taskId));
+				// A prior process may have died after freezing profiles but before its
+				// append revision became authority. Under the mutation lease these
+				// task IDs are proven absent, so the stale reservation can be replaced.
+				if (!this.context.preflightAgent) await removeV3OrphanAgentProfiles(runDir, appended);
+				const frozenProfiles = !this.context.preflightAgent
+					? await freezeV3GraphAgents(runDir, authorization.sourceCwd, appended)
+					: [];
+				try {
+					return await appendV3GraphNodes({ runDir, baseGraph, nodes, expectedRevision, capability });
+				} catch (error) {
+					if (frozenProfiles.length > 0) {
+						// A failure may occur after the no-replace journal publish boundary.
+						// Preserve every profile whose node actually became authority and
+						// remove only this transaction's otherwise-uncommitted profiles.
+						const committed = await readV3MutationJournal(runDir, baseGraph);
+						const committedTaskIds = new Set(committed.graph.nodes.map((node) => node.taskId));
+						const abandoned = frozenProfiles.filter((profile) => !committedTaskIds.has(profile.taskId));
+						await removeV3UncommittedAgentProfiles(runDir, abandoned);
+					}
+					throw error;
+				}
+			}),
+		);
+		await this.wakeAfterTopologyMutation(graphId);
+		return state;
+	}
+
+	/** Tombstone pending nodes. Cancellation is projection authority and creates no Attempt. */
+	async cancel(graphId: string, taskIds: readonly string[], cascade: boolean, expectedRevision: number): Promise<V3GraphMutationState> {
+		const runDir = this.runDirFor(graphId);
+		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
+		const state = await this.withTopologySupervisor(graphId, runDir, authorization, async (capability) => {
+			// cancelV3GraphNodes invokes this view inside capability.withFence, so
+			// the status authority is read in the same transaction as publication.
+			const view: V3MutationNodeStateView = {
+				phaseOf: async (taskId) => (await readLatestV3Attempt(runDir, taskId))?.evidence.phase,
+			};
+			return cancelV3GraphNodes({ runDir, baseGraph, taskIds, cascade, expectedRevision, view, capability });
+		});
+		await this.wakeAfterTopologyMutation(graphId);
+		return state;
+	}
+
+	/**
+	 * Retry one terminal node and every non-cancelled descendant. The immutable
+	 * intent records each node's latest Attempt baseline under a live Supervisor
+	 * fence; recovery only resets nodes still at that exact baseline.
+	 */
+	async retry(graphId: string, taskId: string): Promise<GraphSnapshotV3> {
+		if (this.supervised.has(graphId)) {
+			graphV3Error("INVALID_MUTATION", `V3 graph '${graphId}' is still supervised; retry is allowed only after the run is terminal.`);
+		}
+		const runDir = this.runDirFor(graphId);
+		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
+		const effective = await this.withTopologySupervisor(graphId, runDir, authorization, async (capability) => {
+			// Reload topology under the same fence as retry admission so an append
+			// or cancellation cannot slip between host.loadRun and the baselines.
+			const mutation = await readV3MutationJournal(runDir, baseGraph);
+			await commitV3RetryIntent({
+				runDir,
+				graph: mutation.graph,
+				runInstanceId: authorization.runInstanceId,
+				taskId,
+				cancelledTaskIds: mutation.cancelledTaskIds,
+				capability,
+			});
+			return mutation.graph;
+		});
+		await initializeV3RunControl(runDir, authorization.runInstanceId, effective.graphId);
+		await updateV3RunControl(runDir, "running", {
+			runInstanceId: authorization.runInstanceId,
+			graphId: effective.graphId,
+		});
+		await this.superviseResumedRun(graphId, runDir, effective, authorization);
+		// Retry acknowledges once its intent is durable and a Supervisor has been
+		// installed. Callers that need the terminal result use waitForCompletion().
+		return this.status(graphId);
+	}
+
+	/** Permanently seal an OPEN graph; its Runner then derives a true terminal result. */
+	async seal(graphId: string, expectedRevision: number): Promise<V3GraphMutationState> {
+		const runDir = this.runDirFor(graphId);
+		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
+		const state = await this.withTopologySupervisor(graphId, runDir, authorization, (capability) =>
+			sealV3Graph({ runDir, baseGraph, expectedRevision, capability }));
+		await this.wakeAfterTopologyMutation(graphId);
+		return state;
+	}
+
+	/** Rebuild immutable admission authority, then replay the mutation journal into the effective graph. */
 	async loadRun(runDir: string, graphId?: string): Promise<LoadedV3Run> {
 		const resolved = resolve(runDir);
-		const authorizationRaw = JSON.parse(await readFile(join(resolved, "authorization.json"), "utf8")) as unknown;
-		const authorization = validateAuthorizationV4(authorizationRaw);
-		const graph = compileGraphSpecV3(authorization.sourceGraphSpec as GraphSpecV3);
-		if (graph.sourceGraphSpecDigest !== authorization.sourceGraphSpecDigest) {
+		const [runsStat, runStat, canonicalRuns, canonicalRun] = await Promise.all([
+			lstat(this.runsDir),
+			lstat(resolved),
+			realpath(this.runsDir),
+			realpath(resolved),
+		]);
+		if (!runsStat.isDirectory() || runsStat.isSymbolicLink() || canonicalRuns !== this.runsDir) {
+			graphV3Error("RUN_NEEDS_ATTENTION", "V3 runsDir must be a canonical non-symbolic-link directory.");
+		}
+		if (!runStat.isDirectory() || runStat.isSymbolicLink() || canonicalRun !== resolved || dirname(canonicalRun) !== canonicalRuns) {
+			graphV3Error("RUN_NEEDS_ATTENTION", "V3 run root must be a direct, canonical, non-symbolic-link child of runsDir.");
+		}
+		if (graphId !== undefined && basename(canonicalRun) !== graphId) {
+			graphV3Error("RUN_NEEDS_ATTENTION", `V3 run root name '${basename(canonicalRun)}' does not match requested graph '${graphId}'.`);
+		}
+		const [authorizationRead, snapshotRead] = await Promise.all([
+			readStableJson(join(resolved, "authorization.json"), "authorization.json"),
+			readStableSnapshot(join(resolved, "snapshot.json")),
+		]);
+		if (detectRunFormat(snapshotRead.value, authorizationRead.value).kind !== "v3") {
+			graphV3Error("RUN_NEEDS_ATTENTION", "V3 run authority files do not describe a V3 run.");
+		}
+		const authorization = validateAuthorizationV4(authorizationRead.value);
+		const snapshot = validateGraphSnapshotV3(snapshotRead.value);
+		if (snapshot.runInstanceId !== authorization.runInstanceId
+			|| snapshot.graphId !== authorization.graph.graphId
+			|| snapshot.graphDigest !== authorization.graphDigest
+			|| snapshot.sourceGraphSpecDigest !== authorization.sourceGraphSpecDigest) {
+			graphV3Error("RUN_NEEDS_ATTENTION", "V3 snapshot identity does not match immutable authorization.");
+		}
+		let observedSource;
+		try {
+			observedSource = await resolveSourceIdentityV3(authorization.sourceCwd);
+		} catch (error) {
+			graphV3Error("RUN_NEEDS_ATTENTION", `V3 admitted source identity is unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+		}
+		if (observedSource.sourceCwd !== authorization.sourceCwd
+			|| canonicalJson(observedSource.sourceRepository) !== canonicalJson(authorization.sourceRepository)) {
+			graphV3Error("RUN_NEEDS_ATTENTION", "V3 admitted source directory or repository identity has changed.");
+		}
+		const [currentRun, currentAuthorization] = await Promise.all([
+			lstat(resolved),
+			readStableJson(join(resolved, "authorization.json"), "authorization.json"),
+		]);
+		if (currentRun.isSymbolicLink() || !currentRun.isDirectory()
+			|| currentRun.dev !== runStat.dev || currentRun.ino !== runStat.ino
+			|| !sameStableObservation(authorizationRead, currentAuthorization)) {
+			graphV3Error("RUN_NEEDS_ATTENTION", "V3 run root or authorization changed while authority was verified.");
+		}
+		const baseGraph = compileGraphSpecV3(authorization.sourceGraphSpec as GraphSpecV3);
+		if (baseGraph.sourceGraphSpecDigest !== authorization.sourceGraphSpecDigest) {
 			graphV3Error("INVALID_AUTHORIZATION", "V3 run sourceGraphSpecDigest no longer matches its admitted source GraphSpec.", { field: "sourceGraphSpecDigest" });
 		}
-		if (graph.graphDigest !== authorization.graphDigest) {
+		if (baseGraph.graphDigest !== authorization.graphDigest) {
 			graphV3Error("INVALID_AUTHORIZATION", "V3 run graphDigest no longer matches its admitted compiled graph.", { field: "graphDigest" });
 		}
-		return { graph, authorization, runDir: resolved };
+		if (graphId !== undefined && baseGraph.graphId !== graphId) {
+			graphV3Error("INVALID_AUTHORIZATION", `V3 run directory identity '${graphId}' does not match admitted graph '${baseGraph.graphId}'.`);
+		}
+		const mutation = await readV3MutationJournal(resolved, baseGraph);
+		return { baseGraph, graph: mutation.graph, mutation, authorization, runDir: resolved };
 	}
 
 	async isV3Run(runDir: string): Promise<boolean> {
 		try {
-			const [snapshotRaw, authorizationRaw] = await Promise.all([
-				readFile(join(runDir, "snapshot.json"), "utf8"),
-				readFile(join(runDir, "authorization.json"), "utf8"),
+			const resolved = resolve(runDir);
+			const [rootStat, canonical, snapshot, authorization] = await Promise.all([
+				lstat(resolved),
+				realpath(resolved),
+				readStableSnapshot(join(resolved, "snapshot.json")),
+				readStableJson(join(resolved, "authorization.json"), "authorization.json"),
 			]);
-			return detectRunFormat(JSON.parse(snapshotRaw), JSON.parse(authorizationRaw)).kind === "v3";
+			if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || canonical !== resolved || dirname(canonical) !== await realpath(this.runsDir)) return false;
+			return detectRunFormat(snapshot.value, authorization.value).kind === "v3";
 		} catch {
 			return false;
 		}
 	}
 
 	/** Start a new V3 graph: admit, initialize, and run in the background. */
-	async start(spec: GraphSpecV3, sourceCwd: string): Promise<V3StartResult> {
+	async start(spec: GraphSpecV3, sourceCwd: string): Promise<V3GraphRunHandle> {
 		const graph = compileGraphSpecV3(spec);
 		const graphId = graph.graphId;
 		const runDir = this.runDirFor(graphId);
@@ -153,42 +577,133 @@ export class V3GraphHost {
 			sourceCwd,
 			runInstanceId: graphId,
 		});
-		const runner = new V3GraphRunner(this.runnerOptions(runDir, graph, init.authorization, sourceCwd));
-		const promise = runner.run();
-		this.supervised.set(graphId, { runner, promise });
-		void promise.finally(() => {
-			if (this.supervised.get(graphId)?.promise === promise) this.supervised.delete(graphId);
-		}).catch(() => undefined);
+		await initializeV3RunControl(runDir, init.authorization.runInstanceId, graphId);
+		// Production admission freezes every Agent definition before any node can
+		// dispatch. Tests that inject preflight use the workspace's deterministic
+		// synthetic profile instead of depending on a developer's ambient agents.
+		if (!this.context.preflightAgent) await freezeV3GraphAgents(runDir, init.authorization.sourceCwd, graph.nodes);
+		const runner = new V3GraphRunner(this.runnerOptions(runDir, graph, init.authorization, init.authorization.sourceCwd));
+		this.supervise(graphId, runner);
+		const mutation = await readV3MutationJournal(runDir, graph);
 		const snapshot = await buildV3SnapshotProjection({
 			runDir,
 			graph,
 			authorization: init.authorization,
 			sessionId: init.authorization.sessionId,
 			supervisorEpoch: init.authorization.supervisorEpoch,
+			...this.dynamicProjection(mutation),
 		});
-		return { graph, runDir, graphId, snapshot };
+		return new V3GraphRunHandle(this, { graph, runDir, graphId, snapshot });
+	}
+
+	/** Explicit handle-named alias for callers migrating from V3StartResult. */
+	startHandle(spec: GraphSpecV3, sourceCwd: string): Promise<V3GraphRunHandle> {
+		return this.start(spec, sourceCwd);
+	}
+
+	/** Open a durable handle without adopting or starting execution. */
+	async openHandle(graphId: string): Promise<V3GraphRunHandle> {
+		const runDir = this.runDirFor(graphId);
+		const { graph, authorization } = await this.loadRun(runDir, graphId);
+		await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+		const snapshot = await this.status(graphId);
+		return new V3GraphRunHandle(this, { graph, runDir, graphId, snapshot });
+	}
+
+	/** Read the durable desired state without conflating it with observed status. */
+	async control(graphId: string): Promise<V3RunControl> {
+		const runDir = this.runDirFor(graphId);
+		const { graph, authorization } = await this.loadRun(runDir, graphId);
+		return initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+	}
+
+	/** Persist a control command before applying any process-local side effect. */
+	async requestDesiredState(
+		graphId: string,
+		desiredState: V3DesiredState,
+		options: V3ControlMutationOptions = {},
+	): Promise<V3RunControl> {
+		const runDir = this.runDirFor(graphId);
+		const { graph, authorization } = await this.loadRun(runDir, graphId);
+		await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+		const control = await updateV3RunControl(runDir, desiredState, {
+			...options,
+			runInstanceId: authorization.runInstanceId,
+			graphId: graph.graphId,
+		});
+		if (desiredState === "stopped") this.supervised.get(graphId)?.runner.requestStop();
+		if (desiredState === "paused") this.supervised.get(graphId)?.runner.requestPause();
+		if (desiredState === "running") {
+			const current = this.supervised.get(graphId);
+			if (current) {
+				// Resume can race the quiescent paused return. If the old promise wins
+				// that race, continue under a fresh real Runner after it releases lease.
+				this.continueAfterPausedSupervisor(graphId, runDir, graph, authorization, current.promise);
+			} else {
+				// initializeForResume may read substantial Attempt evidence, but run()
+				// is registered and left in the background; callers receive the
+				// committed control revision rather than terminal execution.
+				await this.superviseResumedRun(graphId, runDir, graph, authorization);
+			}
+		}
+		return control;
+	}
+
+	/** Persist pause intent, then wait for this Host's active Supervisor to quiesce. */
+	async pause(graphId: string): Promise<GraphSnapshotV3> {
+		await this.requestDesiredState(graphId, "paused");
+		const supervised = this.supervised.get(graphId);
+		if (supervised) return supervised.promise;
+		return this.status(graphId);
 	}
 
 	/** Live status projection for a V3 run. */
 	async status(graphId: string): Promise<GraphSnapshotV3> {
 		const runDir = this.runDirFor(graphId);
-		const { graph, authorization } = await this.loadRun(runDir, graphId);
+		const { graph, mutation, authorization } = await this.loadRun(runDir, graphId);
 		const supervised = this.supervised.get(graphId);
+		const control = await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+		if (control.runInstanceId !== authorization.runInstanceId || control.graphId !== graph.graphId) {
+			graphV3Error("RUN_NEEDS_ATTENTION", `V3 graph '${graphId}' control identity does not match its authorization.`);
+		}
+		const stopRequested = control.desiredState === "stopped" || supervised?.runner.isStopRequested === true;
+		const paused = control.desiredState === "paused" || supervised?.runner.isPauseRequested === true;
+		const retryBaselines = await latestV3RetryBaselines(runDir, authorization.runInstanceId, graph.graphId);
 		return buildV3SnapshotProjection({
 			runDir,
 			graph,
 			authorization,
 			sessionId: authorization.sessionId,
 			supervisorEpoch: authorization.supervisorEpoch,
-			...(supervised ? { stopRequested: supervised.runner.isStopRequested } : {}),
+			...(retryBaselines ? { retryBaselines } : {}),
+			...(stopRequested ? { stopRequested: true } : {}),
+			...(paused && !stopRequested ? { projectionStatusOverride: "paused" } : {}),
+			...this.dynamicProjection(mutation),
 		});
 	}
 
-	/** Await the supervised run's terminal snapshot, or return the live projection. */
+	/**
+	 * Await the observed result for the latest durable intent. A Supervisor may
+	 * quiesce on a paused revision just before a newer running/stopped revision is
+	 * committed; in that case its paused snapshot is stale and a fresh Supervisor
+	 * must continue without writing another control revision.
+	 */
 	async waitForCompletion(graphId: string): Promise<GraphSnapshotV3> {
-		const supervised = this.supervised.get(graphId);
-		if (supervised) return supervised.promise;
-		return this.status(graphId);
+		while (true) {
+			const supervised = this.supervised.get(graphId);
+			const snapshot = supervised ? await supervised.promise : await this.status(graphId);
+			if (supervised && this.supervised.get(graphId)?.promise === supervised.promise) {
+				// The promise is settled and its lease has been released. Do not let a
+				// lagging finally callback hide the successor started below.
+				this.supervised.delete(graphId);
+			}
+			if (snapshot.status !== "paused") return snapshot;
+			const control = await this.control(graphId);
+			if (control.desiredState === "paused") return snapshot;
+			const runDir = this.runDirFor(graphId);
+			const { graph, authorization } = await this.loadRun(runDir, graphId);
+			await this.superviseResumedRun(graphId, runDir, graph, authorization);
+		}
 	}
 
 	/**
@@ -198,34 +713,38 @@ export class V3GraphHost {
 	 */
 	async stop(graphId: string): Promise<GraphSnapshotV3> {
 		const runDir = this.runDirFor(graphId);
+		await this.requestDesiredState(graphId, "stopped");
 		const supervised = this.supervised.get(graphId);
 		if (supervised) {
-			supervised.runner.requestStop();
 			return supervised.promise;
 		}
 		const { graph, authorization } = await this.loadRun(runDir, graphId);
 		const runner = new V3GraphRunner(this.runnerOptions(runDir, graph, authorization, authorization.sourceCwd));
 		await runner.initializeForResume();
 		runner.requestStop();
-		const promise = runner.run();
-		this.supervised.set(graphId, { runner, promise });
-		void promise.finally(() => {
-			if (this.supervised.get(graphId)?.promise === promise) this.supervised.delete(graphId);
-		}).catch(() => undefined);
+		const promise = this.supervise(graphId, runner);
 		return promise;
 	}
 
 	/** Resume a crashed/interrupted V3 run (crash recovery). */
 	async resume(graphId: string): Promise<GraphSnapshotV3> {
-		const runDir = this.runDirFor(graphId);
-		if (this.supervised.has(graphId)) return this.supervised.get(graphId)!.promise;
-		const { graph, authorization } = await this.loadRun(runDir, graphId);
-		const promise = resumeV3GraphRun(this.runnerOptions(runDir, graph, authorization, authorization.sourceCwd));
-		this.supervised.set(graphId, { runner: promise as unknown as V3GraphRunner, promise });
-		void promise.finally(() => {
-			if (this.supervised.get(graphId)?.promise === promise) this.supervised.delete(graphId);
-		}).catch(() => undefined);
-		return promise;
+		await this.requestDesiredState(graphId, "running");
+		while (true) {
+			let supervised = this.supervised.get(graphId);
+			if (!supervised) {
+				const runDir = this.runDirFor(graphId);
+				const { graph, authorization } = await this.loadRun(runDir, graphId);
+				const control = await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+				if (control.desiredState !== "running") return this.status(graphId);
+				await this.superviseResumedRun(graphId, runDir, graph, authorization);
+				supervised = this.supervised.get(graphId);
+			}
+			if (!supervised) return this.status(graphId);
+			const snapshot = await supervised.promise;
+			if (snapshot.status !== "paused") return snapshot;
+			const control = await this.control(graphId);
+			if (control.desiredState !== "running") return this.status(graphId);
+		}
 	}
 
 	/** List V3 runs with their live projections. Legacy runs are not shown here. */
@@ -237,16 +756,8 @@ export class V3GraphHost {
 			const runDir = join(this.runsDir, entry.name);
 			if (!await this.isV3Run(runDir)) continue;
 			try {
-				const { graph, authorization } = await this.loadRun(runDir, entry.name);
 				const supervised = this.supervised.has(entry.name);
-				const snapshot = await buildV3SnapshotProjection({
-					runDir,
-					graph,
-					authorization,
-					sessionId: authorization.sessionId,
-					supervisorEpoch: authorization.supervisorEpoch,
-					...(supervised ? { stopRequested: this.supervised.get(entry.name)!.runner.isStopRequested } : {}),
-				});
+				const snapshot = await this.status(entry.name);
 				summaries.push({ graphId: entry.name, runDir, snapshot, supervised });
 			} catch (error) {
 				// Unreadable or tampered V3 runs are reported by doctor, not list.
@@ -254,6 +765,11 @@ export class V3GraphHost {
 		}
 		summaries.sort((left, right) => right.snapshot.createdAt.localeCompare(left.snapshot.createdAt));
 		return summaries;
+	}
+
+	/** Synchronous background-work inventory for the Pi host session. */
+	listActiveWork(): Array<{ id: string; sessionId: string }> {
+		return [...this.supervised.entries()].map(([id, entry]) => ({ id, sessionId: entry.sessionId }));
 	}
 
 	/** Adoption scan: recover every non-terminal V3 run not supervised by this host. */
@@ -265,17 +781,50 @@ export class V3GraphHost {
 			if (this.supervised.has(entry.name)) continue;
 			const runDir = join(this.runsDir, entry.name);
 			if (!await this.isV3Run(runDir)) continue;
-			let status: GraphRuntimeStatusV3;
+			let snapshot: GraphSnapshotV3;
 			try {
-				const raw = JSON.parse(await readFile(join(runDir, "snapshot.json"), "utf8"));
-				status = validateGraphSnapshotV3(raw).status;
+				// Recompute from safe on-site authority and Attempt evidence. The mutable
+				// persisted snapshot is a cache, not adoption authority.
+				snapshot = await this.status(entry.name);
 			} catch {
 				adopted.push({ graphId: entry.name, outcome: "needs_attention" });
 				continue;
 			}
-			if (TERMINAL_STATUSES.has(status)) continue;
 			try {
-				await this.resume(entry.name);
+				const control = await this.control(entry.name);
+				const loaded = await this.loadRun(runDir, entry.name);
+				const retryPending = await pendingV3RetryBaselines(
+					runDir,
+					loaded.authorization.runInstanceId,
+					loaded.graph.graphId,
+					loaded.graph,
+					loaded.mutation.cancelledTaskIds,
+				) !== undefined;
+				if (retryPending) {
+					await this.requestDesiredState(entry.name, "running");
+					await this.resume(entry.name);
+					adopted.push({ graphId: entry.name, outcome: "resumed" });
+					continue;
+				}
+				if (control.desiredState === "paused") {
+					adopted.push({ graphId: entry.name, outcome: "skipped" });
+					continue;
+				}
+				if (control.desiredState === "stopped") {
+					// A stopped intent is projected as `stopped` as soon as no Attempt is
+					// actively running. Queued nodes still require a real Supervisor pass
+					// to publish their no-dispatch aborted evidence; graph status alone
+					// therefore cannot prove that offline stop finalization has completed.
+					const stopFinalized = loaded.graph.nodes.every((node) =>
+						snapshot.nodes?.[node.taskId]?.terminalStatus !== undefined);
+					if (stopFinalized) continue;
+					await this.stop(entry.name);
+				} else {
+					// A paused projection is terminal only while the durable intent is
+					// paused. A committed running intent makes it resumable again.
+					if (TERMINAL_STATUSES.has(snapshot.status) && snapshot.status !== "paused") continue;
+					await this.resume(entry.name);
+				}
 				adopted.push({ graphId: entry.name, outcome: "resumed" });
 			} catch (error) {
 				adopted.push({ graphId: entry.name, outcome: "needs_attention" });

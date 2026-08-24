@@ -45,3 +45,13 @@ test("V3 initialize and inspect have no governance configuration probes", async 
 		assert.doesNotMatch(source, /model-registry\.json|routing-policy\.json/u, file);
 	}
 });
+
+test("V3 Agent admission, freezing, and dispatch all use project scope", async () => {
+	const preflight = await readFile(join(v3SourceDir, "preflight.ts"), "utf8");
+	const workspace = await readFile(join(v3SourceDir, "workspace.ts"), "utf8");
+	const runner = await readFile(join(v3SourceDir, "runner.ts"), "utf8");
+	assert.match(preflight, /agentScope:\s*"project"/u);
+	assert.match(workspace, /discoverAgents\(sourceCwd,\s*"project"\)/u);
+	assert.doesNotMatch(workspace, /discoverAgents\(sourceCwd,\s*"both"\)/u);
+	assert.match(runner, /agentScope:\s*"project"/u);
+});

@@ -64,6 +64,7 @@ export async function v3PreflightAgent(input: { agent: string; cwd: string; sess
 		const resolver = await publicPreflightResolver();
 		const result = await resolver({
 			agent: input.agent,
+			agentScope: "project",
 			cwd: resolve(input.cwd),
 			context: "fresh",
 			task: "Resolve this Agent for the V3 capability catalog without launching it.",

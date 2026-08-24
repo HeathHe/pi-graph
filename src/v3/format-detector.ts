@@ -16,9 +16,7 @@ export function detectRunFormat(snapshot: unknown, authorization?: unknown): Run
 		...(authorizationSchemaVersion === undefined ? {} : { authorizationSchemaVersion }),
 		...(runtimeSchemaVersion === undefined ? {} : { runtimeSchemaVersion }),
 	};
-	if (snapshotSchemaVersion === 1 && !authorizationPresent) return { kind: "legacy-readonly", ...versions };
-	if (snapshotSchemaVersion === 2 && (authorizationSchemaVersion === 2 || authorizationSchemaVersion === 3)) return { kind: "legacy-v2", ...versions };
-	if (snapshotSchemaVersion === 3 && authorizationSchemaVersion === 4 && runtimeSchemaVersion === 3) return { kind: "v3", ...versions };
+  if (snapshotSchemaVersion === 3 && authorizationSchemaVersion === 4 && runtimeSchemaVersion === 3) return { kind: "v3", ...versions };
 	return {
 		kind: "invalid",
 		...versions,

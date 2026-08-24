@@ -66,6 +66,22 @@ test("V3 compiler normalizes a legal three-node graph with a stable digest", () 
 	assert.equal(JSON.stringify(first).includes("deadline"), false);
 });
 
+test("V3 compiler binds graph-wide readOnly and toolFilter constraints into every node", () => {
+	const input = validThreeNodeSpec();
+	input.nodes = [(input.nodes as Array<Record<string, unknown>>)[0]!];
+	input.readOnly = true;
+	input.toolFilter = ["read", "grep"];
+	const graph = compileGraphSpecV3(input);
+	assert.ok(graph.nodes.every((node) => node.readOnly === true));
+	assert.ok(graph.nodes.every((node) => JSON.stringify(node.toolFilter) === JSON.stringify(["grep", "read"])));
+	const writable = validThreeNodeSpec();
+	writable.readOnly = true;
+	expectGraphError(() => compileGraphSpecV3(writable), "INVALID_GRAPH_SPEC");
+	const invalidTool = validThreeNodeSpec();
+	invalidTool.toolFilter = ["bad tool"];
+	expectGraphError(() => compileGraphSpecV3(invalidTool), "INVALID_GRAPH_SPEC");
+});
+
 test("V3 compiler detects cycles", () => {
 	const input = validThreeNodeSpec();
 	const nodes = input.nodes as Array<Record<string, unknown>>;
@@ -86,6 +102,18 @@ test("V3 compiler detects duplicate task IDs", () => {
 	const nodes = input.nodes as Array<Record<string, unknown>>;
 	nodes[2]!.taskId = "build";
 	expectGraphError(() => compileGraphSpecV3(input), "DUPLICATE_TASK_ID");
+});
+
+test("V3 compiler bounds task IDs before they become durable path components", () => {
+	const accepted = validThreeNodeSpec();
+	(accepted.nodes as Array<Record<string, unknown>>)[0]!.taskId = "a".repeat(200);
+	(accepted.nodes as Array<Record<string, unknown>>)[1]!.dependsOn = ["a".repeat(200)];
+	(accepted.nodes as Array<Record<string, unknown>>)[1]!.inputArtifacts = [`demo-graph/${"a".repeat(200)}/out`];
+	assert.equal(compileGraphSpecV3(accepted).nodes[0]?.taskId.length, 200);
+
+	const rejected = validThreeNodeSpec();
+	(rejected.nodes as Array<Record<string, unknown>>)[0]!.taskId = "a".repeat(201);
+	expectGraphError(() => compileGraphSpecV3(rejected), "INVALID_GRAPH_SPEC");
 });
 
 test("V3 compiler rejects unordered overlapping writes", () => {
@@ -137,7 +165,6 @@ test("V3 compiler requires write scope and validation commands for local_write",
 	for (const patch of [
 		{ writeScope: [{ kind: "tree", path: "out" }] },
 		{ validationCommands: ["npm test"] },
-		{ childAcceptance: { criteria: ["looks correct"] }, writeScope: [{ kind: "tree", path: "out" }] },
 	]) {
 		const input = validThreeNodeSpec();
 		(input.nodes as Array<Record<string, unknown>>)[1] = {
@@ -150,6 +177,22 @@ test("V3 compiler requires write scope and validation commands for local_write",
 		};
 		expectGraphError(() => compileGraphSpecV3(input), "LOCAL_WRITE_REQUIREMENTS");
 	}
+});
+
+test("V3 compiler exposes only the implemented shadow workspace", () => {
+	const implicit = compileGraphSpecV3(validThreeNodeSpec());
+	assert.equal(implicit.workspace, "shadow");
+	for (const unsupported of ["auto", "git"]) {
+		const input = validThreeNodeSpec();
+		input.workspace = unsupported;
+		expectGraphError(() => compileGraphSpecV3(input), "INVALID_GRAPH_SPEC");
+	}
+});
+
+test("V3 compiler rejects the removed childAcceptance pseudo-contract", () => {
+	const input = validThreeNodeSpec();
+	(input.nodes as Array<Record<string, unknown>>)[0]!.childAcceptance = { criteria: ["looks correct"] };
+	expectGraphError(() => compileGraphSpecV3(input), "INVALID_FIELD");
 });
 
 test("V3 compiler rejects unsafe validation commands", () => {
@@ -218,6 +261,18 @@ test("V3 compiler generates deterministic output artifacts and graph IDs", () =>
 	assert.match(first.graphId, /^graph-[a-f0-9]{16}$/u);
 	assert.equal(first.nodes[0]?.outputArtifact, `${first.graphId}/collect/out`);
 	assert.equal(first.nodes[0]?.outputArtifact, second.nodes[0]?.outputArtifact);
+});
+
+test("V3 compiler rejects graph IDs that could escape or alias the run directory", () => {
+	for (const graphId of ["../escape", "nested/run", ".hidden", "with space", "éxample", `x${"a".repeat(200)}`]) {
+		const input = { schemaVersion: 3, graphId, goal: "Validate graph identity", nodes: [{ taskId: "one", agent: "reader", task: "One", sideEffect: "none" }] };
+		const error = expectGraphError(() => compileGraphSpecV3(input), "INVALID_GRAPH_SPEC");
+		assert.equal(error.field, "graphId");
+	}
+	for (const graphId of ["A", "graph.v3", "graph_v3", "graph-v3", "9graph"]) {
+		const input = { schemaVersion: 3, graphId, goal: "Validate graph identity", nodes: [{ taskId: "one", agent: "reader", task: "One", sideEffect: "none" }] };
+		assert.equal(compileGraphSpecV3(input).graphId, graphId);
+	}
 });
 
 test("V3 compiler rejects artifacts not produced by an upstream node", () => {

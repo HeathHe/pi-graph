@@ -2,11 +2,12 @@ import { posix } from "node:path";
 import { canonicalDigest, canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
 import type {
-	ChildAcceptanceV3,
 	CompiledGraphNodeV3,
 	CompiledGraphProjectionV3,
 	CompiledGraphV3,
 	GraphSpecV3,
+	GraphTopologyModeV3,
+	GraphWhenV3,
 	RetryPolicyV3,
 	RetryReasonV3,
 	ScopeEntryV3,
@@ -15,14 +16,14 @@ import type {
 } from "./types.ts";
 import { validateValidationCommandV3 } from "./validation-command.ts";
 
-const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "maxConcurrency", "failFast", "workspace"]);
+const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "maxConcurrency", "failFast", "workspace", "mode", "readOnly", "toolFilter"]);
 const NODE_FIELDS = new Set([
-	"taskId", "agent", "task", "dependsOn", "inputArtifacts", "outputArtifact", "readScope", "writeScope", "sideEffect",
-	"timeoutMs", "retryPolicy", "acceptance", "validationCommands", "childAcceptance",
+	"taskId", "agent", "task", "dependsOn", "when", "inputArtifacts", "outputArtifact", "readScope", "writeScope", "sideEffect",
+	"timeoutMs", "retryPolicy", "acceptance", "validationCommands",
 ]);
 const RETRY_FIELDS = new Set(["maxAttempts", "retryOn", "backoffMs"]);
-const CHILD_ACCEPTANCE_FIELDS = new Set(["criteria"]);
 const SCOPE_FIELDS = new Set(["kind", "path"]);
+const WHEN_FIELDS = new Set(["node", "status"]);
 const GOVERNANCE_FIELDS = new Set([
 	"model", "thinking", "routing", "planning", "routingProfile", "taskRisk", "producerRefs", "maxAuthorization", "resolvedModel",
 	"contractPolicy", "context", "cwd", "toolBudget", "priority", "resourceClass", "allowDelete", "allowBash", "planningReceipt",
@@ -30,10 +31,17 @@ const GOVERNANCE_FIELDS = new Set([
 ]);
 const SIDE_EFFECTS = new Set<SideEffectV3>(["none", "local_read", "local_write"]);
 const RETRY_REASONS = new Set<RetryReasonV3>(["task_failed", "validation", "timeout", "workspace_conflict"]);
-const WORKSPACES = new Set<WorkspaceModeV3>(["auto", "shadow", "git"]);
+const WORKSPACES = new Set<WorkspaceModeV3>(["shadow"]);
+const TOPOLOGY_MODES = new Set<GraphTopologyModeV3>(["sealed", "open"]);
 const TASK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u;
+const GRAPH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/u;
 const MAX_CONCURRENCY_V3 = 6;
+export const MAX_GRAPH_NODES_V3 = 512;
+// taskId is embedded in several durable filenames. 200 leaves room for the
+// longest recovery/quarantine suffix below the common POSIX NAME_MAX of 255.
+export const MAX_TASK_ID_LENGTH_V3 = 200;
 const PROTECTED_CONTROL_SEGMENTS = new Set([".git", ".pi-graph", ".pi-subagents"]);
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/u;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -181,11 +189,19 @@ function normalizeRetryPolicy(value: unknown, taskId: string): RetryPolicyV3 {
 	return { maxAttempts: maxAttempts as number, retryOn: retryOn as RetryReasonV3[], backoffMs: backoffMs as number };
 }
 
-function normalizeChildAcceptance(value: unknown, taskId: string): ChildAcceptanceV3 | undefined {
+function normalizeWhen(value: unknown, taskId: string): GraphWhenV3 | undefined {
 	if (value === undefined) return undefined;
-	if (!isRecord(value)) graphV3Error("INVALID_GRAPH_SPEC", "childAcceptance must be an object.", { taskId, field: "childAcceptance" });
-	assertAllowedFields(value, CHILD_ACCEPTANCE_FIELDS, "childAcceptance", taskId);
-	return { criteria: stringArray(value.criteria, "childAcceptance.criteria", taskId) };
+	if (!isRecord(value)) graphV3Error("INVALID_GRAPH_SPEC", `Node '${taskId}' when must be { node, status }.`, { taskId, field: "when" });
+	assertAllowedFields(value, WHEN_FIELDS, `node '${taskId}' when`, taskId);
+	if (Object.keys(value).length !== WHEN_FIELDS.size) {
+		graphV3Error("INVALID_GRAPH_SPEC", `Node '${taskId}' when must contain exactly 'node' and 'status'.`, { taskId, field: "when" });
+	}
+	const node = requiredString(value, "node", `node '${taskId}' when`, taskId);
+	if (node === taskId) graphV3Error("INVALID_GRAPH_SPEC", `Node '${taskId}' when.node cannot reference itself.`, { taskId, field: "when" });
+	if (value.status !== "accepted" && value.status !== "failed") {
+		graphV3Error("INVALID_GRAPH_SPEC", `Node '${taskId}' when.status must be 'accepted' or 'failed'.`, { taskId, field: "when" });
+	}
+	return { node, status: value.status };
 }
 
 function normalizeValidationCommands(value: unknown, taskId: string): string[] {
@@ -312,30 +328,43 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 	assertAllowedFields(input, TOP_LEVEL_FIELDS, "GraphSpec V3");
 	if (input.schemaVersion !== 3) graphV3Error("INVALID_SCHEMA_VERSION", "GraphSpec V3 requires schemaVersion: 3.", { field: "schemaVersion", details: { received: input.schemaVersion } });
 	const goal = requiredString(input, "goal", "GraphSpec V3", undefined, 2_000);
-	if (!Array.isArray(input.nodes) || input.nodes.length === 0) graphV3Error("INVALID_GRAPH_SPEC", "GraphSpec V3 nodes must be a non-empty array.", { field: "nodes" });
+	const mode = input.mode ?? "sealed";
+	if (typeof mode !== "string" || !TOPOLOGY_MODES.has(mode as GraphTopologyModeV3)) graphV3Error("INVALID_GRAPH_SPEC", "mode must be 'sealed' or 'open'.", { field: "mode" });
+	if (!Array.isArray(input.nodes) || (input.nodes.length === 0 && mode !== "open")) graphV3Error("INVALID_GRAPH_SPEC", "GraphSpec V3 nodes must be non-empty unless mode is 'open'.", { field: "nodes" });
+	if (input.nodes.length > MAX_GRAPH_NODES_V3) graphV3Error("INVALID_GRAPH_SPEC", `GraphSpec V3 supports at most ${MAX_GRAPH_NODES_V3} nodes.`, { field: "nodes" });
 	const sourceGraphSpecDigest = canonicalDigest(input);
 	const explicitGraphId = optionalString(input, "graphId", "GraphSpec V3");
 	const graphId = explicitGraphId ?? `graph-${sourceGraphSpecDigest.slice(0, 16)}`;
-	if (graphId.length > 200) graphV3Error("INVALID_GRAPH_SPEC", "GraphSpec V3 graphId must be at most 200 characters.", { field: "graphId" });
+	if (!GRAPH_ID_PATTERN.test(graphId)) {
+		graphV3Error("INVALID_GRAPH_SPEC", "GraphSpec V3 graphId must start with an ASCII letter or digit and contain only ASCII letters, digits, '.', '_', or '-' (maximum 200 characters).", { field: "graphId" });
+	}
 	const maxConcurrency = input.maxConcurrency ?? 2;
 	if (!Number.isInteger(maxConcurrency) || (maxConcurrency as number) < 1 || (maxConcurrency as number) > MAX_CONCURRENCY_V3) graphV3Error("INVALID_GRAPH_SPEC", `maxConcurrency must be an integer from 1 through ${MAX_CONCURRENCY_V3}.`, { field: "maxConcurrency" });
 	const failFast = input.failFast ?? false;
 	if (typeof failFast !== "boolean") graphV3Error("INVALID_GRAPH_SPEC", "failFast must be a boolean.", { field: "failFast" });
-	const workspace = input.workspace ?? "auto";
-	if (typeof workspace !== "string" || !WORKSPACES.has(workspace as WorkspaceModeV3)) graphV3Error("INVALID_GRAPH_SPEC", "workspace must be 'auto', 'shadow', or 'git'.", { field: "workspace" });
+	const workspace = input.workspace ?? "shadow";
+	if (typeof workspace !== "string" || !WORKSPACES.has(workspace as WorkspaceModeV3)) graphV3Error("INVALID_GRAPH_SPEC", "workspace must be 'shadow'.", { field: "workspace" });
+	const readOnly = input.readOnly ?? false;
+	if (typeof readOnly !== "boolean") graphV3Error("INVALID_GRAPH_SPEC", "readOnly must be a boolean.", { field: "readOnly" });
+	const toolFilter = input.toolFilter === undefined ? [] : stringArray(input.toolFilter, "toolFilter");
+	for (const toolName of toolFilter) {
+		if (!TOOL_NAME_PATTERN.test(toolName)) graphV3Error("INVALID_GRAPH_SPEC", `toolFilter contains invalid tool name '${toolName}'.`, { field: "toolFilter" });
+	}
+	toolFilter.sort();
 
 	const seenTaskIds = new Set<string>();
 	const nodes: CompiledGraphNodeV3[] = input.nodes.map((rawNode, index) => {
 		if (!isRecord(rawNode)) graphV3Error("INVALID_GRAPH_SPEC", `nodes[${index}] must be an object.`, { field: "nodes" });
 		const candidateTaskId = taskIdFromRecord(rawNode);
 		assertAllowedFields(rawNode, NODE_FIELDS, `nodes[${index}]`, candidateTaskId);
-		const taskId = requiredString(rawNode, "taskId", `nodes[${index}]`, candidateTaskId);
+		const taskId = requiredString(rawNode, "taskId", `nodes[${index}]`, candidateTaskId, MAX_TASK_ID_LENGTH_V3);
 		if (!TASK_ID_PATTERN.test(taskId)) graphV3Error("INVALID_TASK_ID", `Invalid taskId '${taskId}'.`, { taskId, field: "taskId" });
 		if (seenTaskIds.has(taskId)) graphV3Error("DUPLICATE_TASK_ID", `Duplicate taskId '${taskId}'.`, { taskId, field: "taskId" });
 		seenTaskIds.add(taskId);
 		const agent = requiredString(rawNode, "agent", `nodes[${index}]`, taskId);
 		const task = requiredString(rawNode, "task", `nodes[${index}]`, taskId);
 		const dependsOn = rawNode.dependsOn === undefined ? [] : stringArray(rawNode.dependsOn, "dependsOn", taskId).sort();
+		const when = normalizeWhen(rawNode.when, taskId);
 		const inputArtifacts = rawNode.inputArtifacts === undefined
 			? []
 			: stringArray(rawNode.inputArtifacts, "inputArtifacts", taskId).map((artifact) => normalizeArtifact(artifact, "inputArtifacts", taskId)).sort();
@@ -354,9 +383,11 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		const retryPolicy = normalizeRetryPolicy(rawNode.retryPolicy, taskId);
 		const acceptance = optionalString(rawNode, "acceptance", `nodes[${index}]`, taskId);
 		const validationCommands = normalizeValidationCommands(rawNode.validationCommands, taskId);
-		const childAcceptance = normalizeChildAcceptance(rawNode.childAcceptance, taskId);
 		if (sideEffectValue === "local_write" && (writeScope.length === 0 || validationCommands.length === 0)) {
-			graphV3Error("LOCAL_WRITE_REQUIREMENTS", `local_write node '${taskId}' requires non-empty writeScope and validationCommands; childAcceptance cannot replace validationCommands.`, { taskId, details: { hasWriteScope: writeScope.length > 0, hasValidationCommands: validationCommands.length > 0 } });
+			graphV3Error("LOCAL_WRITE_REQUIREMENTS", `local_write node '${taskId}' requires non-empty writeScope and validationCommands.`, { taskId, details: { hasWriteScope: writeScope.length > 0, hasValidationCommands: validationCommands.length > 0 } });
+		}
+		if (readOnly && sideEffectValue === "local_write") {
+			graphV3Error("INVALID_GRAPH_SPEC", `readOnly graph cannot contain local_write node '${taskId}'.`, { taskId, field: "readOnly" });
 		}
 		if (sideEffectValue !== "local_write" && writeScope.length > 0) {
 			graphV3Error("INVALID_SCOPE", `Node '${taskId}' may declare writeScope only with sideEffect 'local_write'.`, { taskId, field: "writeScope", details: { sideEffect: sideEffectValue } });
@@ -366,6 +397,7 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 			agent,
 			task,
 			dependsOn,
+			...(when === undefined ? {} : { when }),
 			inputArtifacts,
 			outputArtifact,
 			readScope,
@@ -375,11 +407,21 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 			retryPolicy,
 			...(acceptance === undefined ? {} : { acceptance }),
 			validationCommands,
-			...(childAcceptance === undefined ? {} : { childAcceptance }),
+			...(readOnly ? { readOnly: true as const } : {}),
+			...(toolFilter.length === 0 ? {} : { toolFilter: [...toolFilter] }),
 		};
 		validateOwnWriteScopes(node);
 		return node;
 	});
+	for (const node of nodes) {
+		if (node.when === undefined) continue;
+		if (!seenTaskIds.has(node.when.node)) {
+			graphV3Error("UNKNOWN_DEPENDENCY", `Node '${node.taskId}' when.node references unknown task '${node.when.node}'.`, { taskId: node.taskId, field: "when", details: { dependency: node.when.node } });
+		}
+		if (!node.dependsOn.includes(node.when.node)) {
+			graphV3Error("INVALID_GRAPH_SPEC", `Node '${node.taskId}' when.node '${node.when.node}' must be listed in dependsOn.`, { taskId: node.taskId, field: "when" });
+		}
+	}
 
 	const topologicalOrder = topologicalSort(nodes);
 	const ancestors = ancestorMap(nodes, topologicalOrder);
@@ -398,5 +440,5 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		workspace: workspace as WorkspaceModeV3,
 	};
 	const sourceGraphSpec = JSON.parse(canonicalJson(input)) as GraphSpecV3;
-	return { ...projection, sourceGraphSpec, sourceGraphSpecDigest, graphDigest: canonicalDigest(projection) };
+	return { ...projection, ...(mode === "open" ? { mode: "open" as const } : {}), sourceGraphSpec, sourceGraphSpecDigest, graphDigest: canonicalDigest(projection) };
 }

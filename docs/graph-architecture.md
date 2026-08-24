@@ -1,205 +1,276 @@
-# pi-graph 架构详解
+# pi-graph V3 架构
 
-`pi-graph` 是 Pi 的持久化 DAG 执行引擎：把父级 Agent 提交的 GraphSpec 编译成一个有向无环图，为每个节点启动独立的 `pi-subagents` 异步子 Agent，持久化每一次状态迁移，隔离写入，做确定性验证，只有 Supervisor 判定 `ACCEPTED` 的节点才能解锁下游。
+pi-graph 当前只有一个职责：可靠执行调用方已经定义好的 DAG。生产链路从 `extensions/pi-graph.ts` 进入 `src/v3/**`，不存在旧 GraphManager、治理门或模型路由旁路。
 
-它**故意不做**：是否该用 Graph 的判断、目标拆解、模型选择、上下文搜索。这些是 `agent-workflow` 和父级 Agent 的职责。
+```text
+GraphSpec / capsule / template
+            │
+            ▼
+ compileGraphSpecV3
+            │
+            ▼
+ V3GraphHost ── durable control / mutation / retry
+            │
+            ▼
+ V3GraphRunner ── Supervisor lease + generation fence
+            │
+            ├── pi-subagents RPC child
+            ├── shadow workspace + Graph Guard
+            ├── deterministic validation + atomic apply
+            └── Attempt / acceptance / artifact evidence
+```
 
----
+## 1. 分层
 
-## 一、分层结构
+| 层 | 主要文件 | 责任 |
+| --- | --- | --- |
+| Pi 入口 | `extensions/pi-graph.ts` | 注册 14 个 `graph` actions、`/graphs`、background-work provider 和 session 生命周期 |
+| Child 护栏 | `extensions/pi-graph-guard.ts` | 执行 node contract：scope、readOnly、toolFilter、保护路径、bash 禁用 |
+| 输入 | `src/v3/graph-capsule.ts`, `templates.ts` | 安全读取 `.graph.json`、类型化输入替换、内置模板 |
+| 编译 | `src/v3/compiler.ts` | 严格 schema、拓扑排序、环/依赖/artifact/scope 检查、digest |
+| Admission | `src/v3/initialize.ts`, `authorization.ts`, `source-identity.ts` | 原子创建 run、绑定源目录身份、写 Authorization V4 和初始 Snapshot V3 |
+| Host | `src/v3/host.ts`, `config.ts` | start/load/status/list/control、恢复认领、动态变更、显式 retry |
+| Control | `src/v3/control.ts` | `running/paused/stopped` desired state 与 revision CAS |
+| 动态拓扑 | `src/v3/mutations.ts` | OPEN/SEALED、append/cancel/seal、revision CAS、digest-chain journal |
+| 调度 | `src/v3/runner.ts`, `scheduler.ts` | dependency readiness、when、并发、failFast、Attempt 状态机、恢复 |
+| 派发 | `src/v3/dispatch.ts`, `rpc.ts` | stable request ID、durable emit intent、child 监控/停止/找回 |
+| Workspace | `src/v3/workspace.ts` | shadow workspace、Agent freeze、baseline、write inspection、atomic apply |
+| 验证 | `src/v3/validation-command.ts`, `verify.ts` | argv 白名单、shell:false、deadline、字节上限、进程树终止 |
+| 证据 | `src/v3/attempt.ts`, `events.ts`, `projection.ts`, `snapshot.ts` | Attempt/validation/acceptance、最佳努力事件、可重建 snapshot |
+| 排他写者 | `src/v3/lease.ts`, `claims.ts` | PID+process identity lease、单调 Supervisor generation fence |
+| 重试 | `src/v3/retry.ts` | 目标+下游 retry intent、Attempt baselines、崩溃后一次性继续 |
+| 数据交接 | `src/v3/capsule.ts` | 有界、不可信的直接依赖 output capsule |
+| 原子原语 | `src/v3/durable.ts`, `digests.ts`, `path-safety.ts` | fsync/rename/link、canonical digest、可信目录锚 |
 
-| 层 | 文件 | 职责 |
-|---|---|---|
-| 入口 | `extensions/pi-graph.ts` | 注册 `graph` 工具（start/status/list/stop/resume/doctor）与 `/graphs` 运维命令；向 pi-subagents 注册 background-work provider，防止 headless 会话在节点间退出 |
-| 护栏 | `extensions/pi-graph-guard.ts` | 注入子 Agent workspace 的策略护栏；默认 `allowBash:false`，路径类工具限制在声明 scope 内，畸形合同 fail closed |
-| 管理 | `src/manager.ts` (`GraphManager`) | 图级生命周期：start/stop/resume/list、session_start 认领本会话的活跃图、session_shutdown 挂起监督、维护任务 |
-| 编译 | `src/compile.ts` | GraphSpec → CompiledGraph：路径 canonicalize（realpath、禁止逃逸 cwd）、DAG 无环检查、**编译期拒绝 writeScope 重叠的并行节点** |
-| 调度 | `src/runner.ts` (`GraphRunner`) | DAG 主循环：并发控制（默认 2，只读突发 3）、`resourceClass` 车道限流、provider 冷却、重试调度（业务 `maxAttempts` 与 `maxProviderRetries` 分离） |
-| 执行 | `src/executor.ts` (`NodeExecutor`) | 单节点单 attempt 的完整状态机（见下） |
-| 隔离 | `src/workspace.ts` | git 仓库用 detached worktree，其他用 shadow workspace；写入先落在隔离区，验证通过后才回放源仓库 |
-| 验证 | `src/validation.ts` | `validationCommands`：argv 无 shell 执行、可执行文件白名单、禁止内联解释器载荷与路径逃逸 |
-| 派发 | `src/rpc.ts` + `src/child-runtime.ts` | 通过 pi-subagents RPC 派发 async 子 Agent；dispatch ledger + lineage + nonce 保证"派发结果未知时查找/保护，绝不盲目重发" |
-| 持久化 | `src/store.ts` (`GraphStore`) | 原子写 + fsync（文件与父目录）；`snapshot.json` 投影、`events.jsonl` 观测、attempt/acceptance 权威记录 |
-| 一致性 | `src/claims.ts` / `leases.ts` / `reservations.ts` | fencing claim（PID+进程启动身份）防两个会话同时监督同一张图；写 scope 有内存 lease + 跨进程 source reservation 两级保护 |
-| 恢复 | `src/reconciler.ts` | 崩溃后从证据链重建可信投影；证据缺失/矛盾时创建受保护 incident 而不是猜 |
-| 运维 | `src/doctor.ts` / `src/retention.ts` | 只读体检；历史压缩、Trash 宽限期删除、存储报告 |
-
----
-
-## 二、流程图：从 graph 工具调用到 ACCEPTED
-
-![pi-graph 主流程图](images/pi-graph-flowchart.png)
+## 2. 从 `graph start` 到完成
 
 ```mermaid
 flowchart TD
-    A["父级 Agent 调用 graph 工具<br/>{ action: start, spec }"] --> B["extensions/pi-graph.ts<br/>GraphManager.start"]
-    B --> C["src/compile.ts<br/>编译期静态校验"]
-    C -->|路径逃逸 / 环 /<br/>写范围重叠| CX["GraphCompileError<br/>拒绝"]
-    C -->|通过| D["src/store.ts<br/>创建 run 目录<br/>~/.pi/agent/graph-runs/&lt;graphId&gt;/"]
-    D --> E["src/runner.ts GraphRunner.run<br/>获取 Supervisor fencing claim"]
-    E --> F{"DAG 主循环<br/>reconcile + canStart"}
-
-    F -->|"依赖全部 ACCEPTED<br/>且有并发容量"| G["src/executor.ts<br/>NodeExecutor.execute"]
-    G --> H{"有 writeScope?"}
-    H -->|是| I["获取 lease +<br/>source reservation"]
-    H -->|否| J
-    I -->|被占用| RW["resource_wait<br/>1s 后重试"]
-    RW --> F
-    I -->|获得| J["prepareWorkspace<br/>git worktree 或 shadow<br/>拷贝 input artifacts"]
-    J --> K["写入 recovery-handoff.md<br/>（若是重试 attempt）"]
-    K --> L["leased → dispatching<br/>写 attempt authority +<br/>dispatch ledger"]
-    L --> M["child-runtime 派发<br/>pi-subagents async 子 Agent"]
-    M -->|RPC 超时| LU{"resolveDispatch<br/>找回同一 attempt?"}
-    LU -->|找不到| ST["stale<br/>绝不盲目重发"]
-    LU -->|找回| N
-    M -->|成功| N["running<br/>等待子 Agent 完成"]
-    N -->|子 Agent failed| F1["classifyChildFailure<br/>区分 provider/dispatch/<br/>timeout/validation"]
-    N -->|complete| O["collecting<br/>校验 output artifact<br/>必须是常规文件、不逃逸"]
-    O --> P["verifying<br/>runValidations<br/>确定性验证命令"]
-    P -->|验证失败| F2["failed<br/>retryKind=validation"]
-    P -->|通过| Q["写 validated-result.json<br/>记录 outputDigest"]
-    Q --> R["workspace.apply<br/>隔离区写回源仓库<br/>（多文件 v2 plan + 备份 + 断点恢复）"]
-    R --> S["原子 rename 发布<br/>attempt 私有输出 → artifacts/"]
-    S --> T["写 acceptance 记录<br/>manifestDigest + outputDigest"]
-    T --> U["ACCEPTED<br/>解锁下游节点"]
-    U --> F
-
-    F1 --> RT{"可重试?<br/>retryOn + maxAttempts /<br/>maxProviderRetries"}
-    F2 --> RT
-    RT -->|是| RJ["retry_wait<br/>指数退避<br/>provider 同车道冷却"]
-    RJ --> F
-    RT -->|否| FT["failed / blocked<br/>下游级联 blocked"]
-
-    F -->|"全部节点 terminal"| Z{"汇总图状态"}
-    Z -->|全部 accepted| Z1["complete"]
-    Z -->|有 stale / dispatch_unknown| Z2["needs_attention"]
-    Z -->|有 failed| Z3["failed"]
+  A["graph start<br/>spec / capsule / template"] --> B["解析来源与 typed overrides"]
+  B --> C["compileGraphSpecV3"]
+  C -->|非法字段、环、scope/artifact 冲突| X["结构化拒绝"]
+  C --> D["原子初始化 run<br/>authorization + snapshot + control"]
+  D --> E["冻结所有项目 Agent 定义"]
+  E --> F["V3GraphRunner 获取 lease/fence"]
+  F --> G{"刷新 mutation/control<br/>计算 ready 节点"}
+  G -->|pause 且无 in-flight| P["paused"]
+  G -->|stop| S["停止并确认 child"]
+  G -->|OPEN 暂无工作| I["idle，等待 append/seal"]
+  G -->|ready + 并发容量| H["创建 Attempt"]
+  H --> W["准备 shadow workspace<br/>物化 Agent + Guard contract"]
+  W --> Q["写 dispatch prepared/emitting intent"]
+  Q --> R["pi-subagents RPC child"]
+  R --> V["持久 child outcome"]
+  V --> K{"local_write?"}
+  K -->|否| A1["发布 artifact + declared acceptance"]
+  K -->|是| L["FIFO 写槽：验证 → inspect → atomic apply"]
+  L -->|失败/冲突| F1["failed 或按 policy retry"]
+  L -->|成功| A2["发布 artifact + machine-verified acceptance"]
+  A1 --> G
+  A2 --> G
+  G -->|SEALED 且全部 terminal| Z["complete / failed / stopped / needs_attention"]
 ```
 
----
+关键边界：
 
-## 三、流程图：崩溃恢复（resume / session_start 认领）
+1. `start` 在初始化完成后异步返回，不等待全图完成。
+2. child 自报 complete 不是 ACCEPTED；写节点还必须验证并 apply。
+3. acceptance 最后发布，所以不会指向半写产物。
+4. 一个节点 accepted 后立即解锁自己的下游，不等待无关同层节点。
+5. 单图所有 `local_write` 节点按获得写槽的 FIFO 顺序串行整个 Attempt，读节点仍可并发。
+
+## 3. 编译后的图
+
+编译器把输入转成 `CompiledGraphV3`：
+
+```text
+sourceGraphSpec + sourceGraphSpecDigest
+compiled nodes + topologicalOrder
+graphDigest
+maxConcurrency + failFast + workspace=shadow
+mode(open 仅显式保留；sealed 为默认省略表示)
+```
+
+编译器是所有入口的共同信任边界：内联 spec、capsule、模板、append 后候选图、恢复时 Authorization 都会再次经过它。这样动态拓扑和恢复不能绕过首次 admission 规则。
+
+scope 冲突检查同时考虑 read/write：无祖先关系的两个节点如果可能触碰同一路径，会在执行前被拒绝。有显式依赖顺序时允许重叠，因为上游必须 accepted 后下游才可运行。
+
+## 4. 调度模型
+
+### 普通依赖
+
+普通节点的全部 `dependsOn` 必须 accepted。failed、aborted、needs_attention 或 cancelled 依赖会让下游 blocked；skipped 依赖使下游 skipped。
+
+### 条件依赖
+
+`when` 只允许观察一个直接依赖的 accepted 或 failed。匹配的 failed 边可以解锁条件节点，但不会修改原失败 Attempt，因此最终图仍能反映失败。
+
+### synthetic state
+
+`skipped`、`blocked`、`cancelled` 不对应 child 执行。`scheduler.ts` 从拓扑、cancel journal 与真实 Attempt 终态计算 fixed point；`projection.ts` 把结果写进 snapshot。恢复时可以重新推导，而不需要伪造 Attempt 文件。
+
+### 并发与写槽
+
+- 图并发默认 2，最大 6。
+- read/none 节点只受图并发上限控制。
+- `local_write` 节点从 Attempt 开始到终态持有单图 FIFO 写槽，避免多个写 child 的工作期交叠。
+- 动态 mutation 正在 fence 内提交时，runner 暂停启动新节点，避免新拓扑与旧 ready 观察交错。
+- `failFast` 为 true 时，任何 failed/needs_attention 终态会阻止继续启动未开始节点；in-flight 节点先正常收尾。
+
+## 5. OPEN/SEALED 与 mutation
 
 ```mermaid
-flowchart TD
-    A["graph resume / session_start"] --> B["GraphManager 校验<br/>fencing claim 归属"]
-    B --> C["reconciler.loadOrRebuildValidatedRun<br/>校验 V2 证据链"]
-    C -->|证据缺失/矛盾| INC["受保护 incident<br/>不猜、不自动重建"]
-    C -->|证据一致| D["GraphRunner.run 恢复"]
-    D --> E{"逐节点检查最新 attempt"}
-    E -->|authority 已 accepted| P1["直接投影为 ACCEPTED"]
-    E -->|authority 到 validated/applying| P2["从 validated-result.json<br/>续跑 finalize（apply→发布→验收）"]
-    E -->|running/dispatching| P3["resolveDispatch 找回<br/>子 Agent 身份，原地监控"]
-    E -->|找回失败/身份歧义| P4["stale<br/>不创建替代 attempt"]
-    E -->|collecting/verifying 且输出已存在| P5["从本地输出继续验证"]
-    P1 --> F["继续 DAG 主循环"]
-    P2 --> F
-    P3 --> F
-    P5 --> F
+stateDiagram-v2
+  [*] --> OPEN: start mode=open
+  OPEN --> OPEN: append(revision)
+  OPEN --> OPEN: cancel(revision)
+  OPEN --> SEALED: seal(revision)
+  [*] --> SEALED: start mode=sealed
+  SEALED --> [*]: terminal projection
 ```
 
----
+拓扑状态与执行状态正交：OPEN 可以 running 或 idle；SEALED 可以 queued/running/terminal。每次 append/cancel/seal 都在 live Supervisor fence 中重新读取当前 journal、比较 revision、验证候选结果，再 no-replace 发布下一条完整记录。
 
-## 四、脑图：模块全景
+cancel 和 Attempt 创建争用同一 fence：cancel 先赢时节点保持 Attempt-free cancelled；Attempt `prepared` 先赢时 cancel fail closed。这个顺序点避免“已经启动但又被投影成从未执行”的矛盾。
 
-![pi-graph 模块脑图](images/pi-graph-mindmap.png)
+## 6. Attempt 状态机
 
 ```mermaid
-mindmap
-  root((pi-graph<br/>持久化 DAG 执行))
-    入口层
-      graph 工具
-        start / status / list
-        stop / resume / doctor
-      /graphs 运维命令
-        doctor / storage / maintain
-        pin / archive / compact
-        delete / trash / restore / purge
-      pi-graph-guard
-        子 Agent 工具护栏
-        allowBash 默认关闭
-    编译层 compile.ts
-      路径 canonicalize
-      DAG 无环检查
-      writeScope 重叠拒绝
-      external_write 拒绝（V2）
-    调度层 runner.ts
-      DAG 主循环
-      并发控制
-        默认 maxConcurrency 2
-        只读突发 3
-        resourceClass 车道
-        provider 冷却
-      重试策略
-        maxAttempts 业务重试
-        maxProviderRetries 独立
-        指数退避上限 300s
-      failFast
-      durable stop
-    执行层 executor.ts
-      attempt 状态机
-        leased → dispatching
-        running → collecting
-        verifying → accepted
-      recovery-handoff.md
-      Result Manifest
-      先验证后发布
-    隔离层 workspace.ts
-      git detached worktree
-      shadow workspace
-      apply 回写
-        v2 plan + 全量预检
-        digest 备份
-        中断恢复
-      baseline 指纹防陈旧
-    派发层
-      rpc.ts
-        pi-subagents RPC 客户端
-        async run 身份校验
-      child-runtime.ts
-        attempt nonce
-        dispatch ledger
-        lineage 血缘
-        防重复派发
-    持久化层 store.ts
-      原子写 + fsync
-      snapshot.json 投影
-      events.jsonl 观测
-      authority 权威记录
-    一致性
-      claims.ts fencing
-        PID + 进程启动身份
-        防多会话监督
-      leases.ts 内存写锁
-      reservations.ts
-        跨进程源事务预留
-        事务门 + 历史归档
-    恢复层 reconciler.ts
-      证据链校验
-      终态投影重建
-      受保护 incident
-    运维层
-      doctor.ts 只读体检
-      retention.ts
-        压缩 → Trash 宽限 → 清除
-        5GiB 软上限
-      config.ts 配置加载
+stateDiagram-v2
+  [*] --> prepared
+  prepared --> dispatched: binding persisted
+  dispatched --> running
+  running --> verifying: child complete
+  verifying --> applying: local_write validations passed
+  applying --> accepted: apply + artifact + acceptance
+  verifying --> accepted: none/local_read artifact + acceptance
+  prepared --> failed
+  dispatched --> failed
+  running --> failed
+  verifying --> failed
+  applying --> failed
+  prepared --> aborted: stop
+  running --> aborted: confirmed stop
+  prepared --> needs_attention: dispatch identity unknown
+  running --> needs_attention: child stop unconfirmed
 ```
 
----
+每次 phase 更新都落在独立 `attempt.json` 中，并带 run/graph/task/attempt/nonce/epoch 身份。自动 retry 创建下一个数字 Attempt；历史 Attempt 不覆盖。显式 retry 也从最新 baseline 增一，每节点总上限 100。
 
-## 五、关键设计决策
+`timeoutMs` 被转换成 Attempt 创建时的绝对 `deadlineAt`。所有异步阶段每次开始都计算剩余时间；恢复仍读取同一个 deadline。
 
-1. **Graph 只执行给定的 DAG**。路由、拆解、模型选择留在 `agent-workflow` / 父级 Agent；Graph 不自行扩张目标，也不替代 pi-convergence。
-2. **ACCEPTED 是唯一的解锁信号**。一个节点必须同时满足：子 Agent 完成 + 确定性验证通过 + workspace 变更回放完成 + Result Manifest 生成。下游通过 `inputArtifacts` 消费已发布产物，不能在任务正文里隐式依赖未验收结果。
-3. **先隔离、先验证、后发布**。子 Agent 的写入发生在 worktree/shadow 隔离区；输出先落 attempt 私有路径，验证通过后才原子 `rename` 到 `artifacts/`。失败的 workspace 变更永不自动应用。
-4. **派发宁可 stale 不可重复**。一旦派发可能已经逃逸（RPC 超时、进程崩溃），同一 attempt 只能被查找或保护，绝不盲目重发——配合 nonce、dispatch ledger、lineage 实现。
-5. **权威在证据，不在投影**。Runtime V2 中 `authorization.json`、attempt 记录、validated result、acceptance 记录是权威；`snapshot.json` 是可重建投影，`events.jsonl` 只是观测。恢复时证据缺失或矛盾就创建受保护 incident，绝不猜测。
-6. **监控无隐式 deadline**。子 Agent 只有在节点显式声明 `timeoutMs` 时才因耗时被杀；资源等待可观测但不杀活跃子 Agent。
-7. **provider 故障与业务故障分离**。`maxProviderRetries` 独立计数、独立指数退避，同 `resourceClass` 车道的其他节点会被冷却暂停，但不挤占业务 `maxAttempts`。
+## 7. 派发崩溃窗口
 
-## 六、验证方式
+RPC 调用不是原子文件操作，因此 runner 在 emit 前建立 durable intent：
 
-- `npm test`：确定性回归套件（编译、快照、租约、保留策略、RPC 生命周期、失败分类等）。
-- `npm run test:soak`：60 秒长任务场景 + 挂起/恢复 + 写冲突压测；用确定性模拟子 Agent，不消耗模型配额。
-- `PI_GRAPH_SOAK_MS=300000 npm run test:soak`：延长到约 5 分钟（合法区间 15 秒 ~ 30 分钟）。
+```text
+prepared intent
+    ↓
+emitting intent（RPC 边界可能已经跨过）
+    ↓
+dispatch binding（asyncId + asyncDir + requestDigest）
+```
+
+stable request ID 来自 Attempt nonce。若进程在 emitting 后崩溃，新 Supervisor 先向 `pi-subagents` 找回相同 request；找不到就进入 `needs_attention`，不会重发一个“看起来相同”的 child。
+
+stop/timeout 也遵循同一原则：发送 child stop 后必须得到确认。确认窗口耗尽意味着 child 可能仍存活，因此不能安全重试或宣布 stopped。
+
+## 8. 写入安全链
+
+```mermaid
+flowchart LR
+  A["源 scope baseline"] --> B["shadow workspace"]
+  B --> C["Graph Guard 限制 child 工具"]
+  C --> D["validationCommands"]
+  D --> E["inspect actual writes"]
+  E --> F{"源 baseline 仍相同?"}
+  F -->|否| G["workspace_conflict"]
+  F -->|是| H["durable apply plan"]
+  H --> I["逐文件原子 apply"]
+  I --> J["machine-verified acceptance"]
+```
+
+Graph Guard 与 shadow workspace 分工不同：
+
+- shadow 降低错误 child 直接破坏源文件的风险；
+- Guard 在 Pi tool-call 边界限制读写 scope、工具名和保护目录；
+- baseline 检查发现 source 在 child 工作期间被其他进程改变；
+- deterministic validation 验证结果，而不是验证 child 的自我陈述；
+- apply plan 处理进程在多文件提交中途崩溃的恢复。
+
+它们仍不是 OS sandbox；直接以同一用户操作文件系统的恶意代码不在保证范围内。
+
+## 9. 证据与投影
+
+```text
+不可变/append-only authority
+  authorization.json
+  mutation-journal/*
+  retry-journal/*
+  nodes/*/attempts/*/{attempt,workspace,validated-result,acceptance}.json
+  artifacts/*/attempt-N.txt
+
+持久控制 authority
+  control.json
+  supervisor-fence.json
+  lease.json（只在持有期间存在）
+
+可重建/观测
+  snapshot.json
+  artifacts/<taskId>.txt（latest alias）
+  events.jsonl（unverified，best effort）
+```
+
+恢复顺序是“重新编译 admission → 重放 mutation → 读取 retry baseline → 校验 lease/source/Agent/workspace/Attempt → 重建 snapshot”。不能从 `events.jsonl` 推导 authority，也不能因为 snapshot 写着 running 就盲目信任旧进程仍拥有执行权。
+
+## 10. Supervisor fencing
+
+lease 用 PID 加进程启动身份防 PID 重用；generation ledger 在每次 acquire/takeover 时单调递增。旧 generation 的 capability 即使还留在内存里，也无法通过 `assertCurrent`/`withFence`。
+
+fence 覆盖 Attempt 写入、snapshot、apply、acceptance、mutation 和 retry。它既是“单 Supervisor”约束，也是动态 cancel 与 Attempt create 的线性化点。
+
+## 11. pause、resume、stop、retry
+
+控制意图和观察状态分开：
+
+- `pause` 先写 control，再禁止新 dispatch；现有 child 收尾后 paused。
+- `resume` 把 desired state 改为 running，现场校验证据并继续。
+- `stop` 写 stopped intent，要求活跃 child 确认停止，未开始节点转 aborted。
+- session shutdown 等价于对本 session 的活跃图 durable pause。
+- `retry` 只在整图 terminal 时提交，目标节点及其未取消下游按 durable baseline 重跑。
+
+重启 adoption scan 尊重 `control.json`：paused 不擅自继续，stopped 不擅自变 running，pending retry 在拿到新 lease 后继续。
+
+## 12. 与 dsh-graph 的架构映射
+
+pi-graph 保留了 dsh-graph 的关键形状：
+
+```text
+compiler              → compiler.ts
+event-driven DAG loop → runner.ts + scheduler.ts
+OPEN mutation         → mutations.ts
+Attempt history       → attempt.ts
+dependency hand-off   → capsule.ts
+capsule/templates     → graph-capsule.ts + templates.ts
+versioned artifacts   → runner.ts artifact publication
+localWriteLock        → runner.ts FIFO local-write slot
+```
+
+宿主适配和耐久性实现不同：dsh-graph 聚合 `run.json` 并假设单 Host writer；pi-graph 使用 `pi-subagents` RPC、多文件证据、shadow apply、durable control 以及跨进程 lease generation fence。这里的目标是复用已验证的架构语义，不是逐文件移植源码。
+
+## 13. 明确删除的架构
+
+主链中不存在以下层或模块角色：
+
+```text
+assess_task
+plan_graph
+review_graph_spec
+planning receipt
+routing policy / model registry
+model resolver / degradation
+visual evidence gate
+legacy GraphManager / legacy executor
+```
+
+任何未来功能如果需要上述能力，应位于调用方或独立扩展，不得悄悄塞回 DAG 执行内核。

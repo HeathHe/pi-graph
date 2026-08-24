@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,11 +8,13 @@ import { compileGraphSpecV3 } from "../src/v3/compiler.ts";
 import { initializeV3Run } from "../src/v3/initialize.ts";
 import {
 	readLatestV3Attempt,
+	v3AcceptedAttemptBasis,
 	writeV3AcceptanceEvidence,
 	writeV3AttemptEvidence,
 	writeV3ValidatedResult,
 	writeV3WorkspaceEvidence,
 } from "../src/v3/attempt.ts";
+import { canonicalDigest } from "../src/v3/digests.ts";
 import { v3DispatchChild } from "../src/v3/dispatch.ts";
 import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import { resumeV3GraphRun } from "../src/v3/runner.ts";
@@ -60,10 +63,11 @@ test("V3 resume monitors an already-dispatched child instead of re-dispatching a
 	// Node A was already accepted before the crash: fabricate its full evidence chain.
 	const nodeA = nodeOf(graph.nodes, "a");
 	const aWorkspace = await prepareV3Workspace({ runInstanceId: f.runInstanceId, graphId: graph.graphId, node: nodeA, attempt: 1, runDir: f.runDir, sourceCwd: f.sourceCwd, workspace: "shadow" });
+	const aWrites = [{ path: join(f.sourceCwd, "out-a.txt"), before: undefined, after: createHash("sha256").update("a\n").digest("hex") }];
 	const aValidated: import("../src/v3/types.ts").V3ValidatedResult = {
 		schemaVersion: 1, runInstanceId: f.runInstanceId, graphId: graph.graphId, taskId: "a", attempt: 1,
 		validations: [{ command: "test -f out-a.txt", ok: true, exitCode: 0, signal: null, timedOut: false, stdout: "", stdoutTruncated: false, stderr: "", stderrTruncated: false, durationMs: 1 }],
-		allPassed: true, writes: [], recordedAt: now,
+		allPassed: true, writes: aWrites, recordedAt: now,
 	};
 	const aValidatedDigest = await writeV3ValidatedResult(f.runDir, "a", 1, aValidated);
 	const aAttempt: Parameters<typeof writeV3AttemptEvidence>[3] = {
@@ -71,11 +75,25 @@ test("V3 resume monitors an already-dispatched child instead of re-dispatching a
 		phase: "accepted", terminalStatus: "accepted", createdAt: now, updatedAt: now, supervisorEpoch: "epoch",
 		workspaceDigest: (await import("../src/v3/digests.ts")).canonicalDigest(aWorkspace.evidence),
 		verification: { allPassed: true, validatedResultDigest: aValidatedDigest, verifiedAt: now },
-		applied: { writes: [{ path: join(f.sourceCwd, "out-a.txt"), before: undefined, after: "a\n" }], appliedAt: now },
+		applied: { writes: aWrites, appliedAt: now },
 		child: { terminal: "complete", output: "a-done", completedAt: now },
 	};
-	const aAttemptDigest = await writeV3AttemptEvidence(f.runDir, "a", 1, aAttempt);
-	await writeV3AcceptanceEvidence(f.runDir, "a", 1, { schemaVersion: 1, runInstanceId: f.runInstanceId, graphId: graph.graphId, taskId: "a", attempt: 1, acceptance: "wrote out-a", method: "machine-verified", verified: true, validatedResultDigest: aValidatedDigest, attemptDigest: aAttemptDigest, recordedAt: now, supervisorEpoch: "epoch" });
+	await mkdir(join(f.runDir, "artifacts", "a"), { recursive: true });
+	await writeFile(join(f.runDir, "artifacts", "a", "attempt-1.txt"), JSON.stringify({ taskId: "a", output: "a-done" }), "utf8");
+	const aAcceptanceDigest = await writeV3AcceptanceEvidence(f.runDir, "a", 1, {
+		schemaVersion: 1,
+		runInstanceId: f.runInstanceId,
+		graphId: graph.graphId,
+		taskId: "a",
+		attempt: 1,
+		method: "machine-verified",
+		verified: true,
+		validatedResultDigest: aValidatedDigest,
+		attemptDigest: canonicalDigest(v3AcceptedAttemptBasis(aAttempt)),
+		recordedAt: now,
+		supervisorEpoch: "epoch",
+	});
+	await writeV3AttemptEvidence(f.runDir, "a", 1, { ...aAttempt, acceptanceDigest: aAcceptanceDigest });
 	await writeFile(join(f.sourceCwd, "out-a.txt"), "a\n", "utf8");
 
 	// Node B was mid-flight (dispatched, child running) when the process crashed.
