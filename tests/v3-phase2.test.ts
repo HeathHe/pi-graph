@@ -9,6 +9,7 @@ import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import { graphV3Error } from "../src/v3/errors.ts";
 import type { GraphSpecV3 } from "../src/v3/types.ts";
 import { MockSubagents, completeChild } from "./helpers/mock-subagents.ts";
+import { piCliPath } from "./helpers/pi-cli.ts";
 
 const GOVERNANCE_MODULES = ["subagent-router", "model-routing", "model-routing-adapter", "recommend", "subagent-model-router"];
 
@@ -97,7 +98,7 @@ test("D1: production extensions import only the V3 core", async () => {
 		const source = await readFile(resolve(file), "utf8");
 		for (const line of source.split("\n")) {
 			const match = /from\s+"\.\.\/src\/(.+?)"/u.exec(line);
-			if (match && !match[1]?.startsWith("v3/")) violations.push(`${file}: ${line.trim()}`);
+			if (match && !match[1]?.startsWith("v3/") && !["runtime/background-work.ts","runtime/controller.ts"].includes(match[1]!)) violations.push(`${file}: ${line.trim()}`);
 		}
 	}
 	assert.deepEqual(violations, [], "production extensions must not retain the legacy GraphManager/runtime stack");
@@ -110,7 +111,8 @@ test("D5: loading the extension in an empty session produces zero graph activity
 	await mkdir(agentDir, { recursive: true });
 	await mkdir(runsDir, { recursive: true });
 	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ graph: { enabled: true, runsDir, history: { autoCompact: false, autoPrune: false, emergencyPurge: false } } }));
-	const child = spawn(join(resolve(process.cwd()), "node_modules", ".bin", "pi"), [
+	const child = spawn(process.execPath, [
+		piCliPath,
 		"--mode", "rpc", "--offline", "--no-session", "--no-context-files", "--no-skills", "--no-extensions",
 		"--extension", join(resolve(process.cwd()), "extensions", "pi-graph.ts"),
 	], {

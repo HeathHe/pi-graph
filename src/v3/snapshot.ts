@@ -1,12 +1,13 @@
 import { validateAuthorizationV4 } from "./authorization.ts";
 import { canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
+import { validateV3ChildObservation } from "./observability.ts";
 import type { AuthorizationV4, CompiledGraphV3, GraphRuntimeStatusV3, GraphSnapshotV3, SourceIdentityV3, V3NodeProjection, V3NodeProjectionPhase, V3NodeProjectionTerminal, V3RunVerification } from "./types.ts";
 
 const SNAPSHOT_FIELDS = new Set([
 	"schemaVersion", "runInstanceId", "graphId", "graphDigest", "sourceGraphSpecDigest", "status", "sessionId", "supervisorEpoch", "createdAt", "updatedAt", "topology", "revision", "sealed", "nodes",
 ]);
-const NODE_PROJECTION_FIELDS = new Set(["phase", "attempt", "terminalStatus"]);
+const NODE_PROJECTION_FIELDS = new Set(["modelFallback", "phase", "attempt", "terminalStatus", "agent", "dependsOn", "observation"]);
 const NODE_PHASES = new Set<V3NodeProjectionPhase>(["queued", "prepared", "dispatched", "running", "verifying", "applying", "accepted", "failed", "aborted", "needs_attention", "skipped", "blocked", "cancelled"]);
 const NODE_TERMINALS = new Set<V3NodeProjectionTerminal>(["accepted", "failed", "aborted", "needs_attention", "skipped", "blocked", "cancelled"]);
 
@@ -23,7 +24,25 @@ function validateNodeProjections(nodes: unknown): Record<string, V3NodeProjectio
 		if (typeof projection.phase !== "string" || !NODE_PHASES.has(projection.phase as V3NodeProjectionPhase)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid phase.`, { field: "nodes", details: { taskId } });
 		if (typeof projection.attempt !== "number" || !Number.isInteger(projection.attempt) || (projection.attempt as number) < 0) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid attempt.`, { field: "nodes", details: { taskId } });
 		if (projection.terminalStatus !== undefined && (typeof projection.terminalStatus !== "string" || !NODE_TERMINALS.has(projection.terminalStatus as V3NodeProjectionTerminal))) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid terminalStatus.`, { field: "nodes", details: { taskId } });
-		output[taskId] = { phase: projection.phase as V3NodeProjectionPhase, attempt: projection.attempt as number, ...(projection.terminalStatus === undefined ? {} : { terminalStatus: projection.terminalStatus as V3NodeProjectionTerminal }) };
+		if (projection.agent !== undefined && (typeof projection.agent !== "string" || projection.agent.length === 0 || projection.agent.length > 200)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid agent.`, { field: "nodes", details: { taskId } });
+		if (projection.dependsOn !== undefined && (!Array.isArray(projection.dependsOn) || projection.dependsOn.some((entry) => typeof entry !== "string" || entry.length === 0) || new Set(projection.dependsOn).size !== projection.dependsOn.length)) graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has invalid dependencies.`, { field: "nodes", details: { taskId } });
+        const fallback = projection.modelFallback as V3NodeProjection["modelFallback"];
+        if (fallback !== undefined && (!fallback || typeof fallback !== "object" || [fallback.from, fallback.to, fallback.reason].some(v => typeof v !== "string" || !v || v.length > 500))) graphV3Error("INVALID_SNAPSHOT", "Invalid model fallback display.");
+		let observation: V3NodeProjection["observation"];
+		try {
+			observation = projection.observation === undefined ? undefined : validateV3ChildObservation(projection.observation);
+		} catch (error) {
+			graphV3Error("INVALID_SNAPSHOT", `Snapshot V3 node projection '${taskId}' has an invalid child observation: ${error instanceof Error ? error.message : String(error)}`, { field: "nodes", details: { taskId } });
+		}
+		output[taskId] = {
+			phase: projection.phase as V3NodeProjectionPhase,
+			attempt: projection.attempt as number,
+			...(projection.terminalStatus === undefined ? {} : { terminalStatus: projection.terminalStatus as V3NodeProjectionTerminal }),
+			...(projection.agent === undefined ? {} : { agent: projection.agent as string }),
+			...(projection.dependsOn === undefined ? {} : { dependsOn: [...projection.dependsOn] as string[] }),
+			...(observation ? { observation } : {}),
+            ...(fallback ? {modelFallback:{...fallback}} : {}),
+		};
 	}
 	return output;
 }

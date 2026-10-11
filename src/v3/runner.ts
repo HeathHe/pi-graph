@@ -1,11 +1,19 @@
-import { randomUUID } from "node:crypto";
+import { V3FallbackPauseError } from "./failure-policy.ts";
+import { safeFallbackContinuation, verifyFallbackContinuation, selectedRuntimeNode } from "./runtime-fallback.ts";
+import { MAILBOX_BINDING_NAMESPACE } from "./mailbox-bindings.ts";
+import { readNativeJson } from "./native-results.ts";
+import { GraphMailbox } from "./mailbox.ts";
+import { MailboxBroker } from "./mailbox-transport.ts";
+import { activeMailboxes, mailboxRegistryKey } from "./mailbox-runtime.ts";
+import { safeBytes, parseBusinessResult, persistEvidenceFiles, verifyEvidenceFiles, evidenceDirectory } from "./evidence-files.ts";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SubagentRpcClient } from "./rpc.ts";
 import { V3WorkspaceConflictError } from "./workspace.ts";
 import { atomicWriteFile, atomicWriteJson, createDurableFile } from "./durable.ts";
 import { initializeV3RunControl, readV3RunControl } from "./control.ts";
-import { buildV3DependencyCapsule, renderV3DependencyCapsule } from "./capsule.ts";
+import { type V3DependencyCapsuleState, buildV3DependencyCapsule, renderV3DependencyCapsule } from "./capsule.ts";
 import {
 	readLatestV3Attempt,
 	V3_MAX_ATTEMPTS_PER_NODE,
@@ -13,18 +21,21 @@ import {
 	verifyV3AcceptedAttemptChain,
 	v3AcceptedAttemptBasis,
 	v3RunPaths,
+	v3NodeAttemptDir,
 	writeV3AcceptanceEvidence,
 	writeV3AttemptEvidence,
 	writeV3ValidatedResult,
 } from "./attempt.ts";
 import { canonicalDigest } from "./digests.ts";
+import { createV3DispatchObservation, v3ChildObservationFingerprint } from "./observability.ts";
 import {
 	V3DispatchError,
 	v3DispatchChild,
+	releaseV3ResultCapture,
 	v3DispatchRequestDigest,
+	v3GraphGuardExtensionBindings,
 	v3MonitorChild,
 	v3PreflightAgent,
-	v3RecoverDispatchBinding,
 	v3StopChild,
 	type V3DispatchSpec,
 } from "./dispatch.ts";
@@ -34,7 +45,8 @@ import { readV3MutationJournal, type V3GraphMutationState, type V3MutationCapabi
 import { buildV3SnapshotProjection } from "./projection.ts";
 import { v3EvaluateNodeReadiness, v3NodeTerminalOf, v3PendingNodes, v3ReadyNodes, v3SyntheticNodeStatuses, type V3NodeSchedulingStatus } from "./scheduler.ts";
 import { runV3Validations } from "./verify.ts";
-import { prepareV3Workspace, reopenV3Workspace, type V3PreparedWorkspace } from "./workspace.ts";
+import { frozenContextTools, prepareV3Workspace, reopenV3Workspace, type V3PreparedWorkspace } from "./workspace.ts";
+import { readV3UsageBudgetDecision } from "./usage-budget.ts";
 import type { RetryReasonV3 } from "./types.ts";
 import type {
 	AuthorizationV4,
@@ -44,6 +56,8 @@ import type {
 	V3AcceptanceEvidence,
 	V3AttemptEvidence,
 	V3ChildOutcome,
+	V3ChildObservation,
+	V3DispatchBinding,
 	V3FailureKind,
 	V3FileDigest,
 	V3NodePhase,
@@ -55,6 +69,7 @@ const RETRY_BACKOFF_BASE_MS = 250;
 const RESUME_POLL_MS = 250;
 
 export interface V3GraphRunOptions {
+	parentToolAllowlist?: () => string[];
 	rpc: SubagentRpcClient;
 	runDir: string;
 	graph: CompiledGraphV3;
@@ -63,10 +78,10 @@ export interface V3GraphRunOptions {
 	authorization: AuthorizationV4;
 	sourceCwd: string;
 	sessionId: string;
+	ownerSessionFile?: string;
 	supervisorEpoch: string;
 	maxConcurrency?: number;
-	validationTimeoutMs?: number;
-	/** Bounded confirmation window after a timeout/stop request (default 5s). */
+	/** Bounded confirmation window after an explicit stop request (default 5s). */
 	childStopTimeoutMs?: number;
 	streamLimitBytes?: number;
 	failFast?: boolean;
@@ -89,11 +104,15 @@ interface NodeRunState {
 }
 
 export function v3RetryScheduledFor(node: CompiledGraphNodeV3, evidence: V3AttemptEvidence): boolean {
-	if (!evidence.failure) return false;
-	if (evidence.failure.kind === "dispatch_unknown") return false;
-	if (evidence.attempt >= V3_MAX_ATTEMPTS_PER_NODE) return false;
-	if (evidence.attempt >= node.retryPolicy.maxAttempts) return false;
-	return node.retryPolicy.retryOn.includes(evidence.failure.kind as RetryReasonV3);
+	if (node.resultContract) return false;
+	const supervision = evidence.child?.observation?.supervision;
+	// One recovery for an observed runtime crash. Provider retries belong to
+	// the runtime; write effects and ambiguous execution never auto-repeat.
+	return !(node.permissionPolicy === "inherited" && !node.readOnly) && evidence.failure?.kind === "task_failed" && evidence.attempt === 1
+		&& (node.sideEffect === "none" || node.sideEffect === "local_read")
+		&& supervision?.version === 2 && supervision.processExitConfirmed === true
+		&& supervision.runtimeFailure === true && supervision.observedMutation === false
+		&& supervision.runtimeRetries === 0;
 }
 
 export class V3GraphRunner {
@@ -101,18 +120,23 @@ export class V3GraphRunner {
 	readonly paths: ReturnType<typeof v3RunPaths>;
 	private readonly state = new Map<string, NodeRunState>();
 	private readonly nodeAborts = new Map<string, AbortController>();
-	private readonly activeBindings = new Map<string, { asyncId: string; asyncDir: string }>();
+	private readonly activeBindings = new Map<string, V3DispatchBinding>();
 	private readonly childStopRequests = new Map<string, Promise<unknown>>();
+	private readonly observationFingerprints = new Map<string, string>();
+	private readonly observationPublishedAt = new Map<string, number>();
 	private readonly resumeActions = new Map<string, () => Promise<void>>();
 	private readonly baseGraph: CompiledGraphV3;
 	private graph: CompiledGraphV3;
 	private mutationState: V3GraphMutationState;
 	private synthetic = new Map<string, "skipped" | "blocked" | "cancelled">();
+	private readonly isolatedAttention = new Set<string>();
 	private stopRequested = false;
 	private pauseRequested = false;
 	private runPromise: Promise<GraphSnapshotV3> | undefined;
 	private eventWriter: V3EventWriter;
 	private activeLease: V3LeaseHandle | undefined;
+ private mailbox?: GraphMailbox;
+ private mailboxBroker?: MailboxBroker;
 	private authorityLost: unknown;
 	private runSettled = false;
 	private topologyMutationInProgress = 0;
@@ -199,19 +223,39 @@ export class V3GraphRunner {
 	}
 
 	private async drive(): Promise<GraphSnapshotV3> {
+  const protocol=JSON.parse(await (await import("node:fs/promises")).readFile(join(this.options.runDir,"communication.json"),"utf8").catch(()=>"null"));
+  if(protocol?.protocol!=="graph-mailbox-v1" || protocol.runInstanceId!==this.options.authorization.runInstanceId) throw new Error("Legacy communication contract: read-only inspection only; no resume or spawn.");
 		const lease = this.options.lease ?? await acquireV3RunLease(this.paths.leasePath, this.options.authorization.runInstanceId);
 		this.activeLease = lease;
+  let heartbeat:NodeJS.Timeout|undefined;
+  let heartbeatWork:Promise<void>|undefined;
+  const registryKey=mailboxRegistryKey(this.options.runDir);
+  try {
 		await this.refreshTopology();
+  this.mailbox = new GraphMailbox(this.options.runDir,lease,async (taskId,attempt)=>{const state=this.state.get(taskId);return !this.stopRequested && !this.mutationState.cancelledTaskIds.includes(taskId) && !!state && !state.terminal && (state.attempt || 1)===attempt;},(from,to)=>{const seen=new Set<string>();const depends=(id:string):boolean=>{if(id===from)return true;if(seen.has(id))return false;seen.add(id);return (this.graph.nodes.find(n=>n.taskId===id)?.dependsOn??[]).some(depends);};return to==="@parent"||!depends(to);},async(taskId,attempt)=>{
+   const state=this.state.get(taskId),binding=this.activeBindings.get(taskId);
+   if(this.stopRequested || this.pauseRequested || this.mutationState.cancelledTaskIds.includes(taskId) || !state || state.attempt!==attempt || state.terminal || !["dispatched","running"].includes(state.phase??"") || !binding)return false;
+   const control=await readV3RunControl(this.options.runDir);
+   if(control.runInstanceId!==this.options.authorization.runInstanceId||control.desiredState!=="running")return false;
+   const status=await readNativeJson(join(binding.asyncDir,"status.json"),true);
+   const terminal=await readNativeJson(join(binding.asyncDir,"process-terminal.json"),true);
+   return status?.runId===binding.asyncId && status.state==="running" && !terminal;
+  });
+  await this.mailbox.initialize(this.options.authorization.runInstanceId,this.options.sessionId,this.graph.nodes.map(node=>({taskId:node.taskId,attempt:this.state.get(node.taskId)?.attempt||1})));
+  this.mailboxBroker=new MailboxBroker(this.mailbox); await this.mailboxBroker.start();
+  activeMailboxes.set(mailboxRegistryKey(this.options.runDir),{mailbox:this.mailbox,owner:this.options.sessionId,runInstanceId:this.options.authorization.runInstanceId,ownerSessionFile:this.options.ownerSessionFile});
+
 		await initializeV3RunControl(
 			this.options.runDir,
 			this.options.authorization.runInstanceId,
 			this.baseGraph.graphId,
 		);
-		const heartbeat = setInterval(() => {
-			void lease.refresh().catch((error) => {
+		heartbeat = setInterval(() => {
+			if (heartbeatWork) return;
+			heartbeatWork = lease.refresh().catch((error) => {
 				this.authorityLost = error;
 				this.requestStop();
-			});
+			}).finally(() => { heartbeatWork = undefined; });
 		}, 5_000);
 		heartbeat.unref();
 		await this.event("run_started", {});
@@ -224,7 +268,6 @@ export class V3GraphRunner {
 			inFlight.set(taskId, promise);
 		}
 		this.resumeActions.clear();
-		try {
 			while (true) {
 				if (this.authorityLost) throw this.authorityLost;
 				await this.refreshTopology();
@@ -236,14 +279,15 @@ export class V3GraphRunner {
 				if (control.desiredState === "stopped" && !this.stopRequested) this.requestStop();
 				this.pauseRequested = control.desiredState === "paused" && !this.stopRequested;
 				const needsAttention = [...this.state.values()].some((state) => state.terminal === "needs_attention");
+				const globalAttention = [...this.state.entries()].some(([id, state]) => state.terminal === "needs_attention" && !this.isolatedAttention.has(id));
 				const failFastAborted = (this.options.failFast === true || this.graph.failFast === true)
 					&& [...this.state.values()].some((state) => state.terminal === "failed");
 				const now = Date.now();
-				const ready = (this.pauseRequested || this.topologyMutationInProgress > 0 || needsAttention || failFastAborted ? [] : v3ReadyNodes(this.graph, this))
+				const ready = (this.pauseRequested || this.topologyMutationInProgress > 0 || globalAttention || failFastAborted ? [] : v3ReadyNodes(this.graph, this))
 					.filter((node) => !inFlight.has(node.taskId))
 					.filter((node) => !(this.state.get(node.taskId)?.retryAt !== undefined && this.state.get(node.taskId)!.retryAt! > now));
 				const pending = v3PendingNodes(this.graph, this);
-				if (needsAttention) {
+				if (needsAttention && (globalAttention || ready.length === 0)) {
 					// Ambiguous durable evidence closes the dispatch gate for the whole
 					// graph. Work already admitted may settle, but nothing new may start.
 					if (running === 0) return await this.persistSnapshot("needs_attention");
@@ -315,8 +359,13 @@ export class V3GraphRunner {
 			}
 			return await this.persistSnapshot();
 		} finally {
-			clearInterval(heartbeat);
-			this.activeLease = undefined;
+			if(heartbeat)clearInterval(heartbeat);
+   // Clearing the timer does not cancel a refresh already holding the lease gate.
+   // Drain it before fencing/releasing authority and returning to callers.
+   await heartbeatWork;
+   await this.mailboxBroker?.close().catch(()=>undefined);
+   activeMailboxes.delete(registryKey);
+   this.activeLease = undefined;
 			await lease.release().catch(() => undefined);
 		}
 	}
@@ -341,22 +390,29 @@ export class V3GraphRunner {
 		await this.executeNodeAttempt(node);
 	}
 
-	private async executeNodeAttempt(node: CompiledGraphNodeV3): Promise<void> {
+	private async executeNodeAttempt(node: CompiledGraphNodeV3, resumedPrepared?: V3AttemptEvidence): Promise<void> {
 		const current = this.state.get(node.taskId)!;
-		const attempt = current.attempt + 1;
+		const attempt = resumedPrepared?.attempt ?? current.attempt + 1;
 		if (attempt > V3_MAX_ATTEMPTS_PER_NODE) {
 			throw new V3AttemptLimitError(node.taskId, attempt);
 		}
-		if (!await this.beginNodeAttempt(node, attempt)) return;
+		if (!resumedPrepared && !await this.beginNodeAttempt(node, attempt)) return;
+  await this.mailbox?.advance(node.taskId,attempt);
 		const abort = new AbortController();
 		this.nodeAborts.set(node.taskId, abort);
+		if (this.stopRequested) abort.abort();
 		let workspace: V3PreparedWorkspace | undefined;
+        let parked = false;
 		try {
+			const budgetDecision = await readV3UsageBudgetDecision(this.options.runDir, node.taskId, attempt, node.launch?.usageBudget);
+			if (budgetDecision.blocked) throw this.failure(node, attempt, "usage_budget", budgetDecision.blocked.message);
+			const remainingUsageBudget = budgetDecision.remaining;
 			const started = await this.requireAttempt(node, attempt);
-			const inputArtifacts = await this.withAttemptDeadline(started, "input artifact resolution", abort, () => this.artifactsFor(node, attempt));
+            node = await selectedRuntimeNode(this.options.runDir, node, started);
+			const inputArtifacts = await this.withAttemptOperation(started, "input artifact resolution", abort, () => this.artifactsFor(node, attempt));
 			// Every child, including pure/no-scope nodes, runs inside a materialized
 			// shadow workspace containing its frozen Agent plus Graph Guard contract.
-			workspace = await this.withAttemptDeadline(started, "workspace preparation", abort, () => prepareV3Workspace({
+			workspace = await this.withAttemptOperation(started, "workspace preparation", abort, () => prepareV3Workspace({
 				runInstanceId: this.options.authorization.runInstanceId,
 				graphId: this.graph.graphId,
 				node,
@@ -367,56 +423,76 @@ export class V3GraphRunner {
 				protectedSourceRoots: this.options.protectedSourceRoots ?? [],
 				artifacts: inputArtifacts,
 			}));
-			await this.withAttemptDeadline(started, "workspace evidence binding", abort, () => this.updateAttempt(node, attempt, {
+			await this.withAttemptOperation(started, "workspace evidence binding", abort, () => this.updateAttempt(node, attempt, {
 				workspaceDigest: canonicalDigest(workspace!.evidence),
 			}, false));
 			if (this.options.preflightAgent) {
-				await this.withAttemptDeadline(started, "agent preflight", abort, () => this.options.preflightAgent!({ agent: node.agent, cwd: this.options.sourceCwd, sessionId: this.options.sessionId }));
+				await this.withAttemptOperation(started, "agent preflight", abort, () => this.options.preflightAgent!({ agent: node.agent, cwd: workspace!.workspaceCwd, sessionId: this.options.sessionId }));
 			} else {
-				await this.withAttemptDeadline(started, "agent preflight", abort, () => v3PreflightAgent({ agent: node.agent }, this.options.sourceCwd, this.options.sessionId));
+				// Production dispatch is deliberately project-scoped to the immutable
+				// Agent profile materialized inside this node's shadow workspace. User
+				// and package Agents were resolved/frozen during admission; checking the
+				// source workspace here would incorrectly reject those exact profiles.
+				await this.withAttemptOperation(started, "agent preflight", abort, () => v3PreflightAgent({ agent: node.agent }, workspace!.workspaceCwd, this.options.sessionId));
 			}
 			if (this.stopRequested || abort.signal.aborted) {
 				throw this.failure(node, attempt, "child_stopped", "Graph stop was requested before child dispatch.");
 			}
 			const sessionDir = join(this.paths.sessionsDir, node.taskId);
-			const capsule = await this.withAttemptDeadline(started, "dependency capsule", abort, () => this.dependencyCapsuleFor(node, attempt));
+			const currentParentTools = this.options.parentToolAllowlist?.();
+                const effectiveParentTools = node.parentToolAllowlist?.filter(tool=>currentParentTools===undefined||currentParentTools.includes(tool));
+			const capsule = await this.withAttemptOperation(started, "dependency capsule", abort, () => this.dependencyCapsuleFor(node, attempt, workspace?.evidence, effectiveParentTools ?? currentParentTools));
 			const renderedCapsule = renderV3DependencyCapsule(capsule);
+			const requestedAgent = this.requestedAgentFor(node);
 			const dispatchSpec: V3DispatchSpec = {
 				agent: node.agent,
-				task: renderedCapsule ? `${node.task}\n\n${renderedCapsule}` : node.task,
+				...(requestedAgent ? { requestedAgent } : {}),
+				task: `${renderedCapsule ? `${node.task}\n\n${renderedCapsule}` : node.task}${node.resultContract ? '\nFinal output MUST be exact JSON {"status":"pass"|"blocked"|"fail","reason":"..."}. If blocked, finish with blocked; do not loop requesting permission or guess authorization.' : ""}${node.evidenceFiles?.length ? `\nDeclared non-secret evidence files to produce before finishing: ${JSON.stringify(node.evidenceFiles.map(e => e.path))}` : ""}`,
 				cwd: workspace.workspaceCwd,
 				sessionDir,
 				agentScope: "project",
+				...(node.launch?.customModelDefinitions?{customModelDefinitions:node.launch.customModelDefinitions}:{}),
+    ...(node.launch?.requestedModel ? { requestedModel: node.launch.requestedModel } : {}),
+				...(node.launch?.resolvedModel ? { resolvedModel: node.launch.resolvedModel } : {}),
+				...(node.launch?.thinking === undefined ? {} : { thinking: node.launch.thinking }),
+				...(node.launch?.turnBudget ? { turnBudget: node.launch.turnBudget } : {}),
+				...(node.launch?.toolBudget ? { toolBudget: node.launch.toolBudget } : {}),
+				...(remainingUsageBudget ? { usageBudget: remainingUsageBudget } : {}),
+				extensionBindings: {...v3GraphGuardExtensionBindings(workspace.evidence), [MAILBOX_BINDING_NAMESPACE]: {socketPath:this.mailboxBroker!.socketPath,token:await this.mailbox!.capability(node.taskId,attempt)}},
+				graphToolFilter: node.toolFilter?.length ? [...node.toolFilter,"graph_mailbox"] : [],
+				...(effectiveParentTools === undefined ? {} : { parentToolAllowlist: effectiveParentTools }),
 			};
 			const requestId = this.dispatchRequestId(started);
 			const requestDigest = v3DispatchRequestDigest(dispatchSpec);
 			const preparedAt = new Date().toISOString();
-			await this.withAttemptDeadline(started, "dispatch intent persistence", abort, () => this.updateAttempt(node, attempt, {
+			await this.withAttemptOperation(started, "dispatch intent persistence", abort, () => this.updateAttempt(node, attempt, {
 				dispatchIntent: { requestId, requestDigest, state: "prepared", preparedAt },
-			}));
-			const emittedAt = new Date().toISOString();
-			await this.withAttemptDeadline(started, "dispatch emit persistence", abort, () => this.updateAttempt(node, attempt, {
-				dispatchIntent: { requestId, requestDigest, state: "emitting", preparedAt, emittedAt },
 			}));
 			let binding;
 			try {
-				binding = await this.withAttemptDeadline(started, "child dispatch", abort, () => v3DispatchChild(this.options.rpc, dispatchSpec, { stableRequestId: requestId }));
+				binding = await this.withAttemptOperation(started, "child dispatch", abort, () => v3DispatchChild(this.options.rpc, dispatchSpec, {
+					resultPath: join(v3NodeAttemptDir(this.options.runDir, node.taskId, attempt), "child-result.json"),
+					stableRequestId: requestId,
+					beforeSpawn: async () => {
+						await this.withAttemptOperation(started, "dispatch emit persistence", abort, () => this.updateAttempt(node, attempt, {
+							dispatchIntent: { requestId, requestDigest, state: "emitting", preparedAt, emittedAt: new Date().toISOString() },
+						}));
+					},
+				}));
 			} catch (error) {
-				const recovered = await this.recoverDispatch({ requestId, requestDigest, state: "emitting", preparedAt, emittedAt });
-				if (!recovered) {
-					if (error instanceof V3NodeFailureError && error.kind === "timeout") throw error;
-					throw this.failure(node, attempt, "dispatch_unknown", `Child dispatch crossed its durable emit boundary without a recoverable identity: ${error instanceof Error ? error.message : String(error)}`);
-				}
-				binding = recovered;
+				if (error instanceof V3FallbackPauseError) throw error;
+                if (error instanceof V3DispatchError && error.kind === "runtime_unavailable") throw this.failure(node, attempt, "internal", error.message);
+				throw this.failure(node, attempt, "dispatch_unknown", `Child dispatch crossed its durable emit boundary without a durable binding: ${error instanceof Error ? error.message : String(error)}`);
 			}
+			binding = this.withDispatchObservation(node, binding);
 			this.activeBindings.set(node.taskId, binding);
 			if (this.stopRequested) {
 				const request = this.stopChild(binding).finally(() => abort.abort());
 				void request.catch(() => undefined);
 				this.childStopRequests.set(node.taskId, request);
 			}
-			await this.withAttemptDeadline(started, "dispatch binding persistence", abort, () => this.updateAttempt(node, attempt, { phase: "dispatched", dispatch: binding }));
-			await this.withAttemptDeadline(started, "running state persistence", abort, () => this.updateAttempt(node, attempt, { phase: "running" }));
+			await this.withAttemptOperation(started, "dispatch binding persistence", abort, () => this.updateAttempt(node, attempt, { phase: "dispatched", dispatch: binding }));
+			await this.withAttemptOperation(started, "running state persistence", abort, () => this.updateAttempt(node, attempt, { phase: "running" }));
 			const child = await this.monitorChild(node, attempt, binding, abort, started);
 			this.activeBindings.delete(node.taskId);
 			if (this.stopRequested) {
@@ -426,31 +502,80 @@ export class V3GraphRunner {
 			}
 			await this.continueAfterChild(node, attempt, child, workspace, abort);
 		} catch (error) {
-			await this.handleFailure(node, attempt, error, abort.signal);
+			if (error instanceof V3FallbackPauseError) {parked = true;}
+            else await this.handleFailure(node, attempt, error, abort.signal);
 		} finally {
+			const activeBinding = this.activeBindings.get(node.taskId);
+			if (activeBinding) await releaseV3ResultCapture(activeBinding.asyncId);
 			this.activeBindings.delete(node.taskId);
 			this.childStopRequests.delete(node.taskId);
-			await workspace?.cleanup().catch(() => undefined);
+			this.observationFingerprints.delete(`${node.taskId}:${attempt}`);
+			this.observationPublishedAt.delete(`${node.taskId}:${attempt}`);
+			if (!parked) await workspace?.cleanup().catch(() => undefined);
 		}
 	}
 
 	private async monitorChild(
 		node: CompiledGraphNodeV3,
 		attempt: number,
-		binding: { asyncId: string; asyncDir: string },
+		binding: V3DispatchBinding,
 		abort: AbortController,
 		evidence?: V3AttemptEvidence,
 	): Promise<V3ChildOutcome> {
 		try {
-			const current = evidence ?? await this.requireAttempt(node, attempt);
-			const remaining = this.remainingAttemptMs(current, "child monitoring");
+			const baseObservation = binding.observation ?? this.dispatchObservation(node, binding.asyncId, binding.dispatchedAt);
 			return await v3MonitorChild(this.options.rpc, binding, {
-				...(remaining === undefined ? {} : { timeoutMs: remaining }),
+				ownerSessionId: this.options.sessionId,
+				ownerSessionFile: this.options.ownerSessionFile,
+				resultPath: join(v3NodeAttemptDir(this.options.runDir, node.taskId, attempt), "child-result.json"),
 				signal: abort.signal,
+				baseObservation,
+				onObservation: (observation) => this.publishChildObservation(node, attempt, observation),
 			});
 		} catch (error) {
 			throw this.dispatchFailure(node, attempt, error);
 		}
+	}
+
+	private dispatchObservation(node: CompiledGraphNodeV3, asyncId: string, observedAt?: string): V3ChildObservation {
+		const requestedAgent = this.requestedAgentFor(node);
+		return createV3DispatchObservation({
+			asyncId,
+			...(requestedAgent ? { requestedAgent } : {}),
+			resolvedAgent: node.binding?.resolvedAgent ?? node.agent,
+			...(node.launch?.customModelDefinitions?{customModelDefinitions:node.launch.customModelDefinitions}:{}),
+    ...(node.launch?.requestedModel ? { requestedModel: node.launch.requestedModel } : {}),
+			...(node.launch?.resolvedModel ? { resolvedModel: node.launch.resolvedModel } : {}),
+			...(node.launch?.thinking === undefined ? {} : { thinking: node.launch.thinking }),
+			...(observedAt ? { observedAt } : {}),
+		});
+	}
+
+	private requestedAgentFor(node: CompiledGraphNodeV3): string | undefined {
+		// Capability-only authoring requests a capability, not an Agent, so it has
+		// no requestedAgent. A legacy exact-Agent node has no binding envelope but
+		// its public `agent` value is both the requested and resolved identity.
+		return node.binding?.requestedAgent ?? (node.binding ? undefined : node.agent);
+	}
+
+	private withDispatchObservation(node: CompiledGraphNodeV3, binding: V3DispatchBinding): V3DispatchBinding {
+		return binding.observation ? binding : {
+			...binding,
+			observation: this.dispatchObservation(node, binding.asyncId, binding.dispatchedAt),
+		};
+	}
+
+	private async publishChildObservation(node: CompiledGraphNodeV3, attempt: number, observation: V3ChildObservation): Promise<void> {
+		const key = `${node.taskId}:${attempt}`;
+		const fingerprint = v3ChildObservationFingerprint(observation);
+		if (this.observationFingerprints.get(key) === fingerprint) return;
+		const waitMs = 250 - (Date.now() - (this.observationPublishedAt.get(key) ?? 0));
+		if (waitMs > 0) await sleep(waitMs);
+		await this.updateAttempt(node, attempt, { observation }, false);
+		await this.event("node_observation", { taskId: node.taskId, attempt, observation });
+		await this.persistSnapshot();
+		this.observationFingerprints.set(key, fingerprint);
+		this.observationPublishedAt.set(key, Date.now());
 	}
 
 	private async continueAfterChild(
@@ -461,7 +586,13 @@ export class V3GraphRunner {
 		abort: AbortController,
 	): Promise<void> {
 		const attemptEvidence = await this.requireAttempt(node, attempt);
-		this.assertAttemptDeadline(attemptEvidence, "post-child processing");
+		this.assertCompatibleAttempt(attemptEvidence, "post-child processing");
+		await this.updateAttempt(node, attempt, {child});
+		if (node.evidenceFiles?.length) {
+            if (!workspace) throw this.failure(node, attempt, "validation", "Declared evidence requires a workspace.");
+            const digest = await this.withAttemptOperation(attemptEvidence, "evidence retention", abort, () => this.withAuthority(() => persistEvidenceFiles(this.options.runDir, node.taskId, attempt, workspace!.workspaceCwd, node.evidenceFiles!)));
+            await this.updateAttempt(node, attempt, {evidenceManifestDigest: digest});
+        }
 		if (child.terminal !== "complete") {
 			// Preserve the child outcome in evidence even when it fails the node.
 			await this.updateAttempt(node, attempt, { child });
@@ -469,18 +600,29 @@ export class V3GraphRunner {
 			if (child.terminal === "stopped") throw this.failure(node, attempt, "child_stopped", "Child run was stopped before completion.");
 			throw this.failure(node, attempt, "child_paused", "Child run paused; pi-graph will not resume or duplicate it.");
 		}
-		await this.withAttemptDeadline(attemptEvidence, "child outcome persistence", abort, () => this.updateAttempt(node, attempt, { phase: "verifying", child }));
+		await this.withAttemptOperation(attemptEvidence, "child outcome persistence", abort, () => this.updateAttempt(node, attempt, { phase: "verifying", child }));
+        if (node.resultContract) {
+            let result;
+            try { result = parseBusinessResult(child.output); }
+            catch (error) {
+                await this.recordTerminal(node, attempt, "failed", {child, failure: {kind: "validation", message: String(error), at: new Date().toISOString()}});
+                return;
+            }
+            if (result.status !== "pass") {
+                await this.recordTerminal(node, attempt, "failed", {child, failure: {kind: "task_failed", message: `Business result ${result.status}: ${result.reason}`, at: new Date().toISOString()}});
+                return;
+            }
+        }
 		if (node.sideEffect === "local_write") {
 			if (!workspace) throw this.failure(node, attempt, "internal", "local_write node has no recoverable workspace.");
-			const remaining = this.remainingAttemptMs(attemptEvidence, "validation");
-			const validationTimeout = minDefined(this.options.validationTimeoutMs, remaining);
-			const results = await this.withAttemptDeadline(attemptEvidence, "validation", abort, () => runV3Validations(node.validationCommands, workspace.workspaceCwd, {
-				...(validationTimeout === undefined ? {} : { timeoutMs: validationTimeout }),
+			if (node.permissionPolicy === "inherited" && (node.readOnly || !node.parentToolAllowlist?.includes("bash") || (node.toolFilter?.length && !node.toolFilter.includes("bash")) || (this.options.parentToolAllowlist && !this.options.parentToolAllowlist().includes("bash")))) throw this.failure(node, attempt, "validation", "Shell validation is outside the current parent/Graph bash permissions.");
+			const results = await this.withAttemptOperation(attemptEvidence, "validation", abort, () => runV3Validations(node.validationCommands, workspace.workspaceCwd, {
+				permissionPolicy: node.permissionPolicy,
 				...(this.options.streamLimitBytes === undefined ? {} : { streamLimitBytes: this.options.streamLimitBytes }),
 				signal: abort.signal,
 			}));
-			this.assertAttemptDeadline(attemptEvidence, "workspace inspection");
-			const writes = await this.withAttemptDeadline(attemptEvidence, "workspace inspection", abort, () => workspace.inspectWrites());
+			this.assertCompatibleAttempt(attemptEvidence, "workspace inspection");
+			const writes = await this.withAttemptOperation(attemptEvidence, "workspace inspection", abort, () => workspace.inspectWrites());
 			const validated: V3ValidatedResult = {
 				schemaVersion: 1,
 				runInstanceId: this.options.authorization.runInstanceId,
@@ -492,8 +634,8 @@ export class V3GraphRunner {
 				writes,
 				recordedAt: new Date().toISOString(),
 			};
-			const validatedDigest = await this.withAttemptDeadline(attemptEvidence, "validation evidence persistence", abort, () => this.withAuthority(() => writeV3ValidatedResult(this.options.runDir, node.taskId, attempt, validated)));
-			await this.withAttemptDeadline(attemptEvidence, "verification state persistence", abort, () => this.updateAttempt(node, attempt, {
+			const validatedDigest = await this.withAttemptOperation(attemptEvidence, "validation evidence persistence", abort, () => this.withAuthority(() => writeV3ValidatedResult(this.options.runDir, node.taskId, attempt, validated)));
+			await this.withAttemptOperation(attemptEvidence, "verification state persistence", abort, () => this.updateAttempt(node, attempt, {
 				phase: "verifying",
 				verification: { allPassed: validated.allPassed, validatedResultDigest: validatedDigest, verifiedAt: validated.recordedAt },
 			}));
@@ -501,15 +643,15 @@ export class V3GraphRunner {
 				const failed = results.find((result) => !result.ok);
 				throw this.failure(node, attempt, "validation", `Validation failed${failed ? `: ${failed.command}` : ""}${failed?.signal ? ` (signal ${failed.signal})` : ""}${failed?.timedOut ? " (timeout)" : ""}`);
 			}
-			await this.withAttemptDeadline(attemptEvidence, "applying state persistence", abort, () => this.updateAttempt(node, attempt, { phase: "applying" }));
+			await this.withAttemptOperation(attemptEvidence, "applying state persistence", abort, () => this.updateAttempt(node, attempt, { phase: "applying" }));
 			let applied: V3FileDigest[];
 			try {
-				applied = await this.withAttemptDeadline(attemptEvidence, "workspace apply", abort, () => this.withAuthority(() => workspace.apply(abort.signal)));
+				applied = await this.withAttemptOperation(attemptEvidence, "workspace apply", abort, () => this.withAuthority(() => workspace.apply(abort.signal)));
 			} catch (error) {
 				if (error instanceof V3WorkspaceConflictError) throw this.failure(node, attempt, "workspace_conflict", error.message);
 				throw error;
 			}
-			await this.withAttemptDeadline(attemptEvidence, "apply evidence persistence", abort, () => this.updateAttempt(node, attempt, { phase: "applying", applied: { writes: applied, appliedAt: new Date().toISOString() } }));
+			await this.withAttemptOperation(attemptEvidence, "apply evidence persistence", abort, () => this.updateAttempt(node, attempt, { phase: "applying", applied: { writes: applied, appliedAt: new Date().toISOString() } }));
 		}
 		await this.acceptNode(node, attempt, child, workspace);
 	}
@@ -518,7 +660,12 @@ export class V3GraphRunner {
 		const currentAttempt = (await readLatestV3Attempt(this.options.runDir, node.taskId))?.evidence;
 		if (!currentAttempt) throw this.failure(node, attempt, "internal", "Attempt evidence disappeared before acceptance.");
 		if (!currentAttempt.workspaceDigest) throw this.failure(node, attempt, "dispatch_unknown", "Attempt is not bound to its workspace evidence before acceptance.");
-		this.assertAttemptDeadline(currentAttempt, "artifact publication");
+		this.assertCompatibleAttempt(currentAttempt, "artifact publication");
+        if (node.resultContract && parseBusinessResult(child.output).status !== "pass") throw this.failure(node, attempt, "validation", "Only explicit pass may be accepted.");
+        if (node.evidenceFiles?.length) {
+            if (!currentAttempt.evidenceManifestDigest) throw this.failure(node, attempt, "validation", "Declared evidence was not durably retained before acceptance.");
+            await verifyEvidenceFiles(this.options.runDir, node.taskId, attempt, currentAttempt.evidenceManifestDigest);
+        }
 		const validatedDigest = currentAttempt.verification?.validatedResultDigest ?? "";
 		const method: V3AcceptanceEvidence["method"] = node.sideEffect === "local_write" ? "machine-verified" : "declared";
 		// Freeze the exact terminal basis first. updatedAt participates in the digest,
@@ -549,11 +696,11 @@ export class V3GraphRunner {
 		};
 		// Publish the output first. Acceptance is terminal authority and must never
 		// point at an artifact that was only buffered or partially written.
-		await this.withAttemptDeadline(currentAttempt, "artifact publication", undefined, () => this.writeOutputArtifact(node, attempt, child, workspace));
-		this.assertAttemptDeadline(currentAttempt, "acceptance publication");
-		const acceptanceDigest = await this.withAttemptDeadline(currentAttempt, "acceptance publication", undefined, () => this.withAuthority(() => writeV3AcceptanceEvidence(this.options.runDir, node.taskId, attempt, acceptance)));
+		await this.withAttemptOperation(currentAttempt, "artifact publication", undefined, () => this.writeOutputArtifact(node, attempt, child, workspace));
+		this.assertCompatibleAttempt(currentAttempt, "acceptance publication");
+		const acceptanceDigest = await this.withAttemptOperation(currentAttempt, "acceptance publication", undefined, () => this.withAuthority(() => writeV3AcceptanceEvidence(this.options.runDir, node.taskId, attempt, acceptance)));
 		const finalAttempt = validateV3Attempt({ ...finalBasis, acceptanceDigest });
-		await this.withAttemptDeadline(currentAttempt, "terminal acceptance persistence", undefined, () => this.withAuthority(() =>
+		await this.withAttemptOperation(currentAttempt, "terminal acceptance persistence", undefined, () => this.withAuthority(() =>
 			writeV3AttemptEvidence(this.options.runDir, node.taskId, attempt, finalAttempt)));
 		this.state.set(node.taskId, { attempt, phase: "accepted", terminal: "accepted" });
 		await this.event("node_accepted", { taskId: node.taskId, attempt });
@@ -578,8 +725,8 @@ export class V3GraphRunner {
 		});
 	}
 
-	private async artifactsFor(node: CompiledGraphNodeV3, consumerAttempt?: number): Promise<Array<{ name: string; source: string }>> {
-		const artifacts: Array<{ name: string; source: string }> = [];
+	private async artifactsFor(node: CompiledGraphNodeV3, consumerAttempt?: number, workspace?: V3WorkspaceEvidence, parentTools?: readonly string[]): Promise<Array<{ name: string; source: string; expectedDigest: string }>> {
+		const artifacts: Array<{ name: string; source: string; expectedDigest: string }> = [];
 		for (const artifactName of node.inputArtifacts) {
 			const producer = this.graph.nodes.find((candidate) => candidate.outputArtifact === artifactName);
 			if (!producer) continue;
@@ -595,7 +742,12 @@ export class V3GraphRunner {
 			if (!chain.ok) {
 				throw this.failure(node, consumerAttempt ?? this.state.get(node.taskId)?.attempt ?? 1, "dispatch_unknown", `Input artifact '${artifactName}' failed accepted-evidence verification: ${chain.reasons.join(" ")}`);
 			}
-			artifacts.push({ name: artifactName, source: chain.artifactPath });
+			artifacts.push({ name: artifactName, source: chain.artifactPath, expectedDigest: createHash("sha256").update(chain.artifactContents!).digest("hex") });
+            if (latest.evidence.evidenceManifestDigest) {
+                const manifest = await verifyEvidenceFiles(this.options.runDir, producer.taskId, latest.attempt, latest.evidence.evidenceManifestDigest);
+                const directory = evidenceDirectory(this.options.runDir, producer.taskId, latest.attempt);
+                for (const file of manifest.files) artifacts.push({name: `${artifactName}.files/${file.path}`, source: join(directory, "files", file.path), expectedDigest: file.sha256});
+            }
 		}
 		return artifacts;
 	}
@@ -610,52 +762,20 @@ export class V3GraphRunner {
 		return latest.evidence;
 	}
 
-	private assertAttemptDeadline(evidence: V3AttemptEvidence, stage: string): void {
-		this.remainingAttemptMs(evidence, stage);
+	private assertCompatibleAttempt(evidence: V3AttemptEvidence, stage: string): void {
+		if (evidence.deadlineAt) throw new V3NodeFailureError(evidence.taskId, evidence.attempt, "dispatch_unknown", `Historical timed execution requires reconciliation before ${stage}; it will not be relaunched automatically.`);
 	}
 
-	private remainingAttemptMs(evidence: V3AttemptEvidence, stage: string): number | undefined {
-		if (!evidence.deadlineAt) return undefined;
-		const remaining = Date.parse(evidence.deadlineAt) - Date.now();
-		if (remaining <= 0) throw new V3AttemptDeadlineError(evidence.taskId, evidence.attempt, stage, evidence.deadlineAt);
-		return remaining;
-	}
-
-	private async withAttemptDeadline<T>(
-		evidence: V3AttemptEvidence,
-		stage: string,
-		abort: AbortController | undefined,
-		operation: () => Promise<T>,
-	): Promise<T> {
-		const remaining = this.remainingAttemptMs(evidence, stage);
-		if (remaining === undefined) return operation();
-		let timer: NodeJS.Timeout | undefined;
-		try {
-			return await Promise.race([
-				operation(),
-				new Promise<never>((_resolve, reject) => {
-					timer = setTimeout(() => {
-						abort?.abort();
-						reject(new V3AttemptDeadlineError(evidence.taskId, evidence.attempt, stage, evidence.deadlineAt!));
-					}, remaining);
-				}),
-			]);
-		} finally {
-			if (timer) clearTimeout(timer);
-		}
-	}
-
-	private async recoverDispatch(intent: NonNullable<V3AttemptEvidence["dispatchIntent"]>, polls = 20): Promise<NonNullable<V3AttemptEvidence["dispatch"]> | undefined> {
-		for (let index = 0; index < polls; index += 1) {
-			const recovered = await v3RecoverDispatchBinding(
-				intent.requestId,
-				intent.requestDigest,
-				intent.emittedAt ?? intent.preparedAt,
-			);
-			if (recovered) return recovered;
-			if (index < polls - 1) await sleep(50);
-		}
-		return undefined;
+	private async withAttemptOperation<T>(evidence: V3AttemptEvidence, stage: string, _abort: AbortController | undefined, operation: () => Promise<T>): Promise<T> {
+		this.assertCompatibleAttempt(evidence, stage);
+		if (_abort?.signal.aborted || this.stopRequested) throw new Error(`Graph operation aborted before ${stage}.`);
+		if (evidence.routeSelection && evidence.routeSelection.candidateIndex > 0 && !evidence.dispatch && !this.activeBindings.has(evidence.taskId)) {
+            const control = await readV3RunControl(this.options.runDir);
+            if (control.runInstanceId !== evidence.runInstanceId || control.desiredState === "stopped" || _abort?.signal.aborted || this.stopRequested)
+                throw new Error(`Graph operation aborted before ${stage}.`);
+            if (control.desiredState === "paused") throw new V3FallbackPauseError();
+        }
+        return operation();
 	}
 
 	private declaredDependenciesFor(node: CompiledGraphNodeV3): string[] {
@@ -663,9 +783,9 @@ export class V3GraphRunner {
 		return source?.dependsOn ? [...source.dependsOn] : [...node.dependsOn];
 	}
 
-	private async dependencyCapsuleFor(node: CompiledGraphNodeV3, consumerAttempt?: number) {
+	private async dependencyCapsuleFor(node: CompiledGraphNodeV3, consumerAttempt?: number, workspace?: V3WorkspaceEvidence, parentTools?: readonly string[]) {
 		const dependsOn = this.declaredDependenciesFor(node);
-		const states = new Map<string, { status?: string; detail?: unknown; output?: unknown }>();
+		const states = new Map<string, V3DependencyCapsuleState>();
 		for (const taskId of dependsOn) {
 			const latest = await readLatestV3Attempt(this.options.runDir, taskId);
 			if (!latest) continue;
@@ -681,7 +801,30 @@ export class V3GraphRunner {
 				if (!chain.ok || !chain.attempt?.child) {
 					throw this.failure(node, consumerAttempt ?? this.state.get(node.taskId)?.attempt ?? 1, "dispatch_unknown", `Dependency '${taskId}' failed accepted-evidence verification: ${chain.reasons.join(" ")}`);
 				}
-				states.set(taskId, { status, detail: chain.attempt.child.output });
+				let structured:Record<string,unknown>|undefined;
+                if(node.dependencyInputs?.some(s=>s.from===taskId)) {
+                 structured={};
+                 if(producer.resultContract)Object.assign(structured,parseBusinessResult(chain.attempt.child.output));
+                 if(node.dependencyInputs.some(s=>s.from===taskId&&s.field==="evidenceFiles")) {
+                  if(!chain.attempt.evidenceManifestDigest || !node.inputArtifacts.includes(producer.outputArtifact))throw new Error("Typed evidenceFiles requires an accepted manifest and inputArtifacts mapping");
+                  const manifest=await verifyEvidenceFiles(this.options.runDir,taskId,latest.attempt,chain.attempt.evidenceManifestDigest);
+                  structured.evidenceFiles=manifest.files.map(file=>({...file,path:`.pi-graph/inputs/${producer.outputArtifact}.files/${file.path}`}));
+                 }
+                }
+                let reference:V3DependencyCapsuleState["reference"];
+                const full=chain.attempt.child.output;
+                if(node.contextPolicy==="v1" && !node.dependencyInputs && !producer.resultContract && workspace
+                 && (parentTools===undefined || parentTools.includes("read")) && Buffer.byteLength(full)>=4096 && node.inputArtifacts.includes(producer.outputArtifact) && !producer.outputArtifact.split("/").some((part,index,parts)=>[".git",".pi-graph",".pi-subagents"].includes(part)||(part==="agents"&&parts[index-1]===".pi"))
+                 && (await frozenContextTools(this.options.runDir,node,workspace.workspaceDir)).includes("read")) {
+                  const name=producer.outputArtifact,baseline=workspace.inputBaseline[name];
+                  const expected=createHash("sha256").update(chain.artifactContents!).digest("hex");
+                  if(baseline?.digest===expected) {
+                   const bytes=await safeBytes(workspace.workspaceDir,`.pi-graph/inputs/${name}`);
+                   if(createHash("sha256").update(bytes).digest("hex")!==expected)throw new Error("Dependency material changed after workspace preparation");
+                   if(bytes.toString("utf8").split("\n").every(line=>Buffer.byteLength(line)<50*1024))reference={path:`.pi-graph/inputs/${name}`,sha256:expected,bytes:bytes.length,producer:taskId,attempt:latest.attempt,format:producer.sideEffect==="local_write"?"json-task-output":"text",acceptance:producer.sideEffect==="local_write"?"machine-verified":"declared"};
+                  }
+                }
+                states.set(taskId, { status, detail: reference ? Array.from(full).slice(0,512).join("") : full, structured, ...(reference?{reference}:{}) });
 			} else if (status === "failed") {
 				if (latest.evidence.runInstanceId !== this.options.authorization.runInstanceId
 					|| latest.evidence.graphId !== this.baseGraph.graphId
@@ -697,16 +840,14 @@ export class V3GraphRunner {
 				states.set(taskId, { status, output: latest.evidence.child?.output ?? latest.evidence.failure?.message ?? "" });
 			}
 		}
-		return buildV3DependencyCapsule({ dependsOn, ...(node.when ? { when: node.when } : {}) }, states);
+		return buildV3DependencyCapsule({ dependsOn, ...(node.dependencyInputs===undefined?{}:{dependencyInputs:node.dependencyInputs}), ...(node.when ? { when: node.when } : {}) }, states);
 	}
 
 	private dispatchFailure(node: CompiledGraphNodeV3, attempt: number, error: unknown): Error {
 		if (error instanceof V3DispatchError) {
-			if (error.kind === "monitor_timeout") return this.failure(node, attempt, "timeout", error.message);
 			if (error.kind === "monitor_unknown") return this.failure(node, attempt, "dispatch_unknown", error.message);
 			return this.failure(node, attempt, "internal", error.message);
 		}
-		if (error instanceof Error && error.message.includes("deadline")) return this.failure(node, attempt, "timeout", error.message);
 		if (error instanceof Error && error.message.includes("aborted")) return this.failure(node, attempt, "internal", error.message);
 		return error instanceof Error ? error : new Error(String(error));
 	}
@@ -723,7 +864,7 @@ export class V3GraphRunner {
 				: new V3NodeFailureError(node.taskId, attempt, "internal", error instanceof Error ? error.message : String(error));
 		const at = new Date().toISOString();
 		const childEvidence = await this.childOutcomeEvidence(node, attempt);
-		const terminationRequired = signal.aborted || this.stopRequested || failureError.kind === "timeout";
+		const terminationRequired = signal.aborted || this.stopRequested;
 		if (terminationRequired) {
 			try {
 				await this.awaitChildStopConfirmation(node, attempt);
@@ -746,15 +887,51 @@ export class V3GraphRunner {
 			});
 			return;
 		}
-		if (this.stopRequested || (signal.aborted && failureError.kind !== "timeout")) {
+		if (this.stopRequested || signal.aborted) {
 			await this.recordTerminal(node, attempt, "aborted", {
 				failure: { kind: failureError.kind, message: `Aborted: ${failureError.message}`, at },
 				...childEvidence,
 			});
 			return;
 		}
-		const retryable = attempt < V3_MAX_ATTEMPTS_PER_NODE && attempt < node.retryPolicy.maxAttempts && node.retryPolicy.retryOn.includes(failureError.kind as RetryReasonV3);
+		const latest = await this.requireAttempt(node, attempt);
+        const staticNode = this.graph.nodes.find(n => n.taskId === node.taskId)!;
+        const continuation = failureError.kind === "task_failed" && attempt < V3_MAX_ATTEMPTS_PER_NODE
+            ? await safeFallbackContinuation(this.options.runDir, staticNode, latest) : undefined;
+        if (continuation) {
+            const budget = await readV3UsageBudgetDecision(this.options.runDir, node.taskId, attempt + 1, node.launch?.usageBudget);
+            const control = await readV3RunControl(this.options.runDir);
+            if (!budget.blocked && !this.stopRequested && !signal.aborted && control.runInstanceId === latest.runInstanceId && control.desiredState !== "stopped") {
+                await this.recordTerminal(node, attempt, "failed", {failure:{kind:failureError.kind,message:failureError.message,at}, ...childEvidence, fallbackContinuation:continuation});
+                if (this.stopRequested || signal.aborted) return;
+                const next = staticNode.launch!.runtimeFallback!.candidates[continuation.candidateIndex]!;
+                await this.event("node_model_fallback", {taskId:node.taskId, attempt, reason:continuation.failureKind,
+                    from:node.launch?.resolvedModel, to:next.resolvedModel});
+                const current = this.state.get(node.taskId)!;
+                this.state.set(node.taskId, {...current, attempt, phase:undefined, terminal:undefined, retryAt:Date.now()});
+                return;
+            }
+        }
+		const retryable = v3RetryScheduledFor(node, { ...latest, failure: { kind: failureError.kind, message: failureError.message, at } });
+		const supervision = latest.child?.observation?.supervision;
+		if (supervision?.runtimeFailure && !retryable) {
+			if (supervision.processExitConfirmed) this.isolatedAttention.add(node.taskId);
+			await this.recordTerminal(node, attempt, "needs_attention", { failure: { kind: failureError.kind, message: `${failureError.message} Automatic recovery is unsafe or exhausted; reconcile the existing run before retrying.`, at }, ...childEvidence });
+			return;
+		}
 		if (retryable) {
+			const budgetDecision = await readV3UsageBudgetDecision(this.options.runDir, node.taskId, attempt + 1, node.launch?.usageBudget);
+			if (budgetDecision.blocked) {
+				await this.recordTerminal(node, attempt, "failed", {
+					failure: {
+						kind: "usage_budget",
+						message: `${budgetDecision.blocked.message} Automatic retry was suppressed after ${failureError.kind}: ${failureError.message}`,
+						at,
+					},
+					...childEvidence,
+				});
+				return;
+			}
 			await this.recordTerminal(node, attempt, "failed", {
 				failure: { kind: failureError.kind, message: failureError.message, at },
 				...childEvidence,
@@ -764,8 +941,13 @@ export class V3GraphRunner {
 			this.state.set(node.taskId, { ...current, attempt, phase: undefined, terminal: undefined, retryAt: Date.now() + backoff });
 			return;
 		}
+        const exhaustedPlan = node.launch?.runtimeFallback;
+        const selectedIndex = latest.routeSelection?.candidateIndex ?? 0;
+        const finalMessage = exhaustedPlan && selectedIndex === exhaustedPlan.candidates.length - 1
+            ? `${failureError.message} All ${exhaustedPlan.candidates.length} admitted model candidates have been attempted; automatic fallback is exhausted.`
+            : failureError.message;
 		await this.recordTerminal(node, attempt, "failed", {
-			failure: { kind: failureError.kind, message: failureError.message, at },
+			failure: { kind: failureError.kind, message: finalMessage, at },
 			...childEvidence,
 		});
 	}
@@ -778,11 +960,9 @@ export class V3GraphRunner {
 		}
 		const latest = await readLatestV3Attempt(this.options.runDir, node.taskId);
 		if (!latest || latest.evidence.attempt !== attempt) return;
-		let binding = latest.evidence.dispatch;
+		const binding = latest.evidence.dispatch;
 		if (!binding && latest.evidence.dispatchIntent?.state === "emitting") {
-			binding = await this.recoverDispatch(latest.evidence.dispatchIntent);
-			if (!binding) throw new V3DispatchError("monitor_unknown", `Dispatch identity for '${node.taskId}' attempt ${attempt} could not be recovered after its emit boundary.`);
-			await this.updateAttempt(node, attempt, { phase: "dispatched", dispatch: binding });
+			throw new V3DispatchError("monitor_unknown", `Dispatch identity for '${node.taskId}' attempt ${attempt} was not durably bound after its emit boundary.`);
 		}
 		if (!binding) return;
 		await this.stopChild(binding);
@@ -811,7 +991,6 @@ export class V3GraphRunner {
 			createdAt: now,
 			updatedAt: now,
 			supervisorEpoch: this.options.supervisorEpoch,
-			...(node.timeoutMs === undefined ? {} : { deadlineAt: new Date(Date.now() + node.timeoutMs).toISOString() }),
 		};
 	}
 
@@ -831,7 +1010,16 @@ export class V3GraphRunner {
 			if (!effective || v3EvaluateNodeReadiness(effective, (taskId) => this.phaseOf(taskId)).state !== "ready") return undefined;
 			const latest = await readLatestV3Attempt(this.options.runDir, node.taskId);
 			if (latest && latest.evidence.attempt >= attempt) return undefined;
-			const next = validateV3Attempt(await this.attemptBase(effective, attempt));
+			const plan = effective.launch?.runtimeFallback;
+            let routeSelection;
+            if (plan) {
+                const index = latest?.evidence.fallbackContinuation?.candidateIndex ?? latest?.evidence.routeSelection?.candidateIndex ?? 0;
+                if (latest?.evidence.fallbackContinuation && !await verifyFallbackContinuation(this.options.runDir, effective, latest.evidence)) throw new Error("Fallback predecessor proof no longer verifies.");
+                const control = await readV3RunControl(this.options.runDir);
+                if (index > 0 && (this.stopRequested || this.pauseRequested || control.desiredState !== "running")) return undefined;
+                routeSelection = {candidateIndex:index, planDigest:plan.digest};
+            }
+            const next = validateV3Attempt({...await this.attemptBase(effective, attempt), ...(routeSelection ? {routeSelection} : {})});
 			await writeV3AttemptEvidence(this.options.runDir, node.taskId, attempt, next);
 			this.state.set(node.taskId, { ...(this.state.get(node.taskId) ?? {}), attempt, phase: next.phase });
 			return next;
@@ -933,6 +1121,7 @@ export class V3GraphRunner {
 			throw new Error(`V3 mutation journal revision moved backwards from ${this.mutationState.revision} to ${mutation.revision}.`);
 		}
 		this.applyMutationState(mutation);
+  await this.mailbox?.admit(this.graph.nodes.map(node=>({taskId:node.taskId,attempt:this.state.get(node.taskId)?.attempt||1})));
 	}
 
 	private applyMutationState(mutation: V3GraphMutationState): void {
@@ -968,6 +1157,10 @@ export class V3GraphRunner {
 			if (retryBaseline !== undefined) {
 				if (retryBaseline > attempt) throw new Error(`V3 retry baseline for '${node.taskId}' is ahead of durable Attempt ${attempt}.`);
 				if (retryBaseline === attempt) {
+					if (evidence.dispatch && evidence.child?.observation?.supervision?.processExitConfirmed !== true) {
+						this.state.set(node.taskId, { attempt, phase: "needs_attention", terminal: "needs_attention" });
+						continue;
+					}
 					if (attempt >= V3_MAX_ATTEMPTS_PER_NODE) throw new V3AttemptLimitError(node.taskId, attempt + 1);
 					this.state.set(node.taskId, { attempt, phase: undefined });
 					continue;
@@ -985,6 +1178,7 @@ export class V3GraphRunner {
 				continue;
 			}
 			if (evidence.phase === "needs_attention") {
+				if (evidence.child?.observation?.supervision?.runtimeFailure && evidence.child.observation.supervision.processExitConfirmed) this.isolatedAttention.add(node.taskId);
 				this.state.set(node.taskId, { attempt, phase: "needs_attention", terminal: "needs_attention" });
 				continue;
 			}
@@ -993,11 +1187,20 @@ export class V3GraphRunner {
 				continue;
 			}
 			if (evidence.phase === "failed") {
-				if (v3RetryScheduledFor(node, evidence)) {
-					this.state.set(node.taskId, { attempt, phase: undefined, retryAt: now + RETRY_BACKOFF_BASE_MS });
+				if (await verifyFallbackContinuation(this.options.runDir, node, evidence) || v3RetryScheduledFor(node, evidence)) {
+					const budgetDecision = await readV3UsageBudgetDecision(this.options.runDir, node.taskId, attempt + 1, node.launch?.usageBudget);
+					this.state.set(node.taskId, budgetDecision.blocked
+						? { attempt, phase: "failed", terminal: "failed" }
+						: { attempt, phase: undefined, retryAt: now + RETRY_BACKOFF_BASE_MS });
 				} else {
 					this.state.set(node.taskId, { attempt, phase: "failed", terminal: "failed" });
 				}
+				continue;
+			}
+			// Historical timed runs remain inspectable, but cannot silently adopt a
+			// new execution contract or duplicate an unconfirmed old child.
+			if (evidence.deadlineAt || node.timeoutMs !== undefined) {
+				this.state.set(node.taskId, { attempt, phase: "needs_attention", terminal: "needs_attention" });
 				continue;
 			}
 			// Interrupted non-terminal attempt → schedule a resume continuation.
@@ -1021,19 +1224,27 @@ export class V3GraphRunner {
 	}
 
 	private async resumeNodeAttempt(node: CompiledGraphNodeV3, evidence: V3AttemptEvidence): Promise<void> {
+        if (evidence.phase === "prepared" && !evidence.dispatchIntent && !evidence.dispatch && (evidence.routeSelection?.candidateIndex ?? 0) > 0) {
+            await selectedRuntimeNode(this.options.runDir, node, evidence);
+            await this.executeNodeAttempt(node, evidence);
+            return;
+        }
 		const attempt = evidence.attempt;
 		const abort = new AbortController();
 		this.nodeAborts.set(node.taskId, abort);
+		if (this.stopRequested) abort.abort();
 		let workspace: V3PreparedWorkspace | undefined;
+        let parked = false;
 		try {
-			this.assertAttemptDeadline(evidence, "attempt recovery");
+			this.assertCompatibleAttempt(evidence, "attempt recovery");
+            node = await selectedRuntimeNode(this.options.runDir, node, evidence);
 			if (evidence.phase === "applying" || (evidence.phase === "verifying" && evidence.applied)) {
-				const reopenedWorkspace = await this.withAttemptDeadline(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
+				const reopenedWorkspace = await this.withAttemptOperation(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
 				workspace = reopenedWorkspace;
 				await this.updateAttempt(node, attempt, { phase: "applying" });
 				let applied: V3FileDigest[];
 				try {
-					applied = await this.withAttemptDeadline(evidence, "workspace apply recovery", abort, () => this.withAuthority(() => reopenedWorkspace.apply(abort.signal)));
+					applied = await this.withAttemptOperation(evidence, "workspace apply recovery", abort, () => this.withAuthority(() => reopenedWorkspace.apply(abort.signal)));
 				} catch (error) {
 					if (error instanceof V3WorkspaceConflictError) throw this.failure(node, attempt, "workspace_conflict", error.message);
 					throw error;
@@ -1044,46 +1255,75 @@ export class V3GraphRunner {
 			}
 			if (evidence.phase === "verifying" || (evidence.phase === "prepared" && evidence.child)) {
 				if (!evidence.child) throw this.failure(node, attempt, "dispatch_unknown", "Resume found a verifying attempt without a recorded child outcome.");
-				workspace = await this.withAttemptDeadline(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
+				workspace = await this.withAttemptOperation(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
 				await this.continueAfterChild(node, attempt, evidence.child, workspace, abort);
 				return;
 			}
 			if (evidence.phase === "dispatched" || evidence.phase === "running") {
 				if (!evidence.dispatch) throw this.failure(node, attempt, "dispatch_unknown", "Resume found a dispatched attempt without a dispatch binding.");
-				this.activeBindings.set(node.taskId, evidence.dispatch);
-				await this.updateAttempt(node, attempt, { phase: "running" });
-				const child = await this.monitorChild(node, attempt, evidence.dispatch, abort, evidence);
+				const binding = this.withDispatchObservation(node, evidence.dispatch);
+				this.activeBindings.set(node.taskId, binding);
+				await this.updateAttempt(node, attempt, { phase: "running", dispatch: binding });
+				const child = await this.monitorChild(node, attempt, binding, abort, evidence);
 				this.activeBindings.delete(node.taskId);
-				workspace = await this.withAttemptDeadline(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
+				workspace = await this.withAttemptOperation(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
 				await this.continueAfterChild(node, attempt, child, workspace, abort);
 				return;
 			}
 			if (evidence.phase === "prepared" && evidence.dispatchIntent) {
-				workspace = await this.withAttemptDeadline(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
-				const capsule = await this.withAttemptDeadline(evidence, "dependency capsule recovery", abort, () => this.dependencyCapsuleFor(node, attempt));
+				if (evidence.dispatchIntent.state === "emitting") {
+					throw this.failure(node, attempt, "dispatch_unknown", "Resume found a dispatch that may have crossed its emit boundary without a durable child binding.");
+				}
+				const budgetDecision = await readV3UsageBudgetDecision(this.options.runDir, node.taskId, attempt, node.launch?.usageBudget);
+				if (budgetDecision.blocked) {
+					throw this.failure(node, attempt, "usage_budget", budgetDecision.blocked.message);
+				}
+				const remainingUsageBudget = budgetDecision.remaining;
+				workspace = await this.withAttemptOperation(evidence, "workspace recovery", abort, () => this.reopenWorkspaceFor(node, attempt));
+				const currentParentTools = this.options.parentToolAllowlist?.();
+                const effectiveParentTools = node.parentToolAllowlist?.filter(tool=>currentParentTools===undefined||currentParentTools.includes(tool));
+			const capsule = await this.withAttemptOperation(evidence, "dependency capsule recovery", abort, () => this.dependencyCapsuleFor(node, attempt, workspace?.evidence, effectiveParentTools ?? currentParentTools));
 				const renderedCapsule = renderV3DependencyCapsule(capsule);
+				const requestedAgent = this.requestedAgentFor(node);
 				const spec: V3DispatchSpec = {
 					agent: node.agent,
-					task: renderedCapsule ? `${node.task}\n\n${renderedCapsule}` : node.task,
+					...(requestedAgent ? { requestedAgent } : {}),
+					task: `${renderedCapsule ? `${node.task}\n\n${renderedCapsule}` : node.task}${node.resultContract ? '\nFinal output MUST be exact JSON {"status":"pass"|"blocked"|"fail","reason":"..."}. If blocked, finish with blocked; do not loop requesting permission or guess authorization.' : ""}${node.evidenceFiles?.length ? `\nDeclared non-secret evidence files to produce before finishing: ${JSON.stringify(node.evidenceFiles.map(e => e.path))}` : ""}`,
 					cwd: workspace.workspaceCwd,
 					sessionDir: join(this.paths.sessionsDir, node.taskId),
 					agentScope: "project",
+					...(node.launch?.customModelDefinitions?{customModelDefinitions:node.launch.customModelDefinitions}:{}),
+    ...(node.launch?.requestedModel ? { requestedModel: node.launch.requestedModel } : {}),
+					...(node.launch?.resolvedModel ? { resolvedModel: node.launch.resolvedModel } : {}),
+					...(node.launch?.thinking === undefined ? {} : { thinking: node.launch.thinking }),
+					...(node.launch?.turnBudget ? { turnBudget: node.launch.turnBudget } : {}),
+					...(node.launch?.toolBudget ? { toolBudget: node.launch.toolBudget } : {}),
+					...(remainingUsageBudget ? { usageBudget: remainingUsageBudget } : {}),
+					extensionBindings: {...v3GraphGuardExtensionBindings(workspace.evidence), [MAILBOX_BINDING_NAMESPACE]: {socketPath:this.mailboxBroker!.socketPath,token:await this.mailbox!.capability(node.taskId,attempt)}},
+				graphToolFilter: node.toolFilter?.length ? [...node.toolFilter,"graph_mailbox"] : [],
+				...(effectiveParentTools === undefined ? {} : { parentToolAllowlist: effectiveParentTools }),
 				};
 				if (v3DispatchRequestDigest(spec) !== evidence.dispatchIntent.requestDigest) {
 					throw this.failure(node, attempt, "dispatch_unknown", "Recovered dispatch parameters do not match the durable request intent.");
 				}
-				let binding = evidence.dispatchIntent.state === "emitting" ? await this.recoverDispatch(evidence.dispatchIntent) : undefined;
-				if (!binding && evidence.dispatchIntent.state === "prepared") {
-					const intent = { ...evidence.dispatchIntent, state: "emitting" as const, emittedAt: new Date().toISOString() };
-					await this.updateAttempt(node, attempt, { dispatchIntent: intent });
-					try {
-						binding = await this.withAttemptDeadline(evidence, "child dispatch recovery", abort, () => v3DispatchChild(this.options.rpc, spec, { stableRequestId: intent.requestId }));
-					} catch (error) {
-						binding = await this.recoverDispatch(intent);
-						if (!binding) throw this.failure(node, attempt, "dispatch_unknown", `Recovered dispatch crossed its emit boundary without a recoverable identity: ${error instanceof Error ? error.message : String(error)}`);
-					}
+				const intent = evidence.dispatchIntent;
+				let binding;
+				try {
+					binding = await this.withAttemptOperation(evidence, "child dispatch recovery", abort, () => v3DispatchChild(this.options.rpc, spec, {
+						resultPath: join(v3NodeAttemptDir(this.options.runDir, node.taskId, attempt), "child-result.json"),
+						stableRequestId: intent.requestId,
+						beforeSpawn: async () => {
+							await this.withAttemptOperation(evidence, "recovered dispatch emit persistence", abort, () => this.updateAttempt(node, attempt, {
+								dispatchIntent: { ...intent, state: "emitting", emittedAt: new Date().toISOString() },
+							}));
+						},
+					}));
+				} catch (error) {
+					if (error instanceof V3FallbackPauseError) throw error;
+                if (error instanceof V3DispatchError && error.kind === "runtime_unavailable") throw this.failure(node, attempt, "internal", error.message);
+					throw this.failure(node, attempt, "dispatch_unknown", `Recovered prepared dispatch crossed its emit boundary without a durable binding: ${error instanceof Error ? error.message : String(error)}`);
 				}
-				if (!binding) throw this.failure(node, attempt, "dispatch_unknown", "Resume could not bind the Child after its durable dispatch emit boundary.");
+				binding = this.withDispatchObservation(node, binding);
 				this.activeBindings.set(node.taskId, binding);
 				await this.updateAttempt(node, attempt, { phase: "running", dispatch: binding });
 				const child = await this.monitorChild(node, attempt, binding, abort, evidence);
@@ -1094,10 +1334,15 @@ export class V3GraphRunner {
 			// Legacy prepared evidence lacks proof of whether dispatch crossed its boundary.
 			throw this.failure(node, attempt, "dispatch_unknown", "Resume found a prepared attempt without a durable dispatch intent; refusing to blindly re-dispatch.");
 		} catch (error) {
-			await this.handleFailure(node, attempt, error, abort.signal);
+			if (error instanceof V3FallbackPauseError) {parked = true;}
+            else await this.handleFailure(node, attempt, error, abort.signal);
 		} finally {
+			const activeBinding = this.activeBindings.get(node.taskId);
+			if (activeBinding) await releaseV3ResultCapture(activeBinding.asyncId);
 			this.activeBindings.delete(node.taskId);
-			await workspace?.cleanup().catch(() => undefined);
+			this.observationFingerprints.delete(`${node.taskId}:${attempt}`);
+			this.observationPublishedAt.delete(`${node.taskId}:${attempt}`);
+			if (!parked) await workspace?.cleanup().catch(() => undefined);
 		}
 	}
 
@@ -1171,11 +1416,7 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-function minDefined(left: number | undefined, right: number | undefined): number | undefined {
-	if (left === undefined) return right;
-	if (right === undefined) return left;
-	return Math.min(left, right);
-}
+
 
 function capMessage(message: string): string {
 	return message.length > 500 ? `${message.slice(0, 500)}…` : message;
@@ -1194,16 +1435,7 @@ export class V3NodeFailureError extends Error {
 	}
 }
 
-export class V3AttemptDeadlineError extends V3NodeFailureError {
-	readonly deadlineAt: string;
-	readonly stage: string;
-	constructor(taskId: string, attempt: number, stage: string, deadlineAt: string) {
-		super(taskId, attempt, "timeout", `Attempt deadline ${deadlineAt} expired during ${stage}.`);
-		this.name = "V3AttemptDeadlineError";
-		this.deadlineAt = deadlineAt;
-		this.stage = stage;
-	}
-}
+
 
 export class V3AttemptLimitError extends Error {
 	readonly taskId: string;

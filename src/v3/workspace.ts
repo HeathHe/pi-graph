@@ -1,3 +1,4 @@
+import { safeBytes } from "./evidence-files.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { cp, lstat, mkdir, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -11,6 +12,7 @@ import { graphV3Error } from "./errors.ts";
 import { readV3WorkspaceEvidence, writeV3WorkspaceEvidence, v3NodeAttemptDir } from "./attempt.ts";
 import type {
 	CompiledGraphNodeV3,
+	CompiledGraphV3,
 	ScopeEntryV3,
 	V3FileDigest,
 	V3WorkspaceEvidence,
@@ -25,7 +27,7 @@ export interface V3WorkspaceInput {
 	sourceCwd: string;
 	workspace?: "shadow";
 	protectedSourceRoots?: string[];
-	artifacts?: Array<{ name: string; source: string }>;
+	artifacts?: Array<{ name: string; source: string; expectedDigest?: string }>;
 }
 
 export interface V3PreparedWorkspace {
@@ -49,9 +51,15 @@ export interface V3NodeContract {
 	readScope: Array<{ kind: "file" | "tree"; path: string }>;
 	writeScope: Array<{ kind: "file" | "tree"; path: string }>;
 	sideEffect: CompiledGraphNodeV3["sideEffect"];
-	allowBash: false;
+	allowBash: boolean;
+	permissionPolicy?: "inherited" | "strict";
+	contextPolicy?: "v1" | "disabled";
+	contextTools?: string[];
+	parentToolAllowlist?: string[];
 	readOnly: boolean;
 	toolFilter: string[];
+	/** Per-provider-request output-token ceiling enforced inside the child. */
+	maxTokens?: number;
 	writeBaseline: Record<string, string | null>;
 	readBaseline: Record<string, string | null>;
 	protectedSourceRoots: string[];
@@ -172,23 +180,27 @@ async function filesUnder(directory: string): Promise<string[]> {
 }
 
 const GRAPH_GUARD_PATH = fileURLToPath(new URL("../../extensions/pi-graph-guard.ts", import.meta.url));
-
 interface MaterializedAgent {
 	name: string;
 	filePath?: string;
+	runner?: { type?: unknown; [key: string]: unknown };
+	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	[key: string]: unknown;
 }
 
 interface FrozenAgentSnapshot {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	taskId: string;
 	agent: string;
+	/** Durable proof that dispatch stays inside the guarded native Pi child. */
+	runnerType: "pi";
 	source?: string;
 	definitionDigest: string;
 	serializedDigest: string;
 	guardDigest: string;
+	configuredExtensions: Array<{ path: string; digest: string }>;
 	serialized: string;
 	synthetic?: true;
 }
@@ -210,28 +222,14 @@ interface ResolvedFrozenAgent {
 const AGENT_PROFILE_QUEUES = new Map<string, Promise<void>>();
 
 let agentInternals: Promise<{
-	discoverAgents(cwd: string, scope: "project"): { agents: MaterializedAgent[] };
+	discoverAgents(cwd: string, scope: "both"): { agents: MaterializedAgent[] };
 	serializeAgent(agent: MaterializedAgent): string;
 	agentDefinitionDigest(agent: MaterializedAgent): string;
 }> | undefined;
 
 async function loadAgentInternals() {
-	if (agentInternals) return agentInternals;
-	agentInternals = (async () => {
-		const packageRoot = dirname(createRequire(import.meta.url).resolve("pi-subagents"));
-		const jiti = createJiti(import.meta.url);
-		const [agentsModule, serializerModule, launchModule] = await Promise.all([
-			jiti.import(join(packageRoot, "src", "agents", "agents.ts")),
-			jiti.import(join(packageRoot, "src", "agents", "agent-serializer.ts")),
-			jiti.import(join(packageRoot, "src", "shared", "launch-contract.ts")),
-		]);
-		return {
-			discoverAgents: (agentsModule as { discoverAgents(cwd: string, scope: "project"): { agents: MaterializedAgent[] } }).discoverAgents,
-			serializeAgent: (serializerModule as { serializeAgent(agent: MaterializedAgent): string }).serializeAgent,
-			agentDefinitionDigest: (launchModule as { agentDefinitionDigest(agent: MaterializedAgent): string }).agentDefinitionDigest,
-		};
-	})();
-	return agentInternals;
+ const agents = await import('../runtime/agents.ts');
+ return agents as unknown as {discoverAgents(cwd:string,scope:"both"):{agents:MaterializedAgent[]};serializeAgent(agent:MaterializedAgent):string;agentDefinitionDigest(agent:MaterializedAgent):string};
 }
 
 function frozenAgentPath(runDir: string, taskId: string): string {
@@ -241,15 +239,32 @@ function frozenAgentPath(runDir: string, taskId: string): string {
 function validateFrozenAgent(value: unknown, taskId: string, agent: string): FrozenAgentSnapshot {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Frozen Agent profile for '${taskId}' is malformed.`);
 	const record = value as Partial<FrozenAgentSnapshot>;
-	if (record.schemaVersion !== 1 || record.taskId !== taskId || record.agent !== agent
+	const configuredExtensions = record.configuredExtensions;
+	if (record.schemaVersion !== 2 || record.taskId !== taskId || record.agent !== agent
+		|| record.runnerType !== "pi"
 		|| typeof record.definitionDigest !== "string" || !/^[a-f0-9]{64}$/u.test(record.definitionDigest)
 		|| typeof record.serializedDigest !== "string" || !/^[a-f0-9]{64}$/u.test(record.serializedDigest)
 		|| typeof record.guardDigest !== "string" || !/^[a-f0-9]{64}$/u.test(record.guardDigest)
+		|| !Array.isArray(configuredExtensions)
+		|| configuredExtensions.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry)
+			|| Object.keys(entry).length !== 2 || !("path" in entry) || !("digest" in entry)
+			|| typeof entry.path !== "string" || entry.path.length > 4_096 || !isAbsolute(entry.path)
+			|| resolve(entry.path) !== entry.path || typeof entry.digest !== "string" || !/^[a-f0-9]{64}$/u.test(entry.digest))
+		|| configuredExtensions.some((entry, index) => index > 0 && configuredExtensions[index - 1]!.path.localeCompare(entry.path) >= 0)
 		|| typeof record.serialized !== "string" || record.serialized.length === 0
 		|| createHash("sha256").update(record.serialized).digest("hex") !== record.serializedDigest) {
 		throw new Error(`Frozen Agent profile for '${taskId}' failed identity validation.`);
 	}
 	return record as FrozenAgentSnapshot;
+}
+
+/** Existing frozen-profile validation plus exact Graph Guard bytes; arbitrary
+ * configured extensions may execute during startup and cannot authorize replay. */
+export async function controlledV3FrozenAgent(runDir: string, node: CompiledGraphNodeV3): Promise<boolean> {
+ const snapshot = await readFrozenAgent(runDir, node.taskId, node.agent);
+ if (!snapshot || snapshot.runnerType !== "pi" || snapshot.definitionDigest !== node.binding?.agentDefinitionDigest) return false;
+ const guardDigest = createHash("sha256").update(await readFile(GRAPH_GUARD_PATH)).digest("hex");
+ return snapshot.guardDigest === guardDigest && snapshot.configuredExtensions.every(e => basename(e.path) === "pi-graph-guard.ts" && e.digest === guardDigest);
 }
 
 async function readFrozenAgent(runDir: string, taskId: string, agent: string): Promise<FrozenAgentSnapshot | undefined> {
@@ -258,6 +273,99 @@ async function readFrozenAgent(runDir: string, taskId: string, agent: string): P
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
+	}
+}
+
+export async function frozenContextTools(runDir:string,node:CompiledGraphNodeV3,workspaceCwd:string):Promise<string[]> {
+ if(node.contextPolicy!=="v1")return [];
+ const snapshot=await readFrozenAgent(runDir,node.taskId,node.agent);
+ if(!snapshot || snapshot.synthetic || snapshot.configuredExtensions.length)return [];
+ assertFrozenAgentMatchesBinding(snapshot,node);
+ const internals=await loadAgentInternals();
+ const agent=internals.discoverAgents(workspaceCwd,"both").agents.find(a=>a.name===node.agent);
+ if(!agent || internals.serializeAgent(agent)!==snapshot.serialized)return [];
+ const module=await import('../runtime/launch-contract.ts');
+ const plan=module.resolvePiLaunchToolPlan({tools:agent.tools,cwd:workspaceCwd,agentName:agent.name});
+ return ["read","grep","find","ls"].filter(name=>plan.effectiveToolAllowlist.includes(name)
+  && (node.parentToolAllowlist===undefined||node.parentToolAllowlist.includes(name))
+  && (!node.toolFilter?.length||node.toolFilter.includes(name)));
+}
+
+function assertFrozenAgentMatchesBinding(snapshot: FrozenAgentSnapshot, node: CompiledGraphNodeV3): void {
+	const expected = node.binding?.agentDefinitionDigest;
+	if (expected !== undefined && snapshot.definitionDigest !== expected) {
+		throw new Error(
+			`Agent '${node.agent}' definition changed after capability binding for V3 node '${node.taskId}' `
+			+ `(expected ${expected}, frozen ${snapshot.definitionDigest}).`,
+		);
+	}
+}
+
+function assertNativePiRunner(agent: MaterializedAgent, taskId: string): void {
+	if (agent.runner === undefined || agent.runner?.type === "pi") return;
+	const runnerType = typeof agent.runner?.type === "string" ? agent.runner.type : "invalid";
+	throw new Error(
+		`Agent '${agent.name}' uses runner.type='${runnerType}' for V3 node '${taskId}'; `
+		+ "pi-graph requires the native Pi runner so Graph Guard can enforce the node contract.",
+	);
+}
+
+function toolExtensionPath(value: string): boolean {
+	return value.includes("/") || value.endsWith(".ts") || value.endsWith(".js");
+}
+
+async function freezeExtensionEntry(input: string, sourceCwd: string, taskId: string): Promise<{ path: string; digest: string }> {
+	const requestedPath = isAbsolute(input) ? resolve(input) : resolve(sourceCwd, input);
+	const requestedInfo = await lstat(requestedPath).catch((error) => {
+		throw new Error(`Agent extension '${input}' cannot be frozen for V3 node '${taskId}': ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	});
+	if (requestedInfo.isSymbolicLink()) throw new Error(`Agent extension cannot be a symbolic link for V3 node '${taskId}': ${requestedPath}`);
+	const path = await realpath(requestedPath);
+	const info = await lstat(path);
+	if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
+		throw new Error(`Agent extension must be one regular, non-linked entry-point file for V3 node '${taskId}': ${path}`);
+	}
+	const digest = await digestFile(path);
+	if (!digest) throw new Error(`Agent extension disappeared while it was frozen for V3 node '${taskId}': ${path}`);
+	return { path, digest };
+}
+
+async function freezeConfiguredAgentExtensions(
+	agent: MaterializedAgent,
+	sourceCwd: string,
+	taskId: string,
+): Promise<{ guarded: MaterializedAgent; evidence: Array<{ path: string; digest: string }> }> {
+	const byInput = new Map<string, { path: string; digest: string }>();
+	const freeze = async (input: string): Promise<string> => {
+		const existing = byInput.get(input);
+		if (existing) return existing.path;
+		const frozen = await freezeExtensionEntry(input, sourceCwd, taskId);
+		byInput.set(input, frozen);
+		return frozen.path;
+	};
+	const tools = await Promise.all((agent.tools ?? []).map(async (tool) => toolExtensionPath(tool) ? freeze(tool) : tool));
+	const extensions = await Promise.all((agent.extensions ?? []).map(freeze));
+	const subagentOnlyExtensions = await Promise.all((agent.subagentOnlyExtensions ?? []).map(freeze));
+	const evidence = [...new Map([...byInput.values()].map((entry) => [entry.path, entry])).values()]
+		.sort((left, right) => left.path.localeCompare(right.path));
+	return {
+		guarded: {
+			...agent,
+			...(agent.tools === undefined ? {} : {tools: [...new Set([...tools.filter(tool => tool !== "contact_supervisor" && tool !== "subagent_supervisor" && !tool.startsWith("intercom")), "graph_mailbox"]) ]}),
+			// Explicit empty disables ambient extensions inside every Graph child.
+			extensions,
+			subagentOnlyExtensions: [...new Set([...subagentOnlyExtensions, GRAPH_GUARD_PATH])],
+		},
+		evidence,
+	};
+}
+
+async function verifyFrozenAgentExtensions(snapshot: FrozenAgentSnapshot, taskId: string): Promise<void> {
+	for (const extension of snapshot.configuredExtensions) {
+		const current = await freezeExtensionEntry(extension.path, dirname(extension.path), taskId);
+		if (current.path !== extension.path || current.digest !== extension.digest) {
+			throw new Error(`Frozen Agent extension changed for V3 node '${taskId}': ${extension.path}`);
+		}
 	}
 }
 
@@ -270,13 +378,17 @@ async function resolveFrozenAgent(
 	const existing = await readFrozenAgent(runDir, node.taskId, node.agent);
 	if (existing) {
 		if (existing.synthetic && !allowSynthetic) throw new Error(`Agent '${node.agent}' has no production-resolved frozen profile.`);
+		assertFrozenAgentMatchesBinding(existing, node);
+		await verifyFrozenAgentExtensions(existing, node.taskId);
 		return { snapshot: existing };
 	}
 	const internals = await loadAgentInternals();
 	// The real Runner performs public pi-subagents preflight before dispatch.
 	// A deterministic fallback keeps the workspace primitive independently
 	// testable without turning this private compatibility import into authority.
-	const resolved = internals.discoverAgents(sourceCwd, "project").agents.find((candidate) => candidate.name === node.agent);
+	// Match Pi's normal Agent universe. Binding admission used the same scope;
+	// comparing its digest below closes the catalog/preflight/freeze TOCTOU gap.
+	const resolved = internals.discoverAgents(sourceCwd, "both").agents.find((candidate) => candidate.name === node.agent);
 	if (!resolved && !allowSynthetic) throw new Error(`Agent '${node.agent}' is not available for V3 node '${node.taskId}'.`);
 	const discovered = resolved ?? {
 		name: node.agent,
@@ -291,25 +403,25 @@ async function resolveFrozenAgent(
 		const info = await lstat(discovered.filePath);
 		if (info.isSymbolicLink() || !info.isFile() || info.nlink > 1) throw new Error(`Agent definition must be a single regular file: ${discovered.filePath}`);
 	}
+	assertNativePiRunner(discovered, node.taskId);
 	const guardDigest = createHash("sha256").update(await readFile(GRAPH_GUARD_PATH)).digest("hex");
-	const guarded: MaterializedAgent = {
-		...discovered,
-		// Empty is deliberate: it makes pi-subagents disable ambient Extensions.
-		extensions: Array.isArray(discovered.extensions) ? [...discovered.extensions] : [],
-		subagentOnlyExtensions: [...new Set([...(discovered.subagentOnlyExtensions ?? []), GRAPH_GUARD_PATH])],
-	};
+	const frozenExtensions = await freezeConfiguredAgentExtensions(discovered, sourceCwd, node.taskId);
+	const guarded = frozenExtensions.guarded;
 	const serialized = internals.serializeAgent(guarded);
 	const snapshot: FrozenAgentSnapshot = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		taskId: node.taskId,
 		agent: node.agent,
+		runnerType: "pi",
 		...(typeof discovered.source === "string" ? { source: discovered.source } : {}),
 		definitionDigest: internals.agentDefinitionDigest(discovered),
 		serializedDigest: createHash("sha256").update(serialized).digest("hex"),
 		guardDigest,
+		configuredExtensions: frozenExtensions.evidence,
 		serialized,
 		...(!resolved ? { synthetic: true as const } : {}),
 	};
+	assertFrozenAgentMatchesBinding(snapshot, node);
 	try {
 		const { createDurableJson } = await import("./durable.ts");
 		const path = frozenAgentPath(runDir, node.taskId);
@@ -333,12 +445,18 @@ async function resolveFrozenAgent(
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		const raced = await readFrozenAgent(runDir, node.taskId, node.agent);
 		if (!raced) throw new Error(`Frozen Agent profile race for '${node.taskId}' could not be resolved.`);
+		assertFrozenAgentMatchesBinding(raced, node);
+		await verifyFrozenAgentExtensions(raced, node.taskId);
 		return { snapshot: raced };
 	}
 }
 
 async function materializeFrozenAgent(runDir: string, sourceCwd: string, workspaceCwd: string, node: CompiledGraphNodeV3): Promise<void> {
 	const { snapshot } = await resolveFrozenAgent(runDir, sourceCwd, node, true);
+	// Also cover the first materialization that created the snapshot in this call;
+	// the existing-snapshot branch in resolveFrozenAgent already performs this
+	// check, but a newly frozen extension can drift before dispatch as well.
+	await verifyFrozenAgentExtensions(snapshot, node.taskId);
 	const currentGuardDigest = createHash("sha256").update(await readFile(GRAPH_GUARD_PATH)).digest("hex");
 	if (snapshot.guardDigest !== currentGuardDigest) throw new Error(`Graph Guard changed after Agent '${node.agent}' was frozen; refusing to dispatch.`);
 	const directory = join(workspaceCwd, ".pi", "agents");
@@ -491,9 +609,73 @@ export async function removeV3UncommittedAgentProfiles(
 	return removed;
 }
 
+/** Trusted host input only: declared files must exist inside source and readable scopes. */
+async function validateRequiredMaterials(sourceCwd: string, node: Pick<CompiledGraphNodeV3, "taskId" | "readScope" | "writeScope" | "requiredMaterials">, future: ReadonlySet<string> = new Set()): Promise<void> {
+ if (!node.requiredMaterials?.length) return;
+ const root = await realpath(sourceCwd);
+ const scopes = [...node.readScope, ...node.writeScope].map(scope => resolveScope(scope, root));
+ for (const material of node.requiredMaterials ?? []) {
+  const target = resolve(root, material);
+  const fail = (reason: string): never => graphV3Error("INVALID_SCOPE", `Node '${node.taskId}' required material '${material}': ${reason}.`, {taskId: node.taskId, field: "requiredMaterials"});
+  if (isAbsolute(material) || material.split(/[\\/]/u).includes("..") || !within(root, target)) fail("invalid source-relative path");
+  if (!scopes.some(scope => scope.kind === "file" ? scope.path === target : within(scope.path, target))) fail("outside declared readable scope");
+  // Inspect every existing component, including a dangling symlink above a
+  // future file. Missing descendants never excuse an unsafe existing ancestor.
+  let cursor = root;
+  for (const component of relative(root, target).split(sep)) {
+   cursor = join(cursor, component);
+   const info = await lstat(cursor).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+   });
+   if (!info) break;
+   if (info.isSymbolicLink()) fail("symbolic-link path");
+   if (cursor !== target && !info.isDirectory()) fail("non-directory ancestor");
+  }
+  const existing = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+   if (error.code === "ENOENT") return undefined;
+   throw error;
+  });
+  if (!existing && future.has(material)) continue;
+  try { await rejectSymlinks(target); } catch { fail("missing or symbolic-link path"); }
+  let canonical: string;
+  try { canonical = await realpath(target); } catch { fail("file does not exist"); }
+  if (canonical! !== target || !within(root, canonical!)) fail("path escapes source");
+  if (!(await lstat(target)).isFile()) fail("must be a regular file");
+ }
+}
+
+/** At dispatch every input must exist, even if its producer was admitted earlier. */
+export async function validateV3RequiredMaterials(sourceCwd: string, node: Pick<CompiledGraphNodeV3, "taskId" | "readScope" | "writeScope" | "requiredMaterials">): Promise<void> {
+ await validateRequiredMaterials(sourceCwd, node);
+}
+
+/** Only a transitive dependency with a declared write scope can supply a future input. */
+export async function validateV3InitialRequiredMaterials(sourceCwd: string, graph: CompiledGraphV3): Promise<void> {
+ const byId = new Map(graph.nodes.map(node => [node.taskId, node]));
+ const covers = (scope: ScopeEntryV3, material: string) => {
+  const target = resolve(sourceCwd, material), allowed = resolveScope(scope, resolve(sourceCwd));
+  return allowed.kind === "file" ? allowed.path === target : within(allowed.path, target);
+ };
+ for (const node of graph.nodes) {
+  const ancestors = new Set<string>();
+  const visit = (id: string) => {
+   if (id === node.taskId || ancestors.has(id)) return;
+   ancestors.add(id);
+   for (const dependency of byId.get(id)?.dependsOn ?? []) visit(dependency);
+  };
+  for (const dependency of node.dependsOn) visit(dependency);
+  const future = new Set((node.requiredMaterials ?? []).filter(material =>
+   node.readScope.some(scope => covers(scope, material)) &&
+   [...ancestors].some(id => byId.get(id)?.writeScope.some(scope => covers(scope, material)))));
+  await validateRequiredMaterials(sourceCwd, node, future);
+ }
+}
+
 export async function prepareV3Workspace(input: V3WorkspaceInput): Promise<V3PreparedWorkspace> {
 	const attemptDir = v3NodeAttemptDir(input.runDir, input.node.taskId, input.attempt);
 	const sourceCwd = await realpath(input.sourceCwd);
+	await validateV3RequiredMaterials(sourceCwd, input.node);
 	const workspaceRoot = join(input.runDir, "shadow", `${input.node.taskId}-${input.attempt}`);
 	const workspaceCwd = join(workspaceRoot, "workspace");
 	await mkdir(workspaceCwd, { recursive: true });
@@ -526,8 +708,14 @@ export async function prepareV3Workspace(input: V3WorkspaceInput): Promise<V3Pre
 			throw new V3WorkspaceConflictError(`Graph input artifact must be a single regular file: ${artifact.name}`);
 		}
 		const target = join(workspaceCwd, ".pi-graph", "inputs", artifact.name);
+        const sourceDigest = createHash("sha256").update(await safeBytes(dirname(artifact.source), basename(artifact.source))).digest("hex");
+        const expected = artifact.expectedDigest ?? sourceDigest;
+        if (sourceDigest !== expected) throw new V3WorkspaceConflictError(`Input artifact does not match accepted digest: ${artifact.name}`);
 		await copyIfPresent(artifact.source, target);
-		inputBaseline[artifact.name] = { sourcePath: artifact.source, digest: (await digestFile(artifact.source)) ?? null };
+        const targetDigest = createHash("sha256").update(await safeBytes(dirname(target), basename(target))).digest("hex");
+        const sourceAfter = createHash("sha256").update(await safeBytes(dirname(artifact.source), basename(artifact.source))).digest("hex");
+        if (targetDigest !== expected || sourceAfter !== expected) throw new V3WorkspaceConflictError(`Input artifact changed during copy: ${artifact.name}`);
+		inputBaseline[artifact.name] = { sourcePath: artifact.source, digest: targetDigest };
 	}
 	await materializeFrozenAgent(input.runDir, sourceCwd, workspaceCwd, input.node);
 	const protectedSource = protectedSourceRoots(sourceCwd, input.protectedSourceRoots ?? []);
@@ -551,9 +739,13 @@ export async function prepareV3Workspace(input: V3WorkspaceInput): Promise<V3Pre
 		],
 		writeScope: mapScopes(input.node.writeScope, sourceCwd, workspaceCwd),
 		sideEffect: input.node.sideEffect,
-		allowBash: false,
+		allowBash: input.node.permissionPolicy === "inherited" && !input.node.readOnly,
+		...(input.node.contextPolicy === undefined ? {} : { contextPolicy: input.node.contextPolicy, contextTools: await frozenContextTools(input.runDir,input.node,workspaceCwd) }),
+		...(input.node.permissionPolicy === undefined ? {} : { permissionPolicy: input.node.permissionPolicy }),
+		...(input.node.parentToolAllowlist === undefined ? {} : { parentToolAllowlist: [...input.node.parentToolAllowlist] }),
 		readOnly: input.node.readOnly === true,
 		toolFilter: [...(input.node.toolFilter ?? [])],
+		...(input.node.launch?.maxTokens === undefined ? {} : { maxTokens: input.node.launch.maxTokens }),
 		writeBaseline,
 		readBaseline,
 		protectedSourceRoots: protectedSource,
@@ -621,18 +813,27 @@ export async function reopenV3Workspace(input: {
 		|| contract.workspaceCwd !== evidence.workspaceDir
 		|| canonicalJson(contract.readScope) !== canonicalJson([
 			...mapScopes(input.node.readScope, evidence.sourceCwd, evidence.workspaceDir),
-			...input.node.inputArtifacts.map((name) => ({ kind: "file" as const, path: join(evidence.workspaceDir, ".pi-graph", "inputs", name) })),
+			...Object.keys(evidence.inputBaseline).map((name) => ({ kind: "file" as const, path: join(evidence.workspaceDir, ".pi-graph", "inputs", name) })),
 		])
 		|| canonicalJson(contract.writeScope) !== canonicalJson(mapScopes(input.node.writeScope, evidence.sourceCwd, evidence.workspaceDir))
 		|| contract.sideEffect !== input.node.sideEffect
 		|| contract.readOnly !== (input.node.readOnly === true)
 		|| canonicalJson(contract.toolFilter) !== canonicalJson(input.node.toolFilter ?? [])
-		|| contract.allowBash !== false
+		|| contract.maxTokens !== input.node.launch?.maxTokens
+		|| contract.allowBash !== (input.node.permissionPolicy === "inherited" && !input.node.readOnly)
+		|| (input.node.contextPolicy !== undefined && canonicalJson(contract.contextTools) !== canonicalJson(await frozenContextTools(input.runDir,input.node,evidence.workspaceDir)))
+		|| contract.contextPolicy !== input.node.contextPolicy
+		|| contract.permissionPolicy !== input.node.permissionPolicy
+		|| canonicalJson(contract.parentToolAllowlist ?? null) !== canonicalJson(input.node.parentToolAllowlist ?? null)
 		|| canonicalJson(contract.inputBaseline) !== canonicalJson(evidence.inputBaseline)
 		|| canonicalJson(contract.writeBaseline) !== canonicalJson(evidence.writeBaseline)
 		|| canonicalJson(contract.readBaseline) !== canonicalJson(evidence.readBaseline)) {
 		graphV3Error("INVALID_ATTEMPT", "V3 workspace contract no longer matches its immutable evidence.", { taskId: input.node.taskId });
 	}
+    for (const [name, baseline] of Object.entries(evidence.inputBaseline)) {
+        const bytes = await safeBytes(evidence.workspaceDir, `.pi-graph/inputs/${name}`);
+        if (createHash("sha256").update(bytes).digest("hex") !== baseline.digest) throw new V3WorkspaceConflictError(`Input artifact changed before recovery: ${name}`);
+    }
 	await verifyMaterializedAgent(input.runDir, evidence.workspaceDir, input.node);
 	return {
 		workspaceCwd: evidence.workspaceDir,
@@ -654,6 +855,7 @@ async function readV3NodeContract(workspaceCwd: string): Promise<V3NodeContract>
 		|| typeof contract.workspaceCwd !== "string" || !contract.workspaceCwd
 		|| typeof contract.allowBash !== "boolean" || typeof contract.readOnly !== "boolean"
 		|| !Array.isArray(contract.toolFilter) || contract.toolFilter.some((name) => typeof name !== "string" || !name)
+		|| (contract.maxTokens !== undefined && (!Number.isSafeInteger(contract.maxTokens) || contract.maxTokens < 16))
 		|| "resourceScopes" in contract) throw new Error("V3 node contract is malformed.");
 	return contract;
 }
@@ -661,6 +863,8 @@ async function readV3NodeContract(workspaceCwd: string): Promise<V3NodeContract>
 async function verifyMaterializedAgent(runDir: string, workspaceCwd: string, node: CompiledGraphNodeV3): Promise<void> {
 	const snapshot = await readFrozenAgent(runDir, node.taskId, node.agent);
 	if (!snapshot) throw new Error(`Frozen Agent profile disappeared for '${node.taskId}'.`);
+	assertFrozenAgentMatchesBinding(snapshot, node);
+	await verifyFrozenAgentExtensions(snapshot, node.taskId);
 	const agentPath = join(workspaceCwd, ".pi", "agents", `${node.agent.replace(/[^A-Za-z0-9._-]/gu, "_")}.md`);
 	const [agentInfo, guardBytes, agentBytes] = await Promise.all([
 		lstat(agentPath),

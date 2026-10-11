@@ -6,6 +6,7 @@ import test from "node:test";
 import { GraphV3Error } from "../src/v3/errors.ts";
 import {
 	applyV3GraphCapsuleInputs,
+	bindV3GraphCapsule,
 	compileV3GraphCapsule,
 	loadAndCompileV3GraphCapsule,
 	loadV3GraphCapsule,
@@ -143,6 +144,38 @@ test("V3 graph capsule always ends in compileGraphSpecV3 and fails closed on gov
 		() => compileV3GraphCapsule(unknown, { target: "src" }),
 		(error: unknown) => error instanceof GraphV3Error && error.code === "INVALID_FIELD",
 	);
+});
+
+test("capability-authored capsule resolves placeholders before async Binding/Admission", async () => {
+	const value = capsule();
+	const source = (value.source as Record<string, unknown>).spec as Record<string, unknown>;
+	source.contractPolicy = "strict";
+	const node = (source.nodes as Array<Record<string, unknown>>)[0]!;
+	delete node.agent;
+	node.capabilityId = "review.code";
+	const bound = await bindV3GraphCapsule(value, { target: "src/v3", attempts: 3 }, {
+		catalog: { schemaVersion: 1, capabilities: [{ capabilityId: "review.code", agent: "code-reviewer" }] },
+		preflightAgent: async (input) => ({
+			ok: true,
+			name: input.agent,
+			agentDefinitionDigest: "c".repeat(64),
+			launchContractDigest: "d".repeat(64),
+			modelCandidates: input.model ? [input.model] : [],
+			extensions: {
+				runtimeExtensions: [],
+				configuredExtensions: [],
+				extensionArgs: [],
+				disableAmbientExtensions: true,
+			},
+		}),
+	});
+	assert.equal(bound.spec.bindingPolicy, "strict");
+	assert.equal(bound.spec.nodes[0]?.agent, "code-reviewer");
+	assert.equal(bound.spec.nodes[0]?.binding?.resolution, "capability-catalog");
+	assert.equal(Object.hasOwn(bound.spec.nodes[0]!, "capabilityId"), false);
+	assert.equal(bound.compiled.maxConcurrency, 3);
+	assert.equal(bound.spec.readOnly, true);
+	assert.deepEqual(bound.spec.toolFilter, ["read", "grep"]);
 });
 
 test("V3 graph capsule rejects readOnly requirements that contradict local writes", () => {

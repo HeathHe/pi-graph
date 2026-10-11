@@ -1,0 +1,9 @@
+import { Type } from "typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { mailboxRequest, type MailboxBinding } from "./mailbox-transport.ts";
+export function registerGraphMailboxTool(pi:ExtensionAPI,binding:MailboxBinding):void {
+ pi.registerTool({name:"graph_mailbox",label:"Graph mailbox",description:"Durable messages to admitted Graph tasks. receive/read do not acknowledge business completion; ack explicitly. Use stable idempotencyKey when retrying send/reply. No task spawning or permission changes.",parameters:Type.Object({action:Type.Union(["send","receive","read","reply","ack","wait","status"].map(x=>Type.Literal(x))),to:Type.Optional(Type.String()),kind:Type.Optional(Type.String()),text:Type.Optional(Type.String()),idempotencyKey:Type.Optional(Type.String()),messageId:Type.Optional(Type.String()),offset:Type.Optional(Type.Integer({minimum:0}))}),async execute(_id,params,signal){let value=await mailboxRequest(binding,params,signal);
+ if(params.action==="wait") {while((value as {pending?:boolean}).pending){await new Promise<void>((resolve,reject)=>{if(signal?.aborted){reject(new Error("Mailbox wait cancelled"));return;}const timer=setTimeout(()=>{signal?.removeEventListener("abort",abort);resolve();},500);const abort=()=>{clearTimeout(timer);reject(new Error("Mailbox wait cancelled"));};signal?.addEventListener("abort",abort,{once:true});});value=await mailboxRequest(binding,{...params,offset:(value as {nextCursor:number}).nextCursor},signal);}}
+ if(params.action==="receive"||params.action==="wait")for(const m of (value as {messages:Array<{messageId:string;state:string}>}).messages){const receipt=await mailboxRequest(binding,{action:"delivered",messageId:m.messageId},signal) as {state:string};m.state=receipt.state;}
+return {content:[{type:"text",text:JSON.stringify(value)}],details:{protocol:"graph-mailbox-v1"}};}});
+}

@@ -32,6 +32,8 @@ export interface V3NodeRuntimeState {
 	attempt: number;
 	terminalStatus?: string;
 	updatedAt: string;
+	observation?: V3NodeProjection["observation"];
+ modelFallback?: V3NodeProjection["modelFallback"];
 }
 
 export async function buildV3SnapshotProjection(input: V3ProjectionInput): Promise<GraphSnapshotV3> {
@@ -78,10 +80,26 @@ export async function buildV3SnapshotProjection(input: V3ProjectionInput): Promi
 				continue;
 			}
 		}
+        const index = latest.evidence.routeSelection?.candidateIndex ?? 0;
+        const plan = node.launch?.runtimeFallback;
+        const previous = index > 0 ? await import("./attempt.ts").then(m => m.readV3AttemptEvidence(input.runDir, node.taskId, latest.evidence.attempt - 1)) : undefined;
+        const modelFallback = plan && index > 0 && previous?.fallbackContinuation ? {
+            from: plan.candidates[index - 1]!.resolvedModel,
+            to: plan.candidates[index]!.resolvedModel,
+            reason: previous.fallbackContinuation.failureKind,
+        } : undefined;
 		nodeStates.set(node.taskId, {
 			phase: latest.evidence.phase,
+            ...(modelFallback ? {modelFallback} : {}),
 			attempt: latest.evidence.attempt,
 			...(latest.evidence.terminalStatus ? { terminalStatus: latest.evidence.terminalStatus } : {}),
+			...(latest.evidence.child?.observation
+				? { observation: latest.evidence.child.observation }
+				: latest.evidence.observation
+					? { observation: latest.evidence.observation }
+					: latest.evidence.dispatch?.observation
+						? { observation: latest.evidence.dispatch.observation }
+						: {}),
 			updatedAt: latest.evidence.updatedAt,
 		});
 	}
@@ -104,7 +122,15 @@ export async function buildV3SnapshotProjection(input: V3ProjectionInput): Promi
 	const nodes: Record<string, V3NodeProjection> = {};
 	for (const node of input.graph.nodes) {
 		const state = nodeStates.get(node.taskId)!;
-		nodes[node.taskId] = { phase: state.phase as V3NodeProjection["phase"], attempt: state.attempt, ...(state.terminalStatus ? { terminalStatus: state.terminalStatus as V3NodeProjection["terminalStatus"] } : {}) };
+		nodes[node.taskId] = {
+			phase: state.phase as V3NodeProjection["phase"],
+			attempt: state.attempt,
+			...(state.terminalStatus ? { terminalStatus: state.terminalStatus as V3NodeProjection["terminalStatus"] } : {}),
+			agent: node.binding?.resolvedAgent ?? node.agent,
+			dependsOn: [...node.dependsOn],
+			...(state.observation ? { observation: state.observation } : {}),
+            ...(state.modelFallback ? {modelFallback:state.modelFallback} : {}),
+		};
 	}
 	let updatedAt = input.topologyUpdatedAt ?? input.authorization.createdAt;
 	for (const state of nodeStates.values()) {
@@ -142,13 +168,23 @@ function deriveGraphStatus(nodeStates: Map<string, V3NodeRuntimeState>, stopRequ
 		if (!["accepted", "failed", "aborted", "needs_attention", "skipped", "blocked", "cancelled"].includes(state.phase)) allTerminal = false;
 	}
 	if (anyAttention) return "needs_attention";
-	if (stopRequested) return anyRunning ? "stopping" : "stopped";
-	if (!sealed && allTerminal) return "idle";
+	// Durable control intent and observed evidence are deliberately ordered:
+	//
+	// | topology | evidence       | stop requested | projection          |
+	// | OPEN     | all terminal   | yes/no         | stopped / idle       |
+	// | SEALED   | all terminal   | yes/no         | evidence-derived end |
+	// | either   | non-terminal   | yes            | stopping / stopped   |
+	//
+	// Once a SEALED graph has complete terminal evidence, a later/stale stop
+	// intent cannot rewrite accepted work to stopped. An actual aborted Attempt
+	// remains stopped below, so this does not erase real stop evidence.
 	if (allTerminal) {
+		if (!sealed) return stopRequested ? "stopped" : "idle";
 		if (anyFailed) return "failed";
 		if ([...nodeStates.values()].some((state) => state.phase === "aborted")) return "stopped";
 		return "complete";
 	}
+	if (stopRequested) return anyRunning ? "stopping" : "stopped";
 	if (anyRunning) return "running";
 	return "queued";
 }

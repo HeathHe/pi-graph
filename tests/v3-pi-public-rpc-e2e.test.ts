@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { validateGraphSnapshotV3 } from "../src/v3/snapshot.ts";
 import { readLatestV3Attempt } from "../src/v3/attempt.ts";
+import { piCliPath } from "./helpers/pi-cli.ts";
 
 interface RpcMessage extends Record<string, unknown> {
 	type?: string;
@@ -161,36 +164,124 @@ async function waitForSnapshot(path: string, predicate: (value: ReturnType<typeo
 	throw new Error(`Timed out waiting for snapshot predicate; last status=${latest?.status ?? "missing"}.`);
 }
 
-test("real Pi public RPC starts and observes a V3 graph through real pi-subagents", { timeout: 90_000 }, async () => {
+test("real Pi public RPC rejects extension Providers, blocks child-only overrides, and runs models.json Providers", { timeout: 120_000 }, async () => {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-graph-v3-real-rpc-")));
 	const agentDir = join(root, "agent-home");
 	const runsDir = join(root, "runs");
 	const agentsDir = join(root, ".pi", "agents");
 	const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 	const fauxExtension = join(repoRoot, "tests", "helpers", "v3-faux-provider.ts");
+	const childProviderOverride = join(repoRoot, "tests", "helpers", "v3-child-provider-override.ts");
+	let modelRequests = 0;
+	let overrideProbeRequests = 0;
+	const server = createServer((request, response) => {
+		const chunks: Buffer[] = [];
+		request.on("data", (chunk: Buffer) => chunks.push(chunk));
+		request.on("end", async () => {
+			if (request.url === "/probe") {
+				overrideProbeRequests += 1;
+				response.writeHead(204).end();
+				return;
+			}
+			modelRequests += 1;
+			await new Promise((done) => setTimeout(done, 300));
+			assert.equal(request.url, "/v1/chat/completions");
+			assert.match(Buffer.concat(chunks).toString("utf8"), /PI_GRAPH_CHILD_REAL_RPC/u);
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.write(`data: ${JSON.stringify({
+				id: "chatcmpl-pi-graph-e2e",
+				object: "chat.completion.chunk",
+				created: 1,
+				model: "local-1",
+				choices: [{ index: 0, delta: { role: "assistant", content: "Local child completed" }, finish_reason: null }],
+			})}\n\n`);
+			response.write(`data: ${JSON.stringify({
+				id: "chatcmpl-pi-graph-e2e",
+				object: "chat.completion.chunk",
+				created: 1,
+				model: "local-1",
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+			})}\n\n`);
+			response.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolvePromise, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => resolvePromise());
+	});
+	const address = server.address() as AddressInfo;
+	const localBaseUrl = `http://127.0.0.1:${address.port}/v1`;
+	const overrideProbeUrl = `http://127.0.0.1:${address.port}/probe`;
 	await mkdir(agentDir, { recursive: true });
 	await mkdir(runsDir, { recursive: true });
 	await mkdir(agentsDir, { recursive: true });
 	await writeFile(join(agentDir, "settings.json"), JSON.stringify({
 		graph: { enabled: true, runsDir },
-		subagents: { disableBuiltins: true },
+		subagents: { disableBuiltins: true, timeoutMs: 120000 },
+	}, null, 2));
+	await writeFile(join(agentDir, "models.json"), JSON.stringify({
+		providers: {
+			"pi-graph-local": {
+				baseUrl: localBaseUrl,
+				api: "openai-completions",
+				apiKey: "pi-graph-e2e",
+				models: [{
+					id: "local-1",
+					name: "pi-graph local E2E model",
+					reasoning: false,
+					input: ["text"],
+					contextWindow: 128_000,
+					maxTokens: 16_384,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				}],
+			},
+		},
 	}, null, 2));
 	await writeFile(join(agentsDir, "worker.md"), [
 		"---",
 		"name: worker",
 		"description: Deterministic real-Pi E2E worker",
-		"model: pi-graph-faux/faux-1",
+		"timeoutMs: 120000",
+		"model: pi-graph-local/local-1",
 		"thinking: off",
 		"tools: read",
-		`extensions: ${fauxExtension}`,
 		"inheritProjectContext: false",
 		"inheritSkills: false",
 		"---",
 		"Execute the exact graph task and return a concise result.",
 		"",
 	].join("\n"));
+	await writeFile(join(agentsDir, "known-extension-worker.md"), [
+		"---",
+		"name: known-extension-worker",
+		"description: Parent-visible extension Provider negative case",
+		"model: pi-graph-faux/faux-1",
+		"thinking: off",
+		"tools: read",
+		"inheritProjectContext: false",
+		"inheritSkills: false",
+		"---",
+		"This Agent selects an extension-registered Provider visible to admission.",
+		"",
+	].join("\n"));
+	await writeFile(join(agentsDir, "child-override-worker.md"), [
+		"---",
+		"name: child-override-worker",
+		"description: Child-only streamSimple Provider override negative case",
+		"model: pi-graph-local/local-1",
+		"thinking: off",
+		"tools: read",
+		`extensions: ${childProviderOverride}`,
+		"inheritProjectContext: false",
+		"inheritSkills: false",
+		"---",
+		"This Agent overrides its models.json Provider only inside the child.",
+		"",
+	].join("\n"));
 
-	const child = spawn(join(repoRoot, "node_modules", ".bin", "pi"), [
+	const child = spawn(process.execPath, [
+		piCliPath,
 		"--mode", "rpc",
 		"--offline",
 		"--no-session",
@@ -200,16 +291,67 @@ test("real Pi public RPC starts and observes a V3 graph through real pi-subagent
 		"--provider", "pi-graph-faux",
 		"--model", "faux-1",
 		"--extension", fauxExtension,
-		"--extension", join(repoRoot, "node_modules", "pi-subagents", "index.ts"),
 		"--extension", join(repoRoot, "extensions", "pi-graph.ts"),
 	], {
 		cwd: root,
-		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: agentDir,
+			PI_GRAPH_CHILD_PROVIDER_PROBE_URL: overrideProbeUrl,
+			PI_OFFLINE: "1",
+			HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", http_proxy: "", https_proxy: "", all_proxy: "", NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost",
+		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	const pi = new PiRpcHarness(child);
 	let runDir: string | undefined;
 	try {
+		const rejected = await pi.graph({
+			action: "start",
+			spec: {
+				schemaVersion: 3,
+				goal: "reject a parent-visible extension Provider",
+				nodes: [{ taskId: "work", agent: "known-extension-worker", task: "MUST_NOT_DISPATCH", sideEffect: "none" }],
+			},
+		}, "known-extension-reject");
+		assert.equal(rejected.isError, true, JSON.stringify(rejected));
+		assert.match(rejected.content?.map((entry) => entry.text).join("\n") ?? "", /cannot admit extension Providers/u);
+		assert.deepEqual(await readdir(runsDir), [], "rejected admission must not publish a run or child dispatch");
+
+		const guarded = await pi.graph({
+			action: "start",
+			spec: {
+				schemaVersion: 3,
+				goal: "block a child-only Provider override before streamSimple",
+				nodes: [{ taskId: "work", agent: "child-override-worker", task: "MUST_NOT_REACH_ANY_PROVIDER", sideEffect: "none" }],
+			},
+		}, "child-override");
+		assert.equal(guarded.isError, undefined, guarded.content?.map((entry) => entry.text).join("\n"));
+		const guardedGraphId = guarded.details?.graphId;
+		assert.equal(typeof guardedGraphId, "string", JSON.stringify(guarded));
+		const guardedRunDir = join(runsDir, guardedGraphId as string);
+        runDir = guardedRunDir;
+		const blocked = await waitForSnapshot(join(guardedRunDir, "snapshot.json"), (snapshot) => snapshot.status === "needs_attention");
+		assert.equal(blocked.status, "needs_attention", "handled input without assistant evidence remains conservative; no automatic replay");
+		const guardedAttempt = (await readLatestV3Attempt(guardedRunDir, "work"))?.evidence;
+		assert.equal(guardedAttempt?.phase, "needs_attention");
+		assert.match(guardedAttempt?.failure?.message ?? "", /Child input was handled without an assistant result/u);
+        assert.match(guardedAttempt?.failure?.message ?? "", /Automatic recovery is unsafe or exhausted/u);
+        const guardedObservation = blocked.nodes?.work.observation;
+        assert.equal(guardedObservation?.progress?.toolCount, 0);
+        assert.equal(guardedObservation?.progress?.turnCount, 0);
+        assert.equal(guardedObservation?.supervision?.processExitConfirmed, true);
+        const guardedAsyncDir=guardedAttempt?.dispatch?.asyncDir;assert.equal(typeof guardedAsyncDir,"string");
+        const terminalProof=JSON.parse(await readFile(join(guardedAsyncDir!,"process-terminal.json"),"utf8"));
+        assert.equal(terminalProof.runtimeKind,"pi-graph-sdk/1");
+        assert.equal(terminalProof.runId,guardedObservation?.asyncId);
+        assert.equal(terminalProof.runnerProcessInstanceId,guardedObservation?.supervision?.runnerInstanceId);
+        assert.equal(terminalProof.instances[0].processInstanceId,terminalProof.runnerProcessInstanceId);
+        assert.equal(typeof terminalProof.instances[0].closeObservedAt,"number");
+        assert.deepEqual(await readdir(join(guardedRunDir,"nodes/work/attempts")),["1"],"guarded task must not retry");
+		assert.equal(overrideProbeRequests, 0, "child custom streamSimple must never start");
+		assert.equal(modelRequests, 0, "the overridden models.json transport must never start");
+
 		const started = await pi.graph({
 			action: "start",
 			spec: {
@@ -229,7 +371,16 @@ test("real Pi public RPC starts and observes a V3 graph through real pi-subagent
 		const childStatus = attempt?.dispatch?.asyncDir
 			? await readFile(join(attempt.dispatch.asyncDir, "status.json"), "utf8").catch(() => "missing")
 			: "no dispatch";
-		assert.match(attempt?.child?.output ?? "", /Faux child completed/, `${JSON.stringify(attempt)}\n${childStatus}`);
+		assert.match(attempt?.child?.output ?? "", /Local child completed/, `${JSON.stringify(attempt)}\n${childStatus}`);
+		assert.equal(JSON.parse(childStatus).runtimeKind, "pi-graph-sdk/1");
+		assert.equal(JSON.parse(childStatus).noTimeout, true);
+		assert.equal(JSON.parse(childStatus).timeoutMs, undefined);
+		assert.equal(JSON.parse(childStatus).deadlineAt, undefined);
+		const receipt = JSON.parse(await readFile(join(runDir, "nodes/work/attempts/1/child-result.json"), "utf8"));
+		assert.equal(receipt.version, 1);
+		assert.match(receipt.completion.results[0].finalOutput, /Local child completed/);
+		assert.equal(overrideProbeRequests, 0);
+		assert.equal(modelRequests, 1, "the standard models.json Provider should receive exactly one child request");
 
 		const status = await pi.graph({ action: "status", id: graphId }, "status");
 		assert.equal(status.isError, undefined, status.content?.map((entry) => entry.text).join("\n"));
@@ -239,6 +390,8 @@ test("real Pi public RPC starts and observes a V3 graph through real pi-subagent
 		throw new Error(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n\n${await rpcFailureDiagnostics(runDir, pi)}`, { cause: error });
 	} finally {
 		await pi.close();
+		server.closeAllConnections();
+		await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
 		await rm(root, { recursive: true, force: true });
 	}
 });

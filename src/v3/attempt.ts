@@ -1,9 +1,11 @@
+import { verifyEvidenceFiles } from "./evidence-files.ts";
 import { constants } from "node:fs";
 import { lstat, open, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { atomicWriteJson } from "./durable.ts";
 import { canonicalDigest, canonicalJson } from "./digests.ts";
 import { graphV3Error } from "./errors.ts";
+import { validateV3ChildObservation } from "./observability.ts";
 import type {
 	V3AcceptanceEvidence,
 	V3AttemptEvidence,
@@ -67,11 +69,11 @@ export function v3NodeEvidencePaths(runDir: string, taskId: string, attempt: num
 
 const ATTEMPT_FIELDS = new Set([
 	"schemaVersion", "runInstanceId", "graphId", "taskId", "attempt", "attemptNonce", "phase", "createdAt", "updatedAt", "supervisorEpoch",
-	"deadlineAt", "dispatchIntent", "dispatch", "child", "verification", "applied", "failure", "terminalStatus", "workspaceDigest", "acceptanceDigest",
+	"routeSelection", "fallbackContinuation", "deadlineAt", "dispatchIntent", "dispatch", "observation", "child", "verification", "applied", "failure", "terminalStatus", "workspaceDigest", "acceptanceDigest", "evidenceManifestDigest",
 ]);
 const PHASES = new Set<V3NodePhase>(["queued", "prepared", "dispatched", "running", "verifying", "applying", "accepted", "failed", "aborted", "needs_attention"]);
 const TERMINALS = new Set<V3NodeTerminal>(["accepted", "failed", "aborted", "needs_attention"]);
-const FAILURE_KINDS = new Set<V3FailureKind>(["task_failed", "validation", "timeout", "workspace_conflict", "dispatch_unknown", "child_paused", "child_stopped", "internal"]);
+const FAILURE_KINDS = new Set<V3FailureKind>(["task_failed", "validation", "timeout", "workspace_conflict", "usage_budget", "dispatch_unknown", "child_paused", "child_stopped", "internal"]);
 const CHILD_TERMINALS = new Set(["complete", "failed", "stopped", "paused"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -95,7 +97,20 @@ function validateChildOutcome(value: unknown): V3ChildOutcome | undefined {
 	if (!isRecord(value)) graphV3Error("INVALID_ATTEMPT", "V3 attempt child outcome must be an object.", { field: "child" });
 	if (typeof value.terminal !== "string" || !CHILD_TERMINALS.has(value.terminal)) graphV3Error("INVALID_ATTEMPT", "V3 attempt child terminal is invalid.", { field: "child" });
 	if (typeof value.output !== "string") graphV3Error("INVALID_ATTEMPT", "V3 attempt child output must be a string.", { field: "child" });
-	return { terminal: value.terminal as V3ChildOutcome["terminal"], output: value.output, completedAt: requireIso(value, "completedAt") };
+	if(value.fullOutputDigest!==undefined && (typeof value.fullOutputDigest!=="string"||!/^[a-f0-9]{64}$/.test(value.fullOutputDigest)))graphV3Error("INVALID_ATTEMPT","Invalid full output digest");
+ let observation: V3ChildOutcome["observation"];
+	try {
+		observation = value.observation === undefined ? undefined : validateV3ChildObservation(value.observation);
+	} catch (error) {
+		graphV3Error("INVALID_ATTEMPT", `V3 attempt child observation is invalid: ${error instanceof Error ? error.message : String(error)}`, { field: "child" });
+	}
+	return {
+		terminal: value.terminal as V3ChildOutcome["terminal"],
+		output: value.output,
+        ...(value.fullOutputDigest===undefined?{}:{fullOutputDigest:value.fullOutputDigest as string}),
+		completedAt: requireIso(value, "completedAt"),
+		...(observation ? { observation } : {}),
+	};
 }
 
 export function validateV3Attempt(value: unknown): V3AttemptEvidence {
@@ -142,15 +157,31 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 		if (!isRecord(value.dispatch)) graphV3Error("INVALID_ATTEMPT", "V3 attempt dispatch must be an object.", { field: "dispatch" });
 		if (typeof value.dispatch.asyncId !== "string" || typeof value.dispatch.asyncDir !== "string") graphV3Error("INVALID_ATTEMPT", "V3 attempt dispatch requires asyncId and asyncDir.", { field: "dispatch" });
 		if (typeof value.dispatch.requestDigest !== "string" || !/^[a-f0-9]{64}$/u.test(value.dispatch.requestDigest)) graphV3Error("INVALID_ATTEMPT", "V3 attempt dispatch requestDigest must be a SHA-256 digest.", { field: "dispatch" });
+		let observation;
+		try {
+			observation = value.dispatch.observation === undefined ? undefined : validateV3ChildObservation(value.dispatch.observation);
+		} catch (error) {
+			graphV3Error("INVALID_ATTEMPT", `V3 dispatch observation is invalid: ${error instanceof Error ? error.message : String(error)}`, { field: "dispatch" });
+		}
+		if (observation && observation.asyncId !== value.dispatch.asyncId) graphV3Error("INVALID_ATTEMPT", "V3 dispatch observation identity does not match asyncId.", { field: "dispatch" });
 		dispatch = {
 			asyncId: value.dispatch.asyncId,
 			asyncDir: value.dispatch.asyncDir,
 			requestDigest: value.dispatch.requestDigest,
 			dispatchedAt: requireIso(value.dispatch, "dispatchedAt"),
+			...(observation ? { observation } : {}),
 		};
 	}
 	if (dispatch && dispatchIntent && dispatch.requestDigest !== dispatchIntent.requestDigest) graphV3Error("INVALID_ATTEMPT", "V3 dispatch binding does not match its durable request intent.", { field: "dispatch" });
+	let observation: V3AttemptEvidence["observation"];
+	try {
+		observation = value.observation === undefined ? undefined : validateV3ChildObservation(value.observation);
+	} catch (error) {
+		graphV3Error("INVALID_ATTEMPT", `V3 attempt observation is invalid: ${error instanceof Error ? error.message : String(error)}`, { field: "observation" });
+	}
+	if (observation && dispatch && observation.asyncId !== dispatch.asyncId) graphV3Error("INVALID_ATTEMPT", "V3 attempt observation identity does not match dispatch asyncId.", { field: "observation" });
 	const child = validateChildOutcome(value.child);
+	if (child?.observation && dispatch && child.observation.asyncId !== dispatch.asyncId) graphV3Error("INVALID_ATTEMPT", "V3 child observation identity does not match dispatch asyncId.", { field: "child" });
 	let verification: V3AttemptEvidence["verification"];
 	if (value.verification !== undefined) {
 		if (!isRecord(value.verification)) graphV3Error("INVALID_ATTEMPT", "V3 attempt verification must be an object.", { field: "verification" });
@@ -173,7 +204,17 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 	}
 	const workspaceDigest = optionalDigest(value.workspaceDigest, "workspaceDigest");
 	const acceptanceDigest = optionalDigest(value.acceptanceDigest, "acceptanceDigest");
+	const evidenceManifestDigest = optionalDigest(value.evidenceManifestDigest, "evidenceManifestDigest");
+    const routeSelection = value.routeSelection as V3AttemptEvidence["routeSelection"];
+    const fallbackContinuation = value.fallbackContinuation as V3AttemptEvidence["fallbackContinuation"];
+    for (const selection of [routeSelection, fallbackContinuation]) {
+        if (selection !== undefined && (!isRecord(selection) || !Number.isSafeInteger(selection.candidateIndex) || selection.candidateIndex < 0 || selection.candidateIndex > 8
+            || typeof selection.planDigest !== "string" || !/^[a-f0-9]{64}$/.test(selection.planDigest))) graphV3Error("INVALID_ATTEMPT", "Invalid runtime route selection.");
+    }
+    if (fallbackContinuation && (fallbackContinuation.fromAttempt !== attemptValue || !/^[a-f0-9]{64}$/.test(fallbackContinuation.proofDigest)
+        || !["quota", "auth", "model", "provider"].includes(fallbackContinuation.failureKind))) graphV3Error("INVALID_ATTEMPT", "Invalid fallback continuation.");
 	const result: V3AttemptEvidence = {
+        ...(routeSelection ? {routeSelection} : {}), ...(fallbackContinuation ? {fallbackContinuation} : {}),
 		schemaVersion: V3_ATTEMPT_SCHEMA_VERSION,
 		runInstanceId,
 		graphId,
@@ -187,6 +228,7 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 		...(deadlineAt ? { deadlineAt } : {}),
 		...(dispatchIntent ? { dispatchIntent } : {}),
 		...(dispatch ? { dispatch } : {}),
+		...(observation ? { observation } : {}),
 		...(child ? { child } : {}),
 		...(verification ? { verification } : {}),
 		...(applied ? { applied } : {}),
@@ -194,6 +236,7 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
 		...(terminalStatus ? { terminalStatus } : {}),
 		...(workspaceDigest ? { workspaceDigest } : {}),
 		...(acceptanceDigest ? { acceptanceDigest } : {}),
+		...(evidenceManifestDigest ? { evidenceManifestDigest } : {}),
 	};
 	return result;
 }
@@ -331,8 +374,26 @@ export function v3AttemptEvidenceDigest(evidence: V3AttemptEvidence): string {
  * Attempt with only `acceptanceDigest` omitted.
  */
 export function v3AcceptedAttemptBasis(evidence: V3AttemptEvidence): V3AttemptEvidence {
-	const { acceptanceDigest: _acceptanceDigest, ...basis } = evidence;
-	return basis;
+	const { acceptanceDigest: _acceptanceDigest, observation: _observation, child, dispatch, ...basis } = evidence;
+	return {
+		...basis,
+		...(dispatch ? {
+			dispatch: {
+				asyncId: dispatch.asyncId,
+				asyncDir: dispatch.asyncDir,
+				requestDigest: dispatch.requestDigest,
+				dispatchedAt: dispatch.dispatchedAt,
+			},
+		} : {}),
+		...(child ? {
+			child: {
+				terminal: child.terminal,
+				output: child.output,
+                ...(child.fullOutputDigest===undefined?{}:{fullOutputDigest:child.fullOutputDigest}),
+				completedAt: child.completedAt,
+			},
+		} : {}),
+	};
 }
 
 export interface V3AcceptedAttemptChainExpectations {
@@ -506,6 +567,10 @@ export async function verifyV3AcceptedAttemptChain(
 		if (artifactContents !== expectedContents) reasons.push("ARTIFACT_CONTENT_MISMATCH: immutable Attempt artifact does not match the accepted Child output.");
 	}
 
+    if (attempt?.evidenceManifestDigest) {
+        try { await verifyEvidenceFiles(runDir, taskId, attemptNumber, attempt.evidenceManifestDigest); }
+        catch (error) { reasons.push(`INVALID_EVIDENCE_FILES: ${String(error)}`); }
+    }
 	return {
 		ok: reasons.length === 0,
 		reasons,

@@ -1,10 +1,11 @@
+import { verifySubagentCapabilities } from "./runtime-compatibility.ts";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-export const RPC_REQUEST = "subagents:rpc:v1:request";
-export const RPC_READY = "subagents:rpc:v1:ready";
-export const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+export const RPC_REQUEST = "pi-graph:runtime:v1:request";
+export const RPC_READY = "pi-graph:runtime:v1:ready";
+export const RPC_REPLY_PREFIX = "pi-graph:runtime:v1:reply:";
 
 export interface EventBus {
 	on(channel: string, handler: (data: unknown) => void): (() => void) | void;
@@ -23,7 +24,7 @@ export class RpcTimeoutError extends Error {
 	readonly requestId: string;
 	readonly method: string;
 	constructor(requestId: string, method: string) {
-		super(`pi-subagents RPC '${method}' timed out.`);
+		super(`pi-graph runtime RPC '${method}' timed out.`);
 		this.name = "RpcTimeoutError";
 		this.requestId = requestId;
 		this.method = method;
@@ -55,9 +56,11 @@ export class RpcPreEmitError extends Error {
 export class SubagentRpcClient {
 	readonly events: EventBus;
 	private readonly timeoutMs: number;
-	constructor(events: EventBus, timeoutMs = 10_000) {
+	private readonly verifyRuntime?: () => Promise<void>;
+	constructor(events: EventBus, timeoutMs = 10_000, verifyRuntime?: () => Promise<void>) {
 		this.events = events;
 		this.timeoutMs = timeoutMs;
+		this.verifyRuntime = verifyRuntime;
 	}
 
 	call(method: "ping" | "status" | "spawn" | "interrupt" | "stop" | "resume", params?: unknown, stableRequestId?: string, beforeEmit?: () => void): Promise<unknown> {
@@ -66,12 +69,13 @@ export class SubagentRpcClient {
 			let settled = false;
 			const unsubscribe = this.events.on(`${RPC_REPLY_PREFIX}${requestId}`, (raw) => {
 				if (settled) return;
+				const reply = raw as RpcReply;
+				if (reply?.version !== 1 || reply.requestId !== requestId) return;
 				settled = true;
 				clearTimeout(timer);
 				if (typeof unsubscribe === "function") unsubscribe();
-				const reply = raw as RpcReply;
 				if (reply?.success) resolvePromise(reply.data);
-				else reject(new RpcRejectedError(requestId, method, reply?.error?.message ?? `pi-subagents RPC '${method}' failed.`, reply?.error?.code));
+				else reject(new RpcRejectedError(requestId, method, reply?.error?.message ?? `pi-graph runtime RPC '${method}' failed.`, reply?.error?.code));
 			});
 			const timer = setTimeout(() => {
 				if (settled) return;
@@ -92,11 +96,17 @@ export class SubagentRpcClient {
 		});
 	}
 
+	async requireNativeRuntime(): Promise<void> {
+		// Recheck each dispatch: the host can outlive an extension reload.
+		verifySubagentCapabilities(await this.call("ping"));
+		await this.verifyRuntime?.();
+	}
+
 	async spawn(params: Record<string, unknown>, stableRequestId?: string, beforeEmit?: () => void): Promise<{ asyncId: string; asyncDir: string }> {
 		const response = await this.call("spawn", params, stableRequestId, beforeEmit) as { details?: { asyncId?: string; asyncDir?: string }; isError?: boolean; text?: string };
 		const asyncId = response?.details?.asyncId;
 		const asyncDir = response?.details?.asyncDir;
-		if (response?.isError || !asyncId || !asyncDir) throw new RpcRejectedError(stableRequestId ?? "unknown", "spawn", response?.text ?? "pi-subagents RPC spawn returned no async run identity.");
+		if (response?.isError || !asyncId || !asyncDir) throw new RpcRejectedError(stableRequestId ?? "unknown", "spawn", response?.text ?? "pi-graph runtime RPC spawn returned no async run identity.");
 		assertAsyncRunIdentity(asyncId, asyncDir);
 		return { asyncId, asyncDir };
 	}
@@ -116,7 +126,7 @@ export function subagentAsyncRoot(): string {
 			scope = `home-${sanitize(homedir())}`;
 		}
 	}
-	return join(tmpdir(), `pi-subagents-${scope}`, "async-subagent-runs");
+	return join(process.env.PI_GRAPH_RUNTIME_ROOT?.trim() ? resolve(process.env.PI_GRAPH_RUNTIME_ROOT.trim()) : join(tmpdir(), `pi-graph-runtime-${scope}`), "async-subagent-runs");
 }
 
 function within(root: string, target: string): boolean {
@@ -126,7 +136,7 @@ function within(root: string, target: string): boolean {
 
 export function assertAsyncRunIdentity(asyncId: string, asyncDir: string, asyncRoot = subagentAsyncRoot()): void {
 	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(asyncId) || resolve(asyncDir) !== resolve(join(asyncRoot, asyncId))) {
-		throw new Error("pi-subagents returned an invalid async run identity.");
+		throw new Error("pi-graph runtime returned an invalid async run identity.");
 	}
 }
 

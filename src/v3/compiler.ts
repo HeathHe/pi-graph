@@ -1,3 +1,5 @@
+import {validateCustomGraphModel} from "../runtime/custom-models.ts";
+import { validateRuntimeFallbackPlan } from "./runtime-fallback.ts";
 import { posix } from "node:path";
 import { canonicalDigest, canonicalJson } from "./digests.ts";
 import { GraphV3Error, graphV3Error } from "./errors.ts";
@@ -12,24 +14,32 @@ import type {
 	RetryReasonV3,
 	ScopeEntryV3,
 	SideEffectV3,
+	V3CapabilityEntryBinding,
+	V3NodeBinding,
+	V3NodeLaunchHints,
 	WorkspaceModeV3,
 } from "./types.ts";
 import { validateValidationCommandV3 } from "./validation-command.ts";
 
-const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "maxConcurrency", "failFast", "workspace", "mode", "readOnly", "toolFilter"]);
+const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "maxConcurrency", "failFast", "workspace", "mode", "readOnly", "toolFilter", "bindingPolicy", "permissionPolicy", "parentToolAllowlist", "contextPolicy"]);
 const NODE_FIELDS = new Set([
-	"taskId", "agent", "task", "dependsOn", "when", "inputArtifacts", "outputArtifact", "readScope", "writeScope", "sideEffect",
-	"timeoutMs", "retryPolicy", "acceptance", "validationCommands",
+	"dependencyInputs", "resultContract", "evidenceFiles", "requiredMaterials", "taskId", "agent", "task", "dependsOn", "when", "inputArtifacts", "outputArtifact", "readScope", "writeScope", "sideEffect",
+	"timeoutMs", "retryPolicy", "acceptance", "validationCommands", "binding", "launch", "readOnly",
 ]);
 const RETRY_FIELDS = new Set(["maxAttempts", "retryOn", "backoffMs"]);
 const SCOPE_FIELDS = new Set(["kind", "path"]);
 const WHEN_FIELDS = new Set(["node", "status"]);
+const BINDING_FIELDS = new Set([
+	"fallbackAdmission", "schemaVersion", "resolution", "requestedAgent", "resolvedAgent", "capabilityIds", "unmatchedCapabilityIds", "catalogDigest",
+	"capabilityEntries", "agentDefinitionDigest", "admissionLaunchContractDigest", "authoringNodeDigest", "bindingDigest",
+]);
+const CAPABILITY_ENTRY_FIELDS = new Set(["capabilityId", "agent", "entryDigest"]);
 const GOVERNANCE_FIELDS = new Set([
 	"model", "thinking", "routing", "planning", "routingProfile", "taskRisk", "producerRefs", "maxAuthorization", "resolvedModel",
 	"contractPolicy", "context", "cwd", "toolBudget", "priority", "resourceClass", "allowDelete", "allowBash", "planningReceipt",
 	"planningAdmissionId", "routingDecision", "modelCandidates", "maxProviderRetries", "providerBackoffMs", "modelDegradations",
 ]);
-const SIDE_EFFECTS = new Set<SideEffectV3>(["none", "local_read", "local_write"]);
+const SIDE_EFFECTS = new Set<SideEffectV3>(["none", "local_read", "local_write", "external_read", "external_write"]);
 const RETRY_REASONS = new Set<RetryReasonV3>(["task_failed", "validation", "timeout", "workspace_conflict"]);
 const WORKSPACES = new Set<WorkspaceModeV3>(["shadow"]);
 const TOPOLOGY_MODES = new Set<GraphTopologyModeV3>(["sealed", "open"]);
@@ -42,6 +52,8 @@ export const MAX_GRAPH_NODES_V3 = 512;
 export const MAX_TASK_ID_LENGTH_V3 = 200;
 const PROTECTED_CONTROL_SEGMENTS = new Set([".git", ".pi-graph", ".pi-subagents"]);
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/u;
+const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/u;
+const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -67,6 +79,10 @@ function rejectGovernanceFields(value: unknown, path = "$", inheritedTaskId?: st
 		const record = value as Record<string, unknown>;
 		const taskId = taskIdFromRecord(record) ?? inheritedTaskId;
 		for (const [key, entry] of Object.entries(record)) {
+			// Binding and launch are reserved post-admission records. Their exact
+			// schemas and self-digests are validated below; public authoring fields
+			// with the same routing names remain forbidden everywhere else.
+			if (key === "binding" || key === "launch") continue;
 			if (GOVERNANCE_FIELDS.has(key)) {
 				graphV3Error("GOVERNANCE_FIELD_FORBIDDEN", `Governance field '${key}' has exited the V3 core.`, { taskId, field: key, details: { path } });
 			}
@@ -103,6 +119,99 @@ function stringArray(value: unknown, field: string, taskId?: string, allowEmpty 
 	});
 	if (new Set(output).size !== output.length) graphV3Error("INVALID_GRAPH_SPEC", `${field} must not contain duplicate entries.`, { taskId, field });
 	return output;
+}
+
+function requiredDigest(record: Record<string, unknown>, field: string, location: string, taskId: string): string {
+	const value = requiredString(record, field, location, taskId, 64);
+	if (!DIGEST_PATTERN.test(value)) graphV3Error("INVALID_BINDING", `${location}.${field} must be a lowercase SHA-256 digest.`, { taskId, field });
+	return value;
+}
+
+function positiveSafeInteger(value: unknown, field: string, taskId: string, allowZero = false): number {
+	if (!Number.isSafeInteger(value) || (value as number) < (allowZero ? 0 : 1)) {
+		graphV3Error("INVALID_BINDING", `${field} must be ${allowZero ? "a non-negative" : "a positive"} safe integer.`, { taskId, field });
+	}
+	return value as number;
+}
+
+function normalizeNodeLaunch(value: unknown, taskId: string): V3NodeLaunchHints | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) graphV3Error("INVALID_BINDING", "launch must be an object.", { taskId, field: "launch" });
+	if (value.schemaVersion !== 1) graphV3Error("INVALID_BINDING", "launch requires schemaVersion: 1.", { taskId, field: "launch.schemaVersion" });
+	if (value.customModelDefinitions !== undefined) {if(!Array.isArray(value.customModelDefinitions)||value.customModelDefinitions.length>64)graphV3Error("INVALID_BINDING","Invalid frozen custom models.");for(const m of value.customModelDefinitions)validateCustomGraphModel(m);}
+ if (value.runtimeFallback !== undefined) validateRuntimeFallbackPlan(value.runtimeFallback);
+	const hintDigest = requiredDigest(value, "hintDigest", "launch", taskId);
+	const { hintDigest: _, ...rest } = value;
+	const normalizedBase = { schemaVersion: 1 as const, ...rest };
+	if (Object.keys(rest).length === 0) graphV3Error("INVALID_BINDING", "launch must contain at least one execution hint.", { taskId, field: "launch" });
+	if (canonicalDigest(normalizedBase) !== hintDigest) graphV3Error("INVALID_BINDING", "launch.hintDigest does not match its normalized execution hints.", { taskId, field: "hintDigest" });
+	return { ...normalizedBase, hintDigest } as V3NodeLaunchHints;
+}
+
+function normalizeCapabilityEntries(value: unknown, capabilityIds: readonly string[], resolvedAgent: string, taskId: string): V3CapabilityEntryBinding[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length === 0) graphV3Error("INVALID_BINDING", "binding.capabilityEntries must be a non-empty array.", { taskId, field: "capabilityEntries" });
+	const entries = value.map((entry, index) => {
+		if (!isRecord(entry)) graphV3Error("INVALID_BINDING", `binding.capabilityEntries[${index}] must be an object.`, { taskId, field: "capabilityEntries" });
+		assertAllowedFields(entry, CAPABILITY_ENTRY_FIELDS, `binding.capabilityEntries[${index}]`, taskId);
+		const capabilityId = requiredString(entry, "capabilityId", `binding.capabilityEntries[${index}]`, taskId, 200);
+		if (!CAPABILITY_ID_PATTERN.test(capabilityId) || !capabilityIds.includes(capabilityId)) graphV3Error("INVALID_BINDING", `binding capability entry '${capabilityId}' is not a requested capability.`, { taskId, field: "capabilityEntries" });
+		const agent = requiredString(entry, "agent", `binding.capabilityEntries[${index}]`, taskId, 500);
+		if (agent !== resolvedAgent) graphV3Error("INVALID_BINDING", `binding capability entry '${capabilityId}' does not resolve to binding.resolvedAgent.`, { taskId, field: "capabilityEntries", details: { capabilityId, agent, resolvedAgent } });
+		return {
+			capabilityId,
+			agent,
+			entryDigest: requiredDigest(entry, "entryDigest", `binding.capabilityEntries[${index}]`, taskId),
+		};
+	});
+	entries.sort((left, right) => left.capabilityId.localeCompare(right.capabilityId));
+	if (new Set(entries.map((entry) => entry.capabilityId)).size !== entries.length) graphV3Error("INVALID_BINDING", "binding.capabilityEntries must not contain duplicate capability IDs.", { taskId, field: "capabilityEntries" });
+	return entries;
+}
+
+function normalizeNodeBinding(value: unknown, taskId: string, agent: string): V3NodeBinding | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) graphV3Error("INVALID_BINDING", "binding must be an object.", { taskId, field: "binding" });
+	assertAllowedFields(value, BINDING_FIELDS, "node binding", taskId);
+	if (value.schemaVersion !== 1) graphV3Error("INVALID_BINDING", "binding requires schemaVersion: 1.", { taskId, field: "binding.schemaVersion" });
+	if (value.resolution !== "exact-agent" && value.resolution !== "capability-catalog" && value.resolution !== "temporary-agent") graphV3Error("INVALID_BINDING", "binding.resolution is invalid.", { taskId, field: "binding.resolution" });
+	const requestedAgent = optionalString(value, "requestedAgent", "binding", taskId);
+	const resolvedAgent = requiredString(value, "resolvedAgent", "binding", taskId, 500);
+	if (resolvedAgent !== agent) graphV3Error("INVALID_BINDING", `Node '${taskId}' exact agent does not match binding.resolvedAgent.`, { taskId, field: "binding.resolvedAgent", details: { agent, resolvedAgent } });
+	const capabilityIds = stringArray(value.capabilityIds, "binding.capabilityIds", taskId).sort();
+	for (const capabilityId of capabilityIds) if (!CAPABILITY_ID_PATTERN.test(capabilityId)) graphV3Error("INVALID_BINDING", `Invalid binding capability ID '${capabilityId}'.`, { taskId, field: "capabilityIds" });
+	const unmatchedCapabilityIds = value.unmatchedCapabilityIds === undefined ? undefined : stringArray(value.unmatchedCapabilityIds, "binding.unmatchedCapabilityIds", taskId, false).sort();
+	if (unmatchedCapabilityIds?.some((capabilityId) => !capabilityIds.includes(capabilityId))) graphV3Error("INVALID_BINDING", "binding.unmatchedCapabilityIds must be a subset of capabilityIds.", { taskId, field: "unmatchedCapabilityIds" });
+	const catalogDigest = value.catalogDigest === undefined ? undefined : requiredDigest(value, "catalogDigest", "binding", taskId);
+	const capabilityEntries = normalizeCapabilityEntries(value.capabilityEntries, capabilityIds, resolvedAgent, taskId);
+	if (value.resolution === "exact-agent" && (capabilityIds.length > 0 || catalogDigest || capabilityEntries || unmatchedCapabilityIds)) graphV3Error("INVALID_BINDING", "exact-agent binding must not claim capability-catalog evidence.", { taskId, field: "binding" });
+	if (value.resolution === "capability-catalog" && (capabilityIds.length === 0 || !catalogDigest || !capabilityEntries || capabilityEntries.length !== capabilityIds.length || unmatchedCapabilityIds)) graphV3Error("INVALID_BINDING", "capability-catalog binding requires complete matched catalog evidence.", { taskId, field: "binding" });
+	if (value.resolution === "temporary-agent" && (capabilityIds.length === 0 || !unmatchedCapabilityIds || unmatchedCapabilityIds.length !== capabilityIds.length)) graphV3Error("INVALID_BINDING", "temporary-agent binding must identify every unmatched capability.", { taskId, field: "binding" });
+	const agentDefinitionDigest = requiredDigest(value, "agentDefinitionDigest", "binding", taskId);
+	const admissionLaunchContractDigest = requiredDigest(value, "admissionLaunchContractDigest", "binding", taskId);
+	const authoringNodeDigest = requiredDigest(value, "authoringNodeDigest", "binding", taskId);
+	const bindingDigest = requiredDigest(value, "bindingDigest", "binding", taskId);
+	const fallbackAdmission=value.fallbackAdmission;
+ if(fallbackAdmission!==undefined) {
+  if(!isRecord(fallbackAdmission)||fallbackAdmission.runtimeAutomaticFallback!==false||typeof fallbackAdmission.catalogDigest!=="string"||!DIGEST_PATTERN.test(fallbackAdmission.catalogDigest)||!Array.isArray(fallbackAdmission.candidates)||fallbackAdmission.candidates.length>9||fallbackAdmission.candidates.filter((c:any)=>c.state==="selected"&&c.agent===agent).length!==1)graphV3Error("INVALID_BINDING","Invalid fallback admission evidence",{taskId});
+  for(const c of fallbackAdmission.candidates)if(!isRecord(c)||typeof c.agent!=="string"||typeof c.model!=="string"||!["unprobed","provider-unavailable","selected"].includes(String(c.state)))graphV3Error("INVALID_BINDING","Invalid fallback candidate",{taskId});
+ }
+ const normalizedBase = {
+        ...(fallbackAdmission===undefined?{}:{fallbackAdmission}),
+		schemaVersion: 1 as const,
+		resolution: value.resolution,
+		...(requestedAgent === undefined ? {} : { requestedAgent }),
+		resolvedAgent,
+		capabilityIds,
+		...(unmatchedCapabilityIds === undefined ? {} : { unmatchedCapabilityIds }),
+		...(catalogDigest === undefined ? {} : { catalogDigest }),
+		...(capabilityEntries === undefined ? {} : { capabilityEntries }),
+		agentDefinitionDigest,
+		admissionLaunchContractDigest,
+		authoringNodeDigest,
+	};
+	if (canonicalDigest(normalizedBase) !== bindingDigest) graphV3Error("INVALID_BINDING", "binding.bindingDigest does not match its normalized admission evidence.", { taskId, field: "bindingDigest" });
+	return { ...normalizedBase, bindingDigest } as V3NodeBinding;
 }
 
 function normalizeRelativePath(value: string, field: string, taskId: string, allowDot: boolean): string {
@@ -204,12 +313,13 @@ function normalizeWhen(value: unknown, taskId: string): GraphWhenV3 | undefined 
 	return { node, status: value.status };
 }
 
-function normalizeValidationCommands(value: unknown, taskId: string): string[] {
+function normalizeValidationCommands(value: unknown, taskId: string, inherited = false): string[] {
 	if (value === undefined) return [];
 	const commands = stringArray(value, "validationCommands", taskId);
 	for (const command of commands) {
 		try {
-			validateValidationCommandV3(command);
+			if (!inherited) validateValidationCommandV3(command);
+			else if (!command.trim() || command.includes("\0")) throw new Error("Invalid shell command.");
 		} catch (error) {
 			throw new GraphV3Error("INVALID_VALIDATION_COMMAND", `Invalid validation command for node '${taskId}': ${error instanceof Error ? error.message : String(error)}`, {
 				taskId,
@@ -322,7 +432,7 @@ function validateCrossNodeScopes(nodes: CompiledGraphNodeV3[], ancestors: Map<st
 	}
 }
 
-export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
+export function compileGraphSpecV3(input: unknown, options: { historical?: boolean } = {}): CompiledGraphV3 {
 	rejectGovernanceFields(input);
 	if (!isRecord(input)) graphV3Error("INVALID_GRAPH_SPEC", "GraphSpec V3 must be an object.");
 	assertAllowedFields(input, TOP_LEVEL_FIELDS, "GraphSpec V3");
@@ -344,6 +454,12 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 	if (typeof failFast !== "boolean") graphV3Error("INVALID_GRAPH_SPEC", "failFast must be a boolean.", { field: "failFast" });
 	const workspace = input.workspace ?? "shadow";
 	if (typeof workspace !== "string" || !WORKSPACES.has(workspace as WorkspaceModeV3)) graphV3Error("INVALID_GRAPH_SPEC", "workspace must be 'shadow'.", { field: "workspace" });
+	const contextPolicy = input.contextPolicy;
+	if (contextPolicy !== undefined && contextPolicy !== "v1" && contextPolicy !== "disabled") graphV3Error("INVALID_GRAPH_SPEC", "Invalid contextPolicy.");
+	const permissionPolicy = input.permissionPolicy;
+	if (permissionPolicy !== undefined && permissionPolicy !== "inherited" && permissionPolicy !== "strict") graphV3Error("INVALID_GRAPH_SPEC", "Invalid permissionPolicy.");
+	const parentToolAllowlist = input.parentToolAllowlist === undefined ? undefined : stringArray(input.parentToolAllowlist, "parentToolAllowlist");
+	if (permissionPolicy === "inherited" && parentToolAllowlist === undefined) graphV3Error("INVALID_GRAPH_SPEC", "Inherited policy requires trusted parent tools.");
 	const readOnly = input.readOnly ?? false;
 	if (typeof readOnly !== "boolean") graphV3Error("INVALID_GRAPH_SPEC", "readOnly must be a boolean.", { field: "readOnly" });
 	const toolFilter = input.toolFilter === undefined ? [] : stringArray(input.toolFilter, "toolFilter");
@@ -351,6 +467,8 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		if (!TOOL_NAME_PATTERN.test(toolName)) graphV3Error("INVALID_GRAPH_SPEC", `toolFilter contains invalid tool name '${toolName}'.`, { field: "toolFilter" });
 	}
 	toolFilter.sort();
+	const bindingPolicy = input.bindingPolicy;
+	if (bindingPolicy !== undefined && bindingPolicy !== "strict") graphV3Error("INVALID_BINDING", "bindingPolicy must be 'strict' when provided.", { field: "bindingPolicy" });
 
 	const seenTaskIds = new Set<string>();
 	const nodes: CompiledGraphNodeV3[] = input.nodes.map((rawNode, index) => {
@@ -362,31 +480,74 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		if (seenTaskIds.has(taskId)) graphV3Error("DUPLICATE_TASK_ID", `Duplicate taskId '${taskId}'.`, { taskId, field: "taskId" });
 		seenTaskIds.add(taskId);
 		const agent = requiredString(rawNode, "agent", `nodes[${index}]`, taskId);
+		const binding = normalizeNodeBinding(rawNode.binding, taskId, agent);
+		const launch = normalizeNodeLaunch(rawNode.launch, taskId);
+        if (launch?.runtimeFallback) {
+            const first = launch.runtimeFallback.candidates[0]!;
+            if (!binding || first.requestedModel !== launch.requestedModel || first.resolvedModel !== launch.resolvedModel
+                || first.thinking !== launch.thinking || launch.runtimeFallback.candidates.some(c => c.agentDefinitionDigest !== binding.agentDefinitionDigest))
+                graphV3Error("INVALID_BINDING", "Runtime fallback candidates do not match the frozen Agent and initial launch.", {taskId});
+        }
+		if (bindingPolicy === "strict" && (binding?.resolution !== "capability-catalog" || binding.capabilityIds.length === 0)) {
+			graphV3Error("INVALID_BINDING", `Strict graph node '${taskId}' requires a capability-catalog binding.`, { taskId, field: "binding" });
+		}
 		const task = requiredString(rawNode, "task", `nodes[${index}]`, taskId);
 		const dependsOn = rawNode.dependsOn === undefined ? [] : stringArray(rawNode.dependsOn, "dependsOn", taskId).sort();
 		const when = normalizeWhen(rawNode.when, taskId);
+        let dependencyInputs: CompiledGraphNodeV3["dependencyInputs"];
+        if(rawNode.dependencyInputs!==undefined) {
+         if(!Array.isArray(rawNode.dependencyInputs)||rawNode.dependencyInputs.length>64)graphV3Error("INVALID_GRAPH_SPEC","dependencyInputs must be an array of at most 64 selectors.",{taskId});
+         dependencyInputs=rawNode.dependencyInputs.map((entry:unknown)=>{
+          if(!isRecord(entry)||Object.keys(entry).some(k=>!["from","field","type","as"].includes(k))||typeof entry.from!=="string"||!dependsOn.includes(entry.from)||typeof entry.as!=="string"||!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(entry.as)||!["status","reason","evidenceFiles"].includes(String(entry.field))||entry.type!==(entry.field==="evidenceFiles"?"artifact-list":"string"))graphV3Error("INVALID_GRAPH_SPEC","Invalid typed direct-dependency selector.",{taskId});
+          return entry as unknown as NonNullable<CompiledGraphNodeV3["dependencyInputs"]>[number];
+         });
+         if(new Set(dependencyInputs.map(e=>e.as)).size!==dependencyInputs.length)graphV3Error("INVALID_GRAPH_SPEC","Duplicate dependency alias.",{taskId});
+        }
+
 		const inputArtifacts = rawNode.inputArtifacts === undefined
 			? []
 			: stringArray(rawNode.inputArtifacts, "inputArtifacts", taskId).map((artifact) => normalizeArtifact(artifact, "inputArtifacts", taskId)).sort();
 		const outputArtifact = rawNode.outputArtifact === undefined
 			? normalizeArtifact(`${graphId}/${taskId}/out`, "outputArtifact", taskId)
 			: normalizeArtifact(requiredString(rawNode, "outputArtifact", `nodes[${index}]`, taskId), "outputArtifact", taskId);
-		const readScope = normalizeScopes(rawNode.readScope, "readScope", taskId);
+		if (rawNode.resultContract !== undefined && rawNode.resultContract !== "status-json") graphV3Error("INVALID_GRAPH_SPEC", "resultContract must be 'status-json'.", {taskId});
+        let evidenceFiles: CompiledGraphNodeV3["evidenceFiles"];
+        if (rawNode.evidenceFiles !== undefined) {
+            if (!Array.isArray(rawNode.evidenceFiles) || rawNode.evidenceFiles.length > 64) graphV3Error("INVALID_GRAPH_SPEC", "evidenceFiles must be an array of at most 64 explicitly non-secret files.", {taskId});
+            evidenceFiles = rawNode.evidenceFiles.map((entry: unknown) => {
+                if (!isRecord(entry) || Object.keys(entry).some(k => !["path", "nonSecret"].includes(k)) || entry.nonSecret !== true || typeof entry.path !== "string" || !/^[^\\\x00]+$/.test(entry.path) || entry.path.startsWith("/") || entry.path.split("/").some(p => !p || p === "." || p === "..")) graphV3Error("INVALID_GRAPH_SPEC", "evidenceFiles entries require safe workspace-relative path and nonSecret:true.", {taskId});
+                return {path: entry.path as string, nonSecret: true as const};
+            });
+            if (new Set(evidenceFiles.map(e => e.path)).size !== evidenceFiles.length) graphV3Error("INVALID_GRAPH_SPEC", "evidenceFiles paths must be unique.", {taskId});
+        }
+        const requiredMaterials = rawNode.requiredMaterials === undefined ? undefined : stringArray(rawNode.requiredMaterials, "requiredMaterials", taskId);
+        if (requiredMaterials?.some(path => path.startsWith("/") || path.split(/[\\/]/u).includes("..") || path.includes("\0"))) graphV3Error("INVALID_SCOPE", "requiredMaterials must contain source-relative paths without traversal.", {taskId, field: "requiredMaterials"});
+        const readScope = normalizeScopes(rawNode.readScope, "readScope", taskId);
 		const writeScope = normalizeScopes(rawNode.writeScope, "writeScope", taskId);
+		if (rawNode.readOnly !== undefined && typeof rawNode.readOnly !== "boolean") graphV3Error("INVALID_GRAPH_SPEC", "Node readOnly must be boolean.", { taskId });
+		const nodeReadOnly = readOnly || rawNode.readOnly === true;
 		const sideEffectValue = rawNode.sideEffect;
-		if (sideEffectValue === "external_read" || sideEffectValue === "external_write") {
+		if (permissionPolicy !== "inherited" && (sideEffectValue === "external_read" || sideEffectValue === "external_write")) {
 			graphV3Error("UNSUPPORTED_SIDE_EFFECT", `Node '${taskId}' uses '${sideEffectValue}', but V3 MVP does not permit external side effects.`, { taskId, field: "sideEffect" });
 		}
 		if (typeof sideEffectValue !== "string" || !SIDE_EFFECTS.has(sideEffectValue as SideEffectV3)) graphV3Error("UNSUPPORTED_SIDE_EFFECT", `Node '${taskId}' has an unsupported sideEffect.`, { taskId, field: "sideEffect" });
 		const timeoutMs = rawNode.timeoutMs;
+		if (timeoutMs !== undefined && !options.historical) graphV3Error("INVALID_GRAPH_SPEC", "Graph execution is unlimited; remove timeoutMs before starting a new run.", { taskId, field: "timeoutMs" });
 		if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || (timeoutMs as number) <= 0)) graphV3Error("INVALID_GRAPH_SPEC", "timeoutMs must be a positive integer when provided.", { taskId, field: "timeoutMs" });
 		const retryPolicy = normalizeRetryPolicy(rawNode.retryPolicy, taskId);
 		const acceptance = optionalString(rawNode, "acceptance", `nodes[${index}]`, taskId);
-		const validationCommands = normalizeValidationCommands(rawNode.validationCommands, taskId);
+		const validationCommands = normalizeValidationCommands(rawNode.validationCommands, taskId, permissionPolicy === "inherited");
+		if (sideEffectValue !== "local_write" && validationCommands.length > 0) {
+			graphV3Error("INVALID_VALIDATION_COMMAND", `Node '${taskId}' may declare validationCommands only with sideEffect 'local_write'.`, {
+				taskId,
+				field: "validationCommands",
+				details: { sideEffect: sideEffectValue },
+			});
+		}
 		if (sideEffectValue === "local_write" && (writeScope.length === 0 || validationCommands.length === 0)) {
 			graphV3Error("LOCAL_WRITE_REQUIREMENTS", `local_write node '${taskId}' requires non-empty writeScope and validationCommands.`, { taskId, details: { hasWriteScope: writeScope.length > 0, hasValidationCommands: validationCommands.length > 0 } });
 		}
-		if (readOnly && sideEffectValue === "local_write") {
+		if (nodeReadOnly && (sideEffectValue === "local_write" || sideEffectValue === "external_write")) {
 			graphV3Error("INVALID_GRAPH_SPEC", `readOnly graph cannot contain local_write node '${taskId}'.`, { taskId, field: "readOnly" });
 		}
 		if (sideEffectValue !== "local_write" && writeScope.length > 0) {
@@ -397,9 +558,13 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 			agent,
 			task,
 			dependsOn,
+            ...(dependencyInputs===undefined?{}:{dependencyInputs}),
 			...(when === undefined ? {} : { when }),
 			inputArtifacts,
+			...(rawNode.resultContract === undefined ? {} : {resultContract: "status-json" as const}),
+			...(evidenceFiles === undefined ? {} : {evidenceFiles}),
 			outputArtifact,
+			...(requiredMaterials === undefined ? {} : {requiredMaterials}),
 			readScope,
 			writeScope,
 			sideEffect: sideEffectValue as SideEffectV3,
@@ -407,8 +572,13 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 			retryPolicy,
 			...(acceptance === undefined ? {} : { acceptance }),
 			validationCommands,
-			...(readOnly ? { readOnly: true as const } : {}),
+			...(nodeReadOnly ? { readOnly: true as const } : {}),
+			...(contextPolicy === undefined ? {} : { contextPolicy }),
+			...(permissionPolicy === undefined ? {} : { permissionPolicy }),
+			...(parentToolAllowlist === undefined ? {} : { parentToolAllowlist: [...parentToolAllowlist] }),
 			...(toolFilter.length === 0 ? {} : { toolFilter: [...toolFilter] }),
+			...(binding === undefined ? {} : { binding }),
+			...(launch === undefined ? {} : { launch }),
 		};
 		validateOwnWriteScopes(node);
 		return node;
@@ -438,6 +608,7 @@ export function compileGraphSpecV3(input: unknown): CompiledGraphV3 {
 		maxConcurrency: maxConcurrency as number,
 		failFast,
 		workspace: workspace as WorkspaceModeV3,
+		...(bindingPolicy === "strict" ? { bindingPolicy: "strict" as const } : {}),
 	};
 	const sourceGraphSpec = JSON.parse(canonicalJson(input)) as GraphSpecV3;
 	return { ...projection, ...(mode === "open" ? { mode: "open" as const } : {}), sourceGraphSpec, sourceGraphSpecDigest, graphDigest: canonicalDigest(projection) };

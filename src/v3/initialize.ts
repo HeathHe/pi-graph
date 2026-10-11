@@ -1,3 +1,4 @@
+import { validateV3InitialRequiredMaterials } from "./workspace.ts";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -5,6 +6,7 @@ import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "no
 import { basename, dirname, join, resolve } from "node:path";
 import { authorizationV4For } from "./authorization.ts";
 import { canonicalJson } from "./digests.ts";
+import { atomicWriteJson, syncDirectory } from "./durable.ts";
 import { GraphV3Error } from "./errors.ts";
 import { captureTrustedDirectoryAnchor, unsafeDirectoryComponent } from "./path-safety.ts";
 import type { TrustedDirectoryAnchor } from "./path-safety.ts";
@@ -183,15 +185,6 @@ async function regularFileMatches(path: string, expectedIdentity: DirectoryIdent
 		return false;
 	} finally {
 		await handle?.close().catch(() => undefined);
-	}
-}
-
-async function syncDirectory(path: string): Promise<void> {
-	const handle = await open(path, "r");
-	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
 	}
 }
 
@@ -493,6 +486,7 @@ export async function initializeV3Run(options: InitializeV3RunOptions, dependenc
 	const sessionId = options.sessionId;
 	const supervisorEpoch = options.supervisorEpoch;
 	const admittedGraph = JSON.parse(canonicalJson(options.graph)) as CompiledGraphV3;
+	await validateV3InitialRequiredMaterials(sourceCwd, admittedGraph);
 	const parentDir = dirname(runDir);
 	const runName = basename(runDir);
 	if (!runName || runDir === parentDir) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 runDir must identify a child directory.", { field: "runDir" });
@@ -581,6 +575,7 @@ export async function initializeV3Run(options: InitializeV3RunOptions, dependenc
 		}
 		if (!await initializationLockIsHeld(heldLock)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 initialization lock ownership was lost before initialization completed.");
 		if (await unsafeDirectoryComponent(parentDir, trustedAnchor)) throw new GraphV3Error("INITIALIZATION_FAILED", "V3 trusted root or run parent changed before initialization completed.", { field: "runDir" });
+		await atomicWriteJson(join(runDir,"communication.json"),{protocol:"graph-mailbox-v1",runtimeKind:"pi-graph-sdk/1",runInstanceId:authorization.runInstanceId});
 		return { runDir, authorization, snapshot };
 	} catch (error) {
 		const targetExists = await pathExists(runDir).catch(() => false);

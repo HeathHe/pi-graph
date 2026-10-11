@@ -8,7 +8,8 @@ pi-graph 只接受并创建以下组合：
 
 | 载体 | 版本 | 含义 |
 | --- | --- | --- |
-| GraphSpec | `schemaVersion: 3` | 调用方提交的唯一图输入格式 |
+| GraphSpec authoring | `schemaVersion: 3` | 调用方提交的图输入；可含 capability 与 Pi launch hints |
+| Resolved GraphSpec | `schemaVersion: 3` | Binding 后交给纯 DAG Core 的 exact-Agent 输入 |
 | Snapshot | `schemaVersion: 3` | 从 journal 与 Attempt 证据重建的运行投影 |
 | Authorization | `schemaVersion: 4`, `runtimeSchemaVersion: 3` | 不可变 admission、源目录身份与编译投影 |
 | Attempt / workspace / validation / acceptance | `schemaVersion: 1` | 单次节点执行的权威证据 |
@@ -20,29 +21,30 @@ pi-graph 只接受并创建以下组合：
 V3 明确不包含：
 
 - 任务评估、目标拆解、计划生成或计划复核；
-- 模型选择、模型路由、降级、模型注册表或 provider retry；
+- Core 内模型选择、模型路由、降级、模型注册表或 provider retry；
 - visual evidence 或截图验收；
 - 普通 Pi turn 的监听、自动准入或强制门链；
 - GraphSpec 的 legacy 转换或双内核分流。
 
-编译器会递归拒绝 `model`、`thinking`、`routing`、`planning`、`routingProfile`、`planningReceipt`、`resolvedModel` 等治理字段；Authorization V4 也拒绝这类字段。
+公开入口先执行 Pi Binding / Admission，再调用纯编译器。Binding 只做确定性 capability → exact Agent 解析、`pi-subagents` preflight 和 launch-hint 规范化；它不是治理或路由层。纯编译器仍递归拒绝未解析的 authoring 字段以及 `routing`、`planning`、`routingProfile`、`planningReceipt` 等治理字段。Authorization V4 只接受 Binding 生成的 `binding` / `launch` 证据，不接受调用方伪造的 requested/resolved/actual 字段。
 
 ## 2. GraphSpec V3
 
-### 2.1 顶层
+### 2.1 公开 authoring 顶层
 
 ```ts
-interface GraphSpecV3 {
+interface GraphSpecAuthoringV3 {
   schemaVersion: 3;
   graphId?: string;
   goal: string;
-  nodes: GraphNodeSpecV3[];
+  nodes: GraphNodeAuthoringSpecV3[];
   maxConcurrency?: number;
   failFast?: boolean;
   workspace?: "shadow";
   readOnly?: boolean;
   toolFilter?: string[];
   mode?: "sealed" | "open";
+  contractPolicy?: "standard" | "strict";
 }
 ```
 
@@ -58,15 +60,18 @@ interface GraphSpecV3 {
 | `readOnly` | 默认 `false`；为 true 时编译期拒绝 `local_write`，运行时 Guard 拒绝写工具 |
 | `toolFilter` | 无重复的精确工具名 allow-list；名称匹配 `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$` |
 | `mode` | `sealed`（默认）或 `open` |
+| `contractPolicy` | `standard`（默认）或 `strict`；strict 要求每个节点完整匹配 capability catalog，且禁止临时 fallback |
 
-`sourceGraphSpecDigest` 对调用方原始 JSON 值的 canonical form 计算 SHA-256。编译投影另算 `graphDigest`；这两个 digest 分别绑定输入材料和规范化执行合同。
+Binding 移除 `contractPolicy`，strict 时写入内部 `bindingPolicy: "strict"`，并把节点 authoring 字段归约为 exact-Agent `binding` / `launch` 证据。`sourceGraphSpecDigest` 对这个 resolved GraphSpec 的 canonical form 计算 SHA-256；每个 binding 另含原 authoring node digest、catalog/entry digest、`agentDefinitionDigest` 与 `admissionLaunchContractDigest`。后者只是 source Agent、authoring task 和当时可知 preflight hints 的 admission 证据，不是 runtime child 合同。编译投影另算 `graphDigest`。
 
 ### 2.2 节点
 
 ```ts
-interface GraphNodeSpecV3 {
+interface GraphNodeAuthoringSpecV3 {
   taskId: string;
-  agent: string;
+  agent?: string;
+  capabilityId?: string;
+  requires?: string[];
   task: string;
   dependsOn?: string[];
   when?: { node: string; status: "accepted" | "failed" };
@@ -83,13 +88,26 @@ interface GraphNodeSpecV3 {
   };
   acceptance?: string;
   validationCommands?: string[];
+  model?: string;
+  thinking?: string | false;
+  turnBudget?: { maxTurns: number; graceTurns?: number };
+  toolBudget?: { soft?: number; hard: number; block?: string[] | "*" };
+  usageBudget?: {
+    tokens?: { soft?: number; hard: number };
+    costUsd?: { soft?: number; hard: number };
+  };
+  maxTokens?: number;
 }
 ```
 
 规则：
 
 - `taskId` 匹配 `^[a-z0-9][a-z0-9-]*$`，最长 200 个字符，图内唯一；长度边界保证它可安全用于 durable filename。
-- `agent` 和 `task` 必须是非空字符串；`agent` 在 admission/dispatch 前通过 `pi-subagents` preflight。
+- `task` 必须是非空字符串。standard 合同至少提供 `agent`、`capabilityId` 或 `requires`；strict 合同必须提供 capability。
+- `capabilityId` 是单个能力；`requires` 是无重复能力数组。全部能力必须由 catalog 映射到同一个 Agent；同时提供 `agent` 时必须与结果精确相同。
+- strict 合同要求完整 catalog match。未知显式 Agent、部分匹配、能力映射到多个 Agent 都 fail closed，不使用临时 Agent。
+- 非 strict 合同只有在 `settings.graph.allowTemporaryAgent: true`、没有显式 Agent、所有 capability 均无 exact match 时，才可绑定包 Agent `pi-graph.graph-worker`。
+- Binding 对 resolved Agent 和 launch hints 调用 `pi-subagents` 公共 preflight，持久化 Agent definition 与 admission preflight digest；Core 与恢复不会重新查询 catalog。runtime child 合同另由 lifecycle `launchContractDigest` 证明。
 - `dependsOn`、`inputArtifacts`、`toolFilter` 及 retry reason 不允许重复。
 - `when.node` 不能是自己，必须存在，并且必须同时列入本节点的 `dependsOn`。
 - `outputArtifact` 省略时为 `<graphId>/<taskId>/out`；所有 artifact path 都是项目相对路径。
@@ -99,6 +117,11 @@ interface GraphNodeSpecV3 {
 - `timeoutMs` 若提供必须是正整数；不提供时没有隐式 Attempt deadline。
 - `retryPolicy` 默认 `{ maxAttempts: 1, retryOn: [], backoffMs: 5000 }`；`maxAttempts` 为 1..5，`backoffMs >= 0`。
 - `acceptance` 是声明文本，不参与机器判定；只有 `local_write` 的确定性 `validationCommands` 能产生 machine-verified 验收。
+- `model` 是 requested hint；只有 capability catalog 的 fixed `modelPolicy.model` 可成为 resolved hint，`routingProfile` 与非 fixed model policy 不由 Graph 求值。
+- Provider 隔离分两层。Binding 捕获父 Pi 当前由扩展注册或覆盖的 Provider ID，并检查 resolved primary 与全部 fallback candidate；任一 candidate 命中就 admission fail closed。child 启动后，Graph Guard 在可取消的 `input` 边界再次比较实际模型 Provider 与 child registry；若 Agent 自己配置的扩展注册或覆盖了当前 Provider，输入会在 Agent/provider transport 启动前被处理，并以无 child 输出失败收口。普通 `models.json` / built-in Provider，以及只注册自定义工具而不注册当前 Provider 的 Agent 扩展，继续允许。
+- `turnBudget.maxTurns`、`toolBudget.hard` 和 usage hard limit 必须为正数；soft 不得大于 hard。`turnBudget` / `toolBudget` 由 `pi-subagents` 运行时执行；`usageBudget` 是节点级 lifetime budget，跨全部 Attempt 累计。每次 launch 只收到 `original - previously reported usage` 的剩余 hard/soft；hard 命中或历史 dispatched/emitting Attempt 缺少所配置的 token/cost 证据时，新 Attempt 在 workspace/child dispatch 前 fail closed。它不精确中止已经运行的 child。`maxTokens` 独立表示每次 provider 请求的输出 token 上限，必须为至少 16 的安全整数；Graph Guard 在 provider 原生 payload 边界收紧该值，无法识别的 payload fail closed。
+
+Binding 后，Core 节点必有 `agent: string`。可选 `binding` 记录 requested/resolved Agent、capability IDs 与不可变 digests；可选 `launch` 记录 requested/resolved model、thinking 和预算。public authoring 不能直接提交 `binding`、`launch`、`bindingPolicy` 或 actual runtime 字段。
 
 ### 2.3 路径与保护目录
 
@@ -115,11 +138,11 @@ Scope 和 artifact 必须是规范化相对路径，不能包含 NUL、绝对路
 
 ## 3. 编译合同
 
-`compileGraphSpecV3` 是 spec、capsule、模板、append 回放和 Authorization 现场验证共用的唯一编译器。
+`compileGraphSpecV3` 是所有 **resolved** spec、append 候选图、恢复回放和 Authorization 现场验证共用的唯一纯 Core 编译器。内联 authoring、capsule 与模板先走同一个 Binding adapter。
 
 编译按以下不变量执行：
 
-1. 拒绝治理字段和所有未知字段；
+1. 拒绝未解析 authoring 字段、治理字段和所有未知字段；校验内部 binding/launch evidence 的结构与 digest；
 2. 规范化默认值、scope、artifact、retry policy 与工具名；
 3. 校验 taskId 唯一、依赖存在、`when` 来源是直接依赖；
 4. 使用确定性 Kahn 排序生成 `topologicalOrder`；同一 ready 集按 taskId 排序；
@@ -165,7 +188,7 @@ revision 0 表示还没有 journal mutation。OPEN 图暂时没有可运行节�
 - 只能增加新的不可变节点，不能修改旧节点、旧依赖或旧字段；
 - 可依赖旧节点或同批新节点；整个候选图重新经过 V3 编译器；
 - 不能让新节点依赖已经取消的分支；
-- production Host 在提交前冻结新节点的 Agent 定义；
+- production Host 先按 base graph 的 contract policy 绑定新节点，再在提交前固定 exact Agent 定义与 admission preflight evidence；
 - 成功后 revision 加一，并唤醒 `idle` runner。
 
 ### 4.4 `cancel`
@@ -250,7 +273,7 @@ workspace preparation
 Agent preflight
 dependency capsule
 dispatch intent + RPC emit
-child monitoring
+child monitoring + bounded observation projection
 child result persistence
 validation
 workspace inspection + apply
@@ -269,11 +292,15 @@ crash recovery
 3. 调用 `pi-subagents` RPC，stable request ID 为 `pi-graph-v3-<attemptNonce>`；
 4. 持久化 `{ asyncId, asyncDir, requestDigest, dispatchedAt }` binding。
 
-进程在 emit 附近中断时，恢复逻辑以 stable request ID、request digest 和时间边界查找原 child：
+RPC 请求携带 resolved Agent，以及 Binding 已规范化并持久化的 `model`、`thinking`、`turnBudget`、`toolBudget`、`usageBudget` hints。`maxTokens` 不冒充 RPC usage budget，而是写入不可变 node contract，由 child Graph Guard 在每次 provider 请求时执行。pi-graph 不生成 fallback model 列表，也不根据失败重选 provider。真正 runtime launch contract 包含 dispatch 时才可知的 Guard、dependency capsule 和 workspace 信息，其 digest 通过 child lifecycle 独立观测。
 
-- 找到唯一匹配 binding：继续同一 Attempt；
-- 找不到或身份歧义：`dispatch_unknown` → `needs_attention`；
-- 已跨 emit 边界时禁止盲目再派发。
+进程在 emit 附近中断时按持久证据 fail closed：
+
+- `prepared` 表示 RPC emit 尚未开始；恢复时校验 request digest 后可安全发出一次；
+- `emitting` 表示 RPC emit 可能已经发生；只有 Attempt 已持久化 exact `{ asyncId, asyncDir }` binding 才能继续监控；
+- `emitting` 且没有 binding 时为 `dispatch_unknown` → `needs_attention`，禁止盲目再派发。
+
+stable request ID 用于同一 RPC reply channel 的关联，但 `pi-subagents 0.56` single-run `status.json` 不持久化该外层 ID。因此 RPC 已 emit、reply/binding 丢失后，不能通过扫描状态目录可靠找回 child，也不能宣称该窗口可恢复。
 
 ### 6.4 child 结果与终止确认
 
@@ -288,9 +315,13 @@ child 终态映射：
 
 timeout、AbortSignal 或 graph stop 需要终止 child。Supervisor 必须等待 `pi-subagents` 的 stop 确认（默认确认窗口 5 秒）；无法确认时写入 `dispatch_unknown` 并把 Attempt 置为 `needs_attention`。系统不能在 child 仍可能运行时声称安全停止。
 
+child lifecycle 的有界 projection 可写入 Attempt/snapshot，字段包括 requested/resolved/actual Agent 与模型、attempted models、child run/session file、launch contract digest、token/cost/turn usage、duration、current tool/path 和 activity counts。raw lifecycle 不落盘；控制字符与 ANSI 会被清洗。除“已上报 token/cost 用于后续 Attempt 的 usage-budget fail-closed 核算”这一项外，observation 不参与 scheduler、child 恢复、acceptance digest 或 machine verification。
+
 ### 6.5 自动 retry
 
-可自动重试的 failure 只有 GraphSpec `retryOn` 四类。`dispatch_unknown`、`child_paused`、`child_stopped` 和 internal 不在自动 retry 白名单。每次失败先形成不可变 failed Attempt，再按 `backoffMs` 调度下一次；同时受 spec 的 1..5 上限和 100 次终身上限约束。
+可自动重试的 failure 只有 GraphSpec `retryOn` 四类。`usage_budget`、`dispatch_unknown`、`child_paused`、`child_stopped` 和 internal 不在自动 retry 白名单。每次失败先形成不可变 failed Attempt，再按 `backoffMs` 调度下一次；同时受 spec 的 1..5 上限和 100 次终身上限约束。
+
+准备自动 retry 前，Supervisor 会把包括当前失败 Attempt 在内的全部历史 usage 重新求和。额度已经用尽或证据不足时，当前 Attempt 直接以 `usage_budget` 失败结束，不创建新的自动 retry Attempt。崩溃恢复会执行相同计算；prepared Attempt 用相同 residual budget 重建 request digest，避免恢复时意外获得一份新全额预算。
 
 ## 7. Workspace、Guard、验证与 apply
 
@@ -310,7 +341,7 @@ timeout、AbortSignal 或 graph stop 需要终止 child。Supervisor 必须等�
 - node contract digest；
 - workspace kind（当前为 `shadow`）。
 
-Agent 定义和 Graph Guard 在 admission 时冻结并做 digest 绑定，之后物化到 workspace 的 `.pi/agents`。Guard 文件或冻结 Agent 漂移时拒绝 dispatch/resume。
+Binding evidence、Agent 定义和 admission preflight digest 在 admission 时固定，之后 exact Agent 物化到 workspace 的 `.pi/agents`。catalog 不进入 workspace；Agent definition 与持久化 digest 不一致时拒绝 dispatch/resume。Graph Guard 和 runtime launch contract 在 Attempt 派发路径中产生；Guard 与 Authorization 证据被篡改会 fail closed，child lifecycle 的 `launchContractDigest` 仅作独立运行时观测。
 
 ### 7.2 Guard
 
@@ -322,6 +353,7 @@ Agent 定义和 Graph Guard 在 admission 时冻结并做 digest 绑定，之后
 - `bash` 总是拒绝；
 - 非文件工具必须在 `toolFilter` 中，且 Guard 必须把它识别为只读远程工具；
 - 不支持的 path-bearing 工具 fail closed；
+- 父 Pi 已知的扩展 Provider 不通过 admission；Child-only 注册或覆盖的当前 Provider 必须在 `input` 边界短路；旧的扩展 Provider 准入字段不再属于持久化 schema，恢复遇到它们必须 fail closed；
 - contract 缺失时扩展不介入，contract 畸形时 fail closed。
 
 这是 Pi 工具边界，不是 OS 沙箱。
@@ -426,6 +458,8 @@ history 使用 create-new 语义；同一路径已存在但内容不同视为错
 └── shadow/<taskId>-<N>/workspace      # 活跃/可恢复 Attempt
 ```
 
+`attempt.json` 可包含最新 `observation`；`snapshot.json` 可包含它的节点投影。observation 是可丢失、可更新的显示信息，不改变 Attempt acceptance basis。
+
 权威关系：
 
 - `authorization.json`：不可变 base GraphSpec、compiled projection、digests、session/source identity；
@@ -492,7 +526,8 @@ resume 重放 base GraphSpec、mutation journal、retry journal，重新读取�
 - applying：恢复 apply plan；
 - verifying 且有 child：继续验证/apply；
 - dispatched/running 且有 binding：继续监控原 child；
-- prepared + durable dispatch intent：根据 intent 状态安全发出或找回原 child；
+- prepared + durable dispatch intent：校验 request digest 后安全发出一次；
+- emitting + durable dispatch intent 但无 binding：`dispatch_unknown`，不重发；
 - prepared 但没有 durable intent：`dispatch_unknown`，不猜测。
 
 session start 的 adoption scan 只处理 V3 run：paused desired state 保持暂停；running desired state 恢复非终态；stopped intent 完成安全停止；pending retry intent 优先恢复。live competing lease 或证据错误报告 `needs_attention`。
@@ -543,7 +578,7 @@ interface V3GraphCapsule {
 - `{{input}}` 可递归替换 JSON value，不替换 object key；完整 value placeholder 保留 number/boolean 类型；
 - 未闭合、未知或未解析 placeholder 拒绝；
 - `requires.readOnly/toolFilter` 写入 resolved GraphSpec，属于执行 authority；
-- placeholder 解析后必须再次经过唯一 V3 compiler。
+- placeholder 解析后先经过统一 Binding/Admission，再经过唯一纯 V3 compiler；capsule 不能绕过 capability、Agent 或 launch preflight。
 
 ### 13.2 内置模板
 
@@ -555,6 +590,25 @@ interface V3GraphCapsule {
 
 内置模板从同一 `.graph.json` 资源解析，不能绕过 capsule 或 GraphSpec 校验。
 
+内置模板使用 `contractPolicy: "strict"` 和最窄 capability：
+
+| 模板节点 | capability |
+| --- | --- |
+| code-review scout / review / synthesize | `discover.code` / `review.code` / `review.code` |
+| research-report research / verify / draft | `research.topic` / `review.research` / `write.document` |
+| doc-write outline / write / review | `write.document` / `write.document` / `edit.document` |
+
+因此模板执行依赖共享 `subagent-capabilities.json` 提供完整 exact match；模板文件不硬编码 Agent 或模型。
+
+模板库 API 明确区分 authoring resolution 与 production admission：
+
+| API | 返回 | 用途 |
+| --- | --- | --- |
+| `resolveBuiltinGraphTemplateV3` / `resolveBuiltinGraphTemplateCapsuleV3` | 仍含 capability 的 authoring spec/capsule | 同步 placeholder 替换、预览和编辑；不能直接进入纯 Core 编译器 |
+| `bindBuiltinGraphTemplateV3` / `bindBuiltinGraphTemplateCapsuleV3` | exact-Agent resolved spec/bound capsule | 异步 capability admission 与生产执行 |
+
+旧 `loadBuiltinGraphTemplateV3` / `loadBuiltinGraphTemplateCapsuleV3` 名称已删除。这是明确的 breaking API migration，不以原名称伪装不同的返回语义。
+
 ## 14. 公开 API 与配置
 
 ### 14.1 `graph` action
@@ -562,13 +616,14 @@ interface V3GraphCapsule {
 动作集合必须精确为：
 
 ```text
-start load status list doctor pause resume stop
+start wait load status list doctor pause resume stop
 templates agents retry append cancel seal
 ```
 
 行为摘要：
 
 - `start`：恰选 spec/capsule/template，初始化后异步返回；同一 toolCallId 同参数幂等复用，同 ID 不同参数拒绝；
+- `wait`：按 id 注册 process-local snapshot observer，并在注册后重读 durable status 以关闭快速终态竞态；`queued/running/stopping` 继续观察，其他合法 Graph status 返回；Abort 只停止观察，绝不调用 stop；
 - `load`：无 id 时仅编译；有 id 时重建并返回 durable run；
 - `status/list`：读取 V3 投影；不列出或执行其他格式；
 - `doctor`：报告 stale lease、orphan shadow、invalid run、needs_attention；
@@ -592,10 +647,11 @@ interface V3GraphConfig {
   enabled: boolean;     // default true
   runsDir: string;      // default <Pi agent dir>/graph-runs
   rpcTimeoutMs: number; // default 10000, clamped at 300000
+  allowTemporaryAgent: boolean; // default false
 }
 ```
 
-历史 graph settings 不会被解释成调度、路由或保留策略。
+`allowTemporaryAgent` 只开启非 strict、无显式 Agent、能力完全无 exact match 时的 `pi-graph.graph-worker` fallback；它不允许部分匹配、冲突映射、未知显式 Agent或模型路由。历史 graph settings 不会被解释成调度、路由或保留策略。
 
 ## 15. 与 dsh-graph 的对齐矩阵
 
@@ -604,7 +660,7 @@ interface V3GraphConfig {
 | 能力 | dsh-graph 现状 | pi-graph V3 | 对齐结论 |
 | --- | --- | --- | --- |
 | DAG 编译 | `compileGraphSpec`，拓扑排序与环检 | `compileGraphSpecV3`，另加 scope/artifact/保护路径严格检查 | 核心对齐，Pi 输入更严格 |
-| Graph schema | GraphSpec v1；`agent/requires/model/defaultModel` 等宿主字段 | `schemaVersion: 3`；`agent` 必填；无 model/requires/defaultModel | 概念对齐，格式不兼容 |
+| Graph schema | GraphSpec v1；`agent/requires/model/defaultModel` 等宿主字段 | `schemaVersion: 3` authoring 可用 exact agent、capability requires 与 launch hints；Core 只接收 resolved spec | 概念对齐，格式不兼容 |
 | 固定/动态图 | SEALED/OPEN | SEALED/OPEN | 对齐 |
 | 动态操作 | append/cancel/seal + revision CAS | append/cancel/seal + revision CAS | 对齐 |
 | mutation authority | 聚合在 `run.json`，明确单 Host writer | 独立 digest-chain journal + no-replace 发布 + Supervisor fence | Pi 强化跨进程写者排他 |
@@ -623,12 +679,13 @@ interface V3GraphConfig {
 | pause | 无独立 durable pause action | durable pause + session shutdown pause | Pi 扩展 |
 | child stop confirmation | Host abort/状态收尾 | 必须确认 public RPC stop；未知则 needs_attention | Pi 强化 |
 | writer fencing | 单 runDir 单 Host 约束 | PID+process identity lease、monotonic generation fence | Pi 强化 |
-| Agent 配置 | DSH preset role、capability 匹配、临时 Agent、模型偏好 | 精确 `.pi/agents` 名称，admission freeze，公共 preflight；不选模型 | 宿主适配不同 |
+| Agent 配置 | DSH preset role、capability 匹配、临时 Agent、模型偏好 | Pi capability catalog → exact Agent；公共 preflight + admission freeze；临时 Agent显式 opt-in | 能力对齐，宿主解析不同 |
 | `readOnly` | 与角色 toolFilter/只读 allow-list 取交集 | compiler 禁 local_write，Guard 执行 graph toolFilter 和只读工具判断 | 目标对齐，实现不同 |
 | capsule/templates | 三个内置模板，typed envelope | 三个同类模板，共用 typed `.graph.json` 编译器 | 对齐 |
 | 并发 | 默认 8，最大 32 | 默认 2，最大 6 | 有意不同 |
-| 工具动作 | 12 个，无 `pause/doctor` | 14 个，增加 `pause/doctor` | Pi 扩展 |
-| 模型字段 | Graph 传偏好给 DSH Host，Graph 自身不做路由 | 编译器完全拒绝模型/路由字段 | Pi 保持纯执行器边界 |
+| 工具动作 | 12 个，无 `pause/doctor/wait` | 15 个，增加 `pause/doctor/wait` | Pi 扩展 |
+| 模型字段 | Graph 传偏好给 DSH Host，Graph 自身不做路由 | Binding 接收 model/thinking/budget hints，Core 不路由；requested/resolved/actual 分离 | Pi 保持纯执行器边界并补齐观测 |
+| 实时观测 | 运行状态/事件持久化 | Pi `start`/`wait` 工具卡 + DAG widget/status；actual model/session/usage/tool progress | Pi 宿主增强 |
 
 ## 16. 必须保持的不变量
 
@@ -644,5 +701,12 @@ interface V3GraphConfig {
 8. cancel 与首次 prepared Attempt 由同一 fence 决胜；
 9. retry 只从 durable baseline 产生一次新执行，不覆盖历史；
 10. snapshot/events 可丢失或重建，不得反过来覆盖 authority evidence；
-11. GraphSpec、Authorization 与公开 action 中不得重新引入规划、治理或模型路由；
+11. Binding 可以解析 capability 和显式 launch hints，但 Graph Core、Authorization 恢复与公开 action 中不得引入规划、启发式 Agent 选择、模型注册表或模型路由；
 12. Guard 只能被描述为工具边界，不得声称 OS 沙箱。
+13. requested/resolved/actual Agent 与模型不得互相冒充；actual 只能来自 child lifecycle observation；
+14. strict capability 合同、未知显式 Agent、部分匹配或冲突匹配永不使用临时 fallback；
+15. observation 变化永不改变 scheduling、recovery 或 acceptance digest。
+16. Agent 扩展是受信代码；Guard 能阻止 extension Provider 成为当前模型 transport，但不得声称能沙箱化扩展自身的文件或网络访问。
+
+
+运行时适配：Graph 兼容未修改的 pi-subagents 0.67.x，通过公开 RPC、完成通知、结果回放与进程退出证明接入；在 Graph Attempt 目录保存完整结果和退出证明，二者齐全后才进入验收。Graph 不覆盖上游执行时限，原版单子任务默认 30 分钟。公开证据不足时保留待核对状态，不自动重跑，不安装补丁。详见 README「原版 pi-subagents 适配与结果恢复」。

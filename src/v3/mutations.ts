@@ -226,7 +226,7 @@ async function createAtomicRevisionJson(runDir: string, path: string, value: unk
 function validatedBaseGraph(input: CompiledGraphV3): CompiledGraphV3 {
 	let graph: CompiledGraphV3;
 	try {
-		graph = compileGraphSpecV3(input.sourceGraphSpec);
+		graph = compileGraphSpecV3(input.sourceGraphSpec, { historical: true });
 	} catch (error) {
 		throw new GraphV3Error("INVALID_MUTATION", `Mutation base graph cannot be recompiled: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}

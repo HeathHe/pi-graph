@@ -17,7 +17,7 @@ test("src/v3 has zero direct imports from model routing, subagent routing, recom
 	for (const { file, source } of await v3Sources()) assert.doesNotMatch(source, forbidden, file);
 });
 
-test("src/v3 complete relative import closure stays inside the governance-free V3 kernel", async () => {
+test("V3 relative import closure stays within its kernel and owned runtime", async () => {
 	const importPattern = /(?:from\s+|import\s*\()\s*["']([^"']+)["']/gu;
 	const pending = (await readdir(v3SourceDir)).filter((file) => file.endsWith(".ts")).map((file) => join(v3SourceDir, file));
 	const visited = new Set<string>();
@@ -30,9 +30,10 @@ test("src/v3 complete relative import closure stays inside the governance-free V
 			const specifier = match[1]!;
 			if (!specifier.startsWith(".")) continue;
 			const imported = resolve(dirname(file), specifier);
-			const fromV3 = relative(v3SourceDir, imported);
+			const fromV3 = relative(join(repositoryRoot, "src"), imported);
+			assert.match(fromV3, /^(?:v3|runtime)\//u, "only the kernel and its owned runtime may enter the closure");
 			assert.equal(fromV3.startsWith("..") || fromV3 === "", false, `${relative(repositoryRoot, file)} imports governance-bearing module ${relative(repositoryRoot, imported)}`);
-			assert.doesNotMatch(imported, /model-routing|subagent-router|recommend|model-routing-adapter|extensions|src\/types\.ts/u);
+			assert.doesNotMatch(relative(repositoryRoot, imported), /model-routing|subagent-router|recommend|model-routing-adapter|extensions|src\/types\.ts/u);
 			pending.push(imported);
 		}
 	}
@@ -46,12 +47,15 @@ test("V3 initialize and inspect have no governance configuration probes", async 
 	}
 });
 
-test("V3 Agent admission, freezing, and dispatch all use project scope", async () => {
+test("V3 Binding and freezing resolve all Pi Agent scopes while shadow dispatch stays project-scoped", async () => {
+	const binding = await readFile(join(v3SourceDir, "binding.ts"), "utf8");
 	const preflight = await readFile(join(v3SourceDir, "preflight.ts"), "utf8");
 	const workspace = await readFile(join(v3SourceDir, "workspace.ts"), "utf8");
 	const runner = await readFile(join(v3SourceDir, "runner.ts"), "utf8");
+	assert.match(binding, /agentScope:\s*"both"/u);
+	assert.match(preflight, /agentScope:\s*input\.agentScope\s*\?\?\s*"both"/u);
 	assert.match(preflight, /agentScope:\s*"project"/u);
-	assert.match(workspace, /discoverAgents\(sourceCwd,\s*"project"\)/u);
-	assert.doesNotMatch(workspace, /discoverAgents\(sourceCwd,\s*"both"\)/u);
+	assert.match(workspace, /discoverAgents\(sourceCwd,\s*"both"\)/u);
+	assert.doesNotMatch(workspace, /discoverAgents\(sourceCwd,\s*"project"\)/u);
 	assert.match(runner, /agentScope:\s*"project"/u);
 });

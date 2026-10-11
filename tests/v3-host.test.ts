@@ -216,7 +216,9 @@ test("E2E-2: V3 host resumes a SIGKILLed run fail-closed when stale child termin
 	});
 	try {
 		// Wait for n2 to be mid-run (n1 already applied).
-		await waitForFile(readyFile, "ready", 20_000);
+		// The full suite runs four files concurrently and this crash driver performs
+		// real fsyncs plus two child transitions before publishing readiness.
+		await waitForFile(readyFile, "ready", 60_000);
 		// n1's committed side effect is already on disk exactly once before the crash.
 		assert.equal(await readFile(join(sourceDir, "n1.out"), "utf8"), "n1\n");
 		// SIGKILL the driver while n2 is running.
@@ -236,7 +238,7 @@ test("E2E-2: V3 host resumes a SIGKILLed run fail-closed when stale child termin
 	assert.equal(adopted.length, 1);
 	assert.equal(adopted[0]!.graphId, (await host.list())[0]!.graphId);
 	const graphId = adopted[0]!.graphId;
-	const snapshot = await host.waitForCompletion(graphId);
+	const snapshot = await host.stop(graphId);
 	assert.equal(snapshot.status, "needs_attention");
 	const runDir = host.runDirFor(graphId);
 
@@ -311,7 +313,7 @@ test("E2E-2b: V3 host does not re-dispatch a node whose child completed before t
 	await import("node:fs/promises").then((fs) => fs.rm(sandbox, { recursive: true, force: true }));
 });
 
-test("E2E-2c: SIGKILL after spawn but before dispatch binding recovers the stable request without re-dispatch", async () => {
+test("E2E-2c: SIGKILL after spawn but before dispatch binding fails closed without re-dispatch", async () => {
 	const { sandbox, sourceDir, runsDir } = await fixture();
 	const readyFile = join(sandbox, "dispatch-window-ready.txt");
 	const child = spawnCrashDriver("v3-dispatch-window-crash-driver.ts", {
@@ -335,12 +337,13 @@ test("E2E-2c: SIGKILL after spawn but before dispatch binding recovers the stabl
 	const adopted = await host.adoptCrashedRuns();
 	assert.equal(adopted.length, 1);
 	const snapshot = await host.waitForCompletion(adopted[0]!.graphId);
-	assert.equal(snapshot.status, "complete");
+	assert.equal(snapshot.status, "needs_attention");
 	const attempt = (await readLatestV3Attempt(host.runDirFor(adopted[0]!.graphId), "window"))!.evidence;
 	assert.equal(attempt.attempt, 1);
-	assert.equal(attempt.phase, "accepted");
-	assert.equal(attempt.child!.output, "durable-child-output");
-	assert.equal(mock.spawned.length, 0, "recovery must bind the original stable request instead of spawning a replacement");
+	assert.equal(attempt.phase, "needs_attention");
+	assert.equal(attempt.failure?.kind, "dispatch_unknown");
+	assert.equal(attempt.child, undefined);
+	assert.equal(mock.spawned.length, 0, "recovery must not spawn a replacement when the original child identity is unknown");
 	await mock.dispose();
 	await rm(sandbox, { recursive: true, force: true });
 });
@@ -360,7 +363,12 @@ test("V3 host stop marks a fresh run stopped without dispatching downstream chil
 	};
 	const host = hostFor(runsDir, mock);
 	const result = await host.start(spec, sourceDir);
-	await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+	// Stop an admitted child, rather than racing workspace preparation under load.
+ const dispatchDeadline = Date.now() + 10000;
+ while (!(await readLatestV3Attempt(result.runDir, "slow"))?.evidence.dispatch) {
+  assert.ok(Date.now() < dispatchDeadline, "slow child must be admitted before stop");
+  await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+ }
 	const snapshot = await host.stop(result.graphId);
 	assert.equal(snapshot.status, "stopped");
 	const slow = (await readLatestV3Attempt(result.runDir, "slow"))!.evidence;
@@ -435,18 +443,30 @@ test("E2E-3: a zero-config clean install has no governance files and E2E-1 passe
 		|| p.endsWith("shadow-report.ts"),
 	);
 	assert.deepEqual(governanceHits, [], `zero-config install must contain no governance artifacts: ${governanceHits.join(", ")}`);
-	const legacyCore = installedFiles.filter((path) => path.startsWith("src/") && !path.startsWith("src/v3/"));
-	assert.deepEqual(legacyCore, [], `the installed package must ship only the V3 execution core: ${legacyCore.join(", ")}`);
+	const legacyCore = installedFiles.filter((path) => path.startsWith("src/") && !path.startsWith("src/v3/") && !path.startsWith("src/runtime/"));
+	assert.deepEqual(legacyCore, [], `the installed package must ship only the V3 core and owned SDK runtime: ${legacyCore.join(", ")}`);
 
 	// Extension load manifest == retained set.
-	const installedPackageJson = JSON.parse(await readFile(join(pkgRoot, "package.json"), "utf8")) as { pi?: { extensions?: string[] } };
+	const installedPackageJson = JSON.parse(await readFile(join(pkgRoot, "package.json"), "utf8")) as {
+		pi?: { extensions?: string[] };
+		peerDependencies?: Record<string,string>;dependencies?:Record<string,string>;
+	};
 	assert.deepEqual(installedPackageJson.pi?.extensions, ["./extensions/pi-graph.ts", "./extensions/pi-graph-guard.ts"]);
+	assert.equal(installedPackageJson.peerDependencies?.["pi-subagents"],undefined);
+ assert.equal(installedPackageJson.dependencies?.["pi-subagents"],undefined);
+ assert.ok(installedFiles.includes("src/runtime/child-runner.mjs"));
+	assert.ok(installedFiles.includes("agents/graph-worker.md"), "packed layout must include the opt-in fallback Agent");
+	const graphWorker = await readFile(join(pkgRoot, "agents/graph-worker.md"), "utf8");
+	assert.match(graphWorker, /name: graph-worker/u);
+	assert.match(graphWorker, /package: pi-graph/u);
+	assert.match(graphWorker, /tools: read, grep, find, ls, write, edit/u);
+	assert.doesNotMatch(graphWorker, /tools:.*\bbash\b/u);
 
 	// Provide runtime and peer dependencies exactly like `npm install` would, then run E2E-1
 	// against the installed layout (clean fixture, zero governance config) and confirm it passes.
 	await mkdir(join(pkgRoot, "node_modules"), { recursive: true });
 	await symlink(join(repoRoot, "node_modules", "jiti"), join(pkgRoot, "node_modules", "jiti"), "dir");
-	await symlink(join(repoRoot, "node_modules", "pi-subagents"), join(pkgRoot, "node_modules", "pi-subagents"), "dir");
+	await symlink(join(repoRoot, "node_modules", "yaml"), join(pkgRoot, "node_modules", "yaml"), "dir");
 	const { V3GraphHost: InstalledV3GraphHost } = await import(join(pkgRoot, "src/v3/host.ts")) as typeof import("../src/v3/host.ts");
 	const { readLatestV3Attempt: installedReadAttempt } = await import(join(pkgRoot, "src/v3/attempt.ts")) as typeof import("../src/v3/attempt.ts");
 	const { validateGraphSnapshotV3: installedValidateSnapshot } = await import(join(pkgRoot, "src/v3/snapshot.ts")) as typeof import("../src/v3/snapshot.ts");

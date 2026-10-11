@@ -12,22 +12,51 @@ import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import type { GraphSpecV3 } from "../src/v3/types.ts";
 import { MockSubagents, completeChild, failChild } from "./helpers/mock-subagents.ts";
 
-async function fixture(onStateChange?: (snapshot: import("../src/v3/types.ts").GraphSnapshotV3) => void) {
+async function fixture(
+	onStateChange?: (snapshot: import("../src/v3/types.ts").GraphSnapshotV3) => void,
+	onActiveWorkChange?: (items: readonly { id: string; sessionId: string }[]) => void,
+	createHost?: (context: ConstructorParameters<typeof V3GraphHost>[0]) => V3GraphHost,
+) {
 	const sandbox = await realpath(await mkdtemp(join(tmpdir(), "v3-retry-host-")));
 	const sourceDir = join(sandbox, "source");
 	const runsDir = join(sandbox, "runs");
 	await Promise.all([mkdir(sourceDir, { recursive: true }), mkdir(runsDir, { recursive: true })]);
 	const mock = new MockSubagents();
 	mock.start();
-	const host = new V3GraphHost({
+	const context: ConstructorParameters<typeof V3GraphHost>[0] = {
 		rpc: new SubagentRpcClient(mock),
 		runsDir,
 		sessionId: "retry-session",
 		supervisorEpoch: "retry-epoch",
 		preflightAgent: async () => undefined,
 		...(onStateChange ? { onStateChange } : {}),
-	});
+		...(onActiveWorkChange ? { onActiveWorkChange } : {}),
+	};
+	const host = createHost ? createHost(context) : new V3GraphHost(context);
 	return { sandbox, sourceDir, runsDir, mock, host };
+}
+
+class GatedLoadV3GraphHost extends V3GraphHost {
+	private nextLoadGate: { entered: () => void; released: Promise<void> } | undefined;
+
+	gateNextLoad(): { entered: Promise<void>; release: () => void } {
+		let markEntered!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolveEntered) => { markEntered = resolveEntered; });
+		const released = new Promise<void>((resolveReleased) => { release = resolveReleased; });
+		this.nextLoadGate = { entered: markEntered, released };
+		return { entered, release };
+	}
+
+	override async loadRun(runDir: string, graphId?: string) {
+		const gate = this.nextLoadGate;
+		if (gate) {
+			this.nextLoadGate = undefined;
+			gate.entered();
+			await gate.released;
+		}
+		return super.loadRun(runDir, graphId);
+	}
 }
 
 test("V3 Host forwards authoritative snapshot publications to its background-work notifier", async () => {
@@ -41,6 +70,164 @@ test("V3 Host forwards authoritative snapshot publications to its background-wor
 		await f.host.waitForCompletion(handle.graphId);
 		assert.ok(published.length > 0);
 		assert.equal(published.at(-1), "complete");
+	} finally {
+		await f.mock.dispose();
+		await rm(f.sandbox, { recursive: true, force: true });
+	}
+});
+
+test("V3 Host notifies background work only after active inventory changes", async () => {
+	const inventories: Array<Array<{ id: string; sessionId: string }>> = [];
+	const f = await fixture(undefined, (items) => inventories.push(items.map((item) => ({ ...item }))));
+	try {
+		f.mock.behaviors.set("RUN_ROOT", (input) => completeChild({ ...input, output: "root output" }));
+		f.mock.behaviors.set("RUN_TARGET", (input) => completeChild({ ...input, output: "target output" }));
+		f.mock.behaviors.set("RUN_LEAF", (input) => completeChild({ ...input, output: "leaf output" }));
+		const handle = await f.host.start(chainSpec("active-work-notifier"), f.sourceDir);
+		assert.deepEqual(inventories[0], [{ id: handle.graphId, sessionId: "retry-session" }]);
+		await f.host.waitForCompletion(handle.graphId);
+		assert.deepEqual(inventories.at(-1), [], "the terminal notification must run after Host removes the work item");
+		assert.equal(inventories.length, 2, "node snapshots cannot create background-work wake churn");
+	} finally {
+		await f.mock.dispose();
+		await rm(f.sandbox, { recursive: true, force: true });
+	}
+});
+
+test("V3 Host keeps one background-work identity across a pause-resume Supervisor handoff", { timeout: 15_000 }, async () => {
+	const inventories: string[][] = [];
+	let f!: Awaited<ReturnType<typeof fixture>>;
+	let resumeRequested: Promise<unknown> | undefined;
+	f = await fixture((snapshot) => {
+		if (snapshot.graphId === "pause-resume-active-work" && snapshot.status === "paused" && !resumeRequested) {
+			resumeRequested = f.host.requestDesiredState(snapshot.graphId, "running");
+		}
+	}, (items) => inventories.push(items.map((item) => item.id)));
+	try {
+		let releaseRoot!: () => void;
+		const rootGate = new Promise<void>((resolveGate) => { releaseRoot = resolveGate; });
+		f.mock.behaviors.set("RUN_ROOT", async (input) => {
+			await rootGate;
+			await completeChild({ ...input, output: "root output" });
+		});
+		f.mock.behaviors.set("RUN_TARGET", (input) => completeChild({ ...input, output: "target output" }));
+		f.mock.behaviors.set("RUN_LEAF", (input) => completeChild({ ...input, output: "leaf output" }));
+		const handle = await f.host.start(chainSpec("pause-resume-active-work"), f.sourceDir);
+		while ((await readLatestV3Attempt(handle.runDir, "root"))?.evidence.phase !== "running") {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+		}
+		const pausedPromise = f.host.pause(handle.graphId);
+		releaseRoot();
+		assert.equal((await pausedPromise).status, "paused");
+		await resumeRequested;
+		assert.equal((await f.host.waitForCompletion(handle.graphId)).status, "complete");
+		await Promise.resolve();
+		assert.deepEqual(inventories, [[handle.graphId], []], "the retiring and successor Supervisors must appear as one continuous job");
+	} finally {
+		await f.mock.dispose();
+		await rm(f.sandbox, { recursive: true, force: true });
+	}
+});
+
+test("V3 Host reserves background work when pause overtakes an in-progress running request", { timeout: 15_000 }, async () => {
+	const inventories: string[][] = [];
+	const f = await fixture(
+		undefined,
+		(items) => inventories.push(items.map((item) => item.id)),
+		(context) => new GatedLoadV3GraphHost(context),
+	);
+	const host = f.host as GatedLoadV3GraphHost;
+	let releaseRoot: () => void = () => undefined;
+	let releaseRunningLoad: () => void = () => undefined;
+	let runningRequest: Promise<unknown> | undefined;
+	let graphId: string | undefined;
+	try {
+		const rootGate = new Promise<void>((resolveGate) => { releaseRoot = resolveGate; });
+		f.mock.behaviors.set("RUN_ROOT", async (input) => {
+			await rootGate;
+			await completeChild({ ...input, output: "root output" });
+		});
+		f.mock.behaviors.set("RUN_TARGET", (input) => completeChild({ ...input, output: "target output" }));
+		f.mock.behaviors.set("RUN_LEAF", (input) => completeChild({ ...input, output: "leaf output" }));
+		const handle = await host.start(chainSpec("pause-overtakes-running-active-work"), f.sourceDir);
+		graphId = handle.graphId;
+		while ((await readLatestV3Attempt(handle.runDir, "root"))?.evidence.phase !== "running") {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+		}
+
+		const loadGate = host.gateNextLoad();
+		releaseRunningLoad = loadGate.release;
+		runningRequest = host.requestDesiredState(handle.graphId, "running");
+		await loadGate.entered;
+
+		const pausedPromise = host.pause(handle.graphId);
+		releaseRoot();
+		assert.equal((await pausedPromise).status, "paused");
+		assert.deepEqual(host.listActiveWork(), [{ id: handle.graphId, sessionId: "retry-session" }]);
+		assert.deepEqual(inventories, [[handle.graphId]], "the retiring Supervisor must remain visible while the earlier running request is blocked");
+
+		releaseRunningLoad();
+		await runningRequest;
+		assert.equal((await host.waitForCompletion(handle.graphId)).status, "complete");
+		await Promise.resolve();
+		assert.deepEqual(inventories, [[handle.graphId], []], "the handoff must expose no false completion between Supervisors");
+	} finally {
+		releaseRoot();
+		releaseRunningLoad();
+		await runningRequest?.catch(() => undefined);
+		if (graphId) await host.waitForCompletion(graphId).catch(() => undefined);
+		await f.mock.dispose();
+		await rm(f.sandbox, { recursive: true, force: true });
+	}
+});
+
+test("V3 Host attributes an adopted Graph to the current Pi session", { timeout: 15_000 }, async () => {
+	const f = await fixture();
+	try {
+		let releaseRoot!: () => void;
+		const rootGate = new Promise<void>((resolveGate) => { releaseRoot = resolveGate; });
+		f.mock.behaviors.set("RUN_ROOT", async (input) => {
+			await rootGate;
+			await completeChild({ ...input, output: "root output" });
+		});
+		f.mock.behaviors.set("RUN_TARGET", (input) => completeChild({ ...input, output: "target output" }));
+		f.mock.behaviors.set("RUN_LEAF", (input) => completeChild({ ...input, output: "leaf output" }));
+		const handle = await f.host.start(chainSpec("new-session-active-work"), f.sourceDir);
+		while ((await readLatestV3Attempt(handle.runDir, "root"))?.evidence.phase !== "running") {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+		}
+		const pausedPromise = f.host.pause(handle.graphId);
+		releaseRoot();
+		assert.equal((await pausedPromise).status, "paused");
+
+		let releaseTarget!: () => void;
+		const targetGate = new Promise<void>((resolveGate) => { releaseTarget = resolveGate; });
+		f.mock.behaviors.set("RUN_TARGET", async (input) => {
+			await targetGate;
+			await completeChild({ ...input, output: "target output" });
+		});
+		const inventories: Array<Array<{ id: string; sessionId: string }>> = [];
+		let observeOwner!: () => void;
+		const ownerObserved = new Promise<void>((resolveOwner) => { observeOwner = resolveOwner; });
+		const adopted = new V3GraphHost({
+			rpc: new SubagentRpcClient(f.mock),
+			runsDir: f.runsDir,
+			sessionId: "replacement-session",
+			supervisorEpoch: "replacement-epoch",
+			preflightAgent: async () => undefined,
+			onActiveWorkChange: (items) => {
+				inventories.push(items.map((item) => ({ ...item })));
+				if (items.length > 0) observeOwner();
+			},
+		});
+		const resumed = adopted.resume(handle.graphId);
+		await ownerObserved;
+		assert.deepEqual(adopted.listActiveWork(), [{ id: handle.graphId, sessionId: "replacement-session" }]);
+		assert.deepEqual(inventories[0], [{ id: handle.graphId, sessionId: "replacement-session" }]);
+		releaseTarget();
+		assert.equal((await resumed).status, "complete");
+		await Promise.resolve();
+		assert.deepEqual(inventories.at(-1), []);
 	} finally {
 		await f.mock.dispose();
 		await rm(f.sandbox, { recursive: true, force: true });
@@ -197,4 +384,42 @@ test("V3 Host pause commits durable intent and quiesces before dispatching downs
 		await f.mock.dispose();
 		await rm(f.sandbox, { recursive: true, force: true });
 	}
+});
+
+test("inherited retry rejects an already-dispatched external descendant without replaying any node", async () => {
+ const f = await fixture();
+ try {
+  f.mock.behaviors.set("READ_ROOT", input => completeChild({ ...input, output: "read" }));
+  f.mock.behaviors.set("WRITE_EXTERNAL", input => completeChild({ ...input, output: "external receipt" }));
+  const spec: GraphSpecV3 = { schemaVersion: 3, graphId: "inherited-replay", goal: "Do not duplicate effects", permissionPolicy: "inherited", parentToolAllowlist: ["read", "bash"], nodes: [
+   { taskId: "read", agent: "worker", task: "READ_ROOT", sideEffect: "external_read", readOnly: true },
+   { taskId: "write", agent: "worker", task: "WRITE_EXTERNAL", sideEffect: "external_write", dependsOn: ["read"] },
+  ] };
+  const started = await f.host.start(spec, f.sourceDir);
+  assert.equal((await f.host.waitForCompletion(started.graphId)).status, "complete");
+  assert.equal(f.mock.spawned.length, 2);
+  await assert.rejects(f.host.retry(started.graphId, "read"), /external effects/);
+  assert.equal(f.mock.spawned.length, 2);
+ } finally { await f.mock.dispose(); await rm(f.sandbox, { recursive: true, force: true }); }
+});
+
+test("inherited open Graph append/resume freezes original ceiling and intersects current runtime permissions", async () => {
+ let currentTools = ["read", "bash"];
+ const f = await fixture(undefined, undefined, context => new V3GraphHost({ ...context, parentToolAllowlist: () => currentTools }));
+ try {
+  f.mock.behaviors.set("CEILING_WORK", input => completeChild({ ...input, output: "done" }));
+  const handle = await f.host.start({ schemaVersion: 3, graphId: "inherited-append", goal: "Frozen upper bound", mode: "open", permissionPolicy: "inherited", parentToolAllowlist: ["read", "bash"], toolFilter: ["read", "graph_mailbox"], nodes: [] }, f.sourceDir);
+  assert.equal((await f.host.waitForCompletion(handle.graphId)).status, "idle");
+  await f.host.pause(handle.graphId);
+  currentTools = ["read", "write"];
+  await f.host.append(handle.graphId, [{ taskId: "later", agent: "worker", task: "CEILING_WORK", sideEffect: "external_read", readOnly: true }], 0);
+  await f.host.resume(handle.graphId);
+  await f.host.waitForCompletion(handle.graphId);
+  assert.equal(f.mock.spawned.length, 1);
+  const ceiling = f.mock.spawned[0]!.params.capabilityCeiling as { allowedTools: string[] };
+  assert.deepEqual(ceiling.allowedTools, ["read", "graph_mailbox"]);
+  const loaded = await f.host.loadRun(handle.runDir, handle.graphId);
+  assert.deepEqual(loaded.graph.nodes[0]!.parentToolAllowlist, ["read", "bash"]);
+  assert.equal(loaded.graph.nodes[0]!.permissionPolicy, "inherited");
+ } finally { await f.mock.dispose(); await rm(f.sandbox, { recursive: true, force: true }); }
 });

@@ -8,32 +8,30 @@
     "type": "graph-spec",
     "spec": {
       "schemaVersion": 3,
+      "contractPolicy": "strict",
       "goal": "Review {{target}} for {{focus}}, against requirements: {{requirements}}",
       "nodes": [
         {
           "taskId": "scout",
-          "agent": "code-scout",
+          "capabilityId": "discover.code",
           "task": "Perform read-only reconnaissance of {{target}}: identify affected files and key symbols, including entry points, functions, and call chains. Return a compact file/symbol map.",
           "sideEffect": "local_read",
-          "readScope": [{ "kind": "tree", "path": "." }],
-          "timeoutMs": 300000
+          "readScope": [{ "kind": "tree", "path": "." }]
         },
         {
           "taskId": "review",
-          "agent": "code-reviewer",
+          "capabilityId": "review.code",
           "task": "Review {{target}} without modifying files. Focus on {{focus}}. Cite file:line evidence and severity for every finding. Check against these requirements: {{requirements}}.",
           "dependsOn": ["scout"],
           "sideEffect": "local_read",
-          "readScope": [{ "kind": "tree", "path": "." }],
-          "timeoutMs": 600000
+          "readScope": [{ "kind": "tree", "path": "." }]
         },
         {
           "taskId": "synthesize",
-          "agent": "code-reviewer",
+          "capabilityId": "review.code",
           "task": "Synthesize the review into a final report: one-paragraph summary, findings ordered by severity with file:line evidence, and open questions. Do not modify files.",
           "dependsOn": ["review"],
-          "sideEffect": "none",
-          "timeoutMs": 300000
+          "sideEffect": "none"
         }
       ]
     }

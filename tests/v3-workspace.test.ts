@@ -44,6 +44,38 @@ function node(taskId: string, extra: Partial<CompiledGraphNodeV3> = {}): Compile
 	return { ...base, ...extra };
 }
 
+async function writeRunnerAgent(sourceCwd: string, name: string, runnerFrontmatter: readonly string[]): Promise<void> {
+	await mkdir(join(sourceCwd, ".pi", "agents"), { recursive: true });
+	await writeFile(join(sourceCwd, ".pi", "agents", `${name}.md`), [
+		"---",
+		`name: ${name}`,
+		`description: V3 runner boundary fixture for ${name}`,
+		...runnerFrontmatter,
+		"---",
+		"",
+		`Instructions for ${name}.`,
+		"",
+	].join("\n"), "utf8");
+}
+
+async function writeExtensionAgent(
+	sourceCwd: string,
+	name: string,
+	extensions: readonly string[],
+): Promise<void> {
+	await mkdir(join(sourceCwd, ".pi", "agents"), { recursive: true });
+	await writeFile(join(sourceCwd, ".pi", "agents", `${name}.md`), [
+		"---",
+		`name: ${name}`,
+		`description: V3 extension fixture for ${name}`,
+		`extensions: ${extensions.join(", ")}`,
+		"---",
+		"",
+		`Instructions for ${name}.`,
+		"",
+	].join("\n"), "utf8");
+}
+
 test("V3 workspace captures baselines, inspects writes, and applies within scope", async () => {
 	const { sandbox, sourceCwd, runDir } = await workspaceFixture();
 	await writeFile(join(sourceCwd, "target.txt"), "before\n", "utf8");
@@ -92,7 +124,7 @@ test("V3 tree write scopes detect and atomically apply newly-created nested file
 	await prepared.cleanup();
 });
 
-test("V3 workspace materializes a frozen project-only Agent with Graph Guard and a bounded contract", async () => {
+test("V3 workspace materializes a frozen exact Agent with Graph Guard and a bounded contract", async () => {
 	const { sourceCwd, runDir } = await workspaceFixture();
 	await mkdir(join(sourceCwd, ".pi", "agents"), { recursive: true });
 	await writeFile(join(sourceCwd, ".pi", "agents", "frozen.md"), [
@@ -120,7 +152,73 @@ test("V3 workspace materializes a frozen project-only Agent with Graph Guard and
 	await prepared.cleanup();
 });
 
-test("V3 Agent freeze rejects definitions available only from user scope", async () => {
+test("V3 Agent freeze accepts an explicit native Pi runner and persists durable runner proof", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	const agent = "v3-explicit-pi-runner";
+	await writeRunnerAgent(sourceCwd, agent, ["runner:", "  type: pi"]);
+	const graphNode = node("explicit-pi-runner", { agent, sideEffect: "none" });
+	assert.equal((await freezeV3GraphAgents(runDir, sourceCwd, [graphNode])).length, 1);
+
+	const frozenPath = join(runDir, "agent-profiles", "explicit-pi-runner.json");
+	const frozen = JSON.parse(await readFile(frozenPath, "utf8")) as Record<string, unknown>;
+	assert.equal(frozen.schemaVersion, 2);
+	assert.equal(frozen.runnerType, "pi");
+	assert.match(String(frozen.serialized), /runner:\n\s+type: pi/u);
+
+	// A profile issued before runnerType became mandatory must never be trusted
+	// during recovery, even though its existing byte digests remain valid.
+	const legacy: Record<string, unknown> = { ...frozen, schemaVersion: 1 };
+	delete legacy.runnerType;
+	await writeFile(frozenPath, JSON.stringify(legacy), "utf8");
+	await assert.rejects(
+		freezeV3GraphAgents(runDir, sourceCwd, [graphNode]),
+		/failed identity validation/u,
+	);
+});
+
+test("V3 Agent freeze rejects external runners before publishing a profile", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	const cases = [
+		{
+			name: "v3-external-cli-runner",
+			taskId: "external-cli-runner",
+			type: "external-cli",
+			frontmatter: ["runner:", "  type: external-cli", "  command: node"],
+		},
+		{
+			name: "v3-external-job-runner",
+			taskId: "external-job-runner",
+			type: "external-job",
+			frontmatter: ["runner:", "  type: external-job", "  provider: test-provider"],
+		},
+	] as const;
+	for (const fixture of cases) await writeRunnerAgent(sourceCwd, fixture.name, fixture.frontmatter);
+
+	for (const fixture of cases) {
+		await assert.rejects(
+			freezeV3GraphAgents(runDir, sourceCwd, [node(fixture.taskId, { agent: fixture.name, sideEffect: "none" })]),
+			new RegExp(`runner\\.type='${fixture.type}'.*requires the native Pi runner`, "u"),
+		);
+		await assert.rejects(readFile(join(runDir, "agent-profiles", `${fixture.taskId}.json`), "utf8"), { code: "ENOENT" });
+	}
+});
+
+test("V3 Agent freeze rolls back earlier native profiles when a later external runner is rejected", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	await writeRunnerAgent(sourceCwd, "v3-batch-native-runner", ["runner:", "  type: pi"]);
+	await writeRunnerAgent(sourceCwd, "v3-batch-external-runner", ["runner:", "  type: external-cli", "  command: node"]);
+	await assert.rejects(
+		freezeV3GraphAgents(runDir, sourceCwd, [
+			node("batch-native-runner", { agent: "v3-batch-native-runner", sideEffect: "none" }),
+			node("batch-external-runner", { agent: "v3-batch-external-runner", sideEffect: "none" }),
+		]),
+		/runner\.type='external-cli'.*requires the native Pi runner/u,
+	);
+	await assert.rejects(readFile(join(runDir, "agent-profiles", "batch-native-runner.json"), "utf8"), { code: "ENOENT" });
+	await assert.rejects(readFile(join(runDir, "agent-profiles", "batch-external-runner.json"), "utf8"), { code: "ENOENT" });
+});
+
+test("V3 Agent freeze includes user/package scope used by Pi capability bindings", async () => {
 	const { sandbox, sourceCwd, runDir } = await workspaceFixture();
 	const userAgents = join(sandbox, "user-agents");
 	await mkdir(userAgents, { recursive: true });
@@ -133,17 +231,141 @@ test("V3 Agent freeze rejects definitions available only from user scope", async
 		"User-scoped instructions.",
 		"",
 	].join("\n"), "utf8");
-	const prior = process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
-	process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = userAgents;
+	const prior = process.env.PI_GRAPH_EXTRA_AGENT_DIRS;
+	process.env.PI_GRAPH_EXTRA_AGENT_DIRS = userAgents;
 	try {
-		await assert.rejects(
-			freezeV3GraphAgents(runDir, sourceCwd, [node("user-scope", { agent: "user-only-v3-agent", sideEffect: "none" })]),
-			/Agent 'user-only-v3-agent' is not available/u,
-		);
+		assert.equal((await freezeV3GraphAgents(
+			runDir,
+			sourceCwd,
+			[node("user-scope", { agent: "user-only-v3-agent", sideEffect: "none" })],
+		)).length, 1);
+		const frozen = await readFile(join(runDir, "agent-profiles", "user-scope.json"), "utf8");
+		assert.match(frozen, /User-scoped instructions/u);
 	} finally {
-		if (prior === undefined) delete process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
-		else process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = prior;
+		if (prior === undefined) delete process.env.PI_GRAPH_EXTRA_AGENT_DIRS;
+		else process.env.PI_GRAPH_EXTRA_AGENT_DIRS = prior;
 	}
+});
+
+test("V3 Agent freeze rejects definition drift after capability admission", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	await mkdir(join(sourceCwd, ".pi", "agents"), { recursive: true });
+	await writeFile(join(sourceCwd, ".pi", "agents", "bound.md"), [
+		"---",
+		"name: bound",
+		"description: Bound Agent",
+		"---",
+		"",
+		"Definition which no longer matches admission.",
+	].join("\n"), "utf8");
+	const graphNode = node("bound-node", {
+		agent: "bound",
+		sideEffect: "none",
+		binding: {
+			schemaVersion: 1,
+			resolution: "capability-catalog",
+			resolvedAgent: "bound",
+			capabilityIds: ["test.bound"],
+			catalogDigest: "b".repeat(64),
+			capabilityEntries: [{ capabilityId: "test.bound", agent: "bound", entryDigest: "c".repeat(64) }],
+			agentDefinitionDigest: "a".repeat(64),
+			admissionLaunchContractDigest: "d".repeat(64),
+			authoringNodeDigest: "e".repeat(64),
+			bindingDigest: "f".repeat(64),
+		},
+	});
+	await assert.rejects(
+		freezeV3GraphAgents(runDir, sourceCwd, [graphNode]),
+		/definition changed after capability binding/u,
+	);
+});
+
+test("V3 Agent freeze persists canonical extension evidence and materializes guarded extensions", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	const extensionPath = join(sourceCwd, "extensions", "provider.ts");
+	await mkdir(join(sourceCwd, "extensions"), { recursive: true });
+	await writeFile(extensionPath, "export default function provider() {}\n", "utf8");
+	await writeExtensionAgent(sourceCwd, "extension-agent", ["../../extensions/provider.ts"]);
+	const unbound = node("extension-provider", { agent: "extension-agent", sideEffect: "none" });
+	await freezeV3GraphAgents(runDir, sourceCwd, [unbound]);
+
+	const frozenPath = join(runDir, "agent-profiles", "extension-provider.json");
+	const frozen = JSON.parse(await readFile(frozenPath, "utf8")) as {
+		definitionDigest: string;
+		configuredExtensions: Array<{ path: string; digest: string }>;
+		serialized: string;
+	};
+	const canonicalExtensionPath = await realpath(extensionPath);
+	assert.deepEqual(frozen.configuredExtensions, [{
+		path: canonicalExtensionPath,
+		digest: await digestFile(canonicalExtensionPath),
+	}]);
+	assert.match(frozen.serialized, new RegExp(canonicalExtensionPath.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+
+	const prepared = await prepareV3Workspace({
+		runInstanceId: "r1",
+		graphId: "g1",
+		node: unbound,
+		attempt: 1,
+		runDir,
+		sourceCwd,
+		workspace: "shadow",
+	});
+	const contract = JSON.parse(await readFile(join(prepared.workspaceCwd, ".pi-graph", "node-contract.json"), "utf8")) as Record<string, unknown>;
+	assert.equal(Object.hasOwn(contract, "extensionProviderIds"), false);
+	await reopenV3Workspace({
+		runInstanceId: "r1",
+		graphId: "g1",
+		node: unbound,
+		attempt: 1,
+		runDir,
+		sourceCwd,
+		workspaceCwd: prepared.workspaceCwd,
+		kind: "shadow",
+	});
+	await prepared.cleanup();
+});
+
+test("V3 Agent snapshot schema rejects non-canonical configured extension evidence", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	await writeFile(join(sourceCwd, "a.ts"), "export default function a() {}\n", "utf8");
+	await writeFile(join(sourceCwd, "b.ts"), "export default function b() {}\n", "utf8");
+	await writeExtensionAgent(sourceCwd, "ordered-agent", ["../../b.ts", "../../a.ts"]);
+	const graphNode = node("extension-order", { agent: "ordered-agent", sideEffect: "none" });
+	await freezeV3GraphAgents(runDir, sourceCwd, [graphNode]);
+	const frozenPath = join(runDir, "agent-profiles", "extension-order.json");
+	const frozen = JSON.parse(await readFile(frozenPath, "utf8")) as { configuredExtensions: unknown[] };
+	frozen.configuredExtensions.reverse();
+	await writeFile(frozenPath, JSON.stringify(frozen), "utf8");
+	await assert.rejects(
+		freezeV3GraphAgents(runDir, sourceCwd, [graphNode]),
+		/failed identity validation/u,
+	);
+});
+
+test("V3 materialization and recovery reject extension bytes that drift after freeze", async () => {
+	const { sourceCwd, runDir } = await workspaceFixture();
+	const extensionPath = join(sourceCwd, "provider.ts");
+	await writeFile(extensionPath, "export default function provider() { return 1; }\n", "utf8");
+	await writeExtensionAgent(sourceCwd, "drift-agent", ["../../provider.ts"]);
+
+	const beforeMaterialize = node("drift-before-materialize", { agent: "drift-agent", sideEffect: "none" });
+	await freezeV3GraphAgents(runDir, sourceCwd, [beforeMaterialize]);
+	await writeFile(extensionPath, "export default function provider() { return 2; }\n", "utf8");
+	await assert.rejects(
+		prepareV3Workspace({ runInstanceId: "r1", graphId: "g1", node: beforeMaterialize, attempt: 1, runDir, sourceCwd, workspace: "shadow" }),
+		/Frozen Agent extension changed/u,
+	);
+
+	const beforeRecovery = node("drift-before-recovery", { agent: "drift-agent", sideEffect: "none" });
+	await freezeV3GraphAgents(runDir, sourceCwd, [beforeRecovery]);
+	const prepared = await prepareV3Workspace({ runInstanceId: "r1", graphId: "g1", node: beforeRecovery, attempt: 1, runDir, sourceCwd, workspace: "shadow" });
+	await writeFile(extensionPath, "export default function provider() { return 3; }\n", "utf8");
+	await assert.rejects(
+		reopenV3Workspace({ runInstanceId: "r1", graphId: "g1", node: beforeRecovery, attempt: 1, runDir, sourceCwd, workspaceCwd: prepared.workspaceCwd, kind: "shadow" }),
+		/Frozen Agent extension changed/u,
+	);
+	await prepared.cleanup();
 });
 
 test("V3 append profile cleanup removes only the unpublished inode and permits a later legal definition", async () => {
@@ -489,4 +711,42 @@ test("V3 compile rejects overlapping write scopes without a dependency (schedule
 		],
 	};
 	assert.throws(() => compileGraphSpecV3(spec));
+});
+
+test("already configured active Graph Guard materializes exactly once and inherited contract remains frozen", async () => {
+ const { sourceCwd, runDir } = await workspaceFixture();
+ const guard = resolve(new URL("../extensions/pi-graph-guard.ts", import.meta.url).pathname);
+ await mkdir(join(sourceCwd, ".pi", "agents"), { recursive: true });
+ await writeFile(join(sourceCwd, ".pi", "agents", "same-guard.md"), `---\nname: same-guard\ndescription: Guard deduplication\nsubagentOnlyExtensions:\n  - ${guard}\n---\nTest.\n`);
+ const graphNode = node("same-guard", { agent: "same-guard", permissionPolicy: "inherited", parentToolAllowlist: ["read", "bash"], sideEffect: "external_read" });
+ await freezeV3GraphAgents(runDir, sourceCwd, [graphNode]);
+ const prepared = await prepareV3Workspace({ runInstanceId: "r1", graphId: "g1", node: graphNode, attempt: 1, runDir, sourceCwd, workspace: "shadow" });
+ const profile = JSON.parse(await readFile(join(runDir, "agent-profiles/same-guard.json"), "utf8"));
+ assert.equal(profile.serialized.split(guard).length - 1, 1);
+ const contract = JSON.parse(await readFile(join(prepared.workspaceCwd, ".pi-graph/node-contract.json"), "utf8"));
+ assert.equal(contract.permissionPolicy, "inherited"); assert.equal(contract.allowBash, true);
+ assert.deepEqual(contract.parentToolAllowlist, ["read", "bash"]);
+ await prepared.cleanup();
+});
+
+test("consumer evidence file scopes survive workspace reopen", async () => {
+ const {sandbox,sourceCwd,runDir}=await workspaceFixture();
+ const input=join(sandbox,"report.json");await writeFile(input,'{"ok":true}');
+ const graphNode=node("consumer",{sideEffect:"none",inputArtifacts:["proof"],writeScope:[]});
+ const prepared=await prepareV3Workspace({runInstanceId:"r1",graphId:"g1",node:graphNode,attempt:1,runDir,sourceCwd,artifacts:[{name:"proof",source:input},{name:"proof.files/report.json",source:input}]});
+ const reopened=await reopenV3Workspace({runInstanceId:"r1",graphId:"g1",node:graphNode,attempt:1,runDir,sourceCwd,workspaceCwd:prepared.workspaceCwd,kind:"shadow"});
+ assert.equal(await readFile(join(reopened.workspaceCwd,".pi-graph/inputs/proof.files/report.json"),"utf8"),'{"ok":true}');
+ await reopened.cleanup();
+});
+
+
+test("artifact digest rejects changed source before copy and changed target before recovery", async () => {
+ const {sandbox,sourceCwd,runDir}=await workspaceFixture();
+ const input=join(sandbox,"report.json");await writeFile(input,"changed before copy");
+ const graphNode=node("consumer",{sideEffect:"none",inputArtifacts:["proof"],writeScope:[]});
+ await assert.rejects(prepareV3Workspace({runInstanceId:"r1",graphId:"g1",node:graphNode,attempt:1,runDir,sourceCwd,artifacts:[{name:"proof.files/report.json",source:input,expectedDigest:"0".repeat(64)}]}),/accepted digest/);
+ const prepared=await prepareV3Workspace({runInstanceId:"r1",graphId:"g1",node:graphNode,attempt:2,runDir,sourceCwd,artifacts:[{name:"proof",source:input},{name:"proof.files/report.json",source:input}]});
+ await writeFile(join(prepared.workspaceCwd,".pi-graph/inputs/proof.files/report.json"),"tampered after handoff");
+ await assert.rejects(reopenV3Workspace({runInstanceId:"r1",graphId:"g1",node:graphNode,attempt:2,runDir,sourceCwd,workspaceCwd:prepared.workspaceCwd,kind:"shadow"}),/changed before recovery/);
+ await prepared.cleanup();
 });

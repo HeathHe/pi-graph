@@ -10,7 +10,7 @@ import { V3RevisionConflictError } from "../src/v3/mutations.ts";
 import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import type { GraphNodeSpecV3, GraphSpecV3 } from "../src/v3/types.ts";
 import { freezeV3GraphAgents } from "../src/v3/workspace.ts";
-import { MockSubagents, completeChild } from "./helpers/mock-subagents.ts";
+import { publishMockTerminal, MockSubagents, completeChild } from "./helpers/mock-subagents.ts";
 
 async function fixture() {
 	const sandbox = await realpath(await mkdtemp(join(tmpdir(), "v3-dynamic-runtime-")));
@@ -27,6 +27,12 @@ async function fixture() {
 		preflightAgent: async () => undefined,
 	});
 	return { sandbox, sourceDir, runsDir, mock, host };
+}
+
+async function removeSandbox(path: string): Promise<void> {
+	// A terminal snapshot and mock disposal can race the final atomic directory
+	// sync by a few milliseconds under the full four-file test concurrency.
+	await rm(path, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
 }
 
 function openSpec(graphId: string, nodes: GraphNodeSpecV3[] = []): GraphSpecV3 {
@@ -98,8 +104,106 @@ test("OPEN host replays immutable authorization plus journal, wakes on append, a
 		await f.host.waitForCompletion(handle.graphId);
 	} finally {
 		await f.mock.dispose();
-		await rm(f.sandbox, { recursive: true, force: true });
+		await removeSandbox(f.sandbox);
 	}
+});
+
+test("OPEN stop/seal state matrix preserves active stops but terminalizes quiescent graphs", async (t) => {
+	await t.test("empty OPEN: idle -> stopped -> SEALED complete", async () => {
+		const f = await fixture();
+		try {
+			const handle = await f.host.start(openSpec("dynamic-stop-seal-empty"), f.sourceDir);
+			assert.equal((await f.host.waitForCompletion(handle.graphId)).status, "idle");
+			assert.equal((await f.host.stop(handle.graphId)).status, "stopped");
+			await f.host.seal(handle.graphId, 0);
+			const terminal = await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.status === "complete", "empty stopped OPEN graph to seal complete");
+			assert.equal(terminal.sealed, true);
+			assert.equal((await f.host.control(handle.graphId)).desiredState, "running");
+			await f.host.waitForCompletion(handle.graphId);
+		} finally {
+			await f.mock.dispose();
+			await removeSandbox(f.sandbox);
+		}
+	});
+
+	await t.test("accepted OPEN: idle -> stopped -> SEALED complete", async () => {
+		const f = await fixture();
+		try {
+			f.mock.behaviors.set("STOP_SEAL_ACCEPT", (input) => completeChild({ ...input, output: "accepted before stop" }));
+			const handle = await f.host.start(openSpec("dynamic-stop-seal-accepted", [node("work", "STOP_SEAL_ACCEPT")]), f.sourceDir);
+			await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.status === "idle" && snapshot.nodes?.work?.phase === "accepted", "accepted OPEN idle");
+			await f.host.waitForCompletion(handle.graphId);
+			assert.equal((await f.host.stop(handle.graphId)).status, "stopped");
+			await f.host.seal(handle.graphId, 0);
+			const terminal = await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.status === "complete", "accepted stopped OPEN graph to seal complete");
+			assert.equal(terminal.nodes?.work?.phase, "accepted");
+			await f.host.waitForCompletion(handle.graphId);
+		} finally {
+			await f.mock.dispose();
+			await removeSandbox(f.sandbox);
+		}
+	});
+
+	await t.test("aborted OPEN: stop evidence remains SEALED stopped", async () => {
+		const f = await fixture();
+		try {
+			f.mock.behaviors.set("STOP_SEAL_ABORT", () => new Promise<void>(() => undefined));
+			const handle = await f.host.start(openSpec("dynamic-stop-seal-aborted", [node("work", "STOP_SEAL_ABORT")]), f.sourceDir);
+			await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.nodes?.work?.phase === "running", "OPEN node to enter running before stop");
+			const stopped = await f.host.stop(handle.graphId);
+			assert.equal(stopped.status, "stopped");
+			assert.equal(stopped.nodes?.work?.phase, "aborted");
+			await f.host.seal(handle.graphId, 0);
+			const terminal = await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.sealed === true && snapshot.status === "stopped", "aborted OPEN graph to remain stopped after seal");
+			assert.equal(terminal.nodes?.work?.phase, "aborted");
+		} finally {
+			await f.mock.dispose();
+			await removeSandbox(f.sandbox);
+		}
+	});
+
+	await t.test("active stopping + seal keeps the durable stop intent", async () => {
+		const f = await fixture();
+		try {
+			f.mock.stopBehavior = "ignore";
+			f.mock.behaviors.set("STOP_SEAL_ACTIVE", () => new Promise<void>(() => undefined));
+			const handle = await f.host.start(openSpec("dynamic-stop-seal-active", [node("work", "STOP_SEAL_ACTIVE")]), f.sourceDir);
+			await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.nodes?.work?.phase === "running", "OPEN node to enter running before concurrent stop/seal");
+			const stopping = f.host.stop(handle.graphId);
+			await waitFor(() => f.host.status(handle.graphId), (snapshot) => snapshot.status === "stopping", "OPEN graph to enter stopping");
+			await f.host.seal(handle.graphId, 0);
+			assert.equal((await f.host.control(handle.graphId)).desiredState, "stopped", "seal must not override an active stop");
+			const child = f.mock.spawned[0];
+			assert.ok(child);
+			const statusPath = join(child.asyncDir, "status.json");
+			const status = JSON.parse(await readFile(statusPath, "utf8")) as Record<string, unknown>;
+			await writeFile(String(status.outputFile), "stopped during test", "utf8");
+			await writeFile(statusPath, JSON.stringify({ ...status, state: "stopped" }), "utf8");
+			await publishMockTerminal(child);
+			const terminal = await stopping;
+			assert.equal(terminal.sealed, true);
+			assert.equal(terminal.status, "stopped", JSON.stringify((await readLatestV3Attempt(handle.runDir, "work"))?.evidence));
+			assert.equal(terminal.nodes?.work?.phase, "aborted");
+		} finally {
+			await f.mock.dispose();
+			await removeSandbox(f.sandbox);
+		}
+	});
+
+	await t.test("stop on an already terminal SEALED graph does not rewrite complete", async () => {
+		const f = await fixture();
+		try {
+			f.mock.behaviors.set("STOP_TERMINAL", (input) => completeChild({ ...input, output: "already complete" }));
+			const handle = await f.host.start({ ...openSpec("dynamic-stop-terminal", [node("work", "STOP_TERMINAL")]), mode: "sealed" }, f.sourceDir);
+			assert.equal((await f.host.waitForCompletion(handle.graphId)).status, "complete");
+			const afterStop = await f.host.stop(handle.graphId);
+			assert.equal(afterStop.status, "complete");
+			assert.equal(afterStop.nodes?.work?.phase, "accepted");
+		} finally {
+			await f.mock.dispose();
+			await removeSandbox(f.sandbox);
+		}
+	});
 });
 
 test("OPEN host replaces a frozen profile orphaned before append authority", async () => {
@@ -218,7 +322,7 @@ test("when:failed waits for every direct dependency, receives bounded failure ou
 	} finally {
 		releaseOther?.();
 		await f.mock.dispose();
-		await rm(f.sandbox, { recursive: true, force: true });
+		await removeSandbox(f.sandbox);
 	}
 });
 
@@ -280,7 +384,7 @@ test("when:failed rejects a failed dependency whose persisted Attempt identity d
 	} finally {
 		releaseOther?.();
 		await f.mock.dispose();
-		await rm(f.sandbox, { recursive: true, force: true });
+		await removeSandbox(f.sandbox);
 	}
 });
 
@@ -321,6 +425,6 @@ test("cancel tombstone and propagated block stay Attempt-free and do not poison 
 		await f.host.waitForCompletion(handle.graphId);
 	} finally {
 		await f.mock.dispose();
-		await rm(f.sandbox, { recursive: true, force: true });
+		await removeSandbox(f.sandbox);
 	}
 });

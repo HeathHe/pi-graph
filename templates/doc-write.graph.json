@@ -8,33 +8,31 @@
     "type": "graph-spec",
     "spec": {
       "schemaVersion": 3,
+      "contractPolicy": "strict",
       "goal": "Write a document about {{subject}} to {{doc_path}} in style: {{style}}",
       "nodes": [
         {
           "taskId": "outline",
-          "agent": "document-writer",
+          "capabilityId": "write.document",
           "task": "Draft a section outline for a document about {{subject}} in this style: {{style}}. Return the outline only.",
-          "sideEffect": "none",
-          "timeoutMs": 300000
+          "sideEffect": "none"
         },
         {
           "taskId": "write",
-          "agent": "document-writer",
+          "capabilityId": "write.document",
           "task": "Write the document to {{doc_path}}, following the supplied outline and using this style: {{style}}.",
           "dependsOn": ["outline"],
           "sideEffect": "local_write",
           "writeScope": [{ "kind": "file", "path": "{{doc_path}}" }],
-          "validationCommands": ["test -s \"{{doc_path}}\""],
-          "timeoutMs": 600000
+          "validationCommands": ["test -s \"{{doc_path}}\""]
         },
         {
           "taskId": "review",
-          "agent": "code-reviewer",
+          "capabilityId": "edit.document",
           "task": "Read {{doc_path}} and review it against the outline. Check internal consistency, completeness, and whether it matches this style: {{style}}. Return a checklist verdict and required fixes.",
           "dependsOn": ["write"],
           "sideEffect": "local_read",
-          "readScope": [{ "kind": "file", "path": "{{doc_path}}" }],
-          "timeoutMs": 300000
+          "readScope": [{ "kind": "file", "path": "{{doc_path}}" }]
         }
       ]
     }

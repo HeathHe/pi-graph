@@ -10,7 +10,7 @@ import { v3DispatchChild, v3StopChild } from "../src/v3/dispatch.ts";
 import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import { V3GraphRunner } from "../src/v3/runner.ts";
 import type { GraphSpecV3 } from "../src/v3/types.ts";
-import { MockSubagents, completeChild, failChild, pauseChild } from "./helpers/mock-subagents.ts";
+import { MockSubagents, completeChild, failChild, pauseChild, publishMockTerminal } from "./helpers/mock-subagents.ts";
 
 async function setupRun() {
 	const sandbox = await realpath(await mkdtemp(join(tmpdir(), "v3-runner-")));
@@ -90,6 +90,15 @@ test("V3 runner serializes local_write transactions before their fan-in", async 
 	const aWorkspace = await readV3WorkspaceEvidence(runDir, "node-a", aAttempt.attempt);
 	assert.ok(aWorkspace);
 	assert.ok(aWorkspace.writeBaseline[resolve(sandboxInfo.sourceDir, "out-a.txt")] === null, "baseline recorded null for absent source file");
+	const aSpawn = mock.spawned.find((entry) => String(entry.params.task).includes("NODE_A"));
+	assert.deepEqual((aSpawn?.params.extensionBindings as Record<string, unknown> | undefined)?.["pi-graph/1"], {
+		schemaVersion: 1,
+		graphId: aWorkspace.graphId,
+		taskId: "node-a",
+		attempt: 1,
+		workspaceCwd: aWorkspace.workspaceDir,
+		contractDigest: aWorkspace.contractDigest,
+	}, "fresh dispatch must activate the Guard with the exact workspace contract digest");
 	const aValidated = await readV3ValidatedResult(runDir, "node-a", aAttempt.attempt);
 	assert.ok(aValidated && aValidated.allPassed);
 	const aAcceptance = await readV3AcceptanceEvidence(runDir, "node-a", aAttempt.attempt);
@@ -122,7 +131,7 @@ test("V3 runner serializes local_write transactions before their fan-in", async 
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
 });
 
-test("V3 runner retries a failed local_write node per retryPolicy", async () => {
+test("V3 runner never automatically repeats a failed local_write node", async () => {
 	const sandboxInfo = await setupRun();
 	const mock = new MockSubagents();
 	let attempts = 0;
@@ -148,10 +157,10 @@ test("V3 runner retries a failed local_write node per retryPolicy", async () => 
 		],
 	};
 	const { snapshot, runDir } = await launch(sandboxInfo, spec, mock, { preflightAgent: async () => undefined });
-	assert.equal(snapshot.status, "complete");
-	assert.ok(attempts >= 2, "node was retried");
+	assert.equal(snapshot.status, "failed");
+	assert.equal(attempts, 1, "write nodes cannot be retried automatically");
 	const latest = await readLatestV3Attempt(runDir, "flaky");
-	assert.equal(latest!.evidence.phase, "accepted");
+	assert.equal(latest!.evidence.phase, "failed");
 	assert.equal(latest!.evidence.attempt, attempts);
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
@@ -437,7 +446,15 @@ test("V3 runner requestStop aborts in-flight nodes and leaves blocked dependents
 	const init = await initializeV3Run({ trustedRoot: resolve(sandboxInfo.runsDir), runDir: sandboxInfo.runDir, graph, sessionId: "session-test", supervisorEpoch: "epoch-1", sourceCwd: sandboxInfo.sourceDir, runInstanceId: sandboxInfo.runInstanceId });
 	const runner = new V3GraphRunner({ rpc, runDir: sandboxInfo.runDir, graph, authorization: init.authorization, sourceCwd: sandboxInfo.sourceDir, sessionId: "session-test", supervisorEpoch: "epoch-1", preflightAgent: async () => undefined });
 	const runPromise = runner.run();
-	await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
+ // This test promises an in-flight child; a fixed delay races initialization on busy hosts.
+ const readyDeadline=Date.now()+10_000;
+ let runningEvidence=await readLatestV3Attempt(sandboxInfo.runDir,"slow");
+ while(runningEvidence?.evidence.phase!=="running" && Date.now()<readyDeadline) {
+  await new Promise(resolvePromise=>setTimeout(resolvePromise,20));
+  runningEvidence=await readLatestV3Attempt(sandboxInfo.runDir,"slow");
+ }
+ assert.equal(runningEvidence?.evidence.phase,"running","stop fixture must observe durable running identity before requesting stop");
+
 	runner.requestStop();
 	const snapshot = await runPromise;
 	assert.equal(snapshot.status, "stopped");
@@ -471,29 +488,8 @@ test("V3 runner marks a paused child as child_paused without resuming it", async
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
 });
 
-test("V3 node timeout is one wall-clock deadline and an unconfirmed child stop needs attention", async () => {
-	const sandboxInfo = await setupRun();
-	const mock = new MockSubagents();
-	mock.stopBehavior = "ignore";
-	mock.behaviors.set("DEADLINE", () => new Promise<void>(() => undefined));
-	mock.start();
-	const spec: GraphSpecV3 = {
-		schemaVersion: 3,
-		goal: "deadline",
-		nodes: [{ taskId: "deadline", agent: "test-agent", task: "DEADLINE node", sideEffect: "local_read", timeoutMs: 750 }],
-	};
-	const graph = compileGraphSpecV3(spec);
-	const rpc = new SubagentRpcClient(mock);
-	const init = await initializeV3Run({ trustedRoot: resolve(sandboxInfo.runsDir), runDir: sandboxInfo.runDir, graph, sessionId: "session-test", supervisorEpoch: "epoch-1", sourceCwd: sandboxInfo.sourceDir, runInstanceId: sandboxInfo.runInstanceId });
-	const runner = new V3GraphRunner({ rpc, runDir: sandboxInfo.runDir, graph, authorization: init.authorization, sourceCwd: sandboxInfo.sourceDir, sessionId: "session-test", supervisorEpoch: "epoch-1", childStopTimeoutMs: 200, preflightAgent: async () => undefined });
-	const snapshot = await runner.run();
-	assert.equal(snapshot.status, "needs_attention");
-	const attempt = (await readLatestV3Attempt(sandboxInfo.runDir, "deadline"))!.evidence;
-	assert.equal(attempt.phase, "needs_attention");
-	assert.equal(attempt.failure!.kind, "dispatch_unknown");
-	assert.ok(attempt.deadlineAt, "the original absolute deadline is durable");
-	await mock.dispose();
-	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+test("V3 rejects a new timed node before any dispatch", () => {
+ assert.throws(() => compileGraphSpecV3({schemaVersion:3,goal:"unlimited",nodes:[{taskId:"deadline",agent:"test-agent",task:"test",sideEffect:"local_read",timeoutMs:750}]}), /remove timeoutMs/);
 });
 
 test("V3 runner requestStop uses the configured child-stop confirmation timeout", async () => {
@@ -604,4 +600,94 @@ test("V3 runner respects maxConcurrency by not launching C before A and B finish
 	assert.ok(indexOfC > indexOfB, `C spawned after B, got order: ${spawnOrder.join(" | ")}`);
 	await mock.dispose();
 	await import("node:fs/promises").then((fs) => fs.rm(sandboxInfo.sandbox, { recursive: true, force: true }));
+});
+
+for (const sideEffect of ["local_read", "local_write"] as const) test(`confirmed crash ${sideEffect}: native evidence does not auto-repeat and independent branch proceeds`, async()=>{
+ const f=await setupRun();const mock=new MockSubagents();let attempts=0;
+ mock.behaviors.set("CRASH_BRANCH",async input=>{attempts++;await writeFile(join(input.asyncDir,"status.json"),JSON.stringify({runId:input.asyncId,state:"failed"}));await publishMockTerminal(input,true);});
+ mock.behaviors.set("HEALTHY_BRANCH",input=>completeChild({...input,output:"independent done"}));mock.start();
+ try {
+  const result=await launch(f,{schemaVersion:3,goal:"isolated runtime failure",maxConcurrency:1,nodes:[
+   {taskId:"crash",agent:"test-agent",task:"CRASH_BRANCH",sideEffect,...(sideEffect==="local_write"?{writeScope:[{kind:"file" as const,path:"out.txt"}],validationCommands:["test -f out.txt"]}:{})},
+   {taskId:"healthy",agent:"test-agent",task:"HEALTHY_BRANCH",sideEffect:"local_read"},
+   {taskId:"dependent",agent:"test-agent",task:"MUST_NOT_RUN",dependsOn:["crash"],sideEffect:"local_read"},
+  ]},mock,{preflightAgent:async()=>{}});
+  assert.equal(result.snapshot.status,"needs_attention");assert.equal(attempts,1);
+  assert.equal((await readLatestV3Attempt(result.runDir,"healthy"))?.evidence.phase,"accepted");
+  assert.equal(await readLatestV3Attempt(result.runDir,"dependent"),undefined);
+ } finally {await mock.dispose();await import("node:fs/promises").then(fs=>fs.rm(f.sandbox,{recursive:true,force:true}));}
+});
+
+for (const status of ["blocked", "fail", "invalid"]) {
+ test(`typed business ${status} finishes without launching accepted-only dependent`, async () => {
+  const info = await setupRun(); const mock = new MockSubagents();
+  mock.behaviors.set("TYPED_REVIEW", input => completeChild({...input, output: status === "invalid" ? "PASS" : JSON.stringify({status,reason:"Missing required proof"})}));
+  mock.behaviors.set("ARCHIVE_NODE", input => completeChild(input)); mock.start();
+  try {
+   const {snapshot,runDir} = await launch(info, {schemaVersion:3,goal:"typed gate",nodes:[
+    {taskId:"review",agent:"test-agent",task:"TYPED_REVIEW",sideEffect:"none",resultContract:"status-json"},
+    {taskId:"archive",agent:"test-agent",task:"ARCHIVE_NODE",dependsOn:["review"],sideEffect:"none"}
+   ]},mock,{preflightAgent:async()=>{}});
+   assert.equal(snapshot.status,"failed"); assert.equal(mock.spawned.length,1);
+   assert.equal((await readLatestV3Attempt(runDir,"review"))?.evidence.phase,"failed");
+  } finally {await mock.dispose();}
+ });
+}
+
+test("declared evidence survives cleanup, is delivered byte-for-byte, excludes secrets and detects tampering", async () => {
+ const {lstat} = await import("node:fs/promises");
+ const info = await setupRun(); const mock = new MockSubagents(); let producerCwd = "";
+ mock.behaviors.set("PRODUCE_EVIDENCE", async input => {
+  producerCwd=input.cwd;
+  await writeFile(join(input.cwd,"screen.png"), Buffer.from([137,80,78,71,0,255]));
+  await writeFile(join(input.cwd,"credentials.txt"),"never retain this secret");
+  await completeChild({...input,output:JSON.stringify({status:"pass",reason:"Proof recorded"})});
+ });
+ mock.behaviors.set("CONSUME_EVIDENCE", async input => {
+  assert.deepEqual(await readFile(join(input.cwd,".pi-graph/inputs/proof.files/screen.png")),Buffer.from([137,80,78,71,0,255]));
+  await assert.rejects(readFile(join(input.cwd,".pi-graph/inputs/proof.files/credentials.txt")));
+  await completeChild(input);
+ });mock.start();
+ try {
+  const {snapshot,runDir} = await launch(info,{schemaVersion:3,permissionPolicy:"inherited",parentToolAllowlist:["read","write","bash"],goal:"durable evidence",nodes:[
+   {taskId:"producer",agent:"test-agent",task:"PRODUCE_EVIDENCE",sideEffect:"external_write",outputArtifact:"proof",resultContract:"status-json",evidenceFiles:[{path:"screen.png",nonSecret:true}]},
+   {taskId:"consumer",agent:"test-agent",task:"CONSUME_EVIDENCE",sideEffect:"none",dependsOn:["producer"],inputArtifacts:["proof"]}
+  ]},mock,{preflightAgent:async()=>{}});
+  assert.equal(snapshot.status,"complete"); assert.equal(mock.spawned.length,2);
+  await assert.rejects(lstat(producerCwd));
+  const directory=join(runDir,"artifacts/producer/attempt-1-files");
+  await assert.rejects(readFile(join(directory,"files/credentials.txt")));
+  const attempt=(await readLatestV3Attempt(runDir,"producer"))!.evidence;
+  assert.ok(attempt.evidenceManifestDigest);
+  assert.equal((await verifyV3AcceptedAttemptChain(runDir,"producer",1)).ok,true);
+  await writeFile(join(directory,"files/screen.png"),"tampered");
+  const chain=await verifyV3AcceptedAttemptChain(runDir,"producer",1);
+  assert.equal(chain.ok,false);assert.match(chain.reasons.join(" "),/INVALID_EVIDENCE_FILES/);
+ } finally {await mock.dispose();}
+});
+
+
+test("runner drains an already started heartbeat before releasing its lease", async () => {
+ const f=await setupRun();const mock=new MockSubagents();
+ const {acquireV3RunLease}=await import("../src/v3/lease.ts");
+ let entered!:()=>void,unblock!:()=>void;
+ const refreshing=new Promise<void>(r=>{entered=r;});
+ const gate=new Promise<void>(r=>{unblock=r;});
+ mock.behaviors.set("HEARTBEAT_DRAIN",async input=>{await refreshing;await completeChild({...input,output:"done"});});mock.start();
+ const graph=compileGraphSpecV3({schemaVersion:3,goal:"heartbeat drain",nodes:[{taskId:"work",agent:"test-agent",task:"HEARTBEAT_DRAIN",sideEffect:"local_read"}]});
+ const init=await initializeV3Run({trustedRoot:resolve(f.runsDir),runDir:f.runDir,graph,sessionId:"session-test",supervisorEpoch:"epoch-1",sourceCwd:f.sourceDir,runInstanceId:f.runInstanceId});
+ const lease=await acquireV3RunLease(join(f.runDir,"lease.json"),f.runInstanceId);
+ let releaseCalled=false,settled=false;
+ const runner=new V3GraphRunner({rpc:new SubagentRpcClient(mock),runDir:f.runDir,graph,authorization:init.authorization,sourceCwd:f.sourceDir,sessionId:"session-test",supervisorEpoch:"epoch-1",preflightAgent:async()=>undefined,lease:{...lease,refresh:async()=>{entered();await gate;await lease.refresh();},release:async()=>{releaseCalled=true;await lease.release();}}});
+ try {
+  const running=runner.run().then(value=>{settled=true;return value;});
+  await refreshing;
+  // Allow the child to finish and the runner to reach its final cleanup.
+  await new Promise(r=>setTimeout(r,250));
+  assert.equal(releaseCalled,false,"lease release must wait for refresh completion");
+  assert.equal(settled,false,"run must not return with outstanding lease work");
+  unblock();assert.equal((await running).status,"complete");assert.equal(releaseCalled,true);
+  const {lstat}=await import("node:fs/promises");
+  await assert.rejects(lstat(join(f.runDir,"lease.json.gate")),{code:"ENOENT"});
+ } finally {unblock();await mock.dispose();await import("node:fs/promises").then(fs=>fs.rm(f.sandbox,{recursive:true,force:true}));}
 });

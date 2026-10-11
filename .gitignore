@@ -9,3 +9,10 @@ coverage/
 .pi/
 .pi-subagents/
 /.dsh/
+
+# Legacy installed pi-subagents patch backups are local evidence, not package source.
+/maintenance/native-runtime/backup-*
+/maintenance/native-runtime/target-*
+/maintenance/native-runtime/native-patch-manifest.json
+*.tgz
+/.test-evidence/

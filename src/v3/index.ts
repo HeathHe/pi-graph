@@ -1,6 +1,26 @@
 export { authorizationV4For, compiledGraphProjectionV3, validateAuthorizationV4 } from "./authorization.ts";
 export type { AuthorizationV4Metadata } from "./authorization.ts";
+export {
+	bindGraphNodesV3,
+	bindGraphSpecV3,
+	readV3CapabilityCatalog,
+	validateV3CapabilityCatalog,
+	V3_CAPABILITY_CATALOG_MAX_BYTES,
+	V3_CAPABILITY_CATALOG_MAX_ENTRIES,
+	V3_CAPABILITY_CATALOG_SCHEMA_VERSION,
+	V3_DEFAULT_TEMPORARY_AGENT,
+} from "./binding.ts";
+export type {
+	V3BindGraphNodesOptions,
+	V3BindingOptions,
+	V3BoundGraphSpec,
+	V3CapabilityCatalog,
+	V3CapabilityCatalogEntry,
+	V3CapabilityCatalogReadOptions,
+} from "./binding.ts";
 export { compileGraphSpecV3, MAX_GRAPH_NODES_V3 } from "./compiler.ts";
+export { loadV3GraphConfig, parseV3GraphConfig } from "./config.ts";
+export type { V3GraphConfig } from "./config.ts";
 export {
 	buildV3DependencyCapsule,
 	renderV3DependencyCapsule,
@@ -16,10 +36,13 @@ export type {
 } from "./capsule.ts";
 export {
 	applyV3GraphCapsuleInputs,
+	bindV3GraphCapsule,
 	compileV3GraphCapsule,
+	loadAndBindV3GraphCapsule,
 	loadAndCompileV3GraphCapsule,
 	loadV3GraphCapsule,
 	packV3GraphCapsule,
+	resolveV3GraphCapsule,
 	resolveV3GraphCapsuleInputs,
 	validateV3GraphCapsule,
 	V3_GRAPH_CAPSULE_MAX_BYTES,
@@ -28,7 +51,9 @@ export {
 } from "./graph-capsule.ts";
 export type {
 	V3CompiledGraphCapsule,
+	V3BoundGraphCapsule,
 	V3GraphCapsule,
+	V3GraphCapsuleBindLoadOptions,
 	V3GraphCapsuleErrorCode,
 	V3GraphCapsuleInputDeclaration,
 	V3GraphCapsuleInputType,
@@ -38,9 +63,16 @@ export type {
 	V3GraphCapsuleProvenance,
 	V3GraphCapsuleReadDependencies,
 	V3GraphCapsuleRequirements,
+	V3ResolvedGraphCapsule,
 	V3ResolvedGraphCapsuleInputs,
 } from "./graph-capsule.ts";
-export { listBuiltinGraphTemplatesV3, loadBuiltinGraphTemplateCapsuleV3, loadBuiltinGraphTemplateV3 } from "./templates.ts";
+export {
+	bindBuiltinGraphTemplateCapsuleV3,
+	bindBuiltinGraphTemplateV3,
+	listBuiltinGraphTemplatesV3,
+	resolveBuiltinGraphTemplateCapsuleV3,
+	resolveBuiltinGraphTemplateV3,
+} from "./templates.ts";
 export type {
 	BuiltinGraphTemplateInputV3,
 	BuiltinGraphTemplateInputsV3,
@@ -103,6 +135,29 @@ export type {
 export { V3DispatchError, v3DispatchChild, v3MonitorChild, v3PreflightAgent } from "./dispatch.ts";
 export type { V3DispatchSpec } from "./dispatch.ts";
 export type { V3DispatchBinding } from "./types.ts";
+export { v3PreflightAgentLaunch } from "./preflight.ts";
+export type {
+	V3AgentLaunchExtensionPlan,
+	V3AgentLaunchPreflightInput,
+	V3AgentLaunchPreflightResult,
+	V3PreflightAvailableModel,
+	V3PreflightParentModel,
+} from "./preflight.ts";
+export {
+	createV3DispatchObservation,
+	mergeV3ChildObservation,
+	observeV3ChildLifecycle,
+	validateV3ChildObservation,
+	v3ChildObservationFingerprint,
+	V3ObservationValidationError,
+} from "./observability.ts";
+export { evaluateV3UsageBudget, readV3UsageBudgetDecision } from "./usage-budget.ts";
+export type {
+	V3UsageBudgetBlock,
+	V3UsageBudgetDecision,
+	V3UsageBudgetMetric,
+	V3UsageBudgetUsage,
+} from "./usage-budget.ts";
 export { V3EventWriter, validateV3EventTruncationRecord } from "./events.ts";
 export type { V3EventHealth, V3EventLogDiagnostics, V3EventTruncationReason, V3EventTruncationRecord } from "./events.ts";
 export { acquireV3RunLease, readV3RunLease, validateV3RunLease, writeV3RunLease } from "./lease.ts";

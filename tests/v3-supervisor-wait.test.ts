@@ -1,0 +1,11 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createJiti} from 'jiti';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {GraphMailbox} from '../src/v3/mailbox.ts';
+import {activeMailboxes,mailboxRegistryKey} from '../src/v3/mailbox-runtime.ts';
+import {readGraphSupervisorRequests} from '../src/v3/native-supervisor.ts';
+const {waitForGraphSnapshotV3}=createJiti(import.meta.url)(new URL('../extensions/pi-graph.ts',import.meta.url).href);
+test('public Graph WAIT ignores peer messages, yields decision and resumes after same-channel reply',async()=>{const dir=await mkdtemp(join(tmpdir(),'mailbox-wait-'));const store=new GraphMailbox(dir,{withFence:async f=>f()},async()=>true);await store.initialize('run','owner',[{taskId:'a',attempt:1},{taskId:'b',attempt:1}]);activeMailboxes.set(mailboxRegistryKey(dir),{mailbox:store,owner:'owner',runInstanceId:'run'});try{const snapshot:any={graphId:'g',runInstanceId:'run',sessionId:'owner',status:'running',updatedAt:new Date().toISOString(),nodes:{a:{phase:'running',observation:{supervision:{activity:'unknown'}}}}};const opts={graphId:'g',pollIntervalMs:25,readStatus:async()=>snapshot,readAttention:()=>readGraphSupervisorRequests(snapshot,'owner',undefined,dir),subscribe:()=>()=>{}};let finished=false;const pending=waitForGraphSnapshotV3(opts).then((x:any)=>{finished=true;return x;});const token=await store.capability('a',1);await store.request(token,{action:'send',to:'b',text:'ordinary',idempotencyKey:'peer'});await new Promise(r=>setTimeout(r,100));assert.equal(finished,false);const ask:any=await store.request(token,{action:'send',to:'@parent',kind:'decision',text:'decide',idempotencyKey:'ask'});assert.equal((await pending).reason,'attention_required');await store.request(await store.capability('@parent',1),{action:'reply',messageId:ask.messageId,text:'yes',idempotencyKey:'yes'});const abort=new AbortController();const after=waitForGraphSnapshotV3({...opts,signal:abort.signal});setTimeout(()=>abort.abort(),100);assert.equal((await after).reason,'aborted');assert.equal((await store.request(token,{action:'receive'})as any).messages.length,1);}finally{activeMailboxes.delete(mailboxRegistryKey(dir));await rm(dir,{recursive:true,force:true});}});

@@ -1,3 +1,5 @@
+import { reportedTotalTokens } from "./usage-summary.ts";
+import { supervisionFacts } from "./observability.ts";
 import { constants } from "node:fs";
 import { lstat, open, readdir, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -6,7 +8,9 @@ import { readLatestV3Attempt, v3NodeAttemptDir, v3RunPaths } from "./attempt.ts"
 import { compileGraphSpecV3 } from "./compiler.ts";
 import {
 	initializeV3RunControl,
+ readV3RunControl,
 	updateV3RunControl,
+	V3ControlRevisionConflictError,
 	type V3ControlMutationOptions,
 	type V3DesiredState,
 	type V3RunControl,
@@ -66,6 +70,7 @@ function sameStableObservation(left: StableJsonObservation, right: StableJsonObs
 
 async function readStableJson(path: string, label: string): Promise<StableJsonObservation> {
 	const before = await lstat(path);
+	if (before.isFile() && before.nlink === 0) graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} changed identity while it was opened.`);
 	if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
 		graphV3Error("RUN_NEEDS_ATTENTION", `V3 ${label} must be a single regular non-symbolic-link file.`);
 	}
@@ -119,12 +124,16 @@ async function readStableSnapshot(path: string, attempts = 5): Promise<StableJso
 }
 
 export interface V3HostContext {
+	parentToolAllowlist?: () => string[];
 	rpc: SubagentRpcClient;
 	runsDir: string;
 	sessionId: string;
+	ownerSessionFile?: string;
 	supervisorEpoch: string;
-	/** Notify the Pi background-work provider after an authoritative snapshot publication. */
+	/** Observe every authoritative snapshot publication. */
 	onStateChange?: (snapshot: GraphSnapshotV3) => void;
+	/** Notify integrations only after the process-local active-work set changes. */
+	onActiveWorkChange?: (items: readonly { id: string; sessionId: string }[]) => void;
 	/** Injectable agent preflight; defaults to pi-subagents public preflight. */
 	preflightAgent?: (spec: { agent: string; cwd: string; sessionId?: string }) => Promise<void>;
 }
@@ -215,7 +224,9 @@ export interface LoadedV3Run {
  * lease, source identity) instead of trusting persisted integrity markers.
  */
 export class V3GraphHost {
-	private readonly supervised = new Map<string, { runner: V3GraphRunner; promise: Promise<GraphSnapshotV3>; sessionId: string }>();
+	private readonly supervised = new Map<string, { runner: V3GraphRunner; promise: Promise<GraphSnapshotV3>; ownerSessionId: string }>();
+	private readonly supervisorHandoffs = new Map<string, Map<symbol, string>>();
+	private activeWorkFingerprint = "[]";
 	readonly context: V3HostContext;
 
 	constructor(context: V3HostContext) {
@@ -223,8 +234,9 @@ export class V3GraphHost {
 	}
 
 	/** Re-point the host at a new session (used on session_start). */
-	setSessionContext(sessionId: string, supervisorEpoch: string): void {
+	setSessionContext(sessionId: string, supervisorEpoch: string, ownerSessionFile?: string): void {
 		this.context.sessionId = sessionId;
+		this.context.ownerSessionFile = ownerSessionFile;
 		this.context.supervisorEpoch = supervisorEpoch;
 	}
 
@@ -257,12 +269,14 @@ export class V3GraphHost {
 	private runnerOptions(runDir: string, graph: CompiledGraphV3, authorization: AuthorizationV4, sourceCwd: string, baseGraph = graph): ConstructorParameters<typeof V3GraphRunner>[0] {
 		return {
 			rpc: this.context.rpc,
+			parentToolAllowlist: this.context.parentToolAllowlist,
 			runDir,
 			graph,
 			baseGraph,
 			authorization,
 			sourceCwd,
 			sessionId: authorization.sessionId,
+			ownerSessionFile: authorization.sessionId === this.context.sessionId ? this.context.ownerSessionFile : undefined,
 			supervisorEpoch: authorization.supervisorEpoch,
 			failFast: graph.failFast,
 			preflightAgent: this.preflight(),
@@ -270,11 +284,50 @@ export class V3GraphHost {
 		};
 	}
 
+	private notifyActiveWorkChange(): void {
+		const items = this.listActiveWork();
+		const fingerprint = JSON.stringify(items
+			.map((item) => [item.sessionId, item.id] as const)
+			.sort((left, right) => left[0] === right[0]
+				? left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0
+				: left[0] < right[0] ? -1 : 1));
+		if (fingerprint === this.activeWorkFingerprint) return;
+		try {
+			this.context.onActiveWorkChange?.(items);
+			this.activeWorkFingerprint = fingerprint;
+		} catch {
+			// Background-work notification is observational and cannot fail Graph execution.
+		}
+	}
+
+	/** Keep one provider identity visible while a paused Supervisor hands off to its successor. */
+	private reserveSupervisorHandoff(graphId: string): symbol {
+		const token = Symbol(graphId);
+		const reservations = this.supervisorHandoffs.get(graphId) ?? new Map<symbol, string>();
+		reservations.set(token, this.context.sessionId);
+		this.supervisorHandoffs.set(graphId, reservations);
+		this.notifyActiveWorkChange();
+		return token;
+	}
+
+	private releaseSupervisorHandoff(graphId: string, token: symbol): void {
+		const reservations = this.supervisorHandoffs.get(graphId);
+		if (!reservations?.delete(token)) return;
+		if (reservations.size === 0) this.supervisorHandoffs.delete(graphId);
+		this.notifyActiveWorkChange();
+	}
+
 	private supervise(graphId: string, runner: V3GraphRunner): Promise<GraphSnapshotV3> {
 		const promise = runner.run();
-		this.supervised.set(graphId, { runner, promise, sessionId: runner.options.sessionId });
+		// Background work belongs to the Pi session that started/adopted this
+		// Supervisor, not the immutable session recorded at original admission.
+		this.supervised.set(graphId, { runner, promise, ownerSessionId: this.context.sessionId });
+		this.notifyActiveWorkChange();
 		void promise.finally(() => {
-			if (this.supervised.get(graphId)?.promise === promise) this.supervised.delete(graphId);
+			if (this.supervised.get(graphId)?.promise === promise) {
+				this.supervised.delete(graphId);
+				this.notifyActiveWorkChange();
+			}
 		}).catch(() => undefined);
 		return promise;
 	}
@@ -287,7 +340,7 @@ export class V3GraphHost {
 	): Promise<void> {
 		const alreadySupervised = this.supervised.get(graphId);
 		if (alreadySupervised) return;
-		const baseGraph = compileGraphSpecV3(authorization.sourceGraphSpec);
+		const baseGraph = compileGraphSpecV3(authorization.sourceGraphSpec, { historical: true });
 		const retryMutation = await readV3MutationJournal(runDir, baseGraph);
 		const retryBaselines = await pendingV3RetryBaselines(
 			runDir,
@@ -323,14 +376,20 @@ export class V3GraphHost {
 		graph: CompiledGraphV3,
 		authorization: AuthorizationV4,
 		promise: Promise<GraphSnapshotV3>,
+		handoff: symbol,
 	): void {
-		void promise.then(async (snapshot) => {
-			if (snapshot.status !== "paused" || this.supervised.has(graphId)) return;
-			const latestControl = await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
-			if (latestControl.desiredState === "running") {
-				await this.superviseResumedRun(graphId, runDir, graph, authorization);
+		void (async () => {
+			try {
+				const snapshot = await promise;
+				if (snapshot.status !== "paused" || this.supervised.has(graphId)) return;
+				const latestControl = await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+				if (latestControl.desiredState === "running") {
+					await this.superviseResumedRun(graphId, runDir, graph, authorization);
+				}
+			} finally {
+				this.releaseSupervisorHandoff(graphId, handoff);
 			}
-		}).catch(() => undefined);
+		})().catch(() => undefined);
 	}
 
 	private async withTopologySupervisor<T>(
@@ -363,11 +422,32 @@ export class V3GraphHost {
 		}
 	}
 
-	private async wakeAfterTopologyMutation(graphId: string): Promise<void> {
+	private async wakeAfterTopologyMutation(graphId: string, resumeQuiescentStop = false): Promise<void> {
+		// A live Supervisor owns either ordinary execution or an in-progress stop.
+		// In particular, seal must not turn an active durable stop back into running.
 		if (this.supervised.has(graphId)) return;
 		const runDir = this.runDirFor(graphId);
 		const { baseGraph, graph, authorization } = await this.loadRun(runDir, graphId);
-		const control = await initializeV3RunControl(runDir, authorization.runInstanceId, graphId);
+		let control = await initializeV3RunControl(runDir, authorization.runInstanceId, graphId);
+		if (resumeQuiescentStop && control.desiredState === "stopped") {
+			// Only terminal evidence that seal can project as complete/failed may
+			// supersede the quiescent OPEN stop. Queued/running/aborted evidence is
+			// a real stop boundary and must remain stopped.
+			const sealedProjection = await this.status(graphId);
+			if (sealedProjection.status !== "complete" && sealedProjection.status !== "failed") return;
+			try {
+				control = await updateV3RunControl(runDir, "running", {
+					expectedRevision: control.revision,
+					runInstanceId: authorization.runInstanceId,
+					graphId,
+				});
+			} catch (error) {
+				if (!(error instanceof V3ControlRevisionConflictError)) throw error;
+				// A concurrent explicit pause/stop/resume command wins over seal's
+				// quiescent-stop transition. Reload it instead of overwriting intent.
+				control = await initializeV3RunControl(runDir, authorization.runInstanceId, graphId);
+			}
+		}
 		if (control.desiredState !== "running") return;
 		const runner = new V3GraphRunner(this.runnerOptions(runDir, graph, authorization, authorization.sourceCwd, baseGraph));
 		await runner.initializeForResume();
@@ -375,7 +455,10 @@ export class V3GraphHost {
 	}
 
 	/** Append immutable nodes under revision CAS and wake an idle OPEN graph. */
+ private async hasMailboxProtocol(runDir:string,runInstanceId?:string):Promise<boolean>{try{const record=(await readStableJson(join(runDir,"communication.json"),"communication.json")).value as {protocol?:unknown;runtimeKind?:unknown;runInstanceId?:unknown};return record.protocol==="graph-mailbox-v1" && record.runtimeKind==="pi-graph-sdk/1" && (!runInstanceId||record.runInstanceId===runInstanceId);}catch{return false;}}
+ private async requireMailboxProtocol(graphId:string):Promise<void>{const runDir=this.runDirFor(graphId);const {authorization}=await this.loadRun(runDir,graphId);if(!await this.hasMailboxProtocol(runDir,authorization.runInstanceId))throw new Error("Legacy communication contract: read-only inspection only; create an explicit remaining-work graph.");}
 	async append(graphId: string, nodes: readonly GraphNodeSpecV3[], expectedRevision: number): Promise<V3GraphMutationState> {
+  await this.requireMailboxProtocol(graphId);
 		const runDir = this.runDirFor(graphId);
 		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
 		const state = await this.withTopologySupervisor(graphId, runDir, authorization, async (capability) =>
@@ -420,6 +503,7 @@ export class V3GraphHost {
 
 	/** Tombstone pending nodes. Cancellation is projection authority and creates no Attempt. */
 	async cancel(graphId: string, taskIds: readonly string[], cascade: boolean, expectedRevision: number): Promise<V3GraphMutationState> {
+  await this.requireMailboxProtocol(graphId);
 		const runDir = this.runDirFor(graphId);
 		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
 		const state = await this.withTopologySupervisor(graphId, runDir, authorization, async (capability) => {
@@ -440,6 +524,7 @@ export class V3GraphHost {
 	 * fence; recovery only resets nodes still at that exact baseline.
 	 */
 	async retry(graphId: string, taskId: string): Promise<GraphSnapshotV3> {
+  await this.requireMailboxProtocol(graphId);
 		if (this.supervised.has(graphId)) {
 			graphV3Error("INVALID_MUTATION", `V3 graph '${graphId}' is still supervised; retry is allowed only after the run is terminal.`);
 		}
@@ -472,11 +557,16 @@ export class V3GraphHost {
 
 	/** Permanently seal an OPEN graph; its Runner then derives a true terminal result. */
 	async seal(graphId: string, expectedRevision: number): Promise<V3GraphMutationState> {
+  await this.requireMailboxProtocol(graphId);
 		const runDir = this.runDirFor(graphId);
 		const { baseGraph, authorization } = await this.loadRun(runDir, graphId);
 		const state = await this.withTopologySupervisor(graphId, runDir, authorization, (capability) =>
 			sealV3Graph({ runDir, baseGraph, expectedRevision, capability }));
-		await this.wakeAfterTopologyMutation(graphId);
+		// A fully quiesced OPEN stop is an execution pause, not final topology
+		// evidence. Seal may advance that settled state so the Runner can compute
+		// the SEALED terminal projection. wakeAfterTopologyMutation deliberately
+		// refuses this transition while a stop still has a live Supervisor.
+		await this.wakeAfterTopologyMutation(graphId, true);
 		return state;
 	}
 
@@ -532,7 +622,7 @@ export class V3GraphHost {
 			|| !sameStableObservation(authorizationRead, currentAuthorization)) {
 			graphV3Error("RUN_NEEDS_ATTENTION", "V3 run root or authorization changed while authority was verified.");
 		}
-		const baseGraph = compileGraphSpecV3(authorization.sourceGraphSpec as GraphSpecV3);
+		const baseGraph = compileGraphSpecV3(authorization.sourceGraphSpec as GraphSpecV3, { historical: true });
 		if (baseGraph.sourceGraphSpecDigest !== authorization.sourceGraphSpecDigest) {
 			graphV3Error("INVALID_AUTHORIZATION", "V3 run sourceGraphSpecDigest no longer matches its admitted source GraphSpec.", { field: "sourceGraphSpecDigest" });
 		}
@@ -564,7 +654,7 @@ export class V3GraphHost {
 
 	/** Start a new V3 graph: admit, initialize, and run in the background. */
 	async start(spec: GraphSpecV3, sourceCwd: string): Promise<V3GraphRunHandle> {
-		const graph = compileGraphSpecV3(spec);
+		const graph = compileGraphSpecV3({ ...spec, contextPolicy: spec.contextPolicy ?? "v1" });
 		const graphId = graph.graphId;
 		const runDir = this.runDirFor(graphId);
 		if (this.supervised.has(graphId)) graphV3Error("RUN_ALREADY_EXISTS", `V3 graph '${graphId}' is already supervised by this session.`, { details: { runDir } });
@@ -623,34 +713,46 @@ export class V3GraphHost {
 		desiredState: V3DesiredState,
 		options: V3ControlMutationOptions = {},
 	): Promise<V3RunControl> {
-		const runDir = this.runDirFor(graphId);
-		const { graph, authorization } = await this.loadRun(runDir, graphId);
-		await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
-		const control = await updateV3RunControl(runDir, desiredState, {
-			...options,
-			runInstanceId: authorization.runInstanceId,
-			graphId: graph.graphId,
-		});
-		if (desiredState === "stopped") this.supervised.get(graphId)?.runner.requestStop();
-		if (desiredState === "paused") this.supervised.get(graphId)?.runner.requestPause();
-		if (desiredState === "running") {
-			const current = this.supervised.get(graphId);
-			if (current) {
-				// Resume can race the quiescent paused return. If the old promise wins
-				// that race, continue under a fresh real Runner after it releases lease.
-				this.continueAfterPausedSupervisor(graphId, runDir, graph, authorization, current.promise);
-			} else {
-				// initializeForResume may read substantial Attempt evidence, but run()
-				// is registered and left in the background; callers receive the
-				// committed control revision rather than terminal execution.
-				await this.superviseResumedRun(graphId, runDir, graph, authorization);
+		let handoff = desiredState === "running" && this.supervised.has(graphId)
+			? this.reserveSupervisorHandoff(graphId)
+			: undefined;
+		try {
+			const runDir = this.runDirFor(graphId);
+			const { graph, authorization } = await this.loadRun(runDir, graphId);
+   if(!await this.hasMailboxProtocol(runDir,authorization.runInstanceId))throw new Error("Legacy communication contract: read-only inspection only.");
+			await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+			const control = await updateV3RunControl(runDir, desiredState, {
+				...options,
+				runInstanceId: authorization.runInstanceId,
+				graphId: graph.graphId,
+			});
+			if (desiredState === "stopped") this.supervised.get(graphId)?.runner.requestStop();
+			if (desiredState === "paused") this.supervised.get(graphId)?.runner.requestPause();
+			if (desiredState === "running") {
+				const current = this.supervised.get(graphId);
+				if (current?.runner.isPauseRequested) {
+					// Resume can race the quiescent paused return. Reserve the provider
+					// identity until a successor is installed so bg_wait cannot observe
+					// a false completion between the two real Supervisors.
+					handoff ??= this.reserveSupervisorHandoff(graphId);
+					this.continueAfterPausedSupervisor(graphId, runDir, graph, authorization, current.promise, handoff);
+					handoff = undefined;
+				} else if (!current) {
+					// initializeForResume may read substantial Attempt evidence, but run()
+					// is registered and left in the background; callers receive the
+					// committed control revision rather than terminal execution.
+					await this.superviseResumedRun(graphId, runDir, graph, authorization);
+				}
 			}
+			return control;
+		} finally {
+			if (handoff) this.releaseSupervisorHandoff(graphId, handoff);
 		}
-		return control;
 	}
 
 	/** Persist pause intent, then wait for this Host's active Supervisor to quiesce. */
 	async pause(graphId: string): Promise<GraphSnapshotV3> {
+  await this.requireMailboxProtocol(graphId);
 		await this.requestDesiredState(graphId, "paused");
 		const supervised = this.supervised.get(graphId);
 		if (supervised) return supervised.promise;
@@ -662,7 +764,7 @@ export class V3GraphHost {
 		const runDir = this.runDirFor(graphId);
 		const { graph, mutation, authorization } = await this.loadRun(runDir, graphId);
 		const supervised = this.supervised.get(graphId);
-		const control = await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId);
+		const control = await this.hasMailboxProtocol(runDir,authorization.runInstanceId) ? await initializeV3RunControl(runDir, authorization.runInstanceId, graph.graphId) : await readV3RunControl(runDir).catch(()=>({runInstanceId:authorization.runInstanceId,graphId:graph.graphId,desiredState:"running" as const}));
 		if (control.runInstanceId !== authorization.runInstanceId || control.graphId !== graph.graphId) {
 			graphV3Error("RUN_NEEDS_ATTENTION", `V3 graph '${graphId}' control identity does not match its authorization.`);
 		}
@@ -696,6 +798,7 @@ export class V3GraphHost {
 				// The promise is settled and its lease has been released. Do not let a
 				// lagging finally callback hide the successor started below.
 				this.supervised.delete(graphId);
+				this.notifyActiveWorkChange();
 			}
 			if (snapshot.status !== "paused") return snapshot;
 			const control = await this.control(graphId);
@@ -712,6 +815,7 @@ export class V3GraphHost {
 	 * snapshot; a live lease held by another process surfaces as needs_attention.
 	 */
 	async stop(graphId: string): Promise<GraphSnapshotV3> {
+  await this.requireMailboxProtocol(graphId);
 		const runDir = this.runDirFor(graphId);
 		await this.requestDesiredState(graphId, "stopped");
 		const supervised = this.supervised.get(graphId);
@@ -728,6 +832,7 @@ export class V3GraphHost {
 
 	/** Resume a crashed/interrupted V3 run (crash recovery). */
 	async resume(graphId: string): Promise<GraphSnapshotV3> {
+  await this.requireMailboxProtocol(graphId);
 		await this.requestDesiredState(graphId, "running");
 		while (true) {
 			let supervised = this.supervised.get(graphId);
@@ -769,11 +874,18 @@ export class V3GraphHost {
 
 	/** Synchronous background-work inventory for the Pi host session. */
 	listActiveWork(): Array<{ id: string; sessionId: string }> {
-		return [...this.supervised.entries()].map(([id, entry]) => ({ id, sessionId: entry.sessionId }));
+		const owners = new Map<string, string>();
+		for (const [id, entry] of this.supervised) owners.set(id, entry.ownerSessionId);
+		for (const [id, reservations] of this.supervisorHandoffs) {
+			const ownerSessionId = [...reservations.values()].at(-1);
+			if (ownerSessionId) owners.set(id, ownerSessionId);
+		}
+		return [...owners].map(([id, sessionId]) => ({ id, sessionId }));
 	}
 
-	/** Adoption scan: recover every non-terminal V3 run not supervised by this host. */
-	async adoptCrashedRuns(): Promise<Array<{ graphId: string; outcome: "resumed" | "needs_attention" | "skipped" }>> {
+	/** Adoption scan. Automatic startup must supply the current Pi session ID;
+	 * unscoped scans remain available to explicit recovery callers. */
+	async adoptCrashedRuns(options: { sessionId?: string } = {}): Promise<Array<{ graphId: string; outcome: "resumed" | "needs_attention" | "skipped" }>> {
 		const entries = await readdir(this.runsDir, { withFileTypes: true }).catch(() => []);
 		const adopted: Array<{ graphId: string; outcome: "resumed" | "needs_attention" | "skipped" }> = [];
 		for (const entry of entries) {
@@ -783,6 +895,14 @@ export class V3GraphHost {
 			if (!await this.isV3Run(runDir)) continue;
 			let snapshot: GraphSnapshotV3;
 			try {
+				if(!await this.hasMailboxProtocol(runDir)){adopted.push({graphId:entry.name,outcome:"skipped"});continue;}
+				// Filter by immutable admission identity before status/control reads,
+				// which may initialize durable state, or installing a Supervisor.
+				// Sharing a working directory never implies sharing a Pi session.
+				if (options.sessionId !== undefined) {
+					const authorization = validateAuthorizationV4((await readStableJson(join(runDir, "authorization.json"), "authorization.json")).value);
+					if (authorization.sessionId !== options.sessionId) continue;
+				}
 				// Recompute from safe on-site authority and Attempt evidence. The mutable
 				// persisted snapshot is a cache, not adoption authority.
 				snapshot = await this.status(entry.name);
@@ -802,7 +922,6 @@ export class V3GraphHost {
 				) !== undefined;
 				if (retryPending) {
 					await this.requestDesiredState(entry.name, "running");
-					await this.resume(entry.name);
 					adopted.push({ graphId: entry.name, outcome: "resumed" });
 					continue;
 				}
@@ -823,7 +942,7 @@ export class V3GraphHost {
 					// A paused projection is terminal only while the durable intent is
 					// paused. A committed running intent makes it resumable again.
 					if (TERMINAL_STATUSES.has(snapshot.status) && snapshot.status !== "paused") continue;
-					await this.resume(entry.name);
+					await this.requestDesiredState(entry.name, "running");
 				}
 				adopted.push({ graphId: entry.name, outcome: "resumed" });
 			} catch (error) {
@@ -894,11 +1013,37 @@ export async function graphStatusTextV3(snapshot: GraphSnapshotV3, runsDir: stri
 	const nodeLines: string[] = [];
 	for (const [taskId, node] of Object.entries(snapshot.nodes ?? {})) {
 		const phase = node.terminalStatus ?? node.phase;
-		nodeLines.push(`  - ${taskId}: ${phase}${node.attempt > 0 ? ` (attempt ${node.attempt})` : ""}`);
+		const observation = node.observation;
+		const usage = observation?.usage;
+		const tokens = reportedTotalTokens(usage);
+		const turns = observation?.progress?.turnCount ?? usage?.turns;
+		const facts = [
+			...supervisionFacts(observation),
+			node.attempt > 0 ? `attempt ${node.attempt}` : undefined,
+			observation?.requestedAgent ? `requested agent ${observation.requestedAgent}` : undefined,
+			(observation?.resolvedAgent ?? node.agent) ? `resolved agent ${observation?.resolvedAgent ?? node.agent}` : undefined,
+			observation?.actualAgent ? `actual agent ${observation.actualAgent}` : undefined,
+			observation?.requestedModel ? `requested model ${observation.requestedModel}` : undefined,
+			observation?.resolvedModel ? `resolved model ${observation.resolvedModel}` : undefined,
+			observation?.actualModel ? `actual model ${observation.actualModel}` : undefined,
+			tokens !== undefined ? `${tokens} tokens` : undefined,
+			usage?.costUsd !== undefined ? `cost $${usage.costUsd.toFixed(usage.costUsd < 0.01 ? 4 : 2)}` : undefined,
+			turns !== undefined ? `${turns} turns` : undefined,
+			observation?.progress?.toolCount !== undefined ? `${observation.progress.toolCount} tools` : undefined,
+			observation?.runId ? `child run ${observation.runId}` : undefined,
+			observation?.asyncId ? `async ${observation.asyncId}` : undefined,
+			observation?.sessionFile ? `session ${basename(observation.sessionFile)}` : undefined,
+			observation?.progress?.currentTool ? `tool ${observation.progress.currentTool}` : undefined,
+			observation?.progress?.currentPath ? `path ${observation.progress.currentPath}` : undefined,
+			observation?.durationMs !== undefined ? `duration ${observation.durationMs}ms` : undefined,
+		].filter((fact): fact is string => fact !== undefined);
+		const dependencies = node.dependsOn?.length ? ` ← ${node.dependsOn.join(", ")}` : "";
+		nodeLines.push(`  - ${taskId}${dependencies}: ${phase}${facts.length ? ` (${facts.join(" · ")})` : ""}`);
 	}
 	return [
 		`Graph: ${snapshot.graphId}`,
 		`Status: ${snapshot.status}`,
+		...(snapshot.revision === undefined ? [] : [`Revision: ${snapshot.revision} · ${snapshot.sealed ? "sealed" : "open"}`]),
 		`Created: ${snapshot.createdAt}`,
 		`State: ${join(resolve(runsDir), snapshot.graphId, "snapshot.json")}`,
 		`Nodes:${nodeLines.length ? `\n${nodeLines.join("\n")}` : " (none)"}`,

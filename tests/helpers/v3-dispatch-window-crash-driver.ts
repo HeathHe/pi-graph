@@ -1,5 +1,6 @@
 // SIGKILL fixture: pause the RPC caller after pi-subagents created the durable
-// child but before Runner can persist its dispatch binding.
+// child but before Runner can persist its dispatch binding. The next Supervisor
+// must fail closed because 0.56 status cannot map the request back to this child.
 import { writeFile } from "node:fs/promises";
 import { V3GraphHost } from "../../src/v3/host.ts";
 import { SubagentRpcClient } from "../../src/v3/rpc.ts";

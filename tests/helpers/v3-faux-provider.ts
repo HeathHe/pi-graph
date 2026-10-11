@@ -22,7 +22,10 @@ function textOfContent(content: unknown): string {
 function latestUser(context: Context): { index: number; text: string } | undefined {
 	for (let index = context.messages.length - 1; index >= 0; index -= 1) {
 		const message = context.messages[index];
-		if (message?.role === "user") return { index, text: textOfContent(message.content) };
+		if (message?.role === "user") {
+   const text = textOfContent(message.content);
+   if (text.startsWith(COMMAND_PREFIX) || text.startsWith("PI_GRAPH_REPLY ") || text === "ORDINARY_PI_CHECK" || text.includes("PI_GRAPH_CHILD_DELAY_MS=")) return {index,text};
+  }
 	}
 	return undefined;
 }
@@ -37,6 +40,8 @@ function graphArguments(text: string): Record<string, unknown> | undefined {
 }
 
 const response: FauxResponseFactory = async (context, options) => {
+	const probeUrl = process.env.PI_GRAPH_FAUX_PROVIDER_PROBE_URL;
+	if (probeUrl) await fetch(probeUrl, { method: "POST", body: "streamSimple invoked" });
 	const user = latestUser(context);
 	if (!user) return fauxAssistantMessage("No user task was supplied.");
 	const arguments_ = graphArguments(user.text);
@@ -44,7 +49,7 @@ const response: FauxResponseFactory = async (context, options) => {
 		const toolResultSeen = context.messages.slice(user.index + 1).some((message) => message.role === "toolResult");
 		return toolResultSeen
 			? fauxAssistantMessage("The requested public graph action returned.")
-			: fauxAssistantMessage(fauxToolCall("graph", arguments_), { stopReason: "toolUse" });
+			: fauxAssistantMessage(fauxToolCall("graph", JSON.parse(JSON.stringify(arguments_))), { stopReason: "toolUse" });
 	}
 	const delayMatch = /PI_GRAPH_CHILD_DELAY_MS=(\d+)/u.exec(user.text);
 	if (delayMatch) {
@@ -91,6 +96,7 @@ export default function registerV3FauxProvider(pi: ExtensionAPI): void {
 			contextWindow: model.contextWindow,
 			maxTokens: model.maxTokens,
 		})),
-		streamSimple: faux.streamSimple,
+		// Newer Pi includes a separate system message; the pinned faux helper predates it.
+		streamSimple: (model, context, options) => faux.streamSimple(model, { ...context, messages: context.messages.filter((message) => (message as { role: string }).role !== "system") }, options),
 	});
 }

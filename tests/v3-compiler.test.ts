@@ -82,6 +82,26 @@ test("V3 compiler binds graph-wide readOnly and toolFilter constraints into ever
 	expectGraphError(() => compileGraphSpecV3(invalidTool), "INVALID_GRAPH_SPEC");
 });
 
+test("V3 compiler rejects obsolete extension-Provider admission evidence", () => {
+	const input = validThreeNodeSpec();
+	const node = (input.nodes as Array<Record<string, unknown>>)[0]!;
+	node.binding = {
+		schemaVersion: 1,
+		resolution: "exact-agent",
+		requestedAgent: "reader",
+		resolvedAgent: "reader",
+		capabilityIds: [],
+		agentDefinitionDigest: "a".repeat(64),
+		admissionLaunchContractDigest: "b".repeat(64),
+		extensionProviderIds: ["legacy-provider"],
+		configuredExtensions: [{ path: "/legacy-provider.ts", digest: "c".repeat(64) }],
+		authoringNodeDigest: "d".repeat(64),
+		bindingDigest: "e".repeat(64),
+	};
+	const error = expectGraphError(() => compileGraphSpecV3(input), "INVALID_FIELD");
+	assert.match(error.message, /extensionProviderIds|configuredExtensions/u);
+});
+
 test("V3 compiler detects cycles", () => {
 	const input = validThreeNodeSpec();
 	const nodes = input.nodes as Array<Record<string, unknown>>;
@@ -179,6 +199,23 @@ test("V3 compiler requires write scope and validation commands for local_write",
 	}
 });
 
+test("V3 compiler rejects validation commands on nodes that cannot write", () => {
+	for (const sideEffect of ["none", "local_read"] as const) {
+		const input = validThreeNodeSpec();
+		(input.nodes as Array<Record<string, unknown>>)[0] = {
+			taskId: "collect",
+			agent: "reader",
+			task: "Collect local inputs",
+			sideEffect,
+			validationCommands: ["npm test"],
+		};
+		const error = expectGraphError(() => compileGraphSpecV3(input), "INVALID_VALIDATION_COMMAND");
+		assert.equal(error.taskId, "collect");
+		assert.equal(error.field, "validationCommands");
+		assert.equal(error.details?.sideEffect, sideEffect);
+	}
+});
+
 test("V3 compiler exposes only the implemented shadow workspace", () => {
 	const implicit = compileGraphSpecV3(validThreeNodeSpec());
 	assert.equal(implicit.workspace, "shadow");
@@ -248,7 +285,8 @@ test("V3 compiler leaves timeout absent when the source does not declare it", ()
 	}
 	const input = validThreeNodeSpec();
 	(input.nodes as Array<Record<string, unknown>>)[0]!.timeoutMs = 2_500;
-	assert.equal(compileGraphSpecV3(input).nodes[0]?.timeoutMs, 2_500);
+	assert.throws(() => compileGraphSpecV3(input), /remove timeoutMs/);
+	assert.equal(compileGraphSpecV3(input, { historical: true }).nodes[0]?.timeoutMs, 2_500);
 });
 
 test("V3 compiler generates deterministic output artifacts and graph IDs", () => {

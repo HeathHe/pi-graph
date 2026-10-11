@@ -272,6 +272,14 @@ export async function commitV3RetryIntent(input: V3CommitRetryIntentInput): Prom
 
 		const descendants = descendantsOf(graph, input.taskId);
 		const taskIds = graph.topologicalOrder.filter((taskId) => descendants.has(taskId) && !poisoned.has(taskId));
+		for (const taskId of taskIds) {
+			const node = graph.nodes.find((candidate) => candidate.taskId === taskId)!;
+			const evidence = latestByTask.get(taskId)?.evidence;
+			if ((evidence?.child?.observation?.supervision?.observedMutation === true || node.sideEffect === "local_write" || node.sideEffect === "external_write" || (node.permissionPolicy === "inherited" && !node.readOnly))
+				&& (evidence?.dispatch || evidence?.dispatchIntent?.state === "emitting")) {
+				graphV3Error("INVALID_MUTATION", `Node '${taskId}' may have performed external effects; inspect its outcome and create a new graph for remaining work instead of replaying it.`, { taskId });
+			}
+		}
 		const baselines: Record<string, number> = {};
 		for (const taskId of taskIds) {
 			const attempt = latestByTask.get(taskId)?.attempt ?? 0;

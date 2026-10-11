@@ -3,19 +3,17 @@ import type { V3ValidationResult } from "./types.ts";
 import { validateValidationCommandV3 } from "./validation-command.ts";
 
 export interface V3VerificationLimits {
-	/** Total wall-clock budget for a single validation command. */
-	timeoutMs: number;
 	/** Per-stream (stdout and stderr) byte cap; overflow sets the truncated flag. */
 	streamLimitBytes: number;
 }
 
 export const V3_VERIFY_DEFAULTS: V3VerificationLimits = {
-	timeoutMs: 300_000,
 	streamLimitBytes: 64 * 1024,
 };
 
 export interface V3RunVerificationOptions extends Partial<V3VerificationLimits> {
 	signal?: AbortSignal;
+	permissionPolicy?: "inherited" | "strict";
 }
 
 interface CappedStream {
@@ -68,7 +66,7 @@ export async function runV3Validation(command: string, cwd: string, options: V3R
 		let childSignal: NodeJS.Signals | null = null;
 		let parsed: string[];
 		try {
-			parsed = validateValidationCommandV3(command);
+			parsed = options.permissionPolicy === "inherited" ? ["/bin/bash", "-lc", command] : validateValidationCommandV3(command);
 		} catch (error) {
 			resolvePromise({
 				command, ok: false, exitCode: null, signal: null, timedOut: false,
@@ -90,18 +88,19 @@ export async function runV3Validation(command: string, cwd: string, options: V3R
 		const child = spawn(executable!, args, { cwd, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
 		child.stdout.on("data", (chunk: Buffer) => { stdout = appendCapped(stdout, chunk, limits.streamLimitBytes); });
 		child.stderr.on("data", (chunk: Buffer) => { stderr = appendCapped(stderr, chunk, limits.streamLimitBytes); });
-		let timer: NodeJS.Timeout | undefined;
+		let cancelTimer: NodeJS.Timeout | undefined;
 		const onAbort = () => {
 			aborted = true;
 			killTree(child.pid, "SIGTERM");
-			setTimeout(() => killTree(child.pid, "SIGKILL"), 2_000).unref();
+			cancelTimer = setTimeout(() => killTree(child.pid, "SIGKILL"), 2_000);
+			cancelTimer.unref();
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		child.on("error", (error) => {
 			stderr = appendCapped(stderr, Buffer.from(`\n${error.message}`), limits.streamLimitBytes);
 		});
 		child.on("close", (exitCode, signal) => {
-			if (timer) clearTimeout(timer);
+			if (cancelTimer) clearTimeout(cancelTimer);
 			options.signal?.removeEventListener("abort", onAbort);
 			childExitCode = exitCode;
 			childSignal = signal ?? null;
@@ -119,11 +118,6 @@ export async function runV3Validation(command: string, cwd: string, options: V3R
 				durationMs: Date.now() - started,
 			});
 		});
-		timer = setTimeout(() => {
-			timedOut = true;
-			killTree(child.pid, "SIGTERM");
-			setTimeout(() => killTree(child.pid, "SIGKILL"), 2_000).unref();
-		}, limits.timeoutMs);
 	});
 }
 

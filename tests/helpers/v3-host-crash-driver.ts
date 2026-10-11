@@ -47,7 +47,9 @@ export async function main(): Promise<void> {
 		goal: "e2e crash chain",
 		nodes: [
 			{ taskId: "n1", agent: "test-agent", task: "N1 write", sideEffect: "local_write", writeScope: [{ kind: "file", path: "n1.out" }], validationCommands: ["test -f n1.out"] },
-			{ taskId: "n2", agent: "test-agent", task: "N2 write", dependsOn: ["n1"], sideEffect: "local_write", writeScope: [{ kind: "file", path: "n2.out" }], validationCommands: ["test -f n2.out"], timeoutMs: 800, retryPolicy: { maxAttempts: 2, retryOn: ["timeout"], backoffMs: 50 } },
+			// This child has no deadline. The recovery test explicitly requests stop
+			// and checks that an unconfirmed old child cannot be duplicated.
+			{ taskId: "n2", agent: "test-agent", task: "N2 write", dependsOn: ["n1"], sideEffect: "local_write", writeScope: [{ kind: "file", path: "n2.out" }], validationCommands: ["test -f n2.out"] },
 			{ taskId: "n3", agent: "test-agent", task: "N3 read", dependsOn: ["n2"], sideEffect: "local_read" },
 		],
 	};

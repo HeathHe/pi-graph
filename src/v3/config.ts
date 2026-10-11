@@ -6,6 +6,8 @@ export interface V3GraphConfig {
 	enabled: boolean;
 	runsDir: string;
 	rpcTimeoutMs: number;
+	/** Explicit opt-in for the package fallback Agent when a legacy capability has no catalog match. */
+	allowTemporaryAgent: boolean;
 }
 
 function positiveInteger(value: unknown, fallback: number, maximum: number): number {
@@ -28,6 +30,7 @@ export function parseV3GraphConfig(raw: unknown, agentDir = getAgentDir()): V3Gr
 			? resolve(settings.runsDir)
 			: join(agentDir, "graph-runs"),
 		rpcTimeoutMs: positiveInteger(settings.rpcTimeoutMs, 10_000, 300_000),
+		allowTemporaryAgent: settings.allowTemporaryAgent === true,
 	};
 }
 

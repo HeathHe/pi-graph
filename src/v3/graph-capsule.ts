@@ -2,9 +2,10 @@ import { constants, type BigIntStats } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { TextDecoder } from "node:util";
+import { bindGraphSpecV3, type V3BindingOptions, type V3BoundGraphSpec } from "./binding.ts";
 import { compileGraphSpecV3 } from "./compiler.ts";
 import { canonicalJson } from "./digests.ts";
-import type { CompiledGraphV3, GraphSpecV3 } from "./types.ts";
+import type { CompiledGraphV3, GraphSpecAuthoringV3, GraphSpecV3 } from "./types.ts";
 
 export const V3_GRAPH_CAPSULE_SUFFIX = ".graph.json" as const;
 export const V3_GRAPH_CAPSULE_MAX_BYTES = 1_048_576;
@@ -65,6 +66,23 @@ export interface V3CompiledGraphCapsule {
 	inputs: V3ResolvedGraphCapsuleInputs;
 	spec: GraphSpecV3;
 	compiled: CompiledGraphV3;
+}
+
+/** Placeholder-resolved public authoring input, before Agent/capability admission. */
+export interface V3ResolvedGraphCapsule {
+	capsule: V3GraphCapsule;
+	inputs: V3ResolvedGraphCapsuleInputs;
+	spec: GraphSpecAuthoringV3;
+}
+
+/** Capsule result after capability binding and the authoritative pure-core compile. */
+export interface V3BoundGraphCapsule extends V3CompiledGraphCapsule {
+	catalog?: V3BoundGraphSpec["catalog"];
+}
+
+export interface V3GraphCapsuleBindLoadOptions {
+	load?: V3GraphCapsuleLoadOptions;
+	binding?: V3BindingOptions;
 }
 
 export interface V3GraphCapsuleLoadOptions {
@@ -381,8 +399,11 @@ export function applyV3GraphCapsuleInputs(
 	return applyPlaceholders(cloneJsonValue(specValue, "source.spec"), inputs, "source.spec") as Record<string, unknown>;
 }
 
-/** Resolve a capsule and pass the final spec through the authoritative V3 compiler. */
-export function compileV3GraphCapsule(capsuleValue: unknown, overrides: unknown = {}): V3CompiledGraphCapsule {
+/**
+ * Resolve typed placeholders and capsule execution ceilings without selecting an
+ * Agent. Capability/model authoring fields remain intact for Binding/Admission.
+ */
+export function resolveV3GraphCapsule(capsuleValue: unknown, overrides: unknown = {}): V3ResolvedGraphCapsule {
 	const capsule = validateV3GraphCapsule(capsuleValue);
 	const inputs = resolveInputs(capsule, overrides);
 	const resolvedSpec = applyV3GraphCapsuleInputs(capsule.source.spec, inputs);
@@ -390,20 +411,61 @@ export function compileV3GraphCapsule(capsuleValue: unknown, overrides: unknown 
 	// into the admitted GraphSpec so recovery recompiles the same tool ceiling.
 	if (capsule.requires.readOnly) resolvedSpec.readOnly = true;
 	if (capsule.requires.toolFilter.length > 0) resolvedSpec.toolFilter = [...capsule.requires.toolFilter];
+	return {
+		capsule,
+		inputs,
+		spec: resolvedSpec as unknown as GraphSpecAuthoringV3,
+	};
+}
+
+/**
+ * Legacy exact-Agent capsule compiler. Capability-authored capsules must use
+ * bindV3GraphCapsule so the pure compiler never reads the ambient catalog.
+ */
+export function compileV3GraphCapsule(capsuleValue: unknown, overrides: unknown = {}): V3CompiledGraphCapsule {
+	const resolved = resolveV3GraphCapsule(capsuleValue, overrides);
 	let compiled: CompiledGraphV3;
 	try {
-		compiled = compileGraphSpecV3(resolvedSpec);
+		compiled = compileGraphSpecV3(resolved.spec);
 	} catch (error) {
-		if (capsule.requires.readOnly && error instanceof Error && error.message.includes("readOnly graph")) {
+		if (resolved.capsule.requires.readOnly && error instanceof Error && error.message.includes("readOnly graph")) {
 			capsuleError("INVALID_CAPSULE", "requires.readOnly conflicts with a local_write node in source.spec.", { field: "requires.readOnly", cause: error });
 		}
 		throw error;
 	}
 	return {
-		capsule,
-		inputs,
+		capsule: resolved.capsule,
+		inputs: resolved.inputs,
 		spec: structuredClone(compiled.sourceGraphSpec),
 		compiled,
+	};
+}
+
+/**
+ * Resolve authoring input, bind capability IDs to one exact Pi Agent, freeze
+ * launch evidence, then enter the pure GraphSpec compiler.
+ */
+export async function bindV3GraphCapsule(
+	capsuleValue: unknown,
+	overrides: unknown = {},
+	options: V3BindingOptions = {},
+): Promise<V3BoundGraphCapsule> {
+	const resolved = resolveV3GraphCapsule(capsuleValue, overrides);
+	let bound: V3BoundGraphSpec;
+	try {
+		bound = await bindGraphSpecV3(resolved.spec, options);
+	} catch (error) {
+		if (resolved.capsule.requires.readOnly && error instanceof Error && error.message.includes("readOnly graph")) {
+			capsuleError("INVALID_CAPSULE", "requires.readOnly conflicts with a local_write node in source.spec.", { field: "requires.readOnly", cause: error });
+		}
+		throw error;
+	}
+	return {
+		capsule: resolved.capsule,
+		inputs: resolved.inputs,
+		spec: structuredClone(bound.spec),
+		compiled: bound.compiled,
+		...(bound.catalog ? { catalog: bound.catalog } : {}),
 	};
 }
 
@@ -535,6 +597,19 @@ export async function loadAndCompileV3GraphCapsule(
 	options: V3GraphCapsuleLoadOptions = {},
 ): Promise<V3CompiledGraphCapsule> {
 	return compileV3GraphCapsule(await loadV3GraphCapsule(filePath, options), overrides);
+}
+
+/** Safely load a capsule and run the capability-aware Binding/Admission path. */
+export async function loadAndBindV3GraphCapsule(
+	filePath: string,
+	overrides: unknown = {},
+	options: V3GraphCapsuleBindLoadOptions = {},
+): Promise<V3BoundGraphCapsule> {
+	return bindV3GraphCapsule(
+		await loadV3GraphCapsule(filePath, options.load),
+		overrides,
+		options.binding,
+	);
 }
 
 /** Return deterministic JSON bytes suitable for writing to an explicit .graph.json path. */

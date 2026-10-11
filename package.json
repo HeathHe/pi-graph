@@ -1,8 +1,7 @@
 {
   "name": "pi-graph",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Durable DAG execution for Pi subagents",
+  "version": "0.2.0",
+  "description": "Durable DAG execution with owned Pi SDK child agents",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
@@ -10,13 +9,20 @@
   "files": [
     "extensions/",
     "src/v3/",
+    "agents/",
     "templates/",
-    "README.md"
+    "README.md",
+    "src/runtime/",
+    "docs/",
+    "examples/",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types tests/run-isolated.ts suite",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "release:dry-run": "npm publish --dry-run --ignore-scripts --registry=https://registry.npmjs.org/"
   },
   "pi": {
     "extensions": [
@@ -25,23 +31,52 @@
     ]
   },
   "dependencies": {
-    "jiti": "2.7.0"
+    "jiti": "2.7.0",
+    "yaml": "2.8.2"
   },
   "overrides": {
     "protobufjs": "7.6.5"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.81.0",
-    "@earendil-works/pi-coding-agent": ">=0.81.0",
-    "pi-subagents": "^0.49.0",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": ">=1.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.81.1",
-    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@earendil-works/pi-agent-core": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
     "@types/node": "^24.0.0",
-    "pi-subagents": "0.49.0",
     "typebox": "1.1.38",
     "typescript": "^5.9.0"
+  },
+  "pi-graph": {
+    "agents": [
+      "./agents"
+    ]
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HeathHe/pi-graph.git"
+  },
+  "homepage": "https://github.com/HeathHe/pi-graph#readme",
+  "bugs": {
+    "url": "https://github.com/HeathHe/pi-graph/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "agents",
+    "dag",
+    "multi-agent",
+    "workflow"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

@@ -34,7 +34,7 @@ test("V3 verify caps per-stream output and flags truncation", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
 	await writeFile(join(cwd, "noisy.js"), "for (let i = 0; i < 5000; i++) console.log('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');\n");
 	// Use a tiny stream cap to force truncation with a whitelisted `node` invocation.
-	const result = await runV3Validation("node noisy.js", cwd, { streamLimitBytes: 256, timeoutMs: 10_000 });
+	const result = await runV3Validation("node noisy.js", cwd, { streamLimitBytes: 256 });
 	assert.equal(result.stdoutTruncated, true);
 	assert.ok(result.stdout.length <= 256);
 	assert.equal(result.ok, true);
@@ -43,7 +43,7 @@ test("V3 verify caps per-stream output and flags truncation", async () => {
 test("V3 verify applies stream caps to UTF-8 bytes rather than JavaScript characters", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
 	await writeFile(join(cwd, "unicode.js"), "process.stdout.write('界'.repeat(100));\n");
-	const result = await runV3Validation("node unicode.js", cwd, { streamLimitBytes: 16, timeoutMs: 10_000 });
+	const result = await runV3Validation("node unicode.js", cwd, { streamLimitBytes: 16 });
 	assert.equal(result.stdoutTruncated, true);
 	assert.ok(Buffer.byteLength(result.stdout, "utf8") <= 16);
 	assert.equal(result.ok, true);
@@ -52,17 +52,19 @@ test("V3 verify applies stream caps to UTF-8 bytes rather than JavaScript charac
 test("V3 verify marks output beyond an exactly filled stream cap as truncated", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
 	await writeFile(join(cwd, "exact.js"), "process.stdout.write('12345678'); setImmediate(() => process.stdout.write('9'));\n");
-	const result = await runV3Validation("node exact.js", cwd, { streamLimitBytes: 8, timeoutMs: 10_000 });
+	const result = await runV3Validation("node exact.js", cwd, { streamLimitBytes: 8 });
 	assert.equal(result.stdout, "12345678");
 	assert.equal(result.stdoutTruncated, true);
 });
 
-test("V3 verify enforces the total timeout and records timedOut", async () => {
+test("V3 verify has no default execution deadline and records explicit cancellation", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
 	await writeFile(join(cwd, "slow.js"), "setTimeout(() => {}, 60000);\n");
 	const started = Date.now();
-	const result = await runV3Validation("node slow.js", cwd, { timeoutMs: 300 });
-	assert.equal(result.timedOut, true);
+	const stop = new AbortController();
+	setTimeout(() => stop.abort(), 300);
+	const result = await runV3Validation("node slow.js", cwd, { signal: stop.signal });
+	assert.equal(result.timedOut, false);
 	assert.equal(result.ok, false);
 	assert.ok(Date.now() - started < 3_000);
 });
@@ -70,9 +72,11 @@ test("V3 verify enforces the total timeout and records timedOut", async () => {
 test("V3 verify records the terminating signal when a child is killed", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "v3-verify-"));
 	await writeFile(join(cwd, "slow.js"), "setTimeout(() => {}, 60000);\n");
-	const result = await runV3Validation("node slow.js", cwd, { timeoutMs: 200 });
-	// SIGKILL after SIGTERM grace may produce either a signal or timedOut marker.
-	assert.equal(result.timedOut, true);
+	const stop = new AbortController();
+	setTimeout(() => stop.abort(), 200);
+	const result = await runV3Validation("node slow.js", cwd, { signal: stop.signal });
+	assert.equal(result.timedOut, false);
+	assert.ok(result.signal);
 	assert.equal(result.ok, false);
 });
 

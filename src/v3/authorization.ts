@@ -7,34 +7,12 @@ import type { AuthorizationV4, CompiledGraphProjectionV3, CompiledGraphV3, Sourc
 const AUTHORIZATION_FIELDS = new Set([
 	"schemaVersion", "runtimeSchemaVersion", "sourceGraphSpec", "sourceGraphSpecDigest", "sourceCwd", "sourceRepository", "graphDigest", "runInstanceId", "sessionId", "supervisorEpoch", "createdAt", "graph",
 ]);
-const GRAPH_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "topologicalOrder", "maxConcurrency", "failFast", "workspace"]);
-const FORBIDDEN_AUTHORIZATION_FIELDS = new Set([
-	"planningReceipt", "planningReceiptDigest", "planningBindingDigest", "planningAdmissionId", "routingDecision", "routingProfile", "model", "thinking",
-	"resolvedModel", "modelFamily", "providerDomain", "attemptedModels", "modelCandidates", "evidenceComplete",
-]);
+const GRAPH_FIELDS = new Set(["schemaVersion", "graphId", "goal", "nodes", "topologicalOrder", "maxConcurrency", "failFast", "workspace", "bindingPolicy"]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 const FILE_SYSTEM_ID_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function rejectForbiddenFields(value: unknown, path = "$", seen = new Set<object>()): void {
-	if (typeof value !== "object" || value === null) return;
-	if (seen.has(value)) graphV3Error("INVALID_AUTHORIZATION", `Authorization contains a cyclic value at ${path}.`);
-	seen.add(value);
-	try {
-		if (Array.isArray(value)) {
-			value.forEach((entry, index) => rejectForbiddenFields(entry, `${path}[${index}]`, seen));
-			return;
-		}
-		for (const [field, entry] of Object.entries(value as Record<string, unknown>)) {
-			if (FORBIDDEN_AUTHORIZATION_FIELDS.has(field)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 must not contain '${field}'.`, { field, details: { path } });
-			rejectForbiddenFields(entry, `${path}.${field}`, seen);
-		}
-	} finally {
-		seen.delete(value);
-	}
 }
 
 function requireString(record: Record<string, unknown>, field: string): string {
@@ -98,6 +76,7 @@ export function compiledGraphProjectionV3(graph: CompiledGraphV3): CompiledGraph
 		maxConcurrency: graph.maxConcurrency,
 		failFast: graph.failFast,
 		workspace: graph.workspace,
+		...(graph.bindingPolicy === "strict" ? { bindingPolicy: "strict" as const } : {}),
 	};
 	return JSON.parse(canonicalJson(projection)) as CompiledGraphProjectionV3;
 }
@@ -130,7 +109,6 @@ export function authorizationV4For(graph: CompiledGraphV3, metadata: Authorizati
 }
 
 export function validateAuthorizationV4(value: unknown): AuthorizationV4 {
-	rejectForbiddenFields(value);
 	if (!isRecord(value)) graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 must be an object.");
 	for (const field of Object.keys(value)) {
 		if (!AUTHORIZATION_FIELDS.has(field)) graphV3Error("INVALID_AUTHORIZATION", `Authorization V4 contains unknown field '${field}'.`, { field });
@@ -161,7 +139,7 @@ export function validateAuthorizationV4(value: unknown): AuthorizationV4 {
 	if (!Array.isArray(value.graph.topologicalOrder)) graphV3Error("INVALID_AUTHORIZATION", "Authorization V4 graph.topologicalOrder must be an array.", { field: "topologicalOrder" });
 	let recompiled: CompiledGraphV3;
 	try {
-		recompiled = compileGraphSpecV3(value.sourceGraphSpec);
+		recompiled = compileGraphSpecV3(value.sourceGraphSpec, { historical: true });
 	} catch (error) {
 		throw new GraphV3Error("INVALID_AUTHORIZATION", `Authorization V4 contains an invalid source GraphSpec: ${error instanceof Error ? error.message : String(error)}`, { field: "sourceGraphSpec", cause: error });
 	}

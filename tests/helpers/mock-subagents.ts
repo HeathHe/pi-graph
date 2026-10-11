@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { EventBus } from "../../src/v3/rpc.ts";
 import { RPC_REQUEST, RPC_REPLY_PREFIX, subagentAsyncRoot } from "../../src/v3/rpc.ts";
@@ -56,6 +56,10 @@ export class MockSubagents implements EventBus {
 	private async handleRequest(data: unknown): Promise<void> {
 		const request = data as { version: number; requestId: string; method: string; params?: Record<string, unknown> };
 		if (request?.version !== 1) return;
+		if (request.method === "ping" || request.method === "status") {
+			this.emit(`${RPC_REPLY_PREFIX}${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: nativePing() });
+			return;
+		}
 		if (request.method === "stop") {
 			const params = (request.params ?? {}) as Record<string, unknown>;
 			const asyncId = typeof params.id === "string" ? params.id : typeof params.runId === "string" ? params.runId : "";
@@ -71,6 +75,7 @@ export class MockSubagents implements EventBus {
 			const statusPath = join(child.asyncDir, "status.json");
 			const current = JSON.parse(await (await import("node:fs/promises")).readFile(statusPath, "utf8")) as Record<string, unknown>;
 			await writeFile(statusPath, JSON.stringify({ ...current, runId: asyncId, state: "stopped" }));
+			await publishMockTerminal({ asyncId, asyncDir: child.asyncDir });
 			this.emit(`${RPC_REPLY_PREFIX}${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: { runId: asyncId, asyncDir: child.asyncDir, state: "stopping" } });
 			return;
 		}
@@ -95,8 +100,8 @@ export class MockSubagents implements EventBus {
 			return;
 		}
 		this.nextId += 1;
-		// Real pi-subagents assigns an opaque UUID and retains the stable request
-		// separately as status.toolCallId.
+		// Real pi-subagents assigns an opaque UUID. Its 0.56 single-run status does
+		// not retain the outer RPC request/tool-call id, so neither does this mock.
 		const asyncId = `mock-${this.nextId}-${randomUUID().slice(0, 8)}`;
 		const asyncDir = join(this.asyncRoot, asyncId);
 		this.requests.set(request.requestId, { asyncId, asyncDir });
@@ -106,14 +111,16 @@ export class MockSubagents implements EventBus {
 		await mkdir(sessionDir, { recursive: true });
 		this.createdDirs.push(asyncDir);
 		const outputFile = join(asyncDir, "output.txt");
-		await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, toolCallId: `rpc-spawn-${request.requestId}`, state: "running", sessionDir, outputFile, mode: "single" }));
+		await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, sessionId: "mock-session", cwd: params.cwd, timeoutMs: 1800000, state: "running", sessionDir, outputFile, mode: "single" }));
+
 		this.spawned.push({ asyncId, asyncDir, params });
 		this.emit(`${RPC_REPLY_PREFIX}${request.requestId}`, { version: 1, requestId: request.requestId, success: true, data: { details: { asyncId, asyncDir } } });
 		const cwd = typeof params.cwd === "string" ? params.cwd : process.cwd();
 		const delay = this.spawnDelayMs;
 		setTimeout(() => {
-			void behavior({ cwd, asyncDir, asyncId, params }).catch((error: unknown) => {
-				void writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, state: "failed", error: error instanceof Error ? error.message : String(error), sessionDir, outputFile, mode: "single" }));
+			void behavior({ cwd, asyncDir, asyncId, params }).then(() => publishMockTerminal({ asyncId, asyncDir })).catch(async (error: unknown) => {
+				await writeFile(join(asyncDir, "status.json"), JSON.stringify({ runId: asyncId, state: "failed", error: error instanceof Error ? error.message : String(error), sessionDir, outputFile, mode: "single" }));
+				await publishMockTerminal({ asyncId, asyncDir });
 			});
 		}, delay);
 	}
@@ -145,15 +152,40 @@ export async function completeChild(input: { cwd: string; asyncDir: string; asyn
 }
 
 export async function failChild(input: { asyncDir: string; asyncId: string }): Promise<void> {
-	const { writeFile: write, readFile: read } = await import("node:fs/promises");
+	const { writeFile: write } = await import("node:fs/promises");
 	const { join: joinPath } = await import("node:path");
-	const previous = JSON.parse(await read(joinPath(input.asyncDir, "status.json"), "utf8")) as Record<string, unknown>;
-	await write(joinPath(input.asyncDir, "status.json"), JSON.stringify({ runId: input.asyncId, ...(typeof previous.toolCallId === "string" ? { toolCallId: previous.toolCallId } : {}), state: "failed", error: "synthetic failure", sessionDir: joinPath(input.asyncDir, "session"), mode: "single" }));
+	await write(joinPath(input.asyncDir, "status.json"), JSON.stringify({ runId: input.asyncId, state: "failed", error: "synthetic failure", sessionDir: joinPath(input.asyncDir, "session"), mode: "single" }));
 }
 
 export async function pauseChild(input: { asyncDir: string; asyncId: string }): Promise<void> {
-	const { writeFile: write, readFile: read } = await import("node:fs/promises");
+	const { writeFile: write } = await import("node:fs/promises");
 	const { join: joinPath } = await import("node:path");
-	const previous = JSON.parse(await read(joinPath(input.asyncDir, "status.json"), "utf8")) as Record<string, unknown>;
-	await write(joinPath(input.asyncDir, "status.json"), JSON.stringify({ runId: input.asyncId, ...(typeof previous.toolCallId === "string" ? { toolCallId: previous.toolCallId } : {}), state: "paused", sessionDir: joinPath(input.asyncDir, "session"), mode: "single" }));
+	await write(joinPath(input.asyncDir, "status.json"), JSON.stringify({ runId: input.asyncId, state: "paused", sessionDir: joinPath(input.asyncDir, "session"), mode: "single" }));
+}
+
+export function mockSnapshot(id: string) {
+ return { version:2,runId:id,runnerInstanceId:`runner-${id}`,seq:1,phase:"waiting_model",observedAt:Date.now(),phaseStartedAt:Date.now(),toolCount:0,retryCount:0,observedMutation:false,repeatedErrors:0 };
+}
+export async function publishMockTerminal(input: {asyncDir:string;asyncId:string}, crash=false): Promise<void> {
+ const status=JSON.parse(await readFile(join(input.asyncDir,"status.json"),"utf8"));
+ status.sessionId ??= "mock-session";
+ await writeFile(join(input.asyncDir,"status.json"),JSON.stringify(status));
+ if(!["complete","failed","stopped","paused"].includes(status.state) && !crash)return;
+ if(!crash) { try { await readFile(join(input.asyncDir,"process-terminal.json")); return; } catch {} }
+ const state=mockSnapshot(input.asyncId);
+ let output="";try{output=await readFile(status.outputFile,"utf8");}catch{}
+ if(!crash) {
+  await writeFile(join(input.asyncDir,"result.json"),JSON.stringify({id:input.asyncId,runId:input.asyncId,runtimeKind:"pi-graph-sdk/1",asyncDir:input.asyncDir,sessionId:status.sessionId,state:status.state,summary:status.error,success:status.state === "complete",results:[{output,outputState:"present",success:status.state === "complete"}]}));
+ }
+ await writeFile(join(input.asyncDir,"process-terminal.json"),JSON.stringify({version:1,runtimeKind:"pi-graph-sdk/1",state:"observed",runId:input.asyncId,runnerProcessInstanceId:state.runnerInstanceId,observedAt:Date.now(),instances:[{kind:"runner",processInstanceId:state.runnerInstanceId,closeObservedAt:Date.now(),exitCode:crash?1:0,signal:null}]}));
+ status.runtimeKind="pi-graph-sdk/1";status.runnerProcessInstanceId=state.runnerInstanceId;status.processTerminal={runnerProcessInstanceId:state.runnerInstanceId};
+ await writeFile(join(input.asyncDir,"status.json"),JSON.stringify(status));
+}
+
+export function nativePing() {
+ return { version: 1, methods: ["ping", "spawn", "status", "stop"],
+  capabilities: { asyncSpawn: true, status: true, stop: true,
+   processTerminalProof: { version: 1, lifecycleArtifactVersion: 3 },
+   launchResolvedExtensions: { version: 1 }, runtimeAcknowledgedExtensions: { version: 1 } },
+  runtimeKind:"pi-graph-sdk/1", events: { asyncComplete: "pi-graph:child-complete" } };
 }

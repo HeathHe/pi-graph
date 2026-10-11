@@ -8,30 +8,28 @@
     "type": "graph-spec",
     "spec": {
       "schemaVersion": 3,
+      "contractPolicy": "strict",
       "goal": "Research {{topic}} at {{depth}} depth for a {{audience}}",
       "nodes": [
         {
           "taskId": "research",
-          "agent": "researcher",
+          "capabilityId": "research.topic",
           "task": "Research {{topic}} using current primary sources. Collect key facts, viewpoints, and source URLs at {{depth}} depth. Return a structured evidence brief.",
-          "sideEffect": "none",
-          "timeoutMs": 600000
+          "sideEffect": "none"
         },
         {
           "taskId": "verify",
-          "agent": "code-reviewer",
+          "capabilityId": "review.research",
           "task": "Independently verify the most load-bearing claims about {{topic}}: check source authority, recency, and contradictions. Mark each claim verified, partially verified, or unverified with reasons.",
           "dependsOn": ["research"],
-          "sideEffect": "none",
-          "timeoutMs": 600000
+          "sideEffect": "none"
         },
         {
           "taskId": "draft",
-          "agent": "document-writer",
+          "capabilityId": "write.document",
           "task": "Draft a report on {{topic}} for a {{audience}}: include a one-paragraph summary, structured findings, and a source list. Include only claims that survived verification and mark uncertainty explicitly.",
           "dependsOn": ["verify"],
-          "sideEffect": "none",
-          "timeoutMs": 600000
+          "sideEffect": "none"
         }
       ]
     }

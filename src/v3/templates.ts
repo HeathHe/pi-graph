@@ -1,13 +1,16 @@
 import { readFileSync } from "node:fs";
 import { posix } from "node:path";
 import {
-	compileV3GraphCapsule,
-	type V3CompiledGraphCapsule,
+	bindV3GraphCapsule,
+	resolveV3GraphCapsule,
+	type V3BoundGraphCapsule,
 	type V3GraphCapsule,
 	type V3GraphCapsuleRequirements,
+	type V3ResolvedGraphCapsule,
 	validateV3GraphCapsule,
 } from "./graph-capsule.ts";
-import type { GraphSpecV3 } from "./types.ts";
+import type { V3BindingOptions } from "./binding.ts";
+import type { GraphSpecAuthoringV3, GraphSpecV3 } from "./types.ts";
 
 export type BuiltinGraphTemplateV3Name = "research-report" | "code-review" | "doc-write";
 
@@ -115,22 +118,44 @@ export function listBuiltinGraphTemplatesV3(): BuiltinGraphTemplateSummaryV3[] {
 }
 
 /**
- * Load a built-in .graph.json resource through the exact capsule compiler used by
- * user-supplied files. The returned capsule retains requires/tool-filter metadata
- * for callers that install execution constraints at dispatch time.
+ * Resolve a built-in .graph.json resource through the exact placeholder path used
+ * by user capsules. Binding remains an explicit asynchronous admission step.
  */
-export function loadBuiltinGraphTemplateCapsuleV3(
+export function resolveBuiltinGraphTemplateCapsuleV3(
 	name: BuiltinGraphTemplateV3Name | string,
 	inputs: BuiltinGraphTemplateInputsV3 = {},
-): V3CompiledGraphCapsule {
+): V3ResolvedGraphCapsule {
 	const capsule = capsuleFor(name);
-	return compileV3GraphCapsule(capsule, resolveTemplateOverrides(name as BuiltinGraphTemplateV3Name, capsule, inputs));
+	return resolveV3GraphCapsule(capsule, resolveTemplateOverrides(name as BuiltinGraphTemplateV3Name, capsule, inputs));
 }
 
-/** Load a fresh GraphSpec V3 while preserving the original public template API. */
-export function loadBuiltinGraphTemplateV3(
+/** Load fresh public authoring bytes; capability IDs have not been resolved yet. */
+export function resolveBuiltinGraphTemplateV3(
 	name: BuiltinGraphTemplateV3Name | string,
 	inputs: BuiltinGraphTemplateInputsV3 = {},
-): GraphSpecV3 {
-	return structuredClone(loadBuiltinGraphTemplateCapsuleV3(name, inputs).spec);
+): GraphSpecAuthoringV3 {
+	return structuredClone(resolveBuiltinGraphTemplateCapsuleV3(name, inputs).spec);
+}
+
+/** Bind a built-in template to exact Pi Agents and compile its pure-core spec. */
+export async function bindBuiltinGraphTemplateCapsuleV3(
+	name: BuiltinGraphTemplateV3Name | string,
+	inputs: BuiltinGraphTemplateInputsV3 = {},
+	options: V3BindingOptions = {},
+): Promise<V3BoundGraphCapsule> {
+	const capsule = capsuleFor(name);
+	return bindV3GraphCapsule(
+		capsule,
+		resolveTemplateOverrides(name as BuiltinGraphTemplateV3Name, capsule, inputs),
+		options,
+	);
+}
+
+/** Return the exact-Agent GraphSpec admitted from a capability-authored template. */
+export async function bindBuiltinGraphTemplateV3(
+	name: BuiltinGraphTemplateV3Name | string,
+	inputs: BuiltinGraphTemplateInputsV3 = {},
+	options: V3BindingOptions = {},
+): Promise<GraphSpecV3> {
+	return structuredClone((await bindBuiltinGraphTemplateCapsuleV3(name, inputs, options)).spec);
 }
