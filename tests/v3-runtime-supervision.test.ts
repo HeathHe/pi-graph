@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdir, rm, writeFile, readFile, access } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { childSupervision, supervisionFacts, validateV3ChildObservation } from "../src/v3/observability.ts";
@@ -18,6 +18,16 @@ async function fixture() {
  const publish = (value: object) => writeFile(join(asyncDir,"status.json"),JSON.stringify(value));
  await publish(status);
  return {asyncId,asyncDir,status,publish};
+}
+
+// A status RPC may publish physical exit before its final status write. The
+// fixture owns that writer and must drain it before removing its directory.
+async function cleanupPublishedFixture(bus:MockSubagents,f:{asyncDir:string},publication?:Promise<void>) {
+ const errors:unknown[]=[];
+ try {await publication;}catch(error){errors.push(error);}
+ try {await bus.dispose();await rm(f.asyncDir,{recursive:true,force:true});}catch(error){errors.push(error);}
+ if(errors.length===1)throw errors[0];
+ if(errors.length)throw new AggregateError(errors,'Fixture publication/cleanup failed');
 }
 
 test("unlimited quiet task remains running beyond notice threshold, then completes", async () => {
@@ -45,9 +55,10 @@ test("unreachable status probe is visible without terminating a live task", asyn
 test("targeted reconciliation surfaces a dead process and its explicit error", async()=>{
  const f=await fixture();const bus=new MockSubagents();bus.start();const rpc=new SubagentRpcClient(bus);
  // Real runtimes reconcile targeted status requests; this fixture controls that result.
- rpc.call=async (method)=>{if(method==="status") { await f.publish({...f.status,state:"failed",error:"Runner process exited before writing a result."}); await publishMockTerminal(f,true); }return {};};
+ let publication:Promise<void>|undefined;
+ rpc.call=async (method)=>{if(method==="status") { publication=(async()=>{await f.publish({...f.status,state:"failed",error:"Runner process exited before writing a result."});await publishMockTerminal(f,true);})();await publication;}return {};};
  try {const out=await v3MonitorChild(rpc,f);assert.equal(out.terminal,"failed");assert.match(out.output,/Runner exit confirmed/);}
- finally {await bus.dispose();await rm(f.asyncDir,{recursive:true,force:true});}
+ finally {await cleanupPublishedFixture(bus,f,publication);}
 });
 
 test("legacy monitor deadline is ignored until explicit cancellation",async()=>{
@@ -84,4 +95,21 @@ test("Graph refuses missing public capabilities before spawning",async()=>{
  const {v3DispatchChild}=await import("../src/v3/dispatch.ts");
  await assert.rejects(v3DispatchChild(rpc,{agent:"worker",task:"inspect",cwd:"/tmp",sessionDir:"/tmp"}),/owned runtime incompatible/);
  assert.equal(spawned,false);
+});
+
+test('fixture cleanup waits for its final status writer after physical exit becomes visible',async()=>{
+ const f=await fixture();const bus=new MockSubagents();bus.start();const rpc=new SubagentRpcClient(bus);
+ let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});let publication:Promise<void>|undefined;let cleaned=false;let cleanup:Promise<void>|undefined;
+ rpc.call=async(method)=>{if(method==='status'){publication=(async()=>{await f.publish({...f.status,state:'failed',error:'controlled exit'});await publishMockTerminal(f,true);await gate;await f.publish({...f.status,state:'failed',error:'last fixture write'});})();await publication;}return {};};
+ try {
+  const result=await v3MonitorChild(rpc,f);assert.equal(result.terminal,'failed');assert.ok(publication);
+  cleanup=cleanupPublishedFixture(bus,f,publication).then(()=>{cleaned=true;});
+  await access(f.asyncDir);assert.equal(cleaned,false);
+  release();await cleanup;assert.equal(cleaned,true);await assert.rejects(access(f.asyncDir),{code:'ENOENT'});
+ } finally {release();if(cleanup)await cleanup;else await cleanupPublishedFixture(bus,f,publication);}
+});
+test('fixture publication errors remain visible after cleanup',async()=>{
+ const f=await fixture();const bus=new MockSubagents();const error=new Error('controlled fixture publication failure');
+ await assert.rejects(cleanupPublishedFixture(bus,f,Promise.reject(error)),e=>e===error);
+ await assert.rejects(access(f.asyncDir),{code:'ENOENT'});
 });

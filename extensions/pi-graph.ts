@@ -686,6 +686,7 @@ function trustedSessionId(ctx: { sessionManager: { getSessionId: () => string } 
 export function bindingOptionsFromContextV3(
 	ctx: Pick<ExtensionContext, "cwd" | "model" | "modelRegistry">,
 	allowTemporaryAgent: boolean,
+	_legacyParentThinking?: string,
 ): RoutingAdmissionOptionsV3 {
 	const availableModels = ctx.modelRegistry.getAvailable().map((model) => ({
 		provider: model.provider,

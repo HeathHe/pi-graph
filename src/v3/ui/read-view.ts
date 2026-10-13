@@ -1,9 +1,9 @@
 import { readGraphSupervisorRequests } from "../native-supervisor.ts";
-import { constants } from "node:fs";
-import { lstat, open, readdir } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { readV3AttemptEvidence } from "../attempt.ts";
 import { readV3RunControl } from "../control.ts";
+import { readAtomicRegularFile } from "../safe-read.ts";
 import { validateGraphSnapshotV3 } from "../snapshot.ts";
 import type { GraphSnapshotV3 } from "../types.ts";
 import { setDisplayEvidence, type DisplayEvidence } from "./presentation.ts";
@@ -44,13 +44,8 @@ export async function readGraphView(runsDir: string, id: string, agentDir?: stri
  if (!safeId.test(id)) throw new Error("Invalid graph ID.");
  const runDir = join(runsDir, id); const info = await lstat(runDir);
  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Graph run must be a regular directory.");
- const file = await open(join(runDir, "snapshot.json"), constants.O_RDONLY | constants.O_NOFOLLOW);
- let snapshot: GraphSnapshotV3;
- try {
-  const stat = await file.stat();
-  if (!stat.isFile() || stat.nlink !== 1 || stat.size > 16 * 1024 * 1024) throw new Error("Invalid graph snapshot file.");
-  snapshot = validateGraphSnapshotV3(JSON.parse(await file.readFile("utf8")));
- } finally { await file.close(); }
+ const text=await readAtomicRegularFile(join(runDir,"snapshot.json"),{maxBytes:16*1024*1024,invalidMessage:"Invalid graph snapshot file."});
+ let snapshot=validateGraphSnapshotV3(JSON.parse(text));
  if (snapshot.graphId !== id) throw new Error("Graph snapshot identity mismatch.");
  if (ownerSessionId) snapshot = (await readGraphSupervisorRequests(snapshot, ownerSessionId, ownerSessionFile, runDir)).snapshot;
  await enrichGraphView(snapshot, runsDir, agentDir);

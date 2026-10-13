@@ -1,3 +1,4 @@
+import type {LatestModelIdentity} from '../runtime/model-capabilities.ts';
 export const GRAPH_SPEC_V3_SCHEMA_VERSION = 3 as const;
 export const SNAPSHOT_V3_SCHEMA_VERSION = 3 as const;
 export const AUTHORIZATION_V4_SCHEMA_VERSION = 4 as const;
@@ -37,17 +38,23 @@ export interface V3UsageBudgetHint {
  * is still only the model requested from pi-subagents; the actual child model is
  * runtime evidence and must never be inferred from this record.
  */
-export interface V3RuntimeFallbackCandidate {
+export interface V3RuntimeFallbackCandidate extends Partial<LatestModelIdentity> {
  requestedModel: string; resolvedModel: string; thinking?: string | false;
  agentDefinitionDigest: string; admissionLaunchContractDigest: string;
+ level?:string; capabilities?:import('../runtime/model-capabilities.ts').ModelCapabilities;
 }
 export interface V3RuntimeFallbackPlan {
+ latestPolicy?:'latest-per-tier';approvedLatestIds?:string[];
+ sessionContinuationVersion?:1;
  version: 1; profile: string; modelDegradations: number;
  candidates: V3RuntimeFallbackCandidate[];
+ requirements?:import('../runtime/model-capabilities.ts').ModelRequirements;
  excludedFamilies: string[]; requireCrossFamilyFromProducers: boolean;
  digest: string;
 }
+export interface V3LatestModelSelection { latestPolicy:'latest-per-tier';approvedLatestIds:string[];candidate:V3RuntimeFallbackCandidate; }
 export interface V3NodeLaunchHints {
+ latestModelSelection?:V3LatestModelSelection;
  customModelDefinitions?:import("../runtime/custom-models.ts").CustomGraphModel[];
  runtimeFallback?: V3RuntimeFallbackPlan;
 	schemaVersion: 1;
@@ -402,6 +409,7 @@ export interface V3ChildSupervision {
 }
 
 export interface V3ChildObservation {
+ usageSegments?:Array<{model:string;thinking?:string;usage:V3ChildTokenUsageObservation}>;
 	supervision?: V3ChildSupervision;
 	asyncId: string;
 	runId?: string;

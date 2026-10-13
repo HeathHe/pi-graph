@@ -6,7 +6,7 @@ import test from "node:test";
 import { readLatestV3Attempt, v3RunPaths } from "../src/v3/attempt.ts";
 import { V3GraphHost } from "../src/v3/host.ts";
 import { acquireV3RunLease } from "../src/v3/lease.ts";
-import { mutationCapabilityForLease } from "../src/v3/runner.ts";
+import { V3GraphRunner, mutationCapabilityForLease } from "../src/v3/runner.ts";
 import { commitV3RetryIntent, readV3RetryJournal } from "../src/v3/retry.ts";
 import { SubagentRpcClient } from "../src/v3/rpc.ts";
 import type { GraphSpecV3 } from "../src/v3/types.ts";
@@ -423,3 +423,47 @@ test("inherited open Graph append/resume freezes original ceiling and intersects
   assert.equal(loaded.graph.nodes[0]!.permissionPolicy, "inherited");
  } finally { await f.mock.dispose(); await rm(f.sandbox, { recursive: true, force: true }); }
 });
+
+for (const mode of ["complete","initialization_failure","stop"] as const) {
+ test(`waitForCompletion awaits actual paused handoff initialization: ${mode}`,{timeout:15000},async()=>{
+  const original=V3GraphRunner.prototype.initializeForResume;
+  const originalRun=V3GraphRunner.prototype.run;
+  let releasePaused!:()=>void;const pausedGate=new Promise<void>(r=>releasePaused=r);
+  V3GraphRunner.prototype.run=async function(){const result=await originalRun.call(this);if(result.status==="paused")await pausedGate;return result;};
+  let entered!:()=>void,release!:()=>void;
+  const entry=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  let gated=false;
+  V3GraphRunner.prototype.initializeForResume=async function(){
+   if(!gated){gated=true;entered();await gate;if(mode==="initialization_failure")throw new Error("fixture handoff initialization failure");}
+   return original.call(this);
+  };
+  const inventories:string[][]=[];let resumed:Promise<unknown>|undefined;let f!:Awaited<ReturnType<typeof fixture>>;
+  f=await fixture(s=>{if(s.status==="paused"&&!resumed){resumed=f.host.requestDesiredState(s.graphId,"running");void resumed.then(()=>releasePaused());}},items=>inventories.push(items.map(i=>i.id)));
+  let releaseRoot!:()=>void;const rootGate=new Promise<void>(r=>releaseRoot=r);
+  f.mock.behaviors.set("RUN_ROOT",async i=>{await rootGate;await completeChild({...i,output:"root"});});
+  f.mock.behaviors.set("RUN_TARGET",i=>completeChild({...i,output:"target"}));
+  f.mock.behaviors.set("RUN_LEAF",i=>completeChild({...i,output:"leaf"}));
+  try {
+   const handle=await f.host.start(chainSpec(`gated-handoff-${mode}`),f.sourceDir);
+   while((await readLatestV3Attempt(handle.runDir,"root"))?.evidence.phase!=="running")await new Promise(r=>setTimeout(r,10));
+   const paused=f.host.pause(handle.graphId);releaseRoot();assert.equal((await paused).status,"paused");await entry;await resumed;
+   assert.equal((await f.host.status(handle.graphId)).status,"queued","observe the real gap before successor registration");
+   let settled=false;const waiting=f.host.waitForCompletion(handle.graphId);const observed=waiting.then(v=>{settled=true;return {value:v};},error=>{settled=true;return {error};});
+   await new Promise<void>(r=>setImmediate(r));assert.equal(settled,false,"wait must not return the nonterminal queued projection");
+   if(mode==="stop")await f.host.requestDesiredState(handle.graphId,"stopped");
+   release();const result=await observed;
+   if(mode==="initialization_failure"){
+    assert.match(String((result as any).error),/fixture handoff initialization failure/);
+    await assert.rejects(f.host.waitForCompletion(handle.graphId),/fixture handoff initialization failure/);
+    assert.equal(f.mock.spawned.length,1);
+   }else{
+    assert.equal((result as any).value.status,mode==="stop"?"stopped":"complete");
+    assert.equal(f.mock.spawned.length,mode==="stop"?1:3);
+   }
+   assert.deepEqual(inventories,[[handle.graphId],[]],"one continuous background identity across handoff");
+   assert.equal((f.host as any).supervisorHandoffContinuations.size,0);
+  }finally{
+   release();releaseRoot();releasePaused();V3GraphRunner.prototype.run=originalRun;V3GraphRunner.prototype.initializeForResume=original;await f.mock.dispose();await rm(f.sandbox,{recursive:true,force:true});
+  }
+ });
+}

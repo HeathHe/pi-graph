@@ -7,6 +7,7 @@ import {tmpdir} from "node:os";
 import {createServer} from "node:http";
 import type {AddressInfo} from "node:net";
 import {piCliPath} from "./helpers/pi-cli.ts";
+import {cleanupThenSaveEvidence} from "./helpers/fixture-cleanup.ts";
 const sleep=(ms:number)=>new Promise(done=>setTimeout(done,ms));
 async function until(read:()=>Promise<any>,accept:(value:any)=>boolean,label:string,timeout=45000){const end=Date.now()+timeout;let last:any;while(Date.now()<end){try{last=await read();if(accept(last))return last;}catch(e){last=String(e);}await sleep(100);}throw Error(`${label}: ${JSON.stringify(last)}`);}
 
@@ -75,8 +76,18 @@ test("real Escape cancels Graph/child; inspector, menus and reload preserve canc
   await writeFile(join(capture,"success.json"),JSON.stringify({stopped,attentionStopped,events,ordinary:"ORDINARY_PI_OK"},null,2));console.log("ESCAPE_TUI_PASS "+root);
  }catch(error){await writeFile(join(capture,"failure.txt"),String(error)+"\n"+await screen().catch(()=>output));throw error;}
  finally{
-  await writeFile(join(capture,"terminal.txt"),output);await writeFile(join(capture,"events.json"),JSON.stringify(events,null,2));
-  const destination=process.env.PI_GRAPH_ESCAPE_EVIDENCE_DIR ?? join(repo,".test-evidence",`escape-tui-${Date.now()}`);await mkdir(destination,{recursive:true});await cp(capture,join(destination,"capture"),{recursive:true});await cp(runs,join(destination,"runs"),{recursive:true});console.error("ESCAPE_TUI_EVIDENCE "+destination);
-  for(const timer of timers)clearTimeout(timer);child.kill("SIGTERM");await sleep(2300);if(child.exitCode===null){if(ptyPid)try{process.kill(-ptyPid,"SIGKILL");}catch{}child.kill("SIGKILL");}child.stdin.destroy();child.stdout.destroy();child.stderr.destroy();child.unref();server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));
+  await cleanupThenSaveEvidence(async()=>{
+   for(const timer of timers)clearTimeout(timer);
+   try{
+    child.kill("SIGTERM");await sleep(2300);
+    if(child.exitCode===null){if(ptyPid)try{process.kill(-ptyPid,"SIGKILL");}catch(error){if((error as NodeJS.ErrnoException).code!=="ESRCH")throw error;}child.kill("SIGKILL");}
+   }finally{
+    child.stdin.destroy();child.stdout.destroy();child.stderr.destroy();child.unref();
+    server.closeAllConnections();await new Promise<void>((done,reject)=>server.close(error=>error?reject(error):done()));
+   }
+  },async()=>{
+   await writeFile(join(capture,"terminal.txt"),output);await writeFile(join(capture,"events.json"),JSON.stringify(events,null,2));
+   const destination=process.env.PI_GRAPH_ESCAPE_EVIDENCE_DIR ?? join(repo,".test-evidence",`escape-tui-${Date.now()}`);await mkdir(destination,{recursive:true});await cp(capture,join(destination,"capture"),{recursive:true});await cp(runs,join(destination,"runs"),{recursive:true});console.error("ESCAPE_TUI_EVIDENCE "+destination);
+  });
  }
 });

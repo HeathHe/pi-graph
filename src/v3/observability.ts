@@ -1,3 +1,4 @@
+import {MAX_MODEL_CANDIDATES} from '../runtime/model-capabilities.ts';
 import type {
 	V3ChildObservation,
 	V3ChildSupervision,
@@ -15,7 +16,7 @@ const CURRENT_PATH_MAX = 1_024;
 const ATTEMPTED_MODELS_MAX = 16;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 const OBSERVATION_FIELDS = new Set([
-	"asyncId", "runId", "requestedAgent", "resolvedAgent", "actualAgent", "requestedModel", "resolvedModel", "actualModel",
+	"usageSegments", "asyncId", "runId", "requestedAgent", "resolvedAgent", "actualAgent", "requestedModel", "resolvedModel", "actualModel",
 	"supervision", "thinking", "attemptedModels", "sessionFile", "launchContractDigest", "usage", "durationMs", "progress", "observedAt",
 ]);
 const USAGE_FIELDS = new Set(["inputTokens", "outputTokens", "totalTokens", "cacheReadTokens", "cacheWriteTokens", "turns", "costUsd"]);
@@ -270,6 +271,8 @@ export function observeV3ChildLifecycle(input: {
 	const launchContractDigestRaw = result?.launchContractDigest ?? step?.launchContractDigest ?? input.completion?.launchContractDigest ?? input.status.launchContractDigest;
 	const launchContractDigest = typeof launchContractDigestRaw === "string" && DIGEST_PATTERN.test(launchContractDigestRaw) ? launchContractDigestRaw : undefined;
 	const usage = terminalUsage(input.status, step, input.completion, result);
+ const segments=(result?.continuationEvidence as any)?.segments??(step?.continuationEvidence as any)?.segments;
+ const usageSegments=Array.isArray(segments)&&segments.length<=MAX_MODEL_CANDIDATES?segments.map((s:any)=>({model:s.model,thinking:s.thinking,usage:{inputTokens:s.tokens?.input,outputTokens:s.tokens?.output,totalTokens:s.tokens?.totalTokens,cacheReadTokens:s.tokens?.cacheRead,cacheWriteTokens:s.tokens?.cacheWrite,costUsd:s.totalCost,turns:s.turnCount}})):undefined;
 	const durationMs = finiteNonNegative(
 		input.completion?.durationMs
 			?? result?.durationMs
@@ -291,6 +294,7 @@ export function observeV3ChildLifecycle(input: {
 		...(sessionFile ? { sessionFile } : {}),
 		...(launchContractDigest ? { launchContractDigest } : {}),
 		...(usage ? { usage } : {}),
+        ...(usageSegments ? {usageSegments}: {}),
 		...(durationMs === undefined ? {} : { durationMs }),
 		...(progress ? { progress } : {}),
 		...(supervision ? { supervision } : {}),
@@ -379,6 +383,8 @@ export function validateV3ChildObservation(value: unknown): V3ChildObservation {
 		if (!OBSERVATION_FIELDS.has(field)) throw new V3ObservationValidationError(`child observation contains unknown field '${field}'`);
 	}
 	const asyncId = requireCleanString(raw.asyncId, "asyncId", ID_MAX);
+ let usageSegments:V3ChildObservation['usageSegments'];
+ if(raw.usageSegments!==undefined){if(!Array.isArray(raw.usageSegments)||raw.usageSegments.length>MAX_MODEL_CANDIDATES)throw new V3ObservationValidationError('Invalid usage segments');usageSegments=raw.usageSegments.map((s:any)=>{if(!s||Object.keys(s).some(k=>!['model','thinking','usage'].includes(k)))throw new V3ObservationValidationError('Invalid usage segment');const checked=validateV3ChildObservation({asyncId,observedAt:raw.observedAt,usage:s.usage});return {model:requireCleanString(s.model,'segment.model',MODEL_MAX),...(s.thinking===undefined?{}:{thinking:requireCleanString(s.thinking,'segment.thinking',THINKING_MAX)}),usage:checked.usage!};});}
 	const supervision = validateSupervision(raw.supervision);
 	const runId = optionalCleanString(raw.runId, "runId", ID_MAX);
 	const requestedAgent = optionalCleanString(raw.requestedAgent, "requestedAgent", AGENT_MAX);
@@ -457,6 +463,7 @@ export function validateV3ChildObservation(value: unknown): V3ChildObservation {
 		...(sessionFile ? { sessionFile } : {}),
 		...(launchContractDigest ? { launchContractDigest } : {}),
 		...(usage ? { usage } : {}),
+        ...(usageSegments ? {usageSegments}: {}),
 		...(durationMs === undefined ? {} : { durationMs }),
 		...(progress ? { progress } : {}),
 		...(supervision ? { supervision } : {}),

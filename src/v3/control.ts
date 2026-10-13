@@ -3,6 +3,7 @@ import { lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { processIdentityForPid } from "./claims.ts";
 import { atomicWriteJson, createDurableJson, syncDirectory } from "./durable.ts";
+import { readAtomicRegularFile } from "./safe-read.ts";
 
 export const V3_CONTROL_SCHEMA_VERSION = 1 as const;
 export type V3DesiredState = "running" | "paused" | "stopped";
@@ -114,12 +115,13 @@ export function validateV3RunControl(value: unknown): V3RunControl {
 }
 
 async function readRegularJson(path: string): Promise<unknown> {
-	const before = await lstat(path);
-	if (!before.isFile() || before.isSymbolicLink()) throw new V3InvalidControlError("V3 control path must be a regular file.");
-	const contents = await readFile(path, "utf8");
-	const after = await lstat(path);
-	if (!after.isFile() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino) {
-		throw new V3InvalidControlError("V3 control changed while it was being read.");
+	let contents: string;
+	try {
+		contents = await readAtomicRegularFile(path, { maxBytes: 1024 * 1024, invalidMessage: "Unsafe V3 control file." });
+	} catch (error) {
+		// Initialization needs the original missing-file signal; unsafe files remain fatal.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
+		throw new V3InvalidControlError("V3 control could not be read safely.", { cause: error });
 	}
 	try {
 		return JSON.parse(contents) as unknown;

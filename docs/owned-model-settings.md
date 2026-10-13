@@ -57,7 +57,7 @@
 | `profiles` | 必须为对象；具名模型方案，可配置 `model`、`fallbackModels`、`thinking` |
 | `models` | 可省略；自定义模型对象，键必须恰好等于定义中的 `provider/id` |
 | `model` | 完整的 `provider/model`；不能只填模型简称 |
-| `fallbackModels` | 有序备用模型数组；`[]` 明确关闭该字段的替补链 |
+| `fallbackModels` | 有序备用模型数组；`[]` 明确关闭显式配置的备用链 |
 | `thinking` | `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，仍须模型实际支持 |
 | `profile` | 引用 `profiles` 中存在的方案名；单独的同范围字段可覆盖方案 |
 
@@ -106,7 +106,7 @@ defaultContext: fresh
 /graph-models useprofile {"scope":"project","role":"researcher","profile":"economy"}
 ```
 
-`useprofile` 清除所选范围内该岗位的单独模型覆盖，让选中的方案生效。再使用 `set` 可覆盖方案中的个别字段。`fallbackModels: []` 表示不设置替补；替补是否能启动仍由 Graph 的工具、权限、模型可用性和安全重试条件决定。
+`useprofile` 清除所选范围内该岗位的单独模型覆盖，让选中的方案生效。再使用 `set` 可覆盖方案中的个别字段。`fallbackModels: []` 明确关闭显式配置的备用链；替补是否能启动仍由 Graph 的工具、权限、模型可用性和安全重试条件决定。
 
 Kimi 直接选择既有官方 `kimi-coding/k3`。Grok 直接选择既有官方 `xai/...` 模型。不能把它们伪装成自定义中转模型，也不能将其官方订阅凭证转发给自定义端点。
 
@@ -140,3 +140,26 @@ Kimi 直接选择既有官方 `kimi-coding/k3`。Grok 直接选择既有官方 `
 ```
 
 删除命令会删除所选范围的确切岗位文件，需确认岗位名称和范围；界面删除会显示确认提示。包内提供的岗位不能通过任意路径参数改写。修改提示词或工具不会绕过 Graph 的既有权限限制。
+
+
+## 备用链与主会话分离
+
+新 Graph 与追加节点不会自动追加主会话模型作为最终备用；备用候选只来自岗位/profile明确配置。若显式候选与主会话同型号，保留其配置顺序、thinking和预算，不移到末尾、不增加次数。`fallbackModels: []` 与有效零预算继续关闭备用；显式非空fallbackModels可按既有规则定义普通链及有效预算。
+
+父tool ceiling及peer跨家族身份用途保留。`inherit` scope只是许可别名，不生成备用候选；任务、角色和profile均缺少首选model时的既有父模型默认继承不在本轮变更范围。已加载会话需在任务结束后重启加载新代码，旧Graph冻结链不自动迁移，不改写旧授权或重放任务。
+
+运行时新协议仍按[原会话续接与安全检查点](session-continuation.md)校验明确供应商失败、安全settled或正常checkpoint退出；旧协议保留零活动证明。两者都只消费原冻结候选，预算和权限不扩大。
+
+### 子 Agent 家族否决
+
+可在用户或项目 settings 的 `subagents.modelScope.denyFamilies` 配置模型家族，例如 `["gpt"]`。此限制仅作用于 Pi Graph 子 Agent，不修改主会话默认模型。全局和项目的否决取并集，`graphAgents` 兼容命名空间也参与合并；项目 `enforce: false`、空数组、allow 或 inherit 不能撤销全局否决。没有配置时保留既有行为。
+
+准入解析后的模型 ID、实际 SDK 首选/切换、请求和 checkpoint 下一个候选均检查该限制；GPT 的短名、完整 provider/model、思考后缀和大小写均不能绕过。新合同冻结否决并与运行时当前配置合并，后续配置放宽不能放宽已冻结子任务。已启动且仍加载旧代码的进程不会自动更新，不能通过编辑配置保证它们应用新守卫；不修改旧 Graph 冻结记录。
+
+### 按家族最新档位批准固定型号
+
+Routing profile 可显式设置 `latestPolicy: "latest-per-tier"` 和 `approvedLatestIds`。每个 candidate 同时记录 `family`、`tier`、`version`、`releaseStatus: "stable"` 与 `metadataSource`（来源 URLs、checkedAt、协议验证状态）。程序按家族固定 ID 格式精确核对标签，不根据数字大小判断最新版；批准清单由配置维护，新增符合格式的版本无需改代码。动态 latest、preview、build 别名不作为此策略的固定身份。
+
+准入、项目/岗位覆盖及冻结备用计划都校验批准清单；每个 family/tier 只保留一个型号。首选身份即使在 `fallbackModels: []` 或零预算时也随 launch 摘要冻结，但不会启用备用。旧版未声明此策略的 profile 保持原行为。`modelLifecycleAudit` 仅是目录审计记录，不授权启用 pending 或 classifier 型号。
+
+本机 2026-10-12 快照区分官方最新与本中转已列、已批准型号。工具调用协议证据不保证图片、推理参数或后续可用性；现有输入、thinking、家族隔离及停止/预算/未知副作用守卫继续生效。

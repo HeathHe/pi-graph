@@ -8,8 +8,9 @@ const intent=JSON.parse(await readFile(process.argv[2],'utf8'));
 if(intent.version!==1||typeof intent.runId!=='string'||typeof intent.asyncDir!=='string')throw new Error('Invalid owned child intent.');
 // Test scenarios are fixed and require a test process marker. No arbitrary modules/config hooks.
 const requested=process.argv[3]==='--test-fixture'?process.argv[4]:undefined;
-if(requested && (process.env.NODE_ENV!=='test'||!['success','quota','tool','pending'].includes(requested)))throw new Error('Invalid child test fixture.');
+if(requested && (process.env.NODE_ENV!=='test'||!['success','quota','tool','pending','continuation','checkpoint','route-fallback'].includes(requested)))throw new Error('Invalid child test fixture.');
 await mkdir(intent.asyncDir,{recursive:true,mode:0o700});
+if(intent.continuation){const {runContinuingChild}=await jiti.import('./continuation-runner.ts');process.exitCode=await runContinuingChild(intent,requested);process.exit(process.exitCode);}
 let writes=Promise.resolve();
 const write=(file,value)=>{const snapshot=JSON.stringify(value);const work=writes.then(async()=>{const temporary=join(intent.asyncDir,`${file}.${process.pid}.tmp`);await writeFile(temporary,snapshot,{mode:0o600});await rename(temporary,join(intent.asyncDir,file));});writes=work;return work;};
 const startedAt=Date.now();let child,stopped=false,timedOut=false,promptSettled=false;

@@ -1,3 +1,4 @@
+import { classifyProviderFailure, isOAuthRefreshNetworkFailure } from "../failure-policy.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAuthError, type LocalAuthRecord } from "./auth-view.ts";
@@ -73,6 +74,9 @@ export function errorSummary(error: string): string {
  if (text.includes("Runner exited without a durable final result") || text.includes("Runner exited but a complete final result is unavailable")) return "子任务已结束，但缺少最终结果，尚未验收";
  if (text === "Graph failed fast before this node started.") return "其他任务失败后，本任务未启动";
  if (/\b402\b/.test(text)) return "HTTP 402：额度或订阅不可用";
+ if (isOAuthRefreshNetworkFailure(text)) return "登录续期时网络连接失败，凭据是否有效尚未确认";
+ if (classifyProviderFailure(text).kind === "quota" && /usage limit/i.test(text)) return "模型使用额度已耗尽，查看服务返回的恢复时间";
+ if (/InvalidSubscription|CodingPlan[^\n]{0,100}(?:invalid|expired|inactive)/i.test(text)) return "当次模型请求被拒绝：订阅不可用";
  if (/invalid_grant|refresh.token.*invalid/i.test(text)) return "当次执行时登录凭据失效";
  if (isAuthError(text)) return "当次请求未通过身份验证";
  if (/\b429\b/.test(text)) return "HTTP 429：请求受限，查看服务返回详情";
@@ -99,8 +103,12 @@ export function nodeNextStep(snapshot: GraphSnapshotV3, id: string, n: V3NodePro
  const p = displayPhase(snapshot,id,n);
  if (p === "not_started" || p === "blocked") return "先处理失败的任务，再决定是否继续。";
  if (p !== "failed" && p !== "needs_attention") return undefined;
- const error = errorSummary(evidence.get(snapshot)?.failures[id] ?? n.observation?.supervision?.error ?? "");
- if (error === "运行器不兼容，子任务未启动") return "检查 pi-subagents 是否提供所需公开能力，再重新加载 Pi；子任务尚未启动。";
+ const rawError = evidence.get(snapshot)?.failures[id] ?? n.observation?.supervision?.error ?? "";
+ const error = errorSummary(rawError);
+ if (isOAuthRefreshNetworkFailure(rawError)) return "先检查网络与对应服务的连接；这条错误不能证明登录失效。核对已有执行记录，只从剩余工作恢复，不整项盲重跑。";
+ if (classifyProviderFailure(rawError).kind === "quota" && /usage limit|quota (?:exceeded|exhausted)|insufficient (?:balance|credits?)/i.test(rawError) || error === "当次模型请求被拒绝：订阅不可用") return "查看该模型服务的额度恢复时间或订阅状态；核对已有工具与结果，只从剩余工作恢复，不整项盲重跑。";
+ if (/stream (?:ended|closed|disconnected)|request_timeout|terminated|ECONNRESET/i.test(rawError)) return "按 l 核对原始记录及已完成的工具与结果，只从剩余工作恢复；不要整项盲重跑。";
+ if (error === "运行器不兼容，子任务未启动") return "检查当前 Pi SDK 是否提供自有运行器所需公开能力；子任务尚未启动。";
  if (error.includes("402")) return "检查该模型服务的额度或订阅；也可指定其他可用模型后重试。";
  if (isAuthError(evidence.get(snapshot)?.failures[id] ?? n.observation?.supervision?.error ?? "")) {
   const auth = evidence.get(snapshot)?.localAuth?.[id];

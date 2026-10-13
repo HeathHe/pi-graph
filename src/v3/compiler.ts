@@ -1,3 +1,4 @@
+import {validateLatestModelPolicy} from '../runtime/model-capabilities.ts';
 import {validateCustomGraphModel} from "../runtime/custom-models.ts";
 import { validateRuntimeFallbackPlan } from "./runtime-fallback.ts";
 import { posix } from "node:path";
@@ -139,6 +140,7 @@ function normalizeNodeLaunch(value: unknown, taskId: string): V3NodeLaunchHints 
 	if (!isRecord(value)) graphV3Error("INVALID_BINDING", "launch must be an object.", { taskId, field: "launch" });
 	if (value.schemaVersion !== 1) graphV3Error("INVALID_BINDING", "launch requires schemaVersion: 1.", { taskId, field: "launch.schemaVersion" });
 	if (value.customModelDefinitions !== undefined) {if(!Array.isArray(value.customModelDefinitions)||value.customModelDefinitions.length>64)graphV3Error("INVALID_BINDING","Invalid frozen custom models.");for(const m of value.customModelDefinitions)validateCustomGraphModel(m);}
+ if(value.latestModelSelection!==undefined){const selection=value.latestModelSelection as any;if(!selection||selection.latestPolicy!=='latest-per-tier'||!selection.candidate)throw Error('Invalid latest model selection');validateLatestModelPolicy(selection,[selection.candidate]);}
  if (value.runtimeFallback !== undefined) validateRuntimeFallbackPlan(value.runtimeFallback);
 	const hintDigest = requiredDigest(value, "hintDigest", "launch", taskId);
 	const { hintDigest: _, ...rest } = value;
@@ -482,6 +484,7 @@ export function compileGraphSpecV3(input: unknown, options: { historical?: boole
 		const agent = requiredString(rawNode, "agent", `nodes[${index}]`, taskId);
 		const binding = normalizeNodeBinding(rawNode.binding, taskId, agent);
 		const launch = normalizeNodeLaunch(rawNode.launch, taskId);
+        if(launch?.latestModelSelection){const c=launch.latestModelSelection.candidate;if(launch.runtimeFallback&&(canonicalDigest(launch.runtimeFallback.approvedLatestIds)!==canonicalDigest(launch.latestModelSelection.approvedLatestIds)||canonicalDigest(launch.runtimeFallback.candidates[0])!==canonicalDigest(c)))graphV3Error('INVALID_BINDING','Latest selection and fallback policy differ.',{taskId});if(!binding||c.requestedModel!==launch.requestedModel||c.resolvedModel!==launch.resolvedModel||c.thinking!==launch.thinking||c.agentDefinitionDigest!==binding.agentDefinitionDigest||c.admissionLaunchContractDigest!==binding.admissionLaunchContractDigest)graphV3Error('INVALID_BINDING','Latest model selection does not match frozen launch.',{taskId});}
         if (launch?.runtimeFallback) {
             const first = launch.runtimeFallback.candidates[0]!;
             if (!binding || first.requestedModel !== launch.requestedModel || first.resolvedModel !== launch.resolvedModel

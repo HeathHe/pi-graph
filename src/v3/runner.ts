@@ -1,5 +1,5 @@
 import { V3FallbackPauseError } from "./failure-policy.ts";
-import { safeFallbackContinuation, verifyFallbackContinuation, selectedRuntimeNode } from "./runtime-fallback.ts";
+import { safeFallbackContinuation, verifyFallbackContinuation, selectedRuntimeNode, continuationProducerConstraints } from "./runtime-fallback.ts";
 import { MAILBOX_BINDING_NAMESPACE } from "./mailbox-bindings.ts";
 import { readNativeJson } from "./native-results.ts";
 import { GraphMailbox } from "./mailbox.ts";
@@ -452,6 +452,7 @@ export class V3GraphRunner {
 				sessionDir,
 				agentScope: "project",
 				...(node.launch?.customModelDefinitions?{customModelDefinitions:node.launch.customModelDefinitions}:{}),
+                ...(node.launch?.runtimeFallback?.sessionContinuationVersion===1?{ownedContinuation:{version:1,producerConstraints:await continuationProducerConstraints(this.options.runDir,node),plan:node.launch.runtimeFallback,candidateIndex:node.launch.runtimeFallback.candidates.findIndex(c=>c.resolvedModel===node.launch?.resolvedModel),controlPath:join(this.options.runDir,"control.json"),runInstanceId:this.options.authorization.runInstanceId,graphId:this.graph.graphId}}:{}),
     ...(node.launch?.requestedModel ? { requestedModel: node.launch.requestedModel } : {}),
 				...(node.launch?.resolvedModel ? { resolvedModel: node.launch.resolvedModel } : {}),
 				...(node.launch?.thinking === undefined ? {} : { thinking: node.launch.thinking }),
@@ -1293,6 +1294,7 @@ export class V3GraphRunner {
 					sessionDir: join(this.paths.sessionsDir, node.taskId),
 					agentScope: "project",
 					...(node.launch?.customModelDefinitions?{customModelDefinitions:node.launch.customModelDefinitions}:{}),
+                ...(node.launch?.runtimeFallback?.sessionContinuationVersion===1?{ownedContinuation:{version:1,producerConstraints:await continuationProducerConstraints(this.options.runDir,node),plan:node.launch.runtimeFallback,candidateIndex:node.launch.runtimeFallback.candidates.findIndex(c=>c.resolvedModel===node.launch?.resolvedModel),controlPath:join(this.options.runDir,"control.json"),runInstanceId:this.options.authorization.runInstanceId,graphId:this.graph.graphId}}:{}),
     ...(node.launch?.requestedModel ? { requestedModel: node.launch.requestedModel } : {}),
 					...(node.launch?.resolvedModel ? { resolvedModel: node.launch.resolvedModel } : {}),
 					...(node.launch?.thinking === undefined ? {} : { thinking: node.launch.thinking }),

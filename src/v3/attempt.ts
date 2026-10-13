@@ -1,3 +1,4 @@
+import {MAX_MODEL_DEGRADATIONS} from '../runtime/model-capabilities.ts';
 import { verifyEvidenceFiles } from "./evidence-files.ts";
 import { constants } from "node:fs";
 import { lstat, open, readdir, readFile } from "node:fs/promises";
@@ -208,7 +209,7 @@ export function validateV3Attempt(value: unknown): V3AttemptEvidence {
     const routeSelection = value.routeSelection as V3AttemptEvidence["routeSelection"];
     const fallbackContinuation = value.fallbackContinuation as V3AttemptEvidence["fallbackContinuation"];
     for (const selection of [routeSelection, fallbackContinuation]) {
-        if (selection !== undefined && (!isRecord(selection) || !Number.isSafeInteger(selection.candidateIndex) || selection.candidateIndex < 0 || selection.candidateIndex > 8
+        if (selection !== undefined && (!isRecord(selection) || !Number.isSafeInteger(selection.candidateIndex) || selection.candidateIndex < 0 || selection.candidateIndex > MAX_MODEL_DEGRADATIONS
             || typeof selection.planDigest !== "string" || !/^[a-f0-9]{64}$/.test(selection.planDigest))) graphV3Error("INVALID_ATTEMPT", "Invalid runtime route selection.");
     }
     if (fallbackContinuation && (fallbackContinuation.fromAttempt !== attemptValue || !/^[a-f0-9]{64}$/.test(fallbackContinuation.proofDigest)

@@ -1,3 +1,4 @@
+import {childPolicyFromSettings} from './child-model-policy.ts';
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -95,5 +96,5 @@ export function discoverAgents(cwd: string, scope: AgentScope = "both", _preferr
  for(const {dir,source} of dirs){if(!isDir(dir))continue;for(const file of readdirSync(dir).sort()){if(!file.endsWith(".md"))continue;const path=join(dir,file);if(!statSync(path).isFile())continue;
   try {const a=parseAgentDefinition(readFileSync(path,"utf8"),path,source);const override=cfg.agentOverrides?.[a.name]??{};Object.assign(a,override);if(a.model===undefined&&typeof cfg.defaultModel==="string")a.model=cfg.defaultModel;if(a.modelProvider===undefined&&typeof cfg.defaultProvider==="string")a.modelProvider=cfg.defaultProvider;if(a.thinking===undefined&&typeof cfg.defaultThinking==="string")a.thinking=cfg.defaultThinking;map.set(a.name,a);}catch(e){diagnostics.push({filePath:path,message:e instanceof Error?e.message:String(e)});}
  }}
- return {agents:[...map.values()].filter(a=>!a.disabled),agentDiagnostics:diagnostics,cwd:base,scope,projectAgentsDir:projectRoot?join(projectRoot,".pi","agents"):null,modelScope:cfg.modelScope,maxThinking:cfg.maxThinking};
+ return {agents:[...map.values()].filter(a=>!a.disabled),agentDiagnostics:diagnostics,cwd:base,scope,projectAgentsDir:projectRoot?join(projectRoot,".pi","agents"):null,modelScope:{...cfg.modelScope,...childPolicyFromSettings(user,project)},maxThinking:cfg.maxThinking};
 }

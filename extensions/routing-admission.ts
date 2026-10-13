@@ -1,3 +1,4 @@
+import {MAX_MODEL_CANDIDATES,MAX_MODEL_DEGRADATIONS,modelIdentityFields,validateLatestIdentity,validateLatestModelPolicy,type LatestModelIdentity,modelFamilyId,validateModelCapabilities,validateModelRequirements,candidateMeetsRequirements,type ModelCapabilities} from '../src/runtime/model-capabilities.ts';
 import {readCustomGraphModels} from "../src/runtime/custom-models.ts";
 import {readRoleModelOverride} from "../src/runtime/settings.ts";
 import { classifyProviderFailure } from "../src/v3/failure-policy.ts";
@@ -26,18 +27,26 @@ const JEV_CHOICES = ["fast", "deep", "research", "review", "human"] as const;
 
 type JevChoice = typeof JEV_CHOICES[number];
 
-interface RoutingCandidate {
+interface RoutingCandidate extends Partial<LatestModelIdentity> {
 	model: string;
 	thinking?: string;
 	level: string;
+ capabilities?:ModelCapabilities;
 }
 
+interface RoutingPolicySnapshot { policy?: RoutingPolicy; catalog?: CapabilityRouteCatalog; policyDigest?: string; catalogDigest?: string; }
+
 interface RoutingProfile {
+ candidatePool?:"all-compatible";
+ latestPolicy?:"latest-per-tier";approvedLatestIds?:string[];
 	enforcement?: string;
 	candidates: RoutingCandidate[];
 	modelDegradations: number;
 	constraints?: {
-		requireCrossFamilyFromProducers?: boolean;
+		requiredInputModalities?:("text"|"image")[];
+  requireToolCalls?:boolean;
+  maximumAutomaticFallback?:string;
+  requireCrossFamilyFromProducers?: boolean;
 		producerSource?: "active_main" | "accepted_manifests";
 	};
 }
@@ -88,6 +97,8 @@ export interface TrustedProducerModelV3 {
 export interface RoutingAdmissionDecisionV3 {
 	taskId: string;
 	capabilityIds: string[];
+	/** Existing catalog profile inferred without adding authoring capabilities. */
+	inferredFromExactRole?: true;
 	agent: string;
 	profile: string;
 	selectedModel: string;
@@ -95,7 +106,9 @@ export interface RoutingAdmissionDecisionV3 {
 	thinking?: string;
 	level: string;
 	skipped: Array<{ model: string; reason: string }>;
+	latestModelSelection?: import("../src/v3/types.ts").V3LatestModelSelection;
 	runtimeFallback?: import("../src/v3/types.ts").V3RuntimeFallbackPlan;
+	/** Preserve ordinary constraints even when no multi-candidate plan was formed. */
 }
 
 export type JevShadowObservationV3 =
@@ -114,11 +127,20 @@ export interface RoutingAdmissionReceiptV3 {
 	mode: typeof ROUTING_ENFORCEMENT | "fixed";
 	policyDigest?: string;
 	catalogDigest?: string;
+	/** Provenance only; never a capability Binding grant. */
+	inferredCatalogDigest?: string;
 	decisions: RoutingAdmissionDecisionV3[];
+	/** Historical receipt fields; new admission never adds automatic parent fallback. */
+	parentFallback?: Array<{ taskId: string; model: string; status: "admitted" | "skipped"; reason: string }>;
+	parentFallbackPolicyDigest?: string;
+	parentFallbackCatalogDigest?: string;
 	jevShadow: JevShadowObservationV3;
 }
 
 export interface RoutingAdmissionOptionsV3 extends V3BindingOptions {
+	/** Trusted Pi getThinkingLevel() captured with the current parent model. */
+	/** Legacy input accepted for compatibility; never adds or alters fallback candidates. */
+	parentThinking?: string;
 	routingPolicyPath?: string;
 	modelsPath?: string;
 	environment?: NodeJS.ProcessEnv;
@@ -197,28 +219,39 @@ function validatePolicy(value: unknown): RoutingPolicy {
 	const profiles: Record<string, RoutingProfile> = {};
 	for (const [name, raw] of Object.entries(value.profiles)) {
 		if (!isRecord(raw) || !Array.isArray(raw.candidates) || raw.candidates.length === 0) fail(`Routing profile '${name}' requires at least one candidate.`);
+  if(raw.candidates.length>MAX_MODEL_CANDIDATES)fail(`Routing profile '${name}' exceeds candidate limit.`);
+  if(raw.candidatePool!==undefined&&raw.candidatePool!=='all-compatible')fail('Invalid candidate pool mode');
 		const candidates = raw.candidates.map((candidate, index) => {
 			if (!isRecord(candidate)) fail(`Routing profile '${name}' candidate ${index} must be an object.`);
+   validateLatestIdentity(candidate,raw.latestPolicy!==undefined);
+   if(candidate.capabilities!==undefined)validateModelCapabilities(candidate.capabilities);
 			return {
+    ...modelIdentityFields(candidate),
+    ...(candidate.capabilities===undefined?{}:{capabilities:structuredClone(candidate.capabilities)}),
 				model: nonEmpty(candidate.model, `${name}.candidates[${index}].model`),
 				...(candidate.thinking === undefined ? {} : { thinking: nonEmpty(candidate.thinking, `${name}.candidates[${index}].thinking`, 100) }),
 				level: nonEmpty(candidate.level, `${name}.candidates[${index}].level`, 100),
 			};
 		});
-		if (new Set(candidates.map((candidate) => candidate.model)).size !== candidates.length) fail(`Routing profile '${name}' contains duplicate models.`);
+		validateLatestModelPolicy(raw,candidates);
+  if (new Set(candidates.map((candidate) => candidate.model)).size !== candidates.length) fail(`Routing profile '${name}' contains duplicate models.`);
 		let constraints: RoutingProfile["constraints"];
 		if (raw.constraints !== undefined) {
 			if (!isRecord(raw.constraints)) fail(`Routing profile '${name}' constraints must be an object.`);
-			const producerSource = raw.constraints.producerSource;
+			validateModelRequirements(raw.constraints);
+   const producerSource = raw.constraints.producerSource;
 			if (producerSource !== undefined && producerSource !== "active_main" && producerSource !== "accepted_manifests") fail(`Routing profile '${name}' has unsupported producerSource.`);
 			constraints = {
+    ...(raw.constraints.requiredInputModalities===undefined?{}:{requiredInputModalities:raw.constraints.requiredInputModalities as ("text"|"image")[]}),
+    ...(raw.constraints.requireToolCalls===undefined?{}:{requireToolCalls:raw.constraints.requireToolCalls as boolean}),
+    ...(raw.constraints.maximumAutomaticFallback===undefined?{}:{maximumAutomaticFallback:raw.constraints.maximumAutomaticFallback as string}),
 				...(raw.constraints.requireCrossFamilyFromProducers === true ? { requireCrossFamilyFromProducers: true } : {}),
 				...(producerSource === undefined ? {} : { producerSource }),
 			};
 		}
 		const degradations = isRecord(raw.budget) ? raw.budget.modelDegradations : 0;
-		if (!Number.isSafeInteger(degradations) || (degradations as number) < 0 || (degradations as number) > 8) fail(`Routing profile '${name}' has invalid modelDegradations budget.`);
-		profiles[name] = { modelDegradations: degradations as number, ...(typeof raw.enforcement === "string" ? { enforcement: raw.enforcement } : {}), candidates, ...(constraints ? { constraints } : {}) };
+		if (!Number.isSafeInteger(degradations) || (degradations as number) < 0 || (degradations as number) > MAX_MODEL_DEGRADATIONS) fail(`Routing profile '${name}' has invalid modelDegradations budget.`);
+		profiles[name] = { ...(raw.latestPolicy==="latest-per-tier"?{latestPolicy:"latest-per-tier" as const,approvedLatestIds:[...(raw.approvedLatestIds as string[])]}:{}), ...(raw.candidatePool==="all-compatible"?{candidatePool:"all-compatible" as const}:{}), modelDegradations: degradations as number, ...(typeof raw.enforcement === "string" ? { enforcement: raw.enforcement } : {}), candidates, ...(constraints ? { constraints } : {}) };
 	}
 	let jevShadow: JevShadowConfig | undefined;
 	if (value.jevShadow !== undefined) {
@@ -276,14 +309,7 @@ function capabilityIds(node: Record<string, unknown>): string[] {
 	return [...new Set(ids.filter(Boolean))].sort();
 }
 
-function modelFamily(model: string): string {
-	const id = model.slice(model.indexOf("/") + 1).toLowerCase();
-	if (id.includes("gpt")) return "gpt";
-	if (id.includes("glm")) return "glm";
-	if (id.includes("kimi") || /(?:^|[-_.])k\d/u.test(id)) return "kimi";
-	if (id.includes("grok")) return "grok";
-	return id.split(/[-_.]/u)[0] || id;
-}
+function modelFamily(model: string): string { return modelFamilyId(model); }
 
 function parentFullModel(parent: V3PreflightParentModel | undefined): string | undefined {
 	return parent ? `${parent.provider}/${parent.id}` : undefined;
@@ -323,6 +349,8 @@ async function routeAuthoringNodes(
 		agentScope: "both" as const,
 		...(model === undefined ? {} : { model }),
 		...(thinking === undefined ? {} : { thinking }),
+		...(node.turnBudget === undefined ? {} : { turnBudget: node.turnBudget as GraphNodeAuthoringSpecV3["turnBudget"] }),
+		...(options.parentToolAllowlist === undefined ? {} : { parentToolAllowlist: [...options.parentToolAllowlist], graphToolFilter: options.graphToolFilter === undefined ? undefined : [...options.graphToolFilter] }),
 		...(options.parentModel === undefined ? {} : { parentModel: options.parentModel }),
 		...(options.availableModels === undefined ? {} : { availableModels: options.availableModels }),
 		...(options.preferredProvider === undefined ? {} : { preferredProvider: options.preferredProvider }),
@@ -358,24 +386,58 @@ async function routeAuthoringNodes(
 		const taskId = nonEmpty(node.taskId, "taskId", 200);
 		if (decisions.has(taskId)) return decisions.get(taskId);
 		const ids = capabilityIds(node);
-		if (ids.length === 0) return undefined;
+		const inferred = ids.length === 0;
+  if (inferred && typeof node.agent !== "string") return undefined;
+  const inferredEntries = inferred ? catalog.entries.filter(entry=>entry.agent===node.agent) : [];
+  if (inferred && (inferredEntries.length===0 || new Set(inferredEntries.map(entry=>entry.routingProfile)).size!==1)) return undefined;
 		if (resolving.has(taskId)) fail(`Routing dependency cycle detected at '${taskId}'.`, { taskId });
 		resolving.add(taskId);
 		try {
-			const entries = ids.map((id) => byCapability.get(id) ?? fail(`Capability '${id}' has no routing catalog entry.`, { taskId, capabilityId: id }));
+			const entries = inferred ? inferredEntries : ids.map((id) => byCapability.get(id) ?? fail(`Capability '${id}' has no routing catalog entry.`, { taskId, capabilityId: id }));
 			const agents = [...new Set(entries.map((entry) => entry.agent))];
 			const profiles = [...new Set(entries.map((entry) => entry.routingProfile))];
 			if (agents.length !== 1 || profiles.length !== 1) fail(`Node '${taskId}' capabilities must resolve to one Agent and one routing profile.`, { taskId, agents, profiles });
 			if (node.agent !== undefined && node.agent !== agents[0]) fail(`Node '${taskId}' explicit Agent conflicts with routing catalog.`, { taskId, requestedAgent: node.agent, routedAgent: agents[0] });
 			const profileName = profiles[0]!;
+			if (inferred && !policy.profiles[profileName]) return undefined;
 			let profile = policy.profiles[profileName] ?? fail(`Routing profile '${profileName}' is missing.`, { taskId, profile: profileName });
-   const override = readRoleModelOverride(agents[0]!, resolve(options.cwd ?? process.cwd()), options.agentDir);
+   const override = capturedRoleOverride(agents[0]!,options);
+   const authorModel=typeof node.model==='string'?node.model:undefined;
+   const configuredPrimary=override?.model??profile.candidates[0]!.model;
+   const guidance=`Remove stale explicit model/thinking fields and resubmit only remaining work using the current role/profile configuration; do not replay completed tools.`;
+   const policyContext=`task='${taskId}', role='${agents[0]}', profile='${profileName}', configured primary='${configuredPrimary}', allowed=[${profile.candidates.slice(0,8).map(c=>c.model).join(', ')}${profile.candidates.length>8?', ...':''}]`;
+   if(profile.latestPolicy&&authorModel&&(!profile.approvedLatestIds?.includes(authorModel)||!profile.candidates.some(c=>c.model===authorModel)))fail(`Explicit requested model '${authorModel}' is not approved (${policyContext}; reason=author_model_not_approved). ${guidance}`,{taskId,agent:agents[0],profile:profileName,requestedModel:authorModel,reason:'author_model_not_approved'});
+   if(inferred&&override&&profile.candidatePool!=='all-compatible')return undefined;
    if (override) {
-    const primary=override.model??profile.candidates[0]!.model;
-    const models=[...new Set([primary,...(override.fallbackModels??profile.candidates.map(c=>c.model).filter(m=>m!==primary))])];
-    if(models.length>9)fail('Role model chain exceeds eight permitted replacements.');
-    profile={...profile,candidates:models.map((model,index)=>({model,thinking:override.thinking??profile.candidates.find(c=>c.model===model)?.thinking,level:`settings-${index}`})),modelDegradations:Math.max(0,models.length-1)};
+    const models=[...new Set([configuredPrimary,...(override.fallbackModels??profile.candidates.map(c=>c.model).filter(m=>m!==configuredPrimary))])];
+    if(profile.latestPolicy&&models.some(m=>!profile.approvedLatestIds?.includes(m)))fail(`Override model is not an approved latest candidate (${policyContext}; reason=author_override_not_approved). ${guidance}`,{taskId});
+    if(models.length>MAX_MODEL_CANDIDATES)fail('Role model chain exceeds 63 permitted replacements.');
+    profile={...profile,candidates:models.map((model,index)=>{const original=profile.candidates.find(c=>c.model===model);return {...original,model,thinking:override.thinking??original?.thinking,level:original?.level??`settings-${index}`};}),modelDegradations:profile.latestPolicy&&profile.modelDegradations===0?0:override.fallbackModels===undefined?profile.modelDegradations:Math.max(0,models.length-1)};
    }
+   let implicitFailure:Extract<Awaited<ReturnType<typeof preflight>>,{ok:false}>|undefined;
+   if (inferred) {
+    const baseline=await preflight(preflightInput(node,agents[0]!,authorModel));
+    if(!baseline.ok){
+     const classification=classifyProviderFailure(baseline.message);
+     const failureGuidance=!classification.eligible?'Fix the original Agent configuration, working directory, or tool permissions before resubmitting; model fallback cannot repair this error.':'Resolve the reported model/provider configuration or availability error before resubmitting; no automatic replacement was authorized.';
+     const identityMatches=baseline.attemptedModel===profile.candidates[0]?.model&&baseline.attemptedAgent===agents[0]&&typeof baseline.attemptedAgentDefinitionDigest==='string'&&/^[a-f0-9]{64}$/.test(baseline.attemptedAgentDefinitionDigest);
+     if(profile.latestPolicy&&!authorModel&&profile.candidatePool==='all-compatible'&&classification.eligible&&identityMatches&&profile.modelDegradations>0&&profile.candidates.length>1){implicitFailure=baseline;}
+     else if(profile.latestPolicy)fail(`Primary preflight failed (${policyContext}; attempted='${baseline.attemptedModel??'unknown'}'; reason=${authorModel?'explicit_model_failure':!classification.eligible?classification.kind:!identityMatches?'failed_identity_not_approved_primary':'fallback_disabled'}): ${briefReason(baseline.message)}. ${failureGuidance}`,{taskId,agent:agents[0],profile:profileName,classification});
+     else return undefined;
+    } else {
+     if(baseline.name!==agents[0]){if(profile.latestPolicy)fail(`Primary preflight resolved Agent '${baseline.name}' instead of '${agents[0]}' (${policyContext}; reason=agent_identity_mismatch).`);return undefined;}
+     if(!baseline.model){if(profile.latestPolicy)fail(`Primary preflight is missing resolved model (${policyContext}; reason=missing_model_identity).`);return undefined;}
+     const primary=authorModel??baseline.model.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/,'');
+     const first=profile.candidates.find(candidate=>candidate.model===primary);
+     const thinking=normalizedThinking(node)===false?'off':normalizedThinking(node)??baseline.thinking;
+     if(!first){if(profile.candidatePool==='all-compatible')fail(`Resolved model '${primary}' has no approved capability evidence (${policyContext}; reason=resolved_model_not_approved). ${guidance}`,{taskId});return undefined;}
+     if(profile.candidatePool!=='all-compatible'&&first.thinking!==undefined&&thinking!==undefined&&first.thinking!==thinking)return undefined;
+     node.model=primary;
+     if(node.thinking===undefined&&baseline.thinking!==undefined)node.thinking=baseline.thinking;
+    }
+    if(profile.constraints?.requireCrossFamilyFromProducers&&(profile.constraints.producerSource==='active_main'?!options.parentModel:!Array.isArray(node.dependsOn)||node.dependsOn.length===0))return undefined;
+   }
+
 			const producerModels: string[] = [];
 			if (profile.constraints?.requireCrossFamilyFromProducers) {
 				if (profile.constraints.producerSource === "active_main") {
@@ -407,8 +469,8 @@ async function routeAuthoringNodes(
 			const explicitThinking = node.thinking === false ? "off" : node.thinking === undefined ? undefined : nonEmpty(node.thinking, `${taskId}.thinking`, 100);
 			const configuredModels = new Set(profile.candidates.map((candidate) => candidate.model));
 			if (explicitModel && !configuredModels.has(explicitModel)) fail(`Node '${taskId}' explicit model is outside routing profile '${profileName}'.`, { taskId, requestedModel: explicitModel, candidates: [...configuredModels] });
-			const skipped: Array<{ model: string; reason: string }> = [];
-			const ordered = explicitModel ? profile.candidates.filter((candidate) => candidate.model === explicitModel) : profile.candidates;
+			const skipped: Array<{ model: string; reason: string }> = implicitFailure?[{model:implicitFailure.attemptedModel!,reason:briefReason(implicitFailure.message)}]:[];
+			const ordered = implicitFailure?profile.candidates.slice(1,profile.modelDegradations+1):explicitModel ? profile.candidates.filter((candidate) => candidate.model === explicitModel) : profile.candidates;
 			for (const candidate of ordered) {
 				const provider = candidate.model.includes("/") ? candidate.model.slice(0, candidate.model.indexOf("/")) : "";
 				if (policy.quarantinedProviderDomains.includes(provider)) {
@@ -422,12 +484,19 @@ async function routeAuthoringNodes(
 				if (explicitThinking !== undefined && candidate.thinking !== undefined && explicitThinking !== candidate.thinking) {
 					fail(`Node '${taskId}' explicit thinking conflicts with routing profile '${profileName}'.`, { taskId, requestedThinking: explicitThinking, routedThinking: candidate.thinking });
 				}
+                const candidateMetadata=options.availableModels?.find(m=>(m.fullId??`${m.provider}/${m.id}`)===candidate.model);
+                if(!candidateMeetsRequirements(candidate,profile.constraints,candidateMetadata)||(profile.candidatePool==='all-compatible'&&!candidate.capabilities?.tools)){
+                    skipped.push({model:candidate.model,reason:'capability_requirements_not_met'});continue;
+                }
 				const result = await preflight(preflightInput(node, agents[0]!, candidate.model, candidate.thinking ?? normalizedThinking(node)));
 				if (!result.ok) {
-					if (!classifyProviderFailure(result.message).eligible) fail(`Routing preflight failed without eligible provider evidence: ${result.message}`, {taskId, model:candidate.model});
+					if (!classifyProviderFailure(result.message).eligible) fail(`Routing preflight failed without eligible provider evidence (${policyContext}; model='${candidate.model}'; reason=non_provider): ${briefReason(result.message)}. Fix the original configuration/path/permissions before resubmitting.`, {taskId, model:candidate.model});
 					skipped.push({ model: candidate.model, reason: briefReason(result.message) });
 					continue;
 				}
+                if(implicitFailure&&(result.name!==implicitFailure.attemptedAgent||result.agentDefinitionDigest!==implicitFailure.attemptedAgentDefinitionDigest))fail(`Fallback preflight changed the Agent identity (${policyContext}; reason=agent_identity_drift).`);
+                const remainingDegradations=profile.modelDegradations-(implicitFailure?profile.candidates.indexOf(candidate):0);
+                if(!candidateMeetsRequirements({...candidate,thinking:result.thinking??candidate.thinking},profile.constraints,candidateMetadata)){skipped.push({model:candidate.model,reason:'admitted_thinking_capability_conflict'});continue;}
                 const runtimeCandidates: import("../src/v3/types.ts").V3RuntimeFallbackCandidate[] = [];
                 const addCandidate = (choice: RoutingCandidate, admitted: Extract<Awaited<ReturnType<typeof preflight>>, {ok:true}>) => {
                     if (!admitted.model || admitted.name !== agents[0] || admitted.agentDefinitionDigest !== result.agentDefinitionDigest) return;
@@ -436,21 +505,26 @@ async function routeAuthoringNodes(
                         || canonicalDigest(admitted.extensions) !== canonicalDigest(result.extensions)) return;
                     const provider = choice.model.split("/")[0]!;
                     if (options.extensionRegisteredProviderIds?.includes(provider)) return;
-                    if (/kimi/i.test(choice.model) && choice.model !== "kimi-coding/k3") return;
-                    const requiresImage = /(?:browser-operation|image-analysis|ui-review)/.test(profileName)
+                    const metadata=options.availableModels?.find(m=>(m.fullId??`${m.provider}/${m.id}`)===choice.model);
+                    if(!candidateMeetsRequirements({...choice,thinking:admitted.thinking??choice.thinking},profile.constraints,metadata))return;
+                    if(profile.candidatePool==='all-compatible'&&!choice.capabilities?.tools)return;
+                    const requiresImage = profile.candidatePool==='all-compatible' && profile.constraints?.requiredInputModalities!==undefined
+                        ? profile.constraints.requiredInputModalities.includes('image')
+                        : /(?:browser-operation|image-analysis|ui-review)/.test(profileName)
                         || options.availableModels?.find(m => (m.fullId ?? `${m.provider}/${m.id}`) === candidate.model)?.input?.includes("image");
                     if (choice.model !== candidate.model && requiresImage
                         && !options.availableModels?.find(m => (m.fullId ?? `${m.provider}/${m.id}`) === choice.model)?.input?.includes("image")) return;
                     runtimeCandidates.push({ requestedModel: choice.model, resolvedModel: admitted.model,
                         ...(admitted.thinking === undefined ? {} : {thinking: admitted.thinking}),
-                        agentDefinitionDigest: admitted.agentDefinitionDigest, admissionLaunchContractDigest: admitted.launchContractDigest });
+                        agentDefinitionDigest: admitted.agentDefinitionDigest, admissionLaunchContractDigest: admitted.launchContractDigest,
+                        ...modelIdentityFields(choice),...(choice.capabilities?{capabilities:structuredClone(choice.capabilities)}:{}),level:choice.level });
                 };
-                if (profile.modelDegradations > 0) {
-                    addCandidate(candidate, result);
+                addCandidate(candidate, result);
+                if (remainingDegradations > 0) {
                     // An explicit model is the first choice, never an invitation to downgrade
                     // backwards through weaker choices before it in the configured profile.
-                    for (const next of profile.candidates.slice(profile.candidates.findIndex(c => c.model === candidate.model) + 1)) {
-                        if (runtimeCandidates.length === 0 || runtimeCandidates.length >= profile.modelDegradations + 1) break;
+                    for (const next of (!implicitFailure&&profile.candidatePool==='all-compatible'?profile.candidates.filter(c=>c.model!==candidate.model):profile.candidates.slice(profile.candidates.findIndex(c => c.model === candidate.model) + 1))) {
+                        if (runtimeCandidates.length === 0 || runtimeCandidates.length >= remainingDegradations + 1) break;
                         const provider = next.model.split("/")[0]!;
                         if (policy.quarantinedProviderDomains.includes(provider) || producerFamilies.has(modelFamily(next.model))) continue;
                         const checked = await preflight(preflightInput(node, agents[0]!, next.model, next.thinking ?? normalizedThinking(node)));
@@ -458,14 +532,15 @@ async function routeAuthoringNodes(
                         addCandidate(next, checked);
                     }
                 }
-                const planBase = {version:1 as const, profile:profileName, modelDegradations:profile.modelDegradations,
-                    candidates:runtimeCandidates, excludedFamilies:[...producerFamilies].sort(), requireCrossFamilyFromProducers:profile.constraints?.requireCrossFamilyFromProducers === true};
+                const planBase = {version:1 as const, sessionContinuationVersion:1 as const, profile:profileName, modelDegradations:remainingDegradations,
+                    candidates:runtimeCandidates, ...(profile.latestPolicy?{latestPolicy:profile.latestPolicy,approvedLatestIds:profile.approvedLatestIds}:{}), ...(profile.constraints&&(profile.constraints.requiredInputModalities!==undefined||profile.constraints.maximumAutomaticFallback!==undefined||profile.constraints.requireToolCalls!==undefined)?{requirements:{...(profile.constraints.requiredInputModalities===undefined?{}:{requiredInputModalities:profile.constraints.requiredInputModalities}),...(profile.constraints.maximumAutomaticFallback===undefined?{}:{maximumAutomaticFallback:profile.constraints.maximumAutomaticFallback}),...(profile.constraints.requireToolCalls===undefined?{}:{requireToolCalls:profile.constraints.requireToolCalls})}}:{}), excludedFamilies:[...producerFamilies].sort(), requireCrossFamilyFromProducers:profile.constraints?.requireCrossFamilyFromProducers === true};
                 const runtimeFallback = runtimeCandidates.length > 1 ? {...planBase, digest:canonicalDigest(planBase)} : undefined;
 				node.model = candidate.model;
 				if (candidate.thinking !== undefined) node.thinking = candidate.thinking;
 				const decision: RoutingAdmissionDecisionV3 = {
 					taskId,
 					capabilityIds: ids,
+					...(inferred ? {inferredFromExactRole:true as const} : {}),
 					agent: agents[0]!,
 					profile: profileName,
 					selectedModel: candidate.model,
@@ -474,11 +549,12 @@ async function routeAuthoringNodes(
 					level: candidate.level,
 					skipped,
 					...(runtimeFallback ? {runtimeFallback} : {}),
+                    ...(profile.latestPolicy?{latestModelSelection:{latestPolicy:profile.latestPolicy,approvedLatestIds:profile.approvedLatestIds!,candidate:{requestedModel:candidate.model,resolvedModel:result.model!,...(result.thinking===undefined?{}:{thinking:result.thinking}),agentDefinitionDigest:result.agentDefinitionDigest,admissionLaunchContractDigest:result.launchContractDigest,...modelIdentityFields(candidate),...(candidate.capabilities?{capabilities:structuredClone(candidate.capabilities)}:{}),level:candidate.level}}}:{}),
 				};
 				decisions.set(taskId, decision);
 				return decision;
 			}
-			fail(`No candidate in routing profile '${profileName}' passed admission for node '${taskId}'.`, { taskId, profile: profileName, skipped });
+			fail(`No candidate in routing profile '${profileName}' passed admission for node '${taskId}' (${policyContext}). Reasons: ${skipped.slice(0,8).map(s=>`${s.model}: ${briefReason(s.reason).slice(0,160)}`).join('; ') || 'no eligible candidate'}. Fix the reported configuration or provider availability before resubmitting.`, { taskId, profile: profileName, skipped });
 		} finally {
 			resolving.delete(taskId);
 		}
@@ -591,41 +667,36 @@ async function routeInput(
 		nodes: GraphNodeAuthoringSpecV3[];
 		receipt: RoutingAdmissionReceiptV3;
 		catalogValue?: unknown;
+		routingSnapshot?: RoutingPolicySnapshot;
 		fixedProducerIdentities: FixedProducerAdmissionIdentityV3[];
 	}> {
 	if (!Array.isArray(nodes)) fail("Graph authoring nodes must be an array.");
 	const fixedNodes = cloneJson(nodes) as GraphNodeAuthoringSpecV3[];
-	if (!nodes.some((node) => isRecord(node) && capabilityIds(node).length > 0)) {
-		return {
-			nodes: fixedNodes,
-			fixedProducerIdentities: [],
-			receipt: {
-				schemaVersion: 1,
-				mode: "fixed",
-				decisions: [],
-				jevShadow: { status: "disabled", reason: "policy_disabled" },
-			},
-		};
-	}
-	const paths = configuredPaths(options);
-	const explicitCatalog = options.catalog === undefined ? undefined : cloneJson(options.catalog);
-	const [policyValue, catalogValue] = await Promise.all([
-		readStableJson(paths.policyPath, "routing-policy.json"),
-		explicitCatalog === undefined ? readStableJson(paths.catalogPath, "subagent-capabilities.json") : Promise.resolve(explicitCatalog),
-	]);
-	const policy = validatePolicy(policyValue);
-	const catalog = validateCatalog(catalogValue);
+ const required=nodes.some(node=>isRecord(node)&&capabilityIds(node).length>0);
+ const fixed=(routingSnapshot?:RoutingPolicySnapshot)=>({...(routingSnapshot?{routingSnapshot}:{}),nodes:fixedNodes,fixedProducerIdentities:[],receipt:{schemaVersion:1 as const,mode:"fixed" as const,decisions:[],jevShadow:{status:"disabled" as const,reason:"policy_disabled" as const}}});
+ if(!required && !nodes.some(node=>isRecord(node)&&typeof node.agent==="string")) return fixed();
+ const paths=configuredPaths(options);
+ const explicitCatalog=options.catalog===undefined?undefined:cloneJson(options.catalog);
+ let policyValue:unknown,catalogValue:unknown,policy:RoutingPolicy,catalog:CapabilityRouteCatalog;
+ try {
+  policyValue=await readStableJson(paths.policyPath,"routing-policy.json");
+  catalogValue=explicitCatalog===undefined?await readStableJson(paths.catalogPath,"subagent-capabilities.json"):explicitCatalog;
+  policy=validatePolicy(policyValue);catalog=validateCatalog(catalogValue);
+ }catch(error){if(required||(isRecord(policyValue)&&isRecord(policyValue.profiles)&&Object.values(policyValue.profiles).some(p=>isRecord(p)&&p.latestPolicy!==undefined)))throw error;return fixed();}
 	const routed = await routeAuthoringNodes(nodes, policy, catalog, options);
+	const routingSnapshot={policy,catalog,policyDigest:canonicalDigest(policyValue),catalogDigest:catalog.digest};
+	if (!required && routed.decisions.length===0) return fixed(routingSnapshot);
 	const jevShadow = await observeJevRoutingShadowV3(policy.jevShadow, { goal, nodes: routed.nodes, decisions: routed.decisions }, options, paths.modelsPath);
 	return {
 		nodes: routed.nodes,
+		routingSnapshot,
 		catalogValue,
 		fixedProducerIdentities: routed.fixedProducerIdentities,
 		receipt: {
 			schemaVersion: 1,
 			mode: ROUTING_ENFORCEMENT,
 			policyDigest: canonicalDigest(policyValue),
-			catalogDigest: catalog.digest,
+			...(required ? {catalogDigest:catalog.digest} : {inferredCatalogDigest:catalog.digest}),
 			decisions: routed.decisions,
 			jevShadow,
 		},
@@ -635,12 +706,12 @@ async function routeInput(
 function freezeRuntimeFallback(nodes: GraphNodeSpecV3[], receipt: RoutingAdmissionReceiptV3): void {
  for (const decision of receipt.decisions) {
   const node = nodes.find(n => n.taskId === decision.taskId), plan = decision.runtimeFallback;
-  if (!node?.launch || !node.binding || !plan) continue;
-  const first = plan.candidates[0]!;
+  if (!node?.launch || !node.binding || (!plan&&!decision.latestModelSelection)) continue;
+  const first = plan?.candidates[0]??decision.latestModelSelection!.candidate;
   if (first.requestedModel !== node.launch.requestedModel || first.thinking !== node.launch.thinking || first.agentDefinitionDigest !== node.binding.agentDefinitionDigest || first.resolvedModel !== node.launch.resolvedModel
    || first.admissionLaunchContractDigest !== node.binding.admissionLaunchContractDigest) fail("Fallback admission drifted before freezing.", {taskId:node.taskId});
   const {hintDigest: _, ...base} = node.launch;
-  const frozen = {...base, runtimeFallback: plan};
+  const frozen = {...base, ...(plan?{runtimeFallback:plan}:{}),...(decision.latestModelSelection?{latestModelSelection:decision.latestModelSelection}:{})};
   node.launch = {...frozen, hintDigest:canonicalDigest(frozen)};
  }
 }
@@ -652,8 +723,12 @@ function assertRoutingBindingAlignment(
 	fixedProducerIdentities: readonly FixedProducerAdmissionIdentityV3[],
 ): void {
 	if (receipt.mode !== ROUTING_ENFORCEMENT) return;
-	if (!receipt.catalogDigest || catalog?.digest !== receipt.catalogDigest) {
+	if (receipt.catalogDigest !== undefined || receipt.decisions.some(decision=>decision.capabilityIds.length>0)) {
+		if (!receipt.catalogDigest || catalog?.digest !== receipt.catalogDigest) {
 		fail("Routing admission and Binding did not use the same capability catalog digest.", { routingCatalogDigest: receipt.catalogDigest, bindingCatalogDigest: catalog?.digest });
+		}
+	} else if (!receipt.inferredCatalogDigest || !receipt.decisions.every(decision=>decision.inferredFromExactRole===true || decision.capabilityIds.length===0 && (decision.profile===`role-settings:${decision.agent}` && decision.level==="role-settings" || decision.profile===`parent-model:${decision.agent}` && decision.level==="parent-model"))) {
+		fail("Exact-role routing lacks captured catalog provenance.");
 	}
 	const byTask = new Map(nodes.map((node) => [node.taskId, node]));
 	for (const decision of receipt.decisions) {
@@ -698,24 +773,24 @@ async function fixedRoleSettings(nodes: GraphNodeAuthoringSpecV3[], options:Rout
  const decisions:RoutingAdmissionDecisionV3[]=[];const preflight=options.preflightAgent??v3PreflightAgentLaunch;
  for(const node of nodes){
   if(capabilityIds(node as unknown as Record<string,unknown>).length||!node.agent)continue;
-  const override=readRoleModelOverride(node.agent,resolve(options.cwd??process.cwd()),options.agentDir);if(!override)continue;
+  const override=capturedRoleOverride(node.agent,options);if(!override)continue;
   const primary=node.model??override.model;
   if(primary!==undefined)node.model=primary;
   if(node.thinking===undefined&&override.thinking!==undefined)node.thinking=override.thinking;
   const models=[...new Set([primary,...(override.fallbackModels??[])].filter((m):m is string=>typeof m==='string'))];
-  if(models.length>9)fail('Role model chain exceeds eight permitted replacements.');
+  if(models.length>MAX_MODEL_CANDIDATES)fail('Role model chain exceeds 63 permitted replacements.');
   const admitted:import('../src/v3/types.ts').V3RuntimeFallbackCandidate[]=[];
   let first:Awaited<ReturnType<typeof preflight>>|undefined;
-  for(const model of models){const result=await preflight({agent:node.agent,task:node.task,cwd:resolve(options.cwd??process.cwd()),model,thinking:node.thinking,availableModels:options.availableModels,parentModel:options.parentModel});
+  for(const model of models){const result=await preflight({agent:node.agent,task:node.task,cwd:resolve(options.cwd??process.cwd()),model,thinking:node.thinking,turnBudget:node.turnBudget,availableModels:options.availableModels,parentModel:options.parentModel,preferredProvider:options.preferredProvider,...(options.parentToolAllowlist===undefined?{}:{parentToolAllowlist:[...options.parentToolAllowlist],graphToolFilter:options.graphToolFilter===undefined?undefined:[...options.graphToolFilter]})});
    if(!result.ok){if(!first)fail(result.message);continue;}
    if(!first)first=result;
    if(!first.ok||!result.model||result.agentDefinitionDigest!==first.agentDefinitionDigest||canonicalDigest(result.extensions)!==canonicalDigest(first.extensions)||canonicalDigest(result.toolAllowlist)!==canonicalDigest(first.toolAllowlist))continue;
-   if(options.extensionRegisteredProviderIds?.includes(model.split('/')[0]!)||(/kimi/i.test(model)&&model!=='kimi-coding/k3'))continue;
+   if(options.extensionRegisteredProviderIds?.includes(model.split('/')[0]!))continue;
    const image=options.availableModels?.find(m=>(m.fullId??`${m.provider}/${m.id}`)===models[0])?.input?.includes('image');
    if(admitted.length&&image&&!options.availableModels?.find(m=>(m.fullId??`${m.provider}/${m.id}`)===model)?.input?.includes('image'))continue;
    admitted.push({requestedModel:model,resolvedModel:result.model,thinking:result.thinking,agentDefinitionDigest:result.agentDefinitionDigest,admissionLaunchContractDigest:result.launchContractDigest});
   }
-  if(first?.ok&&primary){node.thinking=first.thinking??node.thinking;const base={version:1 as const,profile:`role-settings:${node.agent}`,modelDegradations:Math.max(0,models.length-1),candidates:admitted,excludedFamilies:[],requireCrossFamilyFromProducers:false};
+  if(first?.ok&&primary){node.thinking=first.thinking??node.thinking;const base={version:1 as const,sessionContinuationVersion:1 as const,profile:`role-settings:${node.agent}`,modelDegradations:Math.max(0,models.length-1),candidates:admitted,excludedFamilies:[],requireCrossFamilyFromProducers:false};
    decisions.push({taskId:node.taskId,capabilityIds:[],agent:node.agent,profile:base.profile,selectedModel:primary,resolvedModel:first.model,thinking:first.thinking,level:'role-settings',skipped:[],...(admitted.length>1?{runtimeFallback:{...base,digest:canonicalDigest(base)}}:{})});}
  }
  return decisions;
@@ -727,11 +802,27 @@ function customRegistryOptions(options:RoutingAdmissionOptionsV3):RoutingAdmissi
  return {...options,availableModels:[...(options.availableModels??[]),...custom.map(m=>({...m,fullId:`${m.provider}/${m.id}`}))]};
 }
 
+const roleOverrideSnapshotKey = Symbol("trusted-binding-role-overrides");
+type RoleOverrideSnapshot = Map<string, ReturnType<typeof readRoleModelOverride>>;
+function beginRoleOverrideSnapshot(options:RoutingAdmissionOptionsV3):RoutingAdmissionOptionsV3 {
+ return Object.assign({...options},{[roleOverrideSnapshotKey]:new Map() as RoleOverrideSnapshot});
+}
+function capturedRoleOverride(agent:string,options:RoutingAdmissionOptionsV3):ReturnType<typeof readRoleModelOverride> {
+ const cache=(options as RoutingAdmissionOptionsV3 & {[roleOverrideSnapshotKey]?:RoleOverrideSnapshot})[roleOverrideSnapshotKey];
+ if(cache?.has(agent))return cache.get(agent);
+ const value=readRoleModelOverride(agent,resolve(options.cwd??process.cwd()),options.agentDir);
+ const frozen=value===undefined?undefined:structuredClone(value);
+ cache?.set(agent,frozen);return frozen;
+}
+
 export async function bindGraphSpecWithRoutingV3(input: GraphSpecAuthoringV3 | unknown, options: RoutingAdmissionOptionsV3 = {}): Promise<RoutedBoundGraphSpecV3> {
-	options=customRegistryOptions(options);
+	options=beginRoleOverrideSnapshot(customRegistryOptions(options));
 	if (!isRecord(input) || !Array.isArray(input.nodes)) fail("GraphSpec V3 routing input requires nodes.");
+	// Mirror Binding: the authored spec owns its filter, including an absent filter.
+	const graphToolFilter = Array.isArray(input.toolFilter) && input.toolFilter.every(tool => typeof tool === "string") ? [...input.toolFilter] as string[] : undefined;
+	options = { ...options, graphToolFilter };
 	const routed = await routeInput(input.nodes, typeof input.goal === "string" ? input.goal : "Graph admission", options);
-	routed.receipt.decisions.push(...await fixedRoleSettings(routed.nodes,options));
+	routed.receipt.decisions.push(...await fixedRoleSettings(routed.nodes.filter(node=>!routed.receipt.decisions.some(d=>d.taskId===node.taskId)),options));
 	const authoring = cloneJson(input) as Record<string, unknown>;
 	authoring.nodes = routed.nodes;
 	const bound = await bindGraphSpecV3(authoring, { ...options, ...(routed.catalogValue === undefined ? {} : { catalog: routed.catalogValue }) });
@@ -744,9 +835,9 @@ export async function bindGraphNodesWithRoutingV3(
 	nodes: readonly GraphNodeAuthoringSpecV3[] | unknown,
 	options: RoutingAdmissionOptionsV3 & { contractPolicy?: "standard" | "strict" } = {},
 ): Promise<{ nodes: GraphNodeSpecV3[]; routingAdmission: RoutingAdmissionReceiptV3; catalog?: V3BoundGraphSpec["catalog"] }> {
-	options=customRegistryOptions(options);
+	options=beginRoleOverrideSnapshot(customRegistryOptions(options));
 	const routed = await routeInput(nodes, "Append Graph nodes", options);
-	routed.receipt.decisions.push(...await fixedRoleSettings(routed.nodes,options));
+	routed.receipt.decisions.push(...await fixedRoleSettings(routed.nodes.filter(node=>!routed.receipt.decisions.some(d=>d.taskId===node.taskId)),options));
 	const bound = await bindGraphNodesV3(routed.nodes, { ...options, ...(routed.catalogValue === undefined ? {} : { catalog: routed.catalogValue }) });
 	freezeRuntimeFallback(bound.nodes, routed.receipt);
 	assertRoutingBindingAlignment(bound.nodes, routed.receipt, bound.catalog, routed.fixedProducerIdentities);

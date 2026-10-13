@@ -1,3 +1,4 @@
+import {authorizeContinuation} from "../runtime/session-continuation.ts";
 import { V3FallbackPauseError } from "./failure-policy.ts";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -68,6 +69,7 @@ export function v3GraphGuardExtensionBindings(
 }
 
 export interface V3DispatchSpec {
+ ownedContinuation?:any;
  customModelDefinitions?:import("../runtime/custom-models.ts").CustomGraphModel[];
 	graphToolFilter?: string[];
 	parentToolAllowlist?: string[];
@@ -118,7 +120,8 @@ export async function v3DispatchChild(
 	const capture = options.resultPath ? new NativeResultCapture(rpc.events) : undefined;
 	try {
 		await options.beforeSpawn?.();
-		response = await rpc.spawn(params, options.stableRequestId, options.beforeEmit);
+		const releaseAuthority=spec.ownedContinuation?authorizeContinuation(params,spec.ownedContinuation):()=>{};
+        try{response = await rpc.spawn(params, options.stableRequestId, options.beforeEmit);}finally{releaseAuthority();}
 	} catch (error) {
 		await capture?.close();
         if (error instanceof V3FallbackPauseError) throw error;

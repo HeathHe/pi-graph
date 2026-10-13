@@ -225,6 +225,8 @@ export interface LoadedV3Run {
  */
 export class V3GraphHost {
 	private readonly supervised = new Map<string, { runner: V3GraphRunner; promise: Promise<GraphSnapshotV3>; ownerSessionId: string }>();
+	private readonly supervisorHandoffContinuations = new Map<string, Set<Promise<void>>>();
+	private readonly supervisorHandoffFailures = new Map<string, unknown>();
 	private readonly supervisorHandoffs = new Map<string, Map<symbol, string>>();
 	private activeWorkFingerprint = "[]";
 	readonly context: V3HostContext;
@@ -378,7 +380,7 @@ export class V3GraphHost {
 		promise: Promise<GraphSnapshotV3>,
 		handoff: symbol,
 	): void {
-		void (async () => {
+		const continuation = (async () => {
 			try {
 				const snapshot = await promise;
 				if (snapshot.status !== "paused" || this.supervised.has(graphId)) return;
@@ -389,7 +391,17 @@ export class V3GraphHost {
 			} finally {
 				this.releaseSupervisorHandoff(graphId, handoff);
 			}
-		})().catch(() => undefined);
+		})().catch((error) => {
+			this.supervisorHandoffFailures.set(graphId, error);
+			throw error;
+		});
+		const pending = this.supervisorHandoffContinuations.get(graphId) ?? new Set<Promise<void>>();
+		pending.add(continuation);
+		this.supervisorHandoffContinuations.set(graphId, pending);
+		void continuation.finally(() => {
+			pending.delete(continuation);
+			if (!pending.size) this.supervisorHandoffContinuations.delete(graphId);
+		}).catch(() => undefined);
 	}
 
 	private async withTopologySupervisor<T>(
@@ -713,6 +725,7 @@ export class V3GraphHost {
 		desiredState: V3DesiredState,
 		options: V3ControlMutationOptions = {},
 	): Promise<V3RunControl> {
+		if (desiredState === "running") this.supervisorHandoffFailures.delete(graphId);
 		let handoff = desiredState === "running" && this.supervised.has(graphId)
 			? this.reserveSupervisorHandoff(graphId)
 			: undefined;
@@ -792,6 +805,14 @@ export class V3GraphHost {
 	 */
 	async waitForCompletion(graphId: string): Promise<GraphSnapshotV3> {
 		while (true) {
+			const pending = this.supervisorHandoffContinuations.get(graphId);
+			if (pending?.size) {
+				await Promise.all([...pending]);
+				continue;
+			}
+			if (this.supervisorHandoffFailures.has(graphId) && (await this.control(graphId)).desiredState === "running") {
+				throw this.supervisorHandoffFailures.get(graphId);
+			}
 			const supervised = this.supervised.get(graphId);
 			const snapshot = supervised ? await supervised.promise : await this.status(graphId);
 			if (supervised && this.supervised.get(graphId)?.promise === supervised.promise) {
@@ -800,6 +821,7 @@ export class V3GraphHost {
 				this.supervised.delete(graphId);
 				this.notifyActiveWorkChange();
 			}
+			if (this.supervisorHandoffContinuations.get(graphId)?.size) continue;
 			if (snapshot.status !== "paused") return snapshot;
 			const control = await this.control(graphId);
 			if (control.desiredState === "paused") return snapshot;

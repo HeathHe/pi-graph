@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, lstat, realpath } from "node:fs/promises";
+import { mkdir, lstat, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { readAtomicRegularFile } from "./safe-read.ts";
 import { atomicWriteJson } from "./durable.ts";
 import type { V3LeaseHandle } from "./lease.ts";
 
@@ -32,8 +33,8 @@ export class GraphMailbox {
  }
  async load(): Promise<MailboxState> {
   if(await realpath(join(this.runDir,"mailbox-v1"))!==join(this.canonicalRoot??await realpath(this.runDir),"mailbox-v1"))throw new Error("Unsafe mailbox directory");
-  const info = await lstat(this.path); if(info.size>16*1024*1024)throw new Error("Mailbox storage limit exceeded"); if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw new Error("Unsafe mailbox store");
-  let state:MailboxState;try{state=JSON.parse(await readFile(this.path,"utf8"));}catch{throw new Error("Mailbox state unreadable or invalid JSON");}
+  const text=await readAtomicRegularFile(this.path,{maxBytes:16*1024*1024,invalidMessage:"Unsafe mailbox store",limitMessage:"Mailbox storage limit exceeded",expectedParentRealpath:join(this.canonicalRoot??await realpath(this.runDir),"mailbox-v1")});
+  let state:MailboxState;try{state=JSON.parse(text);}catch{throw new Error("Mailbox state unreadable or invalid JSON");}
   if (state.protocol !== MAILBOX_PROTOCOL) throw new Error("Legacy communication is read-only");
   if(!Array.isArray(state.participants)||!Array.isArray(state.messages)||state.messages.length>1024||!state.keys||typeof state.keys!=="object"||Array.isArray(state.keys)||typeof state.owner!=="string"||typeof state.runInstanceId!=="string")throw new Error("Invalid mailbox evidence");
   if(this.identity&&(state.owner!==this.identity.owner||state.runInstanceId!==this.identity.runInstanceId))throw new Error("Mailbox identity changed");

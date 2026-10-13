@@ -53,7 +53,7 @@ export async function waitForNativeAsyncRun(input: {
     // only the independently validated matching proof to bridge that atomic-file
     // window, so a valid startup-failure receipt wins over a generic crash text.
     if(exited && status.runtimeKind==='pi-graph-sdk/1' && !status.processTerminal?.runnerProcessInstanceId)
-     status={...status,processTerminal:{runnerProcessInstanceId:proof!.runnerProcessInstanceId}};
+     status={...status,processTerminal:{runnerProcessInstanceId:proof!.runnerProcessInstanceId,...(proof!.generation===undefined?{}:{generation:proof!.generation,ledgerDigest:proof!.ledgerDigest})}};
     const receipt = await reconcileNativeResult(input, input.resultPath, status, completion);
     if (receipt) completion = undefined;
     if (exited && proofPath && !(await readNativeJson(proofPath))) await atomicWriteJson(proofPath, proof);
@@ -78,6 +78,7 @@ export async function waitForNativeAsyncRun(input: {
     const next = v3ChildObservationFingerprint(observation);
     if (fingerprint !== next) { fingerprint = next; await input.onObservation?.(observation); }
     if (settled || !exited) return;
+    if(exited&&status.needsAttention===true&&!receipt){supervision.runtimeFailure=true;supervision.attention='result_unavailable';supervision.error=typeof status.error==='string'?status.error:'Owned continuation was refused after confirmed worker exit.';finish(()=>resolve({state:'failed',status,output:supervision.error!,observation}));return;}
     if (crashed) { finish(() => resolve({ state: "failed", status, output: supervision.error!, observation })); return; }
     if (!receipt) return;
     const result = receipt.completion;

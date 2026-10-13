@@ -1,10 +1,17 @@
+/** A refresh transport failure does not prove that the saved OAuth grant is invalid. */
+export function isOAuthRefreshNetworkFailure(message: string): boolean {
+ if (/invalid_grant|refresh.token.*invalid|\b401\b/i.test(message)) return false;
+ return /OAuth refresh failed(?: for [a-zA-Z0-9_.-]+)?:\s*(?:fetch failed|network (?:error|unavailable)|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b/i.test(message);
+}
 /** Only diagnostics obtained at the provider/preflight boundary are eligible. Never pass task prose. */
 export function classifyProviderFailure(message: string): { eligible: boolean; kind: string } {
  if (/\b(?:task text|prompt|user asked|user requested)\b/i.test(message))return {eligible:false,kind:"untrusted_context"};
  if (/\b(abort(?:ed)?|cancelled|validation|tool error|schema)\b/i.test(message)) return {eligible:false,kind:"non_provider"};
+ if (/^Connection error\.$/.test(message.trim())) return {eligible:true,kind:"provider"};
+ if (isOAuthRefreshNetworkFailure(message)) return {eligible:true,kind:"provider"};
  const rules: Array<[string, RegExp]> = [
-  ["quota", /\b(?:you['’]ve reached your \d+-hour usage limit|(?:HTTP(?: status)?|status(?:Code)?[ :=]+)\s*429|quota (?:exceeded|exhausted)|rate limit(?:ed| exceeded)?|insufficient (?:balance|credits?))\b/i],
-  ["auth", /\b(?:(?:HTTP(?: status)?|status(?:Code)?[ :=]+)\s*401|authentication (?:failed|required)|invalid api key|unauthorized|credentials? (?:missing|expired|unavailable))\b/i],
+  ["quota", /\b(?:you['’]ve reached your (?:\d+-hour|weekly \(7-day\)) usage limit|(?:HTTP(?: status)?|status(?:Code)?[ :=]+)\s*429|quota (?:exceeded|exhausted)|rate limit(?:ed| exceeded)?|insufficient (?:balance|credits?))\b/i],
+  ["auth", /\b(?:InvalidSubscription|CodingPlan[^\n]{0,100}(?:invalid|expired|inactive)|invalid_grant|(?:HTTP(?: status)?|status(?:Code)?[ :=]+)\s*401|authentication (?:failed|required)|invalid api key|unauthorized|credentials? (?:missing|expired|unavailable))\b/i],
   ["model", /\bmodel\b.{0,100}\b(?:not found|not available|unavailable|access denied)\b/i],
   ["provider", /\bprovider\b.{0,100}\b(?:unavailable|not available|overloaded)\b/i],
  ];

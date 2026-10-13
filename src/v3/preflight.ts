@@ -41,9 +41,10 @@ export interface V3PreflightAvailableModel {
 	thinkingLevelMap?: Partial<Record<string, string | null>>;
 }
 
+export interface V3PreflightFailureIdentity { attemptedModel?:string;attemptedAgent?:string;attemptedAgentDefinitionDigest?:string;attemptedThinking?:string; }
 type PreflightResolver = (input: Record<string, unknown>) => Promise<
 	| { ok: true; contract: PreflightContract }
-	| { ok: false; message: string }
+	| ({ ok: false; message: string } & V3PreflightFailureIdentity)
 >;
 
 let cachedResolver: PreflightResolver | undefined;
@@ -58,7 +59,7 @@ async function publicPreflightResolver(): Promise<PreflightResolver> {
  * V3 governance-free agent preflight: delegates agent resolution entirely to
  * pi-subagents' public preflight contract. pi-graph never selects or pins a model.
  */
-export async function v3PreflightAgent(input: { agent: string; cwd: string; sessionId?: string }): Promise<{ ok: true; name: string } | { ok: false; message: string }> {
+export async function v3PreflightAgent(input: { agent: string; cwd: string; sessionId?: string }): Promise<{ ok: true; name: string } | ({ ok: false; message: string } & V3PreflightFailureIdentity)> {
 	try {
 		const resolver = await publicPreflightResolver();
 		const result = await resolver({
@@ -68,7 +69,7 @@ export async function v3PreflightAgent(input: { agent: string; cwd: string; sess
 			context: "fresh",
 			task: "Resolve this Agent for the V3 capability catalog without launching it.",
 		});
-		if (!result.ok) return { ok: false, message: result.message };
+		if (!result.ok) return { ok: false, message: result.message,...(typeof result.attemptedModel==="string"?{attemptedModel:result.attemptedModel}:{}),...(typeof result.attemptedAgent==="string"?{attemptedAgent:result.attemptedAgent}:{}),...(typeof result.attemptedAgentDefinitionDigest==="string"?{attemptedAgentDefinitionDigest:result.attemptedAgentDefinitionDigest}:{}),...(typeof result.attemptedThinking==="string"?{attemptedThinking:result.attemptedThinking}:{}) };
 		const agent = result.contract.agent;
 		if (!agent || typeof agent.name !== "string" || typeof agent.source !== "string" || typeof agent.filePath !== "string") {
 			return { ok: false, message: "the public preflight result omitted the selected Agent definition" };
@@ -123,7 +124,7 @@ export type V3AgentLaunchPreflightResult =
 		toolAllowlist?: string[];
 		explicitToolAllowlist?: boolean;
 	}
-	| { ok: false; message: string };
+	| ({ ok: false; message: string } & V3PreflightFailureIdentity);
 
 function exactStringArray(value: unknown, field: string): string[] {
 	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
@@ -166,7 +167,7 @@ export async function v3PreflightAgentLaunch(input: V3AgentLaunchPreflightInput)
 			...(input.availableModels === undefined ? {} : { availableModels: input.availableModels }),
 			...(input.preferredProvider === undefined ? {} : { preferredProvider: input.preferredProvider }),
 		});
-		if (!result.ok) return { ok: false, message: result.message };
+		if (!result.ok) return { ok: false, message: result.message,...(typeof result.attemptedModel==="string"?{attemptedModel:result.attemptedModel}:{}),...(typeof result.attemptedAgent==="string"?{attemptedAgent:result.attemptedAgent}:{}),...(typeof result.attemptedAgentDefinitionDigest==="string"?{attemptedAgentDefinitionDigest:result.attemptedAgentDefinitionDigest}:{}),...(typeof result.attemptedThinking==="string"?{attemptedThinking:result.attemptedThinking}:{}) };
 		const { agent, launchContractDigest } = result.contract;
 		if (!agent || typeof agent.name !== "string" || typeof agent.definitionDigest !== "string" || typeof launchContractDigest !== "string") {
 			return { ok: false, message: "the public preflight result omitted exact Agent launch evidence" };

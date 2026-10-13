@@ -17,7 +17,8 @@ export function summarizeUsage(attempts: readonly V3AttemptEvidence[]) {
   if (!unique.has(key) || (obs && (!previous || obs.observedAt >= previous.observedAt))) unique.set(key,obs);
  }
  const byActualModel: Record<string, Record<string, {known:number;missing:number;complete:boolean}>> = Object.create(null);
- for (const obs of unique.values()) {
+ for (const aggregate of unique.values()) {
+ for(const obs of aggregate?.usageSegments?.length?aggregate.usageSegments.map(s=>({actualModel:s.model,usage:s.usage} as V3ChildObservation)):[aggregate]) {
   const model = (obs?.attemptedModels?.length ?? 0)>1 ? "mixed/unknown" : obs?.actualModel ?? "unknown";
   const bucket = byActualModel[model] ??= Object.fromEntries(metrics.map(m=>[m,{known:0,missing:0,complete:true}]));
   for (const metric of metrics) {
@@ -25,6 +26,7 @@ export function summarizeUsage(attempts: readonly V3AttemptEvidence[]) {
    if (value === undefined || !Number.isFinite(value) || value<0) {bucket[metric]!.missing++;bucket[metric]!.complete=false;}
    else {const total=bucket[metric]!.known+value;if(Number.isFinite(total))bucket[metric]!.known=total;else {bucket[metric]!.missing++;bucket[metric]!.complete=false;}}
   }
+ }
  }
  return {coverage:"observed child runs only",main:{status:"unknown",reason:"No attributable main-session usage evidence"},childRuns:unique.size,byActualModel};
 }

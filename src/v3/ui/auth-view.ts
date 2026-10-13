@@ -1,3 +1,4 @@
+import { isOAuthRefreshNetworkFailure } from "../failure-policy.ts";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,7 +10,8 @@ export interface LocalAuthRecord {
  hasRefresh?: boolean;
 }
 export function isAuthError(error: string): boolean {
- return /invalid_grant|\b401\b|refresh.token.*invalid|OAuth refresh failed/i.test(error);
+ if (isOAuthRefreshNetworkFailure(error)) return false;
+ return /invalid_grant|\b401\b|refresh.token.*invalid|authentication (?:failed|required)|invalid api key|unauthorized|InvalidSubscription|CodingPlan[^\n]{0,100}(?:invalid|expired|inactive)/i.test(error);
 }
 export function authProvider(model: string | undefined): string | undefined {
  const provider = model?.split("/")[0];

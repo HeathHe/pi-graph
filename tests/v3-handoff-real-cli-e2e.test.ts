@@ -44,10 +44,25 @@ test("real Pi: existing/new mailbox decisions, public reply, persistent declared
  const child=spawn(process.execPath,[piCliPath,"--mode","rpc","--offline","--session",join(root,"saved-parent.jsonl"),"--no-context-files","--no-skills","--no-extensions","--provider","pi-graph-faux","--model","faux-1","--extension",join(repo,"tests/helpers/handoff-real-provider.ts"),"--extension",join(repo,"extensions/pi-graph.ts")],{cwd:root,env:{...process.env,PI_CODING_AGENT_DIR:home,PI_GRAPH_RUNTIME_ROOT:native,PI_OFFLINE:"1",HTTP_PROXY:"",HTTPS_PROXY:"",ALL_PROXY:"",http_proxy:"",https_proxy:"",all_proxy:"",NO_PROXY:"127.0.0.1,localhost"},stdio:["pipe","pipe","pipe"]});
  const messages:any[]=[];let buffer="",stderr="",serial=0;
  child.stdout.on("data",d=>{buffer+=String(d);for(;;){const n=buffer.indexOf("\n");if(n<0)break;const line=buffer.slice(0,n);buffer=buffer.slice(n+1);if(line.trim())messages.push(JSON.parse(line));}});child.stderr.on("data",d=>stderr+=String(d));
+ const turnTimelines:any[]=[];
  async function turn(text:string,toolName?:string){const before=messages.length,id=`prompt-${++serial}`;child.stdin.write(JSON.stringify({type:"prompt",id,message:text})+"\n");
-  await until(async()=>messages.slice(before),m=>m.some(e=>e.type==="agent_end"),`parent turn ${id}`,35000);
-  const result=messages.slice(before).find(e=>e.type==="tool_execution_end"&&e.toolName===toolName)?.result;
-  if(toolName)assert.ok(result,JSON.stringify(messages.slice(before)));return {result,events:messages.slice(before)};
+  const expected=text.startsWith("PI_GRAPH_PUBLIC_RPC_E2E ")?JSON.parse(text.slice("PI_GRAPH_PUBLIC_RPC_E2E ".length)):text.startsWith("PI_GRAPH_REPLY ")?{action:"mailbox",id:JSON.parse(text.slice("PI_GRAPH_REPLY ".length)).graphId,mailbox:{messageId:JSON.parse(text.slice("PI_GRAPH_REPLY ".length)).messageId}}:undefined;
+  const userText=(event:any)=>Array.isArray(event.message?.content)?event.message.content.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n"):event.message?.content;
+  let selected:any;
+  const events=await until(async()=>messages.slice(before),m=>{
+   const response=m.findIndex(e=>e.type==="response"&&e.id===id&&e.command==="prompt");
+   const user=m.findIndex(e=>e.type==="message_start"&&e.message?.role==="user"&&userText(e)===text);
+   if(response<0||user<0)return false;
+   if(!toolName){const end=m.findIndex((e,i)=>i>user&&e.type==="agent_end");if(end<0)return false;selected={response,user,end};return true;}
+   const call=m.findIndex((e,i)=>i>user&&e.type==="tool_execution_start"&&e.toolName===toolName&&e.args?.action===expected.action&&(e.args?.id??e.args?.spec?.graphId)===(expected.id??expected.spec?.graphId)&&(!expected.mailbox?.messageId||e.args?.mailbox?.messageId===expected.mailbox.messageId));
+   if(call<0)return false;
+   const callId=m[call].toolCallId,toolEnd=m.findIndex((e,i)=>i>call&&e.type==="tool_execution_end"&&e.toolCallId===callId&&e.toolName===toolName);
+   const end=m.findIndex((e,i)=>i>toolEnd&&e.type==="agent_end");if(toolEnd<0||end<0)return false;
+   selected={response,user,call,callId,toolEnd,end};return true;
+  },`parent turn ${id}`,35000);
+  const result=toolName?events[selected.toolEnd]?.result:undefined;
+  turnTimelines.push({id,action:expected?.action,graphId:expected?.id??expected?.spec?.graphId,...selected,oldAgentEnds:events.slice(0,selected.user).filter(e=>e.type==="agent_end").length});
+  if(toolName)assert.ok(result,JSON.stringify(turnTimelines));return {result,events};
  }
  const graph=(arg:any)=>turn("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify(arg),"graph");
  const snapshot=(id:string)=>readFile(join(runs,id,"snapshot.json"),"utf8").then(JSON.parse);
@@ -110,6 +125,7 @@ test("real Pi: existing/new mailbox decisions, public reply, persistent declared
    assert.equal(requests.slice(before).filter(r=>r.task===status).length,1,"business/invalid results must never replay external operation");assert.equal(requests.slice(before).filter(r=>r.task==="DOWNSTREAM").length,0);
    assert.match(JSON.stringify((await turn("ORDINARY_PI_CHECK")).events),/ORDINARY_PI_OK/);
   }
+  console.log("HANDOFF_TURN_TIMELINES "+JSON.stringify(turnTimelines));
   console.log("HANDOFF_REAL_CLI_PASS existing/new wait -> parent result -> public reply -> child complete; evidence retained/read; blocked/fail/invalid gate without replay; ordinary input");
  }catch(error){throw new Error(`${String(error)}\n${stderr}\nRecent RPC=${JSON.stringify(messages.slice(-30).map(m=>({type:m.type,toolName:m.toolName,content:m.message?.content,result:m.result?.content})))}\nRequests=${JSON.stringify(requests.map(r=>({task:r.task,messages:r.body.messages.filter((m:any)=>m.role!=="system")})))}`,{cause:error});}
  finally{child.kill("SIGTERM");await Promise.race([new Promise<void>(r=>child.once("close",()=>r())),sleep(3000)]);if(child.exitCode===null)child.kill("SIGKILL");child.stdin.destroy();child.stdout.destroy();child.stderr.destroy();child.unref();server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));await rm(root,{recursive:true,force:true});}

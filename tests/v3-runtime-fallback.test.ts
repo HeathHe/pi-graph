@@ -23,31 +23,34 @@ function proof(binding: unknown) { return {version:1,runtimeKind:'pi-graph-sdk/1
  orphanToolResult:false, lateActivity:false, diagnostic:error, invalid:false, officialInProcess:true, controlledEnvironment:true,
  promptSettled:true, shutdownComplete:true, queuedInput:false, stopped:false, timedOut:false, interrupted:false, forced:false,
  diagnosticSource:"assistant_error", launches:1, graphBinding:binding}; }
-async function fixture(options: {budget?:number; image?:boolean; usageBudget?:any} = {}) {
+async function fixture(options: {budget?:number; image?:boolean; usageBudget?:any; exactRole?:boolean; primary?:string; explicitModel?:string; explicitThinking?:string; catalogProfiles?:string[]; omitCatalog?:boolean; invalidCatalog?:boolean; roleOverride?:any; quarantine?:string[]; fallbackTools?:string[]; fallbackAgent?:string; profileConstraints?:any; parentModel?:any; parentThinking?:string; mixed?:boolean; settingsPeer?:boolean; actualPreflight?:boolean} = {}) {
  const root = await realpath(await mkdtemp(join(tmpdir(), "graph-fallback-"))), source = join(root,"source");
  await mkdir(join(source,".pi/agents"),{recursive:true});
- await writeFile(join(source,".pi/agents/fallback-agent.md"),"---\nname: fallback-agent\ndescription: fixture\nmodel: kimi-coding/k3\nthinking: high\ntools: read\nextensions: \ninheritSkills: false\ninheritProjectContext: false\n---\nOnly the assigned task.\n");
+ await writeFile(join(source,".pi/agents/fallback-agent.md"),"---\nname: fallback-agent\ndescription: fixture\nmodel: kimi-coding/k3\nthinking: high\ntools: read\nextensions: \ninheritSkills: false\ninheritProjectContext: false\n---\nOnly the assigned task.\n".replace("model: kimi-coding/k3",`model: ${options.primary??(options.exactRole?"wisdomrouter/glm-5.3":"kimi-coding/k3")}`));
+ if(options.settingsPeer){const definition=await readFile(join(source,".pi/agents/fallback-agent.md"),"utf8");await writeFile(join(source,".pi/agents/settings-agent.md"),definition.replace("name: fallback-agent","name: settings-agent"));}
  const agents=await import('../src/runtime/agents.ts'), launch=agents;
  const def=launch.agentDefinitionDigest(agents.discoverAgents(source,"both").agents.find((a:any)=>a.name==="fallback-agent")!);
- await writeFile(join(root,"routing-policy.json"),JSON.stringify({schemaVersion:1,enforcement:"graph-admission",quarantinedProviderDomains:[],profiles:{"browser-operation":{budget:{modelDegradations:options.budget ?? 1},candidates:[{model:"kimi-coding/k3",thinking:"high",level:"L0"},{model:"xai/grok-4.7",thinking:"high",level:"L1"}]}}}));
- await writeFile(join(root,"subagent-capabilities.json"),JSON.stringify({schemaVersion:1,capabilities:[{capabilityId:"operate.browser",agent:"fallback-agent",routingProfile:"browser-operation"}]}));
- const bound=await bindGraphSpecWithRoutingV3({schemaVersion:3,graphId:"fallback",goal:"fixture",nodes:[{taskId:"node",requires:["operate.browser"],task:"FALLBACK_TASK",sideEffect:"none",...(options.usageBudget ? {usageBudget:options.usageBudget} : {})}]},{agentDir:root,cwd:source,disableNetwork:true,
-  availableModels:[{provider:"kimi-coding",id:"k3",input:["text","image"]},{provider:"xai",id:"grok-4.7",input:options.image === false ? ["text"] : ["text","image"]}],
-  preflightAgent:async i=>({ok:true,name:i.agent,agentDefinitionDigest:def,launchContractDigest:sha,model:`${i.model}:high`,modelCandidates:[`${i.model}:high`],thinking:"high",extensions:{runtimeExtensions:[],configuredExtensions:[],extensionArgs:[],disableAmbientExtensions:true},toolAllowlist:["read"],explicitToolAllowlist:true})});
+ await writeFile(join(root,"routing-policy.json"),JSON.stringify({schemaVersion:1,enforcement:"graph-admission",quarantinedProviderDomains:options.quarantine??[],profiles:{"browser-operation":{...(options.profileConstraints?{constraints:options.profileConstraints}:{}),budget:{modelDegradations:options.budget ?? 1},candidates:options.exactRole?[{model:"wisdomrouter/glm-5.3",thinking:"high",level:"L0"},{model:"kimi-coding/k3",thinking:"high",level:"L1"}]:[{model:"kimi-coding/k3",thinking:"high",level:"L0"},{model:"xai/grok-4.7",thinking:"high",level:"L1"}]}}}));
+ if(!options.omitCatalog)await writeFile(join(root,"subagent-capabilities.json"),JSON.stringify(options.invalidCatalog?{schemaVersion:999}:{schemaVersion:1,capabilities:(options.catalogProfiles??["browser-operation"]).map((routingProfile,index)=>({capabilityId:index===0?"operate.browser":`operate.browser.${index}`,agent:"fallback-agent",routingProfile}))}));
+ if(options.roleOverride||options.settingsPeer)await writeFile(join(root,"graph-models.json"),JSON.stringify({version:1,profiles:{},models:{},roles:{...(options.roleOverride?{"fallback-agent":options.roleOverride}:{}),...(options.settingsPeer?{"settings-agent":{model:"wisdomrouter/glm-5.3",fallbackModels:[],thinking:"high"}}:{})}}));
+ const bound=await bindGraphSpecWithRoutingV3({schemaVersion:3,graphId:"fallback",goal:"fixture",nodes:[{taskId:"node",...(options.exactRole?{agent:"fallback-agent",...(options.explicitModel?{model:options.explicitModel}:{}),...(options.explicitThinking?{thinking:options.explicitThinking}:{})}:{requires:["operate.browser"]}),task:"FALLBACK_TASK",sideEffect:"none",...(options.usageBudget ? {usageBudget:options.usageBudget} : {})},...(options.settingsPeer?[{taskId:"settings",agent:"settings-agent",task:"SETTINGS_TASK",sideEffect:"none" as const}]:[]),...(options.mixed?[{taskId:"cap",requires:["operate.browser"],task:"CAP_TASK",sideEffect:"none" as const}]:[])]},{agentDir:root,cwd:source,disableNetwork:true,...(options.parentModel?{parentModel:options.parentModel,parentThinking:options.parentThinking}:{}),
+  availableModels:[{provider:"wisdomrouter",id:"glm-5.3",reasoning:true,input:["text","image"]},{provider:"kimi-coding",id:"k3",reasoning:true,input:options.image===false&&options.exactRole?["text"]:["text","image"]},{provider:"xai",id:"grok-4.7",reasoning:true,input:options.image === false ? ["text"] : ["text","image"]}],
+  ...(options.actualPreflight?{}:{preflightAgent:async i=>({ok:true,name:options.exactRole&&i.model==="kimi-coding/k3"&&options.fallbackAgent?options.fallbackAgent:i.agent,agentDefinitionDigest:def,launchContractDigest:sha,model:`${i.model??options.primary??(options.exactRole?"wisdomrouter/glm-5.3":"kimi-coding/k3")}:${i.thinking??"high"}`,modelCandidates:[`${i.model}:high`],thinking:typeof i.thinking==="string"?i.thinking:"high",extensions:{runtimeExtensions:[],configuredExtensions:[],extensionArgs:[],disableAmbientExtensions:true},toolAllowlist:options.exactRole&&i.model==="kimi-coding/k3"&&options.fallbackTools?options.fallbackTools:["read"],explicitToolAllowlist:true})})});
  const graph=compileGraphSpecV3(bound.spec), runDir=join(root,"runs/fallback/instance");
  await mkdir(join(root,"runs"),{recursive:true});
  const init=await initializeV3Run({trustedRoot:join(root,"runs"),runDir,graph,sessionId:"session",supervisorEpoch:"epoch",sourceCwd:source,runInstanceId:"instance"});
  const mock=new MockSubagents();mock.start();
  const runner=new V3GraphRunner({graph,runDir,rpc:new SubagentRpcClient(mock),authorization:init.authorization,sourceCwd:source,sessionId:"session",supervisorEpoch:"epoch",preflightAgent:async()=>{}});
- return {root,source,graph,runDir,init,mock,runner};
+ return {root,source,graph,runDir,init,mock,runner,bound};
 }
 async function providerFailure(input: Parameters<MockChildBehavior>[0], change?: (p:any)=>void, changeResult?: (r:any)=>void) {
  const status=JSON.parse(await readFile(join(input.asyncDir,"status.json"),"utf8")), runner=`runner-${input.asyncId}`;
  const p:any={...proof((input.params.extensionBindings as any)["pi-graph/1"]),runId:input.asyncId,stepIndex:0,agent:"fallback-agent",launchContractDigest:sha};change?.(p);
- status.runtimeKind="pi-graph-sdk/1";status.runnerProcessInstanceId=runner;status.steps=[{toolCount:0}];status.state="failed";status.error=error;status.processTerminal={runnerProcessInstanceId:runner};
+ const diagnostic=typeof p.diagnostic === "string" ? p.diagnostic : error;
+ status.runtimeKind="pi-graph-sdk/1";status.runnerProcessInstanceId=runner;status.steps=[{toolCount:0}];status.state="failed";status.error=diagnostic;status.processTerminal={runnerProcessInstanceId:runner};
  await writeFile(join(input.asyncDir,"status.json"),JSON.stringify(status));
  await mkdir(nativeResultsDir(),{recursive:true});
- const result:any={agent:"fallback-agent",requestedModel:input.params.model,model:input.params.model,launchContractDigest:sha,toolCount:0,preActivityEvidence:p,error,output:"",success:false};changeResult?.(result);
+ const result:any={agent:"fallback-agent",requestedModel:input.params.model,model:input.params.model,launchContractDigest:sha,toolCount:0,preActivityEvidence:p,error:diagnostic,output:"",success:false};changeResult?.(result);
  await writeFile(join(input.asyncDir,"result.json"),JSON.stringify({runId:input.asyncId,asyncDir:input.asyncDir,sessionId:status.sessionId,state:"failed",success:false,results:[result]}));
  await writeFile(join(input.asyncDir,"process-terminal.json"),JSON.stringify({version:1,runtimeKind:"pi-graph-sdk/1",state:"observed",runId:input.asyncId,runnerProcessInstanceId:runner,observedAt:Date.now(),instances:[{kind:"runner",processInstanceId:runner,closeObservedAt:Date.now(),exitCode:0,signal:null}]}));
 }
@@ -184,4 +187,119 @@ test("provider quota proof cannot hide model validation or tracked mutation fail
   const f=await fixture();f.mock.behaviors.set("FALLBACK_TASK",i=>providerFailure(i,undefined,changeResult));
   try {assert.equal((await f.runner.run()).status,"failed");assert.equal(f.mock.spawned.length,1);assert.equal((await readV3AttemptEvidence(f.runDir,"node",1))?.fallbackContinuation,undefined);}finally{await f.mock.dispose();}
  }
+});
+
+const weeklyError = `403 {"error":{"type":"permission_error","message":"You've reached your weekly (7-day) usage limit."}}`;
+const refreshNetworkError = "OAuth refresh failed for xai: fetch failed";
+const subscriptionError = '400 {"error":{"code":"InvalidSubscription","message":"CodingPlan subscription invalid"}}';
+for (const [diagnostic,kind] of [[weeklyError,"quota"],[refreshNetworkError,"provider"],[subscriptionError,"auth"]]) {
+ test(`authoritative provider diagnostic classifies ${kind} and frozen zero-activity proof permits one alternate: ${diagnostic}`,async()=>{
+  assert.deepEqual(classifyProviderFailure(diagnostic!),{eligible:true,kind});
+  const f=await fixture();f.mock.behaviors.set("FALLBACK_TASK",i=>f.mock.spawned.length===1?providerFailure(i,p=>{p.diagnostic=diagnostic;}):completeChild({...i,output:"accepted"}));
+  try {assert.equal((await f.runner.run()).status,"complete");assert.equal(f.mock.spawned.length,2);assert.equal((await readV3AttemptEvidence(f.runDir,"node",1))?.fallbackContinuation?.failureKind,kind);}
+  finally {await f.mock.dispose();}
+ });
+}
+for (const diagnostic of ["HTTP 403 Forbidden","403 WAF access denied","parse 429 in file","task text: "+weeklyError,"tool error: "+refreshNetworkError,"aborted "+weeklyError,"terminated","request timeout","CodingPlan documentation", "OAuth refresh failed for xai: unknown error"]) {
+ test(`non-provider diagnostic cannot authorize fallback: ${diagnostic}`,()=>assert.equal(classifyProviderFailure(diagnostic).eligible,false));
+}
+for (const [name,change,changeResult] of [
+ ["45 tools",(p:any)=>{p.toolsStarted=45;},(r:any)=>{r.toolCount=45;}],
+ ["forced",(p:any)=>{p.forced=true;},undefined],
+ ["timed out",(p:any)=>{p.timedOut=true;},undefined],
+ ["partial result",undefined,(r:any)=>{r.outputPartial=true;}],
+ ["file mutation evidence",undefined,(r:any)=>{r.effects={fileMutation:true};}],
+] as Array<[string,((p:any)=>void)|undefined,((r:any)=>void)|undefined]>) {
+ test(`weekly quota cannot replay ${name}`,async()=>{
+  const f=await fixture();f.mock.behaviors.set("FALLBACK_TASK",i=>providerFailure(i,p=>{p.diagnostic=weeklyError;change?.(p);},changeResult));
+  try {assert.equal((await f.runner.run()).status,"failed");assert.equal(f.mock.spawned.length,1);assert.equal((await readV3AttemptEvidence(f.runDir,"node",1))?.fallbackContinuation,undefined);}finally{await f.mock.dispose();}
+ });
+}
+
+test("exact role infers unique existing profile, preserves default GLM and freezes official Kimi without inventing capabilities",async()=>{
+ const f=await fixture({exactRole:true});
+ try {
+  const node=f.graph.nodes[0]!;assert.equal(node.launch?.requestedModel,"wisdomrouter/glm-5.3");
+  assert.deepEqual(node.launch?.runtimeFallback?.candidates.map(c=>c.requestedModel),["wisdomrouter/glm-5.3","kimi-coding/k3"]);
+  assert.equal(node.binding?.catalogDigest,undefined,"exact authoring must not become a capability grant");
+  assert.equal(f.bound.routingAdmission.catalogDigest,undefined);assert.match(f.bound.routingAdmission.inferredCatalogDigest!,/^[a-f0-9]{64}$/);assert.equal(f.bound.routingAdmission.decisions[0]?.inferredFromExactRole,true);assert.deepEqual(f.bound.routingAdmission.decisions[0]?.capabilityIds,[]);
+  f.mock.behaviors.set("FALLBACK_TASK",i=>f.mock.spawned.length===1?providerFailure(i,p=>{p.diagnostic=subscriptionError;}):completeChild({...i,output:"accepted"}));
+  assert.equal((await f.runner.run()).status,"complete");assert.deepEqual(f.mock.spawned.map(s=>s.params.model),["wisdomrouter/glm-5.3:high","kimi-coding/k3:high"]);
+ }finally{await f.mock.dispose();}
+});
+for(const [name,options] of [
+ ["explicit Kimi never returns backwards to GLM",{explicitModel:"kimi-coding/k3"}],
+ ["ambiguous catalog profile",{catalogProfiles:["browser-operation","other-profile"]}],
+ ["missing catalog",{omitCatalog:true}],
+ ["invalid optional catalog",{invalidCatalog:true}],
+ ["primary outside profile",{primary:"xai/grok-4.7"}],
+ ["explicit thinking conflict",{explicitThinking:"low"}],
+ ["zero budget",{budget:0}],
+ ["quarantined alternate",{quarantine:["kimi-coding"]}],
+ ["alternate image capability missing",{image:false}],
+ ["alternate tool permissions differ",{fallbackTools:["read","bash"]}],
+ ["alternate resolves different role",{fallbackAgent:"other-agent"}],
+ ["alternate conflicts with actual producer family",{profileConstraints:{requireCrossFamilyFromProducers:true,producerSource:"active_main"},parentModel:{provider:"kimi-coding",id:"k3"}}],
+ ["explicit settings empty chain",{roleOverride:{model:"wisdomrouter/glm-5.3",fallbackModels:[],thinking:"high"}}],
+] as Array<[string,any]>) {
+ test(`exact role leaves no fallback when ${name}`,async()=>{
+  const f=await fixture({exactRole:true,...options});try{
+   assert.equal(f.graph.nodes[0]!.launch?.runtimeFallback,undefined);
+   const expected=options.explicitModel??options.primary??"wisdomrouter/glm-5.3";const resolved=f.graph.nodes[0]!.launch?.resolvedModel;
+   if(resolved)assert.equal(resolved.split(":")[0],expected);
+   else {assert.equal(f.graph.nodes[0]!.launch,undefined,"unrouted fixed role stays unfrozen as before");assert.match(await readFile(join(f.source,".pi/agents/fallback-agent.md"),"utf8"),new RegExp(`model: ${expected.replaceAll(".","\\.")}`));}
+  }finally{await f.mock.dispose();}
+ });
+}
+
+test("mixed exact-role inference and real capability preserve strict captured catalog binding",async()=>{
+ const f=await fixture({exactRole:true,mixed:true});try {
+  assert.equal(f.bound.routingAdmission.catalogDigest,f.bound.catalog?.digest);
+  assert.equal(f.bound.routingAdmission.inferredCatalogDigest,undefined);
+  const exact=f.bound.spec.nodes.find(n=>n.taskId==="node")!,cap=f.bound.spec.nodes.find(n=>n.taskId==="cap")!;
+  assert.equal(exact.binding?.catalogDigest,undefined);assert.equal(cap.binding?.catalogDigest,f.bound.routingAdmission.catalogDigest);
+  assert.equal(f.bound.routingAdmission.decisions.find(d=>d.taskId==="node")?.inferredFromExactRole,true);
+  assert.deepEqual(f.bound.routingAdmission.decisions.find(d=>d.taskId==="cap")?.capabilityIds,["operate.browser"]);
+  assert.equal(exact.launch?.runtimeFallback?.candidates[1]?.requestedModel,"kimi-coding/k3");
+ }finally {await f.mock.dispose();}
+});
+
+test("pure exact inferred node coexists with explicit configured role and empty fallback chain",async()=>{
+ const f=await fixture({exactRole:true,settingsPeer:true});try{
+  assert.equal(f.bound.routingAdmission.catalogDigest,undefined);assert.match(f.bound.routingAdmission.inferredCatalogDigest!,/^[a-f0-9]{64}$/);
+  const configured=f.bound.routingAdmission.decisions.find(d=>d.taskId==="settings")!;
+  assert.equal(configured.profile,"role-settings:settings-agent");assert.equal(configured.inferredFromExactRole,undefined);assert.equal(configured.runtimeFallback,undefined);
+  const node=f.bound.spec.nodes.find(n=>n.taskId==="settings")!;assert.equal(node.launch?.requestedModel,"wisdomrouter/glm-5.3");assert.equal(node.binding?.catalogDigest,undefined);assert.equal(node.launch?.runtimeFallback,undefined);
+  assert.equal(f.bound.spec.nodes.find(n=>n.taskId==="node")?.launch?.runtimeFallback?.candidates[1]?.requestedModel,"kimi-coding/k3");
+ }finally{await f.mock.dispose();}
+});
+test("malformed catalog still fails closed for real required capabilities",async()=>{
+ await assert.rejects(fixture({invalidCatalog:true}),/schemaVersion 1 capability list/);
+});
+
+test("actual owned launch preflight admits inferred GLM role and official Kimi with immutable role/tool identities",async()=>{
+ const f=await fixture({exactRole:true,actualPreflight:true});try{
+  const node=f.graph.nodes[0]!,plan=node.launch?.runtimeFallback!;
+  assert.equal(node.launch?.requestedModel,"wisdomrouter/glm-5.3");assert.equal(node.launch?.thinking,"high");
+  assert.deepEqual(plan.candidates.map(c=>c.requestedModel),["wisdomrouter/glm-5.3","kimi-coding/k3"]);
+  assert.ok(plan.candidates.every(c=>c.agentDefinitionDigest===node.binding?.agentDefinitionDigest));
+  assert.match(plan.candidates[1]!.admissionLaunchContractDigest,/^[a-f0-9]{64}$/);const {v3PreflightAgentLaunch}=await import("../src/v3/preflight.ts");
+  const checked=await v3PreflightAgentLaunch({agent:"fallback-agent",cwd:f.source,task:"FALLBACK_TASK",model:"wisdomrouter/glm-5.3",thinking:"high",availableModels:[{provider:"wisdomrouter",id:"glm-5.3",reasoning:true,input:["text","image"]}]});
+  assert.equal(checked.ok,true);if(checked.ok)assert.deepEqual(checked.toolAllowlist,["read"]);
+ }finally{await f.mock.dispose();}
+});
+
+
+test("explicit role fallback: GLM subscription -> Kimi quota -> configured third model, exactly three attempts",async()=>{
+ const f=await fixture({exactRole:true,parentModel:{provider:'xai',id:'grok-4.7'},parentThinking:'low',roleOverride:{model:'wisdomrouter/glm-5.3',fallbackModels:['kimi-coding/k3','xai/grok-4.7'],thinking:'high'}});
+ f.mock.behaviors.set('FALLBACK_TASK',async i=>f.mock.spawned.length<3?providerFailure(i,p=>{p.diagnostic=f.mock.spawned.length===1?'400 InvalidSubscription CodingPlan subscription invalid':error;}):completeChild({...i,output:'accepted'}));
+ try{assert.equal((await f.runner.run()).status,'complete');assert.deepEqual(f.mock.spawned.map(s=>s.params.model),['wisdomrouter/glm-5.3:high','kimi-coding/k3:high','xai/grok-4.7:high']);assert.equal(f.graph.nodes[0]!.launch!.runtimeFallback!.modelDegradations,2);}finally{await f.mock.dispose();}
+});
+for(const active of [false,true])test(`strict provider Connection error. ${active?'with tool activity does not switch':'with complete zero-activity evidence switches'}`,async()=>{
+ const f=await fixture();f.mock.behaviors.set('FALLBACK_TASK',async i=>f.mock.spawned.length===1?providerFailure(i,p=>{p.diagnostic='Connection error.';if(active)p.toolsStarted=1;}):completeChild({...i,output:'accepted'}));
+ try{const result=await f.runner.run();assert.equal(f.mock.spawned.length,active?1:2);if(!active)assert.equal(result.status,'complete');}finally{await f.mock.dispose();}
+});
+test('Connection error classification is exact and does not accept tool/task/abort prose',()=>{
+ assert.deepEqual(classifyProviderFailure('Connection error.'),{eligible:true,kind:'provider'});
+ for(const message of ['tool error: Connection error.','task text: Connection error.','user asked Connection error.','Connection error. cancelled','Connection error during read','timeout','terminated'])assert.equal(classifyProviderFailure(message).eligible,false);
 });

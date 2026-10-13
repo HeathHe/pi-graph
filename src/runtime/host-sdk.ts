@@ -54,3 +54,12 @@ export function assertHostModelRuntimeCapabilities(runtime:any):void {
  const missing=['getModels','registerProvider','registerNativeProvider','getAuth','hasConfiguredAuth','refresh'].filter(name=>typeof runtime?.[name]!=='function');
  if(missing.length)throw new Error(`Host Pi SDK model runtime is incompatible: missing required APIs ${missing.join(', ')}. No child prompt was started.`);
 }
+
+/** Continuation is opt-in: legacy child capability requirements stay unchanged. */
+export function assertContinuationCapabilities(sdk:any,session:any):void {
+ const missing=['setModel','setThinkingLevel','waitForIdle'].filter(k=>typeof session?.[k]!=='function');
+ if(typeof sdk?.SessionManager?.open!=='function')missing.push('SessionManager.open');
+ if(typeof session?.isIdle!=='boolean')missing.push('isIdle');
+ if(typeof session?.sessionManager?.getSessionId!=='function'||typeof session?.sessionManager?.buildSessionContext!=='function')missing.push('session identity/context');
+ if(missing.length)throw Error('Host SDK cannot safely continue sessions: '+missing.join(', '));
+}

@@ -1,3 +1,5 @@
+import {confirmedProcessExit} from "./supervision.ts";
+import {validateContinuationResult} from "../runtime/session-continuation.ts";
 import { constants } from "node:fs";
 import { open, lstat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -47,6 +49,7 @@ function within(root: string, target: string): boolean {
 function receiptDigest(completion: RecordValue): string {
  // Delivery annotations and summaries may differ between file and event.
  return canonicalDigest({ state: completion.state, success: completion.success ?? null, results: completion.results.map((r: RecordValue) => ({
+  ...(r.continuationEvidence?{continuation:r.continuationEvidence,model:r.model,thinking:r.thinking,tokens:r.tokens,totalCost:r.totalCost,toolCount:r.toolCount,turnCount:r.turnCount,actualModelDefinition:r.actualModelDefinition}:{}),
   output: r.finalOutput, success: r.success ?? null, error: r.error ?? null,
   timedOut: r.timedOut === true, stopped: r.stopped === true, interrupted: r.interrupted === true, skipped: r.skipped === true,
  })) });
@@ -114,6 +117,7 @@ function withReceiptWrite<T>(path: string | undefined, run: () => Promise<T>): P
 }
 async function captureNativeResultUnlocked(identity: NativeRunIdentity, path: string | undefined, status: RecordValue,
  raw: RecordValue, source: NativeReceipt["source"]): Promise<NativeReceipt | undefined> {
+ if(status.runtimeKind==='pi-graph-sdk/1'){if(!status.processTerminal?.runnerProcessInstanceId)return undefined;const intent=await readNativeJson(join(identity.asyncDir,'intent.json'));if(intent?.continuation){const sealed=await readNativeJson(join(identity.asyncDir,'generation-state.json'));if(sealed?.state!=='sealed')return undefined;const exit=await readNativeJson(join(identity.asyncDir,'process-terminal.json'));if(!confirmedProcessExit(exit,identity.asyncId,status.processTerminal.runnerProcessInstanceId)||exit?.generation!==sealed.generation||exit?.ledgerDigest!==sealed.ledgerDigest||status.processTerminal.generation!==sealed.generation||status.processTerminal.ledgerDigest!==sealed.ledgerDigest)throw Error('Continuation final generation exit proof mismatch');validateContinuationResult(intent,raw.results?.[0]);if(sealed.ledgerDigest!==raw.results?.[0]?.continuationEvidence?.digest)throw Error('Continuation result does not match terminal seal');}}
  if ((raw.runId ?? raw.id) !== identity.asyncId || status.runId !== identity.asyncId) return undefined;
  if (raw.asyncDir !== undefined && raw.asyncDir !== identity.asyncDir) return undefined;
  if (typeof status.sessionId !== "string" || !status.sessionId || raw.sessionId !== status.sessionId) return undefined;
@@ -163,6 +167,8 @@ async function reconcileNativeResultUnlocked(identity: NativeRunIdentity, path: 
  // Owned worker may publish output just before its guardian observes physical close.
  // Freeze the receipt only after that independent lifecycle evidence is available.
  if(status.runtimeKind==='pi-graph-sdk/1'&&!status.processTerminal?.runnerProcessInstanceId)return undefined;
+ const intent= status.runtimeKind==='pi-graph-sdk/1'?await readNativeJson(join(identity.asyncDir,'intent.json')):undefined;
+ if(intent?.continuation){const state=await readNativeJson(join(identity.asyncDir,'generation-state.json'));if(state?.state!=='sealed')return undefined;const exit=await readNativeJson(join(identity.asyncDir,'process-terminal.json'));if(!confirmedProcessExit(exit,identity.asyncId,status.processTerminal.runnerProcessInstanceId)||exit?.generation!==state.generation||exit?.ledgerDigest!==state.ledgerDigest)throw Error('Continuation terminal exit mismatch');const result=await readNativeJson(join(identity.asyncDir,'result.json'));validateContinuationResult(intent,result?.results?.[0]);if(state.ledgerDigest!==result?.results?.[0]?.continuationEvidence?.digest)throw Error('Continuation terminal seal mismatch');}
  if (path) { const receipt = await readNativeReceipt(identity, path, status); if (receipt) return receipt; }
  if (event) { const receipt = await captureNativeResultUnlocked(identity, path, status, event, "event"); if (receipt) return receipt; }
  const owned = await readNativeJson(join(identity.asyncDir, 'result.json'));

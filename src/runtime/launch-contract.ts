@@ -1,3 +1,4 @@
+import {assertChildModelAllowed,readChildModelPolicy} from './child-model-policy.ts';
 import {normalizeExtensionBindings} from './extension-bindings.ts';
 import {readCustomGraphModels,validateCustomGraphModel} from "./custom-models.ts";
 import {readRoleModelOverride} from "./settings.ts";
@@ -59,6 +60,7 @@ function enforceScope(scope:any,name:string,model:string,input:LaunchContractInp
  if(!allowedFor(scope.allow)||!allowedFor(scope.agents?.[name]?.allow))throw new Error(`Model '${model}' is outside the configured Agent model scope.`);
 }
 export async function resolveSubagentLaunchContract(input:LaunchContractInput) {
+ let attemptedModel:string|undefined,attemptedAgent:string|undefined,attemptedAgentDefinitionDigest:string|undefined,attemptedThinking:string|undefined;
  try{normalizeExtensionBindings(input.extensionBindings);}catch(error){return {ok:false as const,code:"invalid_extension_bindings",message:error instanceof Error?error.message:String(error),diagnostics:[]};}
  try{
   const customModelDefinitions=(input.customModelDefinitions as unknown[]|undefined)?.map(validateCustomGraphModel)??readCustomGraphModels(input.cwd);
@@ -70,20 +72,24 @@ export async function resolveSubagentLaunchContract(input:LaunchContractInput) {
   const matches=exact?[exact]:discovered.agents.filter(a=>a.localName===input.agent||a.aliases?.includes(input.agent));
   if(matches.length!==1)throw new Error(matches.length?`Agent '${input.agent}' is ambiguous; use its qualified name.`:`Agent '${input.agent}' was not found. ${discovered.agentDiagnostics.map(d=>d.message).join(" ")}`);
   const a=matches[0]!;
+  const childModelPolicy=readChildModelPolicy(input.cwd,a.name);
   if(a.runner!==undefined&&typeof a.runner!=="string"&&(a.runner as any)?.type!=="pi")throw new Error(`Agent '${a.name}' declares an unsupported external runner.`);
   if(typeof a.runner==="string"&&a.runner!=="pi")throw new Error(`Agent '${a.name}' declares an unsupported external runner.`);
   if(a.fast===true)throw new Error("Fast provider overrides are not supported by the owned Graph child runtime.");
   const override=readRoleModelOverride(a.name,input.cwd);
   const selected=input.model??override?.model??a.model??(input.parentModel?`${input.parentModel.provider}/${input.parentModel.id}`:undefined);
   let model:string|undefined, suffixThinking:string|undefined;
-  if(selected){const parsed=splitModel(selected);model=chooseModel(parsed.id,input,a);suffixThinking=parsed.thinking;enforceScope(discovered.modelScope,a.name,model,input);}
+  attemptedAgent=a.name;attemptedAgentDefinitionDigest=agentDefinitionDigest(a);
+  const selectedThinking=input.thinking===false?"off":input.thinking??(selected?splitModel(selected).thinking:undefined)??override?.thinking??a.thinking;
+  attemptedThinking=selectedThinking===false?"off":selectedThinking;
+  if(selected){const parsed=splitModel(selected);attemptedModel=parsed.id.includes("/")?parsed.id:undefined;model=chooseModel(parsed.id,input,a);attemptedModel=model;suffixThinking=parsed.thinking;assertChildModelAllowed(model,childModelPolicy);enforceScope(discovered.modelScope,a.name,model,input);}
   const thinking=input.thinking===false?"off":input.thinking??suffixThinking??override?.thinking??a.thinking;
   if(thinking!==undefined&&thinking!==false&&!THINKING.includes(thinking))throw new Error(`Invalid thinking level '${thinking}'.`);
   if(thinking&&discovered.maxThinking&&THINKING.indexOf(thinking)>THINKING.indexOf(discovered.maxThinking))throw new Error("Thinking exceeds the configured maximum.");
   const plan=resolvePiLaunchToolPlan({cwd:resolve(input.cwd),agentName:a.name,tools:a.tools,excludeTools:a.excludeTools,extensions:a.extensions,subagentOnlyExtensions:a.subagentOnlyExtensions,mcpDirectTools:a.mcpDirectTools as string[]|undefined,permissionRules:a.permissions??a.permission,capabilityCeiling:input.capabilityCeiling,inheritedCapabilityCeiling:input.inheritedCapabilityCeiling,requiredExtensions:input.requiredExtensions});
   const definitionDigest=agentDefinitionDigest(a);
-  const launchContractDigest=stableJsonDigest({version:1,definitionDigest,task:input.task,model,thinking,tools:plan.effectiveToolAllowlist,extensions:plan.extensionArgs,disableAmbientExtensions:plan.disableAmbientExtensions,capabilityCeiling:plan.effectiveCapabilityCeiling,systemPromptMode:a.systemPromptMode,inheritProjectContext:a.inheritProjectContext,inheritGlobalContext:a.inheritGlobalContext,inheritSkills:a.inheritSkills,customModelDefinitions});
-  const contract={version:1,...(customModelDefinitions.length?{customModelDefinitions}:{}),agent:{name:a.name,localName:a.localName,source:a.source,filePath:a.filePath,definitionDigest},context:"fresh",model,modelCandidates:model?[model]:[],thinking:thinking===false?"off":thinking,systemPromptMode:a.systemPromptMode,inheritProjectContext:a.inheritProjectContext,inheritGlobalContext:a.inheritGlobalContext,inheritSkills:a.inheritSkills,tools:{...plan,effectiveAllowlist:plan.effectiveToolAllowlist,explicitAllowlist:plan.explicitToolAllowlist},roots:{cwd:resolve(input.cwd)},launchContractDigest,digest:launchContractDigest};
+  const launchContractDigest=stableJsonDigest({version:1,definitionDigest,task:input.task,model,thinking,tools:plan.effectiveToolAllowlist,extensions:plan.extensionArgs,disableAmbientExtensions:plan.disableAmbientExtensions,capabilityCeiling:plan.effectiveCapabilityCeiling,systemPromptMode:a.systemPromptMode,inheritProjectContext:a.inheritProjectContext,inheritGlobalContext:a.inheritGlobalContext,inheritSkills:a.inheritSkills,customModelDefinitions,...(childModelPolicy.denyFamilies.length?{childModelPolicy}:{})});
+  const contract={version:1,...(childModelPolicy.denyFamilies.length?{childModelPolicy}:{}),...(customModelDefinitions.length?{customModelDefinitions}:{}),agent:{name:a.name,localName:a.localName,source:a.source,filePath:a.filePath,definitionDigest},context:"fresh",model,modelCandidates:model?[model]:[],thinking:thinking===false?"off":thinking,systemPromptMode:a.systemPromptMode,inheritProjectContext:a.inheritProjectContext,inheritGlobalContext:a.inheritGlobalContext,inheritSkills:a.inheritSkills,tools:{...plan,effectiveAllowlist:plan.effectiveToolAllowlist,explicitAllowlist:plan.explicitToolAllowlist},roots:{cwd:resolve(input.cwd)},launchContractDigest,digest:launchContractDigest};
   return {ok:true as const,contract};
- }catch(e){return {ok:false as const,code:"invalid_launch",message:e instanceof Error?e.message:String(e),diagnostics:[]};}
+ }catch(e){return {ok:false as const,code:"invalid_launch",message:e instanceof Error?e.message:String(e),diagnostics:[],attemptedModel,attemptedAgent,attemptedAgentDefinitionDigest,attemptedThinking};}
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -64,6 +64,8 @@ async function run(): Promise<number> {
 	const hostTempRoot = resolve(tmpdir());
 	const sandboxRoot = await mkdtemp(join(hostTempRoot, "pi-graph-test-sandbox-"));
 	assert.ok(isWithin(hostTempRoot, sandboxRoot) && resolve(sandboxRoot) !== hostTempRoot, "Refusing an unsafe test sandbox path.");
+	const isolatedAgentDir = join(sandboxRoot, "pi-agent");
+	await mkdir(isolatedAgentDir, { mode: 0o700 });
 	const guardUrl = pathToFileURL(join(testsDir, "assert-isolated-temp.ts")).href;
 	try {
 		const argumentsForChild = await childArguments(mode, process.argv.slice(3), guardUrl);
@@ -73,6 +75,7 @@ async function run(): Promise<number> {
 			detached: process.platform !== "win32",
 			env: {
 				...process.env,
+				PI_CODING_AGENT_DIR: isolatedAgentDir,
 				TMPDIR: sandboxRoot,
 				TMP: sandboxRoot,
 				TEMP: sandboxRoot,

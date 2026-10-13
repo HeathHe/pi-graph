@@ -315,3 +315,25 @@ test("missing final results return a Graph attention hint without stopping or cl
  assert.equal(s.nodes.worker.phase, "running");
  assert.match(nodeReason(s,"worker",s.nodes.worker), /缺少最终结果/);
 });
+
+test("provider UI distinguishes refresh transport, invalid credentials, weekly quota, subscription and termination",()=>{
+ const {errorSummary,nodeNextStep,localAuthLines}=jiti("../src/v3/ui/presentation.ts") as any;
+ const {isAuthError}=jiti("../src/v3/ui/auth-view.ts") as any;
+ const s=snapshot(),n=s.nodes.research;
+ const network="OAuth refresh failed for xai: fetch failed";
+ n.observation.supervision.error=network;
+ assert.equal(isAuthError(network),false);
+ assert.match(errorSummary(network),/续期时网络连接失败.*尚未确认/);
+ assert.deepEqual(localAuthLines(s,"research",n),[]);
+ assert.match(nodeNextStep(s,"research",n),/不能证明登录失效.*剩余工作.*不整项盲重跑/);
+ const invalid="OAuth refresh failed for xai: invalid_grant: Invalid or unknown refresh token";
+ assert.equal(isAuthError(invalid),true);assert.equal(errorSummary(invalid),"当次执行时登录凭据失效");
+ assert.equal(isAuthError("OAuth refresh failed for xai: fetch failed invalid_grant"),true);
+ const quota="403 You've reached your weekly (7-day) usage limit";
+ n.observation.supervision.error=quota;assert.equal(isAuthError(quota),false);assert.match(errorSummary(quota),/使用额度已耗尽/);assert.match(nodeNextStep(s,"research",n),/额度恢复时间.*剩余工作.*不整项盲重跑/);
+ assert.equal(errorSummary('400 {"error":{"code":"InvalidSubscription"}}'),"当次模型请求被拒绝：订阅不可用");
+ n.observation.supervision.error="HTTP 429 rate limit exceeded";assert.match(nodeNextStep(s,"research",n),/重试提示/);assert.doesNotMatch(nodeNextStep(s,"research",n),/额度恢复时间/);
+ n.observation.supervision.error="terminated";assert.match(nodeNextStep(s,"research",n),/剩余工作.*不要整项盲重跑/);
+ n.observation.supervision.error="runtime incompatible";assert.match(nodeNextStep(s,"research",n),/当前 Pi SDK.*自有运行器/);assert.doesNotMatch(nodeNextStep(s,"research",n),/pi-subagents/);
+ assert.equal(errorSummary("HTTP 403 WAF Forbidden"),"HTTP 403 WAF Forbidden");
+});

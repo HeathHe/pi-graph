@@ -1,3 +1,4 @@
+import {validateLatestModelPolicy,MAX_MODEL_DEGRADATIONS,modelFamilyId,candidateMeetsRequirements,validateModelRequirements} from '../runtime/model-capabilities.ts';
 import { controlledV3FrozenAgent } from "./workspace.ts";
 import { join } from "node:path";
 import { canonicalDigest } from "./digests.ts";
@@ -10,23 +11,25 @@ import { v3NodeAttemptDir, readLatestV3Attempt, readV3AttemptEvidence } from "./
 const SHA = /^[a-f0-9]{64}$/;
 export function validateRuntimeFallbackPlan(value: unknown): asserts value is V3RuntimeFallbackPlan {
  const p = value as V3RuntimeFallbackPlan | undefined;
- if (!p || p.version !== 1 || typeof p.profile !== "string" || !p.profile || !Number.isSafeInteger(p.modelDegradations)
-  || p.modelDegradations < 1 || p.modelDegradations > 8 || !Array.isArray(p.candidates)
+ if (!p || p.version !== 1 || (p.sessionContinuationVersion!==undefined&&p.sessionContinuationVersion!==1) || typeof p.profile !== "string" || !p.profile || !Number.isSafeInteger(p.modelDegradations)
+  || p.modelDegradations < 1 || p.modelDegradations > MAX_MODEL_DEGRADATIONS || !Array.isArray(p.candidates)
   || p.candidates.length < 2 || p.candidates.length > p.modelDegradations + 1
   || !Array.isArray(p.excludedFamilies) || p.excludedFamilies.some(f => typeof f !== "string")
   || typeof p.requireCrossFamilyFromProducers !== "boolean" || !SHA.test(p.digest)) throw new Error("Invalid frozen runtime fallback plan.");
  const {digest, ...base} = p;
  if (canonicalDigest(base) !== digest) throw new Error("Runtime fallback plan digest mismatch.");
+ if(p.requirements!==undefined)validateModelRequirements(p.requirements);
+ validateLatestModelPolicy(p,p.candidates);
  const models = new Set<string>();
  for (const c of p.candidates) {
   if (!c || typeof c.requestedModel !== "string" || !c.requestedModel.includes("/") || typeof c.resolvedModel !== "string"
    || !c.resolvedModel || !SHA.test(c.agentDefinitionDigest) || !SHA.test(c.admissionLaunchContractDigest)
    || (c.thinking !== undefined && c.thinking !== false && typeof c.thinking !== "string") || models.has(c.requestedModel)
-   || (/kimi/i.test(c.requestedModel) && (c.requestedModel !== "kimi-coding/k3" || !/^kimi-coding\/k3(?::(?:off|minimal|low|medium|high|xhigh|max))?$/.test(c.resolvedModel)))) throw new Error("Invalid frozen runtime fallback candidate.");
+   || !candidateMeetsRequirements(c,p.requirements)) throw new Error("Invalid frozen runtime fallback candidate.");
   models.add(c.requestedModel);
  }
 }
-export function runtimeModelFamily(model: string): string { return model.slice(model.indexOf("/") + 1).split(/[-_.:]/)[0]!.toLowerCase(); }
+export function runtimeModelFamily(model: string): string { return modelFamilyId(model); }
 
 /** Verify a complete host-side native proof, never task output or a displayed count. */
 export function validateNativePreActivityProof(input: {
@@ -118,4 +121,17 @@ export async function selectedRuntimeNode(runDir: string, node: CompiledGraphNod
  const launch = {...base, requestedModel:c.requestedModel, resolvedModel:c.resolvedModel,
   ...(c.thinking === undefined ? {} : {thinking:c.thinking})};
  return {...node, launch:{...launch, hintDigest:canonicalDigest(launch)}};
+}
+
+/** Frozen from accepted dependency evidence, never from task text or declared route hints. */
+export async function continuationProducerConstraints(runDir:string,node:CompiledGraphNodeV3){
+ const required=node.launch?.runtimeFallback?.requireCrossFamilyFromProducers===true;
+ const dependencies:Array<{taskId:string;attempt:number;actualModel:string;family:string;evidenceDigest:string}>=[];
+ if(required)for(const taskId of node.dependsOn){
+  const producer=await readLatestV3Attempt(runDir,taskId),e=producer?.evidence;
+  const actualModel=e?.child?.observation?.actualModel;
+  if(!e||e.phase!=='accepted'||!actualModel)throw Error('Accepted producer actual-model evidence is required for session continuation');
+  dependencies.push({taskId,attempt:e.attempt,actualModel,family:runtimeModelFamily(actualModel),evidenceDigest:canonicalDigest(e)});
+ }
+ return {version:1,required,dependencies};
 }
