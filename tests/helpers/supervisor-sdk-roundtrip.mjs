@@ -4,9 +4,9 @@ const T=process.env.PI_GRAPH_FIXTURE_EVIDENCE_DIR ?? fs.mkdtempSync(path.join(os
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'graph-supervisor-sdk-')));
 process.env.PI_CODING_AGENT_DIR=path.join(root,'agent');process.env.PI_GRAPH_RUNTIME_ROOT=path.join(root,'native');fs.mkdirSync(process.env.PI_CODING_AGENT_DIR,{recursive:true});
 const runsDir=path.join(root,'graphs');fs.mkdirSync(runsDir);fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR,'settings.json'),JSON.stringify({graph:{runsDir}}));
-const SDK='/Users/heathhe/.nvm/versions/node/v24.14.0/lib/node_modules/@earendil-works/pi-coding-agent';
+import {SDK,AI} from './supervisor-sdk-loader.mjs';
 const {createDefaultChildSessionFactory}=await import('./owned-sdk-factory.mjs');
-const {createFauxCore,fauxAssistantMessage,fauxToolCall}=await import(SDK+'/node_modules/@earendil-works/pi-ai/dist/providers/faux.js');
+const {createFauxCore,fauxAssistantMessage,fauxToolCall}=await import(AI+'/dist/providers/faux.js');
 const {createJiti}=await import(G+'/node_modules/jiti/lib/jiti.mjs');const jiti=createJiti(import.meta.url);
 const graphExtension=(await jiti.import(G+'/extensions/pi-graph.ts')).default;
 const {compileGraphSpecV3}=await jiti.import(G+'/src/v3/compiler.ts');const {initializeV3Run}=await jiti.import(G+'/src/v3/initialize.ts');const A=await jiti.import(G+'/src/v3/attempt.ts');

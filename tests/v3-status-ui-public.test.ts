@@ -11,6 +11,7 @@ import {interactionUiCapture} from "./helpers/interaction-ui-capture.ts";
 // Independent acceptance: actual command, Inspector, Graph widget and own work inventory.
 // Only terminal I/O and durable fixture records are simulated; no model/provider/host tasks.
 const jiti=createJiti(import.meta.url);
+const {setGraphDisplayGoal}=await jiti.import<any>("../src/v3/ui/presentation.ts");
 const {GraphInspector}=await jiti.import<any>("../src/v3/ui/inspector.ts");
 const {default:register,V3GraphNativeUiCommitter}=await jiti.import<any>("../extensions/pi-graph.ts");
 const {visibleWidth}=await jiti.import<any>("@earendil-works/pi-tui");
@@ -31,15 +32,15 @@ test("real committer displays both Graph summaries, dependency reasons and no du
  const a=snapshot(),b=snapshot("status-b","session-b");b.nodes.active.observation.asyncId="child-b";
  const before=JSON.stringify([a,b]),m=mountUi(),c=new V3GraphNativeUiCommitter();
  try{c.commit(m.ui,undefined,[a,b],"session-a");const rendered=m.text();
-  assert.equal((rendered.match(/◆ Graph 摘要/g)??[]).length,2);assert.doesNotMatch(rendered,/status-a|status-b/);assert.match(rendered,/pending/);assert.match(rendered,/当前：native-graph-child/);assert.match(rendered,/graphs/);
+  assert.equal((rendered.match(/◆ Graph 摘要/g)??[]).length,2);assert.doesNotMatch(rendered,/status-a|status-b/);assert.match(rendered,/pending/);assert.match(rendered,/当前：active · native-graph-child\n\s+模型：fixture\/ACTUAL · 工具 read/);assert.match(rendered,/graphs/);
   assert.match(rendered,/fixture\/ACTUAL/);assert.match(rendered,/工具 read/);assert.doesNotMatch(rendered,/正在执行|ACTIVITY\.ts/);
-  assert.equal((rendered.match(/当前：native-graph-child/g)??[]).length,2,"one owned execution row per Graph, no duplicate fleet row");
+  assert.equal((rendered.match(/当前：active · native-graph-child/g)??[]).length,2,"one owned execution row per Graph, no duplicate fleet row");
   assert.equal(m.writes.length,1);
   const changed=structuredClone(a);changed.updatedAt="2026-09-09T00:00:02.000Z";changed.nodes.active.observation.progress.toolCount=8;
   c.commit(m.ui,undefined,[changed,b],"session-a");assert.equal(m.writes.length,1,"observations invisible in summary must not remount widget");
   for(const width of [24,45,80,120])for(const line of m.widgets.get("pi-graph").render(width))assert.ok(visibleWidth(line)<=width);
   c.commit(m.ui,undefined,[a,b],"session-a",undefined,true);assert.equal(m.text(),"");
-  c.commit(m.ui,undefined,[a,b],"session-a",undefined,false);assert.match(m.text(),/当前：native-graph-child/);
+  c.commit(m.ui,undefined,[a,b],"session-a",undefined,false);assert.match(m.text(),/当前：active · native-graph-child/);
   assert.equal(JSON.stringify([a,b]),before);
  }finally{m.dispose();}
 });
@@ -49,7 +50,7 @@ test("owned work providers remain isolated beside one Graph summary without dupl
  const jobs=[{id:'ordinary',sessionId:'isolated-status-ui'},{id:'child-a',sessionId:'isolated-status-ui'}];const before=JSON.stringify(jobs);
  const unregister=registerBackgroundWorkProvider({name:'fixture-other-work',listActiveWork:()=>jobs});
  const m=mountUi(),c=new V3GraphNativeUiCommitter();
- try{c.commit(m.ui,undefined,[snapshot()],'isolated-status-ui');const graph=m.text();assert.match(graph,/pending/);assert.match(graph,/当前：native-graph-child/);assert.match(graph,/fixture\/ACTUAL/);assert.match(graph,/工具 read/);assert.doesNotMatch(graph,/ACTIVITY\.ts|正在执行/);assert.equal((graph.match(/当前：native-graph-child/g)??[]).length,1);assert.equal(m.widgets.has('subagent-fleet-status'),false);assert.equal(m.writes.length,1);assert.deepEqual(listBackgroundWorkProviders().find((p:any)=>p.name==='fixture-other-work').listActiveWork(),jobs);assert.equal(JSON.stringify(jobs),before);c.commit(m.ui,undefined,[],'another-session');assert.equal(JSON.stringify(jobs),before);}finally{unregister();m.dispose();}
+ try{c.commit(m.ui,undefined,[snapshot()],'isolated-status-ui');const graph=m.text();assert.match(graph,/pending/);assert.match(graph,/当前：active · native-graph-child\n\s+模型：fixture\/ACTUAL · 工具 read/);assert.match(graph,/fixture\/ACTUAL/);assert.match(graph,/工具 read/);assert.doesNotMatch(graph,/ACTIVITY\.ts|正在执行/);assert.equal((graph.match(/当前：active · native-graph-child/g)??[]).length,1);assert.equal(m.widgets.has('subagent-fleet-status'),false);assert.equal(m.writes.length,1);assert.deepEqual(listBackgroundWorkProviders().find((p:any)=>p.name==='fixture-other-work').listActiveWork(),jobs);assert.equal(JSON.stringify(jobs),before);c.commit(m.ui,undefined,[],'another-session');assert.equal(JSON.stringify(jobs),before);}finally{unregister();m.dispose();}
 });
 
 test("real Inspector reports observed activity, escapes controls and preserves scroll/phase through stable polling",async()=>{
@@ -106,7 +107,7 @@ test("registered /graphs view reaches actual activity detail and preserves l/o/E
 });
 
 
-test("registered /graphs renders two inspected Graphs, hides only selected Graph and reopens its details",async()=>{
+test("registered /graphs focuses one inspected Graph, counts others and reopens hidden details",async()=>{
  const root=await mkdtemp(join(tmpdir(),"graph-status-two-")),home=join(root,"agent"),a=snapshot(),b=snapshot("status-b");
  b.nodes.active.observation.actualModel="fixture/SECOND";await mkdir(home);
  for(const s of [a,b]){await mkdir(join(root,s.graphId));await writeFile(join(root,s.graphId,"snapshot.json"),JSON.stringify(s));}
@@ -117,10 +118,10 @@ test("registered /graphs renders two inspected Graphs, hides only selected Graph
   const capture=interactionUiCapture([["q"],["\r","q"],["\r","q"]]);Object.assign(capture.ui,{setWidget:m.ui.setWidget,setStatus:m.ui.setStatus,theme});
   const ctx={mode:"tui",cwd:root,sessionManager:{getSessionId:()=>"session-a",getSessionFile:()=>undefined,getEntries:()=>[]},ui:capture.ui};
   const call=(arg:string)=>commands.get("graphs").handler(arg,ctx);
-  await call("view status-a");assert.match(m.text(),/当前：native-graph-child/);
-  await call("view status-b");assert.equal((m.text().match(/◆ Graph 摘要/g)??[]).length,2);
-  await call("hide");assert.equal((m.text().match(/◆ Graph 摘要/g)??[]).length,1);
-  await call("view status-b");assert.equal((m.text().match(/◆ Graph 摘要/g)??[]).length,2);
+  await call("view status-a");await call("expand");assert.match(m.text(),/当前任务（未建总计划）/);assert.match(m.text("pi-graph-agents"),/运行 分配Agent native-graph-child · 模型 fixture\/ACTUAL/);assert.match(m.text("pi-graph-agents"),/fixture\/ACTUAL/);
+  await call("view status-b");assert.equal((m.text().match(/当前任务（未建总计划）/g)??[]).length,1);assert.equal((m.text("pi-graph-agents").match(/运行 分配Agent native-graph-child/g)??[]).length,2);assert.match(m.text("pi-graph-agents"),/fixture\/SECOND/);assert.match(m.text(),/其他记录1\/待处理图0/);
+  await call("hide");assert.equal((m.text().match(/当前任务（未建总计划）/g)??[]).length,1);assert.match(m.text("pi-graph-agents"),/fixture\/ACTUAL/);assert.doesNotMatch(m.text("pi-graph-agents"),/fixture\/SECOND/);
+  await call("view status-b");assert.match(m.text("pi-graph-agents"),/fixture\/SECOND/);assert.match(m.text(),/其他记录1/);
   const details=capture.trace.filter(r=>r.kind==="render").map(r=>r.text).join("\n");assert.match(details,/fixture\/SECOND/);assert.equal(capture.customCount,3);
   for(const s of [a,b])assert.equal(await readFile(join(root,s.graphId,"snapshot.json"),"utf8"),JSON.stringify(s));
  }finally{m.dispose();if(old===undefined)delete process.env.PI_CODING_AGENT_DIR;else process.env.PI_CODING_AGENT_DIR=old;await rm(root,{recursive:true,force:true});}
@@ -158,14 +159,14 @@ test("activity lists suppress undispatched nodes, summarize missing facts once a
 test("registered start/wait expanded receipts are explicit historical snapshots with live-detail entry",()=>{
  let tool:any;let emits=0;
  register({events:{on(){return()=>{};},emit(){emits++;}},on(){},registerCommand(){},registerTool(value:any){tool=value;},sendMessage(){throw Error("unexpected message");}});
- const s=snapshot();const before=JSON.stringify(s);
+ const s=snapshot();setGraphDisplayGoal(s,"fixture goal",Object.keys(s.nodes));const before=JSON.stringify(s);
  for(const action of ["start","wait"]){
   const context={args:{action},state:{},toolCallId:`snapshot-${action}`,isError:false};
   const result={content:[{type:"text",text:"historical"}],details:{snapshot:s}};
-  assert.deepEqual(tool.renderResult(result,{expanded:false,isPartial:false},theme,context).render(200),[]);
+  assert.equal(tool.renderResult(result,{expanded:false,isPartial:false},theme,context).render(200).join("\n"),"","complete healthy receipts remain quiet");
   const text=tool.renderResult(result,{expanded:true,isPartial:false},theme,context).render(240).join("\n");
-  assert.match(text,/回执快照/);assert.match(text,/\/graphs view status-a 实时详情/);
-  assert.match(text,/fixture\/ACTUAL/);assert.match(text,/ACTIVITY\.ts/);
+  assert.match(text,/回执快照/);assert.match(text,/实时图详情：\/graphs view status-a/);
+  assert.match(text,/fixture\/ACTUAL/);assert.doesNotMatch(text,/ACTIVITY\.ts/);assert.match(JSON.stringify(result),/ACTIVITY\.ts/);
   const pending=text.split("\n").findIndex((line:string)=>line.includes("pending"));assert.ok(pending>=0);
  }
  assert.equal(JSON.stringify(s),before);assert.equal(emits,0);
@@ -175,4 +176,15 @@ test("registered start/wait expanded receipts are explicit historical snapshots 
 test("queued Inspector detail contains waiting reason without an activity placeholder block",()=>{
  const s=snapshot();const panel=new GraphInspector({snapshot:s,selectedId:"pending",theme,rows:()=>40,requestRender(){},onClose(){},read:async()=>s,pollMs:60000});
  try{panel.handleInput("\r");const text=panel.render(200).join("\n");assert.match(text,/等待前置任务/);assert.doesNotMatch(text,/本次观测未提供|本次状态未报告|实际模型|当前工具|当前路径|工具调用|最近活动/);}finally{panel.dispose();}
+});
+test("registered tasks/agents/plan linked-detail roundtrip preserves tabs and cancelled history selection",async()=>{
+ const root=await mkdtemp(join(tmpdir(),"graph-cockpit-tabs-")),home=join(root,"agent"),s=snapshot();await mkdir(home);await mkdir(join(root,s.graphId));await writeFile(join(root,s.graphId,"snapshot.json"),JSON.stringify(s));await writeFile(join(home,"settings.json"),JSON.stringify({graph:{enabled:true,runsDir:root}}));
+ const old=process.env.PI_CODING_AGENT_DIR;process.env.PI_CODING_AGENT_DIR=home;const commands=new Map<string,any>(),tools=new Map<string,any>(),entries:any[]=[];let writes=0;
+ try{register({events:{on(){return()=>{};},emit(){throw Error("unexpected runtime call");}},on(){},registerTool(t:any){tools.set(t.name,t);},registerCommand(name:string,c:any){commands.set(name,c);},appendEntry(customType:string,data:any){writes++;entries.push({type:"custom",customType,data});}});
+ const capture=interactionUiCapture([["a","g"],["p"],["\r","\r"],["\x1b"],["q"]]);capture.ui.select=async()=>undefined;capture.ui.theme=theme;
+ const ctx:any={mode:"tui",cwd:root,sessionManager:{getSessionId:()=>"session-a",getSessionFile:()=>undefined,getEntries:()=>entries,getBranch:()=>entries},ui:capture.ui};
+ await tools.get("graph_todo").execute("set",{action:"set",expectedRevision:0,items:[{id:"goal",title:"独立总目标",status:"pending",links:[{graphId:s.graphId,runInstanceId:s.runInstanceId,taskId:"active"}]}]},undefined,undefined,ctx);
+ await commands.get("graphs").handler("tasks status-a",ctx);assert.equal(capture.customCount,5);const renders=capture.trace.filter(r=>r.kind==="render").map(r=>String(r.text));assert.match(renders[2],/成员/);assert.match(renders[3],/总计划/);assert.match(renders[5],/active/);assert.match(renders.at(-1)!,/总计划/);assert.equal(writes,1);assert.equal(await readFile(join(root,s.graphId,"snapshot.json"),"utf8"),JSON.stringify(s));
+ if(process.env.PI_GRAPH_RENDER_ARTIFACT_DIR){await mkdir(process.env.PI_GRAPH_RENDER_ARTIFACT_DIR,{recursive:true});await writeFile(join(process.env.PI_GRAPH_RENDER_ARTIFACT_DIR,"registered-tabs.txt"),renders.join("\n\n--- next native render ---\n\n"));}
+ }finally{if(old===undefined)delete process.env.PI_CODING_AGENT_DIR;else process.env.PI_CODING_AGENT_DIR=old;await rm(root,{recursive:true,force:true});}
 });

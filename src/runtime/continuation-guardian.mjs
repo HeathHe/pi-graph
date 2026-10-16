@@ -8,7 +8,7 @@ const jiti=createJiti(import.meta.url,{moduleCache:false});
 const {canonicalDigest}=await jiti.import('../v3/digests.ts');
 const {atomicWriteJson}=await jiti.import('../v3/durable.ts');
 const {readNativeJson}=await jiti.import('../v3/native-results.ts');
-const {validateCheckpoint}=await jiti.import('./session-checkpoint.ts');
+const {validateCheckpoint,checkpointIdentity}=await jiti.import('./session-checkpoint.ts');
 const {continuationControl,validateContinuationResult}=await jiti.import('./session-continuation.ts');
 export async function guardContinuation(original,args){
  const dir=original.asyncDir,lock=join(dir,'generation-owner.lock');
@@ -23,6 +23,7 @@ export async function guardContinuation(original,args){
    const cp=await readNativeJson(join(dir,`checkpoint-${parked.generation}.json`));
    const exit=await readNativeJson(join(dir,`exit-${parked.generation}.json`));pid=exit?.pid;finalOutcome={exitCode:exit?.exitCode,signal:exit?.signal};
    await validateCheckpoint(previous,cp,exit);
+   if(checkpointIdentity(original)!==cp.identity)throw Error('Checkpoint original intent/host identity changed; adoption refused');
    intent={...original,generation:previous.generation+1,workerInstanceId:randomUUID(),resumeCheckpoint:cp};
   }
   for(;;){
@@ -58,7 +59,8 @@ export async function guardContinuation(original,args){
  }catch(e){
   rejected=true;
   const status=await readNativeJson(join(dir,'status.json'))??{};
-  status.state='failed';status.error=String(e);status.needsAttention=true;status.steps??=[];
+  const primary=status.error??status.steps?.[0]?.error;
+  status.state='failed';status.primaryError=primary;status.secondaryValidationError=String(e);status.error=primary?`${primary} (result validation also failed: ${String(e)})`:String(e);status.needsAttention=true;status.steps??=[];
   await atomicWriteJson(join(dir,'status.json'),status);
   await atomicWriteJson(join(dir,'generation-state.json'),{version:1,state:'needs_attention',generation:intent.generation,error:String(e)});
  }

@@ -452,9 +452,9 @@ test("compact DAG summary shows active task and queue count without repeating no
 	};
 	const compact = graphLiveWidgetTextV3([{ graphId: "priority", status: "running", nodes }]);
 	assert.doesNotMatch(compact, /正在执行 active/u);
-	assert.match(compact, /当前：worker/u);
+	assert.match(compact, /当前：active · worker/u);
  assert.match(compact, /provider\/active/u);
- assert.equal((compact.match(/当前：worker/g) ?? []).length, 1, "one owned row without duplicated task identity");
+ assert.equal((compact.match(/当前：active · worker/g) ?? []).length, 1, "one owned row without duplicated task identity");
 	assert.match(compact, /排队 7/u);
 	assert.doesNotMatch(compact, /排队 queued-0/u);
 	assert.ok(compact.split("\n").length <= 6);

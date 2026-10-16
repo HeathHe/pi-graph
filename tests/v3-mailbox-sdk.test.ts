@@ -1,3 +1,4 @@
+import {captureHostSdkIdentity} from '../src/runtime/host-sdk.ts';
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -10,7 +11,7 @@ async function runFixture(extra: string[] = []) {
     "--import", fileURLToPath(new URL("./helpers/supervisor-sdk-loader.mjs", import.meta.url)),
     fileURLToPath(new URL("./helpers/mailbox-sdk-roundtrip.mjs", import.meta.url)),
     ...extra,
-  ], { stdio: ["ignore", "pipe", "pipe"] });
+  ], { stdio: ["ignore", "pipe", "pipe"], env:{...process.env,PI_GRAPH_TEST_HOST_SDK:(await captureHostSdkIdentity()).root} });
   let output = "";
   child.stdout.on("data", chunk => { output += String(chunk); });
   child.stderr.on("data", chunk => { output += String(chunk); });

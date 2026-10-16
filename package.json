@@ -1,6 +1,6 @@
 {
   "name": "pi-graph",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Durable DAG execution with owned Pi SDK child agents",
   "type": "module",
   "engines": {
@@ -13,7 +13,8 @@
     "templates/",
     "README.md",
     "src/runtime/",
-    "docs/",
+    "docs/owned-model-settings.md",
+    "docs/session-continuation.md",
     "examples/",
     "LICENSE",
     "CHANGELOG.md"

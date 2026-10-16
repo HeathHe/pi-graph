@@ -336,7 +336,7 @@ test("real Pi public RPC rejects extension Providers, blocks child-only override
 		const guardedAttempt = (await readLatestV3Attempt(guardedRunDir, "work"))?.evidence;
 		assert.equal(guardedAttempt?.phase, "needs_attention");
 		assert.match(guardedAttempt?.failure?.message ?? "", /Child input was handled without an assistant result/u);
-        assert.match(guardedAttempt?.failure?.message ?? "", /Automatic recovery is unsafe or exhausted/u);
+        assert.match(guardedAttempt?.failure?.message ?? "", /未自动重派：当前子进程协议未提供重新派发所需的恢复证明/u);
         const guardedObservation = blocked.nodes?.work.observation;
         assert.equal(guardedObservation?.progress?.toolCount, 0);
         assert.equal(guardedObservation?.progress?.turnCount, 0);

@@ -45,14 +45,16 @@ test("real Pi: existing/new mailbox decisions, public reply, persistent declared
  const messages:any[]=[];let buffer="",stderr="",serial=0;
  child.stdout.on("data",d=>{buffer+=String(d);for(;;){const n=buffer.indexOf("\n");if(n<0)break;const line=buffer.slice(0,n);buffer=buffer.slice(n+1);if(line.trim())messages.push(JSON.parse(line));}});child.stderr.on("data",d=>stderr+=String(d));
  const turnTimelines:any[]=[];
- async function turn(text:string,toolName?:string){const before=messages.length,id=`prompt-${++serial}`;child.stdin.write(JSON.stringify({type:"prompt",id,message:text})+"\n");
+ async function turn(text:string,toolName?:string){const before=messages.length,id=`prompt-${++serial}`;child.stdin.write(JSON.stringify({type:"prompt",id,message:text,streamingBehavior:"followUp"})+"\n");
   const expected=text.startsWith("PI_GRAPH_PUBLIC_RPC_E2E ")?JSON.parse(text.slice("PI_GRAPH_PUBLIC_RPC_E2E ".length)):text.startsWith("PI_GRAPH_REPLY ")?{action:"mailbox",id:JSON.parse(text.slice("PI_GRAPH_REPLY ".length)).graphId,mailbox:{messageId:JSON.parse(text.slice("PI_GRAPH_REPLY ".length)).messageId}}:undefined;
   const userText=(event:any)=>Array.isArray(event.message?.content)?event.message.content.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n"):event.message?.content;
   let selected:any;
   const events=await until(async()=>messages.slice(before),m=>{
    const response=m.findIndex(e=>e.type==="response"&&e.id===id&&e.command==="prompt");
    const user=m.findIndex(e=>e.type==="message_start"&&e.message?.role==="user"&&userText(e)===text);
-   if(response<0||user<0)return false;
+   if(response<0)return false;
+   assert.equal(m[response].success,true,JSON.stringify(m[response]));
+   if(user<0)return false;
    if(!toolName){const end=m.findIndex((e,i)=>i>user&&e.type==="agent_end");if(end<0)return false;selected={response,user,end};return true;}
    const call=m.findIndex((e,i)=>i>user&&e.type==="tool_execution_start"&&e.toolName===toolName&&e.args?.action===expected.action&&(e.args?.id??e.args?.spec?.graphId)===(expected.id??expected.spec?.graphId)&&(!expected.mailbox?.messageId||e.args?.mailbox?.messageId===expected.mailbox.messageId));
    if(call<0)return false;

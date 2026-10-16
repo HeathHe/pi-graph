@@ -532,7 +532,7 @@ async function routeAuthoringNodes(
                         addCandidate(next, checked);
                     }
                 }
-                const planBase = {version:1 as const, sessionContinuationVersion:1 as const, profile:profileName, modelDegradations:remainingDegradations,
+                const planBase = {version:1 as const, sessionContinuationVersion:1 as const, transientRetryLimit:1 as const, profile:profileName, modelDegradations:remainingDegradations,
                     candidates:runtimeCandidates, ...(profile.latestPolicy?{latestPolicy:profile.latestPolicy,approvedLatestIds:profile.approvedLatestIds}:{}), ...(profile.constraints&&(profile.constraints.requiredInputModalities!==undefined||profile.constraints.maximumAutomaticFallback!==undefined||profile.constraints.requireToolCalls!==undefined)?{requirements:{...(profile.constraints.requiredInputModalities===undefined?{}:{requiredInputModalities:profile.constraints.requiredInputModalities}),...(profile.constraints.maximumAutomaticFallback===undefined?{}:{maximumAutomaticFallback:profile.constraints.maximumAutomaticFallback}),...(profile.constraints.requireToolCalls===undefined?{}:{requireToolCalls:profile.constraints.requireToolCalls})}}:{}), excludedFamilies:[...producerFamilies].sort(), requireCrossFamilyFromProducers:profile.constraints?.requireCrossFamilyFromProducers === true};
                 const runtimeFallback = runtimeCandidates.length > 1 ? {...planBase, digest:canonicalDigest(planBase)} : undefined;
 				node.model = candidate.model;
@@ -790,7 +790,7 @@ async function fixedRoleSettings(nodes: GraphNodeAuthoringSpecV3[], options:Rout
    if(admitted.length&&image&&!options.availableModels?.find(m=>(m.fullId??`${m.provider}/${m.id}`)===model)?.input?.includes('image'))continue;
    admitted.push({requestedModel:model,resolvedModel:result.model,thinking:result.thinking,agentDefinitionDigest:result.agentDefinitionDigest,admissionLaunchContractDigest:result.launchContractDigest});
   }
-  if(first?.ok&&primary){node.thinking=first.thinking??node.thinking;const base={version:1 as const,sessionContinuationVersion:1 as const,profile:`role-settings:${node.agent}`,modelDegradations:Math.max(0,models.length-1),candidates:admitted,excludedFamilies:[],requireCrossFamilyFromProducers:false};
+  if(first?.ok&&primary){node.thinking=first.thinking??node.thinking;const base={version:1 as const,sessionContinuationVersion:1 as const, transientRetryLimit:1 as const,profile:`role-settings:${node.agent}`,modelDegradations:Math.max(0,models.length-1),candidates:admitted,excludedFamilies:[],requireCrossFamilyFromProducers:false};
    decisions.push({taskId:node.taskId,capabilityIds:[],agent:node.agent,profile:base.profile,selectedModel:primary,resolvedModel:first.model,thinking:first.thinking,level:'role-settings',skipped:[],...(admitted.length>1?{runtimeFallback:{...base,digest:canonicalDigest(base)}}:{})});}
  }
  return decisions;

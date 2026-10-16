@@ -8,9 +8,9 @@ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'context-lazy-sd
 process.env.PI_CODING_AGENT_DIR=path.join(root,'agent');process.env.PI_GRAPH_RUNTIME_ROOT=path.join(root,'native');
 fs.mkdirSync(process.env.PI_CODING_AGENT_DIR,{recursive:true});fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR,'settings.json'),'{}');
 globalThis.fetch=()=>{throw new Error('Lazy SDK fixture forbids network');};
-const SDK='/Users/heathhe/.nvm/versions/node/v24.14.0/lib/node_modules/@earendil-works/pi-coding-agent';
+import {SDK,AI} from './supervisor-sdk-loader.mjs';
 const {createDefaultChildSessionFactory}=await import('./owned-sdk-factory.mjs');
-const {createFauxCore,fauxAssistantMessage,fauxToolCall}=await import(SDK+'/node_modules/@earendil-works/pi-ai/dist/providers/faux.js');
+const {createFauxCore,fauxAssistantMessage,fauxToolCall}=await import(AI+'/dist/providers/faux.js');
 const {createJiti}=await import(G+'/node_modules/jiti/lib/jiti.mjs');const jiti=createJiti(import.meta.url);
 const {compileGraphSpecV3}=await jiti.import(G+'/src/v3/compiler.ts');const {initializeV3Run}=await jiti.import(G+'/src/v3/initialize.ts');
 const {V3GraphRunner}=await jiti.import(G+'/src/v3/runner.ts');const {SubagentRpcClient}=await jiti.import(G+'/src/v3/rpc.ts');

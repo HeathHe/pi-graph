@@ -16,6 +16,7 @@ export function validateRuntimeFallbackPlan(value: unknown): asserts value is V3
   || p.candidates.length < 2 || p.candidates.length > p.modelDegradations + 1
   || !Array.isArray(p.excludedFamilies) || p.excludedFamilies.some(f => typeof f !== "string")
   || typeof p.requireCrossFamilyFromProducers !== "boolean" || !SHA.test(p.digest)) throw new Error("Invalid frozen runtime fallback plan.");
+ if(p.transientRetryLimit!==undefined&&(![0,1].includes(p.transientRetryLimit)||p.sessionContinuationVersion!==1))throw Error("Invalid frozen transient retry limit.");
  const {digest, ...base} = p;
  if (canonicalDigest(base) !== digest) throw new Error("Runtime fallback plan digest mismatch.");
  if(p.requirements!==undefined)validateModelRequirements(p.requirements);

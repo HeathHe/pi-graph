@@ -32,7 +32,7 @@ test('compact owned rows omit absent observations, show recent completed tools, 
  const s:any={schemaVersion:3,graphId:'fixture',status:'running',nodes:{pending:{phase:'running',attempt:1,dependsOn:[]}}};
  let out=compactGraphLines(s).join('\n');assert.match(out,/当前：pending/);assert.doesNotMatch(out,/尚未|未观测|未提供|undefined|模型/);
  s.nodes.pending.agent='backend-developer';s.nodes.pending.observation={actualModel:'fixture/local',progress:{lastTool:'write'}};
- out=compactGraphLines(s).join('\n');assert.match(out,/backend-developer/);assert.doesNotMatch(out,/当前：pending/);assert.match(out,/fixture\/local/);assert.match(out,/最近工具 write/);
+ out=compactGraphLines(s).join('\n');assert.match(out,/backend-developer/);assert.match(out,/当前：pending/);assert.match(out,/fixture\/local/);assert.match(out,/最近工具 write/);
  s.status='complete';s.nodes.pending.phase='accepted';s.nodes.pending.observation.supervision={attention:'result_unavailable',error:'OLD-EXECUTION-ERROR'};
  setDisplayEvidence(s,{failures:{},neverDispatched:new Set(),readError:'fixture artifact changed'});
  const before=JSON.stringify(s);out=compactGraphLines(s).join('\n');assert.match(out,/已完成/);assert.match(out,/成功 1/);assert.match(out,/详情读取异常：fixture artifact changed/);assert.doesNotMatch(out,/OLD-EXECUTION-ERROR|尚未验收|原因/);assert.equal(JSON.stringify(s),before);
@@ -40,7 +40,7 @@ test('compact owned rows omit absent observations, show recent completed tools, 
 
 test('compact task facts cap width and remove terminal controls without guessing task names',()=>{
  const s:any={schemaVersion:3,graphId:'fixture',status:'running',nodes:{['task-'+ 'x'.repeat(200)]:{phase:'running',attempt:1,agent:'role-'+ 'y'.repeat(200),dependsOn:[],observation:{actualModel:'fixture/'+ 'z'.repeat(200),progress:{currentTool:'read\u001b[31m'+ 'q'.repeat(200)}}}}};
- const out=compactGraphLines(s);const row=out.find((x:string)=>x.includes('当前：'));assert.ok(row);assert.ok(visibleWidth(row)<=80);assert.match(row,/工具 read/);assert.doesNotMatch(row,/task-xxx/);assert.doesNotMatch(row,/\u001b|尚未|未观测/);
+ const out=compactGraphLines(s);const row=out.find((x:string)=>x.includes('当前：'));assert.ok(row);assert.ok(visibleWidth(row)<=80);assert.match(out.join("\n"),/工具 read/);assert.match(row,/task-xxx/);for(const line of out)assert.ok(visibleWidth(line)<=80);assert.doesNotMatch(row,/\u001b|尚未|未观测/);
 });
 
 

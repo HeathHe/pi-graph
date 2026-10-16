@@ -116,9 +116,9 @@ test("Graph tool cards keep receipts separate from live status and identify unex
   return [...call.render(160),...body.render(160)].join("\n");
  }
  assert.equal(tool.renderShell,"self");
- const start=render("start",s,false);assert.match(start,/已提交/);assert.doesNotMatch(start,/排队|失败 1|graphs view/);
- const wait=render("wait",s,true);assert.match(wait,/正在等待结果/);assert.doesNotMatch(wait,/排队|失败 1|graphs view/);
- assert.match(render("wait",{snapshot:s,graphContinuesRunning:true},false),/已结束查看，任务继续运行/);
+ const start=render("start",s,false);assert.match(start,/HTTP 402：额度或订阅不可用/);assert.match(start,/前置任务未满足执行条件/);assert.doesNotMatch(start,/◆ 已提交/);
+ const wait=render("wait",s,true);assert.match(wait,/HTTP 402：额度或订阅不可用/);assert.match(wait,/先核对状态与原始原因，不要自动重跑/);
+ assert.match(render("wait",{snapshot:s,graphContinuesRunning:true},false),/HTTP 402：额度或订阅不可用/);
  events.get("message_end")({message:{role:"assistant",stopReason:"error",content:[{type:"toolCall",id:"never-started",name:"graph"}]}});
  const ctx={args:{action:"start",spec:{graphId:"never-started"}},state:{},toolCallId:"never-started",executionStarted:false,isPartial:false,isError:true};
  const call=tool.renderCall(ctx.args,identityTheme,ctx);
@@ -336,4 +336,85 @@ test("provider UI distinguishes refresh transport, invalid credentials, weekly q
  n.observation.supervision.error="terminated";assert.match(nodeNextStep(s,"research",n),/剩余工作.*不要整项盲重跑/);
  n.observation.supervision.error="runtime incompatible";assert.match(nodeNextStep(s,"research",n),/当前 Pi SDK.*自有运行器/);assert.doesNotMatch(nodeNextStep(s,"research",n),/pi-subagents/);
  assert.equal(errorSummary("HTTP 403 WAF Forbidden"),"HTTP 403 WAF Forbidden");
+});
+
+test("same-role sequential tasks retain their own identity across live Inspector updates", () => {
+ const first="finish-hub-runtime-composition", next="implement-real-management-http";
+ const s=snapshot(), worker=structuredClone(s.nodes.worker);
+ Object.assign(worker.observation,{actualAgent:"backend-developer",actualModel:"wisdomrouter/glm-5.3"});
+ s.nodes={[first]:worker,[next]:{phase:"queued",attempt:0,agent:"backend-developer",dependsOn:[first]}};
+ const before=JSON.stringify(s);let accept:any;
+ const panel=new GraphInspector({snapshot:s,theme,rows:()=>40,requestRender(){},onClose(){},read:async()=>s,subscribe(fn:any){accept=fn;return()=>{};},pollMs:60000});
+ try {
+  assert.match(compactGraphLines(s).find((l:string)=>l.startsWith("  当前：")),new RegExp(first+".*backend-developer"));
+  const advanced=structuredClone(s);advanced.updatedAt="2026-09-09T00:00:02.000Z";
+  Object.assign(advanced.nodes[first],{phase:"accepted",terminalStatus:"accepted"});advanced.nodes[next]=structuredClone(worker);
+  const advancedBefore=JSON.stringify(advanced);accept(advanced);
+  const live=compactGraphLines(advanced).filter((l:string)=>l.startsWith("  当前："));
+  assert.equal(live.length,1);assert.match(live[0],new RegExp(next+".*backend-developer"));assert.doesNotMatch(live[0],new RegExp(first));
+  const lines=panel.render(140).map((l:string)=>safeText(l));
+  assert.ok(lines.some((l:string)=>l.includes("运行")&&l.includes(next)&&l.includes("backend-developer")&&l.includes("wisdomrouter/glm-5.3")));
+  assert.ok(lines.some((l:string)=>l.includes("成功")&&l.includes(first)));
+  accept(s);assert.ok(panel.render(140).some((l:string)=>safeText(l).includes("运行")&&l.includes(next)),"older snapshots cannot restore the previous active identity");
+  assert.equal(JSON.stringify(advanced),advancedBefore);
+ } finally {panel.dispose();}
+ assert.equal(JSON.stringify(s),before);
+});
+
+test("parallel same-role nodes are distinct and retain the two-active-row limit", () => {
+ const s=snapshot(), worker=structuredClone(s.nodes.worker);
+ Object.assign(worker.observation,{actualAgent:"backend-developer",actualModel:"wisdomrouter/glm-5.3",progress:{currentTool:"read"}});
+ s.nodes={"http-api":worker,"event-consumer":structuredClone(worker),"third-task":structuredClone(worker)};
+ s.nodes["event-consumer"].observation.actualModel="kimi-coding/k3";
+ const before=JSON.stringify(s), lines=compactGraphLines(s), active=lines.filter((l:string)=>l.startsWith("  当前："));
+ assert.equal(active.length,2);assert.match(active[0],/http-api.*backend-developer/);
+ assert.match(active[1],/event-consumer.*backend-developer/);
+ assert.equal(lines[lines.indexOf(active[0])+1],"    模型：wisdomrouter/glm-5.3 · 工具 read");
+ assert.equal(lines[lines.indexOf(active[1])+1],"    模型：kimi-coding/k3 · 工具 read");
+ assert.ok(lines.includes("  另有 1 项运行，/graphs 查看"));assert.equal(JSON.stringify(s),before);
+});
+
+test("identity views never substitute planned models and sanitize terminal controls within narrow widths", () => {
+ const s=snapshot(), id="任务-http\x1b]52;c;SECRET\x07\nnode", worker=structuredClone(s.nodes.worker);
+ worker.agent="planned-role";worker.model="planned/MODEL";
+ Object.assign(worker.observation,{actualAgent:"backend\x1b[2J-developer",actualModel:undefined,requestedModel:"requested/MODEL",resolvedModel:"resolved/MODEL"});
+ s.nodes={[id]:worker};const before=JSON.stringify(s);
+ const text=compactGraphLines(s).join("\n");
+ assert.match(text,/当前：任务-http node · backend-developer/);
+ assert.doesNotMatch(text,/SECRET|\x1b|planned\/MODEL|requested\/MODEL|resolved\/MODEL|模型：|未观测/);
+ const panel=new GraphInspector({snapshot:s,theme,rows:()=>40,requestRender(){},onClose(){},read:async()=>s,pollMs:60000});
+ try {
+  for(const width of [24,40,45,70,80,120,180]) {
+   const lines=panel.render(width);for(const line of lines)assert.ok(visibleWidth(line)<=width);
+   assert.doesNotMatch(lines.join("\n"),/SECRET|\x1b\[2J|planned\/MODEL|requested\/MODEL|resolved\/MODEL/);
+   if(width>=45)assert.ok(lines.some((l:string)=>l.includes("任务-http node")));
+  }
+  panel.handleInput("\r");const detail=panel.render(160).map((l:string)=>safeText(l)).join("\n");
+  assert.match(detail,/任务-http node/);assert.match(detail,/Agent\s+backend-developer/);assert.match(detail,/本次观测未提供：实际模型/);
+  assert.match(detail,/请求模型\s+requested\/MODEL/);assert.match(detail,/解析模型\s+resolved\/MODEL/);
+ } finally {panel.dispose();}
+ assert.equal(JSON.stringify(s),before);
+ const missing=snapshot();missing.nodes={unobserved:{phase:"running",attempt:1,agent:"configured-role",model:"planned/MODEL"}};
+ assert.match(compactGraphLines(missing).join("\n"),/当前：unobserved · configured-role/);
+});
+
+
+test("real widget preserves the current task, role and model at eighty columns with narrow and wide view samples", () => {
+ const {setGraphLiveWidgetV3}=jiti("../extensions/pi-graph.ts") as any;
+ const s=snapshot(), id="implement-real-management-http", worker=structuredClone(s.nodes.worker);
+ Object.assign(worker.observation,{actualAgent:"backend-developer",actualModel:"wisdomrouter/glm-5.3",progress:{currentTool:"read"}});
+ s.nodes={[id]:worker};const before=JSON.stringify(s);let widget:any;
+ setGraphLiveWidgetV3({setWidget(_key:string,factory:any){widget=factory({},theme);}},[s]);
+ const panel=new GraphInspector({snapshot:s,theme,rows:()=>24,requestRender(){},onClose(){},read:async()=>s,pollMs:60000});
+ try {
+  for(const width of [45,80,120]) {
+   const summary=widget.render(width).map((l:string)=>safeText(l)), list=panel.render(width).map((l:string)=>safeText(l));
+   for(const line of [...widget.render(width),...panel.render(width)])assert.ok(visibleWidth(line)<=width);
+   assert.ok(summary.includes("模型：wisdomrouter/glm-5.3 · 工具 read"));
+   if(width>=80)assert.ok(summary.includes("当前：implement-real-management-http · backend-developer"));
+   if(width===120)assert.ok(list.some((l:string)=>l.includes("implement-real-management-http · backend-developer · wisdomrouter/glm-5.3")));
+   console.log(`IDENTITY SAMPLE width=${width}\n${summary.join("\n")}\nInspector: ${list.find((l:string)=>l.startsWith(">"))}`);
+  }
+ } finally {panel.dispose();widget.dispose();}
+ assert.equal(JSON.stringify(s),before);
 });

@@ -6,7 +6,7 @@ import {join,dirname,relative,isAbsolute,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
 import {canonicalDigest} from '../v3/digests.ts';
-import {resolveHostSdkRoot} from './host-sdk.ts';
+import {validateHostSdkIdentity} from './host-sdk.ts';
 const sha=(b:Buffer|string)=>createHash('sha256').update(b).digest('hex');
 export async function strictSession(file:string,cwd:string){
  const parent=await realpath(dirname(file)),beforeParent=await lstat(parent),beforePath=await lstat(file);
@@ -28,12 +28,12 @@ export async function strictSession(file:string,cwd:string){
 }
 /** Frozen code + host deployment + exact required extensions, never credential material. */
 export async function deploymentDigest(intent:any){
- const root=await resolveHostSdkRoot();const base=fileURLToPath(new URL('../../',import.meta.url));const files:string[]=[];
+ const host=await validateHostSdkIdentity(intent.hostSdkIdentity);const root=host.root;const base=fileURLToPath(new URL('../../',import.meta.url));const files:string[]=[];
  for(const sub of ['src/runtime','src/v3','extensions']){const walk=async(p:string):Promise<void>=>{for(const d of await readdir(p,{withFileTypes:true})){if(d.isDirectory())await walk(join(p,d.name));else if(/\.(?:ts|mjs)$/.test(d.name))files.push(join(p,d.name));}};await walk(join(base,sub));}
- files.push(join(root,'package.json'),join(root,'dist/index.js'),join(root,'dist/core/agent-session.js'),join(root,'dist/core/session-manager.js'),join(root,'dist/core/sdk.js'),join(root,'node_modules/@earendil-works/pi-agent-core/dist/agent.js'),...(intent.params.extensionPaths??intent.launchContract.tools?.extensionArgs??[]));
- return canonicalDigest({sdkRoot:root,files:await Promise.all([...new Set(files)].sort().map(async p=>[await realpath(p),sha(await readFile(p))]))});
+ files.push(...host.files.map(f=>f.path),...(intent.params.extensionPaths??intent.launchContract.tools?.extensionArgs??[]));
+ return canonicalDigest({hostSdkIdentity:host,sdkRoot:root,files:await Promise.all([...new Set(files)].sort().map(async p=>[await realpath(p),sha(await readFile(p))]))});
 }
-export function checkpointIdentity(intent:any){return canonicalDigest({runId:intent.runId,owner:intent.sessionId,params:intent.params,agent:intent.agent,contract:intent.launchContract,continuation:intent.continuation});}
+export function checkpointIdentity(intent:any){return canonicalDigest({hostSdkIdentity:intent.hostSdkIdentity,runId:intent.runId,owner:intent.sessionId,params:intent.params,agent:intent.agent,contract:intent.launchContract,continuation:intent.continuation});}
 export async function validateCheckpoint(intent:any,cp:any,exit:any){
  if(!cp||cp.version!==1||cp.kind!=='pi-graph-session-checkpoint/1'||cp.identity!==checkpointIdentity(intent)||cp.runId!==intent.runId||cp.generation!==intent.generation||cp.runnerProcessInstanceId!==intent.workerInstanceId||cp.nextCandidateIndex!==cp.candidateIndex+1||cp.nextCandidateIndex>=intent.continuation.plan.candidates.length||cp.shutdownComplete!==true||cp.segment?.safe!==true)throw Error('Checkpoint identity or settlement proof invalid');
  const {digest,...body}=cp;if(canonicalDigest(body)!==digest)throw Error('Checkpoint digest mismatch');

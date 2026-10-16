@@ -42,7 +42,7 @@ test("result paging does not claim task completion or verified completeness", ()
  assert.match(render("result",{text:"output",complete:true,nextOffset:2500,sha256:hash}),/仍有后续内容/);
  assert.match(render("result",{text:"output",complete:null,nextOffset:null}),/完整性尚未确认/);
  assert.match(render("result",{text:"output",complete:false,nextOffset:null}),/记录不完整/);
- assert.equal(render("result",{text:"output",complete:true,nextOffset:null}),"结果已读取。展开查看详情。");
+ assert.equal(render("result",{text:"output",complete:true,nextOffset:null}),"output\n结果已读取 · 验收待确认 · 展开查看详情。");
  assert.ok(!render("result",{complete:true}).includes("任务完成"));
 });
 test("source_changed is reading recovery even if tool result is marked as an error", () => {
@@ -67,4 +67,8 @@ test("malformed or oversized envelopes are bounded and do not mutate original pa
   const output=compactToolReceipt("attention",text,{},true);assert.ok(Array.from(output).length<=170);assert.ok(!output.includes("\u001b"));
  }
  assert.equal(compactToolReceipt("unknown","secret",null,false),"操作信息已返回。展开查看详情。");
+});
+
+test("inactive mailbox compact receipt states non-delivery and no retry while retaining expanded facts",()=>{
+ const payload={code:"mailbox_inactive",taskEnded:true,action:"send",delivery:"not_sent",taskRestarted:false,canRetry:false,readOnlyActions:["receive","read","status"],message:"任务已结束，消息未发送；后续要求交给主会话，不会重新启动旧任务。"};const text=JSON.stringify(payload),before=JSON.stringify(payload);const compact=compactToolReceipt("mailbox",text,payload,true);assert.match(compact,/消息未发送.*主会话.*不可自动重试.*不会重启/);assert.doesNotMatch(compact,/已入队|已送达|已完成/);assert.equal(JSON.stringify(payload),before);assert.equal(JSON.parse(text).delivery,"not_sent");
 });

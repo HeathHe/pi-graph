@@ -5,12 +5,12 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn} from 'node:child_process';
-import {loadHostSdk} from '../src/runtime/host-sdk.ts';
+import {loadHostSdk,captureHostSdkIdentity} from '../src/runtime/host-sdk.ts';
 const worker=fileURLToPath(new URL('../src/runtime/child-runner.mjs',import.meta.url));
 async function run(fixture:string,extra:Record<string,unknown>={}){
  const dir=await mkdtemp(join(tmpdir(),'owned-sdk-test-'));
  await mkdir(join(dir,'workspace'));await writeFile(join(dir,'workspace','fixture.txt'),'fixture');
- const intent={version:1,runId:'fixture-run',asyncDir:dir,runnerProcessInstanceId:'fixture-instance',sessionId:'fixture-session',params:{cwd:join(dir,'workspace'),task:'Return fixture response',...extra},agent:{name:'fixture',systemPrompt:'Test role',systemPromptMode:'append'},launchContract:{launchContractDigest:'a'.repeat(64),inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:fixture==='tool'?['read']:[],extensionArgs:[]}}};
+ const intent={hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'fixture-run',asyncDir:dir,runnerProcessInstanceId:'fixture-instance',sessionId:'fixture-session',params:{cwd:join(dir,'workspace'),task:'Return fixture response',...extra},agent:{name:'fixture',systemPrompt:'Test role',systemPromptMode:'append'},launchContract:{launchContractDigest:'a'.repeat(64),inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:fixture==='tool'?['read']:[],extensionArgs:[]}}};
  await writeFile(join(dir,'intent.json'),JSON.stringify(intent));
  const child=spawn(process.execPath,[worker,join(dir,'intent.json'),'--test-fixture',fixture],{env:{...process.env,NODE_ENV:'test'},stdio:['ignore','ignore','pipe']});let stderr='';child.stderr.on('data',b=>stderr+=b);
  const code=await new Promise<number|null>((resolve,reject)=>{child.once('error',reject);child.once('close',resolve)});
@@ -35,17 +35,17 @@ test('owned session obeys role prompt mode and separately filters project/global
   await writeFile(join(cwd,'AGENTS.md'),'PROJECT_CONTEXT_MARKER');await writeFile(join(dir,'fixture-agent','AGENTS.md'),'GLOBAL_CONTEXT_MARKER');
   await mkdir(join(cwd,'.pi','skills','selected'),{recursive:true});await writeFile(join(cwd,'.pi','skills','selected','SKILL.md'),'---\nname: selected\ndescription: SELECTED_SKILL_MARKER\n---\nFixture skill');
   for(const mode of ['append','replace']){
-   const child=await openOwnedChild({version:1,runId:'context-fixture',asyncDir:dir,runnerProcessInstanceId:'instance',sessionId:'owner',params:{cwd,task:'Fixture'},agent:{name:'fixture',systemPrompt:'ROLE_CONTEXT_MARKER'},launchContract:{systemPromptMode:mode,inheritProjectContext:true,inheritGlobalContext:false,inheritSkills:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}},()=>{},'success');
+   const child=await openOwnedChild({hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'context-fixture',asyncDir:dir,runnerProcessInstanceId:'instance',sessionId:'owner',params:{cwd,task:'Fixture'},agent:{name:'fixture',systemPrompt:'ROLE_CONTEXT_MARKER'},launchContract:{systemPromptMode:mode,inheritProjectContext:true,inheritGlobalContext:false,inheritSkills:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}},()=>{},'success');
    try{await child.session.prompt('Fixture');const system=child.session.agent.state.systemPrompt;assert.doesNotMatch(system,/SELECTED_SKILL_MARKER/);assert.match(system,/ROLE_CONTEXT_MARKER/);assert.match(system,/PROJECT_CONTEXT_MARKER/);assert.doesNotMatch(system,/GLOBAL_CONTEXT_MARKER/);if(mode==='append')assert.match(system,/coding assistant/i);else assert.doesNotMatch(system,/coding assistant/i);}finally{await child.shutdown();}
   }
-  const explicit=await openOwnedChild({version:1,runId:'skills-fixture',asyncDir:dir,runnerProcessInstanceId:'instance',sessionId:'owner',params:{cwd,task:'Fixture'},agent:{name:'fixture',skills:['selected']},launchContract:{inheritProjectContext:false,inheritGlobalContext:false,inheritSkills:false,tools:{effectiveAllowlist:['read'],extensionArgs:[]}}},()=>{},'success');
+  const explicit=await openOwnedChild({hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'skills-fixture',asyncDir:dir,runnerProcessInstanceId:'instance',sessionId:'owner',params:{cwd,task:'Fixture'},agent:{name:'fixture',skills:['selected']},launchContract:{inheritProjectContext:false,inheritGlobalContext:false,inheritSkills:false,tools:{effectiveAllowlist:['read'],extensionArgs:[]}}},()=>{},'success');
   try{await explicit.session.prompt('Fixture');assert.match(explicit.session.agent.state.systemPrompt,/SELECTED_SKILL_MARKER/);}finally{await explicit.shutdown();}
  }finally{if(before===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=before;if(childBefore===undefined)delete process.env.PI_GRAPH_CHILD;else process.env.PI_GRAPH_CHILD=childBefore;if(bindingBefore===undefined)delete process.env.PI_GRAPH_EXTENSION_BINDINGS;else process.env.PI_GRAPH_EXTENSION_BINDINGS=bindingBefore;await rm(dir,{recursive:true,force:true});}
 });
 
 test('control file stops session and finalizes shutdown without fabricated exit evidence',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'owned-stop-test-'));const cwd=join(dir,'workspace');await mkdir(cwd);
- const intent={version:1,runId:'stop-fixture',asyncDir:dir,runnerProcessInstanceId:'instance',sessionId:'owner',params:{cwd,task:'Fixture'},agent:{name:'fixture'},launchContract:{inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}};
+ const intent={hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'stop-fixture',asyncDir:dir,runnerProcessInstanceId:'instance',sessionId:'owner',params:{cwd,task:'Fixture'},agent:{name:'fixture'},launchContract:{inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}};
  await writeFile(join(dir,'intent.json'),JSON.stringify(intent));await writeFile(join(dir,'control.json'),JSON.stringify({version:1,runId:'stop-fixture',runnerProcessInstanceId:'instance',action:'stop'}));
  const child=spawn(process.execPath,[worker,join(dir,'intent.json'),'--test-fixture','pending'],{env:{...process.env,NODE_ENV:'test'},stdio:'ignore'});
  try{const code=await new Promise<number|null>((r,j)=>{child.on('close',r);child.on('error',j)});assert.equal(code,1);const completion=JSON.parse(await readFile(join(dir,'result.json'),'utf8'));assert.equal(completion.state,'stopped');assert.equal(completion.results[0].preActivityEvidence.shutdownComplete,true);assert.equal(completion.results[0].preActivityEvidence.stopped,true);await assert.rejects(readFile(join(dir,'process-terminal.json')));}finally{await rm(dir,{recursive:true,force:true});}
@@ -75,7 +75,7 @@ test('current actual SDK handles coalesced Graph wake as followUp while the pare
  const old=process.env.NODE_ENV;process.env.NODE_ENV='test';const dir=await mkdtemp(join(tmpdir(),'owned-busy-wake-'));const cwd=join(dir,'work');await mkdir(cwd);
  let unblock!:()=>void;let entered!:()=>void;const gate=new Promise<void>(r=>unblock=r),started=new Promise<void>(r=>entered=r);let child:any;
  try{
-  child=await openOwnedChild({version:1,runId:'busy',asyncDir:dir,runnerProcessInstanceId:'busy-instance',sessionId:'parent',params:{cwd,task:'Fixture'},agent:{name:'fixture'},launchContract:{inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}},()=>{},'success');
+  child=await openOwnedChild({hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'busy',asyncDir:dir,runnerProcessInstanceId:'busy-instance',sessionId:'parent',params:{cwd,task:'Fixture'},agent:{name:'fixture'},launchContract:{inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}},()=>{},'success');
   const original=child.session.agent.streamFunction;let calls=0;child.session.agent.streamFunction=async(...args:any[])=>{if(calls++===0){entered();await gate;}return original(...args);};
   const prompt=child.session.prompt('Parent work');await started;
   let notifications=0;const scheduled:Promise<void>[]=[];const wake=new GraphParentWake({sendMessage(_msg:any,options:any){assert.equal(options.triggerTurn,false);notifications++;},sendUserMessage(text:string,options:any){assert.equal(options.deliverAs,'followUp');scheduled.push(child.session.followUp(text));}});

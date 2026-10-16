@@ -46,6 +46,7 @@ export interface V3RuntimeFallbackCandidate extends Partial<LatestModelIdentity>
 export interface V3RuntimeFallbackPlan {
  latestPolicy?:'latest-per-tier';approvedLatestIds?:string[];
  sessionContinuationVersion?:1;
+ transientRetryLimit?:0|1;
  version: 1; profile: string; modelDegradations: number;
  candidates: V3RuntimeFallbackCandidate[];
  requirements?:import('../runtime/model-capabilities.ts').ModelRequirements;

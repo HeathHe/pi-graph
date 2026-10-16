@@ -10,7 +10,7 @@ English is expanded by default. Click either language heading to expand or colla
 
 模型与岗位配置文件是一等入口：直接编辑项目 `.pi/graph-models.json`、全局 `~/.pi/agent/graph-models.json` 和相应 `agents/<name>.md`。可复制 [JSON 配置](examples/graph-models.example.json) 与 [岗位 Markdown](examples/agents/custom-worker.md)；完整字段说明及优先级见 [独立模型与岗位设置](docs/owned-model-settings.md)；`/graph-models` 是同一配置格式的交互入口。配置只影响新 Graph，已有 Graph 保留冻结模型、工具、提示词及模型定义。
 
-运行层由本项目直接管理当前安装的宿主 Pi SDK：自有 RPC、独立 OS worker、guardian 退出监管、状态/结果证据与持久邮箱。无需 `pi-subagents` 或 `pi-intercom`，未安装或依赖 Maestro。启动前检查必要 SDK API 和 session 生命周期能力；缺少能力时明确拒绝，不能用扩展开发依赖中的另一版本代替。
+运行层由本项目直接管理当前安装的宿主 Pi SDK：自有 RPC、独立 OS worker、guardian 退出监管、状态/结果证据与持久邮箱。无需 `pi-subagents` 或 `pi-intercom`。启动前检查必要 SDK API 和 session 生命周期能力；缺少能力时明确拒绝，不能用扩展开发依赖中的另一版本代替。
 
 当前生产入口由三个边界清楚的层组成；中间仍只有一套 V3 DAG 内核：
 
@@ -28,11 +28,11 @@ Pi Observability / TUI
 
 它不替调用方拆解目标、不复核计划，也不要求 visual evidence。Pi 扩展会在每个父 Agent turn 前注入一段固定、幂等的 `PI-GRAPH Routing` 合同，要求实际子 Agent 委派统一使用 `graph`：单项工作使用单节点，fan-out/fan-in、依赖链、实现加独立测试/审查使用相应多节点结构；同一份合同也直接用于 `graph` 工具描述，避免两处漂移。这仍只是 prompt guidance，不会自行启动 Graph，也不会把已启动的普通 subagent 自动转换为节点。没有实际调用 `graph` 时，DAG Core 不会介入。`/graphs doctor` 和 `graph doctor` 会显示合同版本、SHA-256 及最近一次注入判断，但不保存 system prompt 或用户内容。
 
-产品边界见 [docs/product-definition.md](docs/product-definition.md)，完整字段与恢复语义见 [docs/v3-technical-contract.md](docs/v3-technical-contract.md)，实现分层见 [docs/graph-architecture.md](docs/graph-architecture.md)。
+用户配置与续接边界分别见[模型与岗位设置](docs/owned-model-settings.md)和[原会话续接](docs/session-continuation.md)。
 
 ## 安装与运行要求
 
-0.2.0 自有运行时版本已发布到 npm；0.2.1 增加同页中英文说明，不改变运行逻辑。检查与发布边界见 [npm 发布流程](docs/npm-release.md)，变更见 [CHANGELOG](CHANGELOG.md)。
+0.2.2 更新终端任务展示、宿主 SDK 兼容与有界超时续接，并修复任务结束与暂停请求交错时错误返回运行中的问题。变更见 [CHANGELOG](CHANGELOG.md)。
 
 要求 Node.js `>=22.19.0` 和已安装的 Pi。运行使用宿主提供的 Pi SDK，启动时核验必要 API 与会话生命周期；开发依赖固定为 `1.0.4`，不是要求宿主必须使用这一精确版本。缺少必要能力时拒绝启动，不偷偷切换另一个 SDK。
 
@@ -53,7 +53,7 @@ PI_CODING_AGENT_DIR="$release_agent_dir" pi -e /absolute/path/to/node_modules/pi
 
 `-e` 不写入安装声明，隔离变量避免复用现有 Pi 配置；不修改 `HOME`。只检查扩展加载，不输入真实模型任务或登录模型服务。`.tgz` 是 npm 包归档，不能直接当作 Pi 的单扩展文件加载。完整命令和本人 npm 登录步骤见发布流程。
 
-不需要安装 `pi-subagents`、`pi-intercom` 或 Maestro；已有重复扩展应先核对安装来源，在无活跃任务时由用户移除，不能直接删除历史运行数据。shell 保护依赖 macOS `sandbox-exec`；其他系统或该命令不可用时，运行器拒绝未受保护的 shell。只读与其他工具仍须通过各自启动前检查，这不承诺其他平台完整功能可用，也不构成外部服务或同一 OS 用户的完整安全隔离。
+不需要安装 `pi-subagents`、`pi-intercom`；已有重复扩展应先核对安装来源，在无活跃任务时由用户移除，不能直接删除历史运行数据。shell 保护依赖 macOS `sandbox-exec`；其他系统或该命令不可用时，运行器拒绝未受保护的 shell。只读与其他工具仍须通过各自启动前检查，这不承诺其他平台完整功能可用，也不构成外部服务或同一 OS 用户的完整安全隔离。
 
 ## 核心能力
 
@@ -308,10 +308,6 @@ Graph 子任务通信统一使用 `graph_mailbox`，旧 `contact_supervisor` / `
 
 Graph 派发任务时在完整原任务之后追加来自 digest-bound shadow contract 的有界执行上下文，保留原任务首行和全部 task/capsule 字节：实际 shadow cwd、相对读写 scope、只读状态和路径限制。内联 task 就是 handoff，除非任务明确提供 scope 内的交接文件；child 不应猜测 `../task-handoff.md` / `code-context.md`、访问原始 source 或 `~` 路径，也不能在 scope 外列目录。路径以转义 JSON 数据呈现；过长或过多条目整体省略并标明数量，不用截短路径冒充权限。上下文只是现有 Guard 权限的说明，不改变其工具过滤和保护目录规则；原任务与 dependency capsule 的不可信数据标记保持原样。
 
-## 与 dsh-graph 的关系
-
-V3 的核心架构参考了 `dsh-graph`：编译 DAG、ACCEPTED 解锁、OPEN/SEALED、revision CAS、条件节点、Attempt 历史、dependency capsule、版本化产物和 capsule 模板。Pi 版本不是源码移植：它使用自有 `pi-graph:runtime:v1` RPC、shadow workspace、Authorization/Attempt 多文件证据和跨进程 Supervisor fencing；准确差异见技术合同的“dsh-graph 对齐矩阵”。
-
 ## 开发验证
 
 ```bash
@@ -338,7 +334,7 @@ guardian 观察真实 child 退出，生成与运行身份绑定的 `process-ter
 
 ### Pi 原生 CLI 任务面板
 
-- 底部显示有界、可收起摘要：状态、分类计数、最多两条运行岗位及合并原因。工具 START 只显示“已提交”，WAIT 只显示“正在等待结果 / 等待已结束”；使用无背景色单行呈现，展开仍保留详细数据。
+- 输入区上方显示可折叠的独立总计划或 Graph 执行清单，下方显示实际活动 Agent 树；总计划完成数与 Graph 已验收数分别统计。优先当前活动图，其他已观测记录及待处理图按数量显示，详情仍可查看。工具 START 只显示“已提交”，WAIT 只显示“正在等待结果 / 等待已结束”；使用无背景色单行呈现，展开仍保留详细数据。
 - `/graphs view` 选择一个 Graph；`/graphs view <graph-id>` 直接打开。↑↓ 或 j/k 选任务，Enter 查看详情，l 查看原始状态 JSON，PgUp/PgDn 翻页，Esc 返回，q 关闭。
 - 查看面板只读，不会接管、重跑或停止任务。原始记录页展示当前持久状态和失败证据，不是完整会话日志。刷新失败时保留上次状态并明确提示。
 - 成功、失败、未执行、运行、排队、停止、取消、跳过分别计数。只有停止请求及节点中止证据都存在时，才显示“已停止 · 含 N 项失败”。“控制探测有响应”只说明运行器可回应，不等于模型有进展。
@@ -346,6 +342,28 @@ guardian 观察真实 child 退出，生成与运行身份绑定的 `process-ter
 - 已有 Pi 会话待任务结束后重新启动，确保加载完整的新运行时代码；新会话直接加载。
 
 启动前主 Agent 响应中断会明确显示“未执行 · 主 Agent 响应中断”；不会将尚未调用的 graph 工具显示为子任务执行失败。Graph 不修改上游的展示归属或会话身份。
+
+### 总计划、执行任务与成员
+
+`Alt+G` 打开统一面板，列表中 `p` / `t` / `a` 切换总计划、执行任务、成员，`g` 选择图。稳定命令为 `/graphs todo`、`/graphs tasks`、`/graphs agents`、`/graphs history`；终端需将 Option 配置为 Meta 才能识别快捷键，不支持时使用命令。计划项 Enter 展示关联，↑↓ 选择关联后 Enter 打开原任务详情。
+
+父级可用 `graph_todo` 明确维护总计划；不会自动提取聊天计划，也不迁移其他 Todo 插件的数据。先 `list` 读取修订号，再带 `expectedRevision` 写入。子 Agent 不注册此工具。例子：
+
+```json
+{"action":"set","expectedRevision":0,"items":[{"id":"delivery","title":"完成交付验收","status":"pending"}]}
+```
+
+- `list` 只读；`set` 替换全计划；`update` 用 `id` 修改单项 `title` / `status`；`link` 用 `id` 和 `links:[{graphId,runInstanceId,taskId}]` 替换关联。写操作都必须使用最新 `expectedRevision`，最多 128 项，每项标题最多 400 字符。
+- 未关联项标为“人工”；人工完成不等于 Graph 验收。关联项只按当前会话、准确运行实例中节点的最新 attempt 投影；所有关联都 accepted 才完成，缺失、读取失败或跨会话显示待核实。关联不会启动或授权 Graph。
+- 计划通过 Pi 原生 `pi-graph-todo/1` session entry 保存；分支恢复当前分支内容，修订号在会话中累积。新空会话可能只在内存，界面明确区分已保存、会话内存与保存未确认；保存报错不自动重试。
+- 面板查看、切换和刷新不写计划，也不触发模型或控制 Graph。当前会话已观测记录的计数不是磁盘全部历史。8 行终端只保留状态和详情入口。
+- 源码修改不会进入已经运行的 Pi 会话。任务结束后更新 Pi 实际加载的安装副本，再重新启动；仅修改源码仓库或仅重启不能更新另一个安装副本。不要在活跃任务中替换安装副本或重载。
+
+
+可信退出证明与 Graph 状态分开显示：当准确绑定当前会话、Graph/run、任务 attempt、原生运行和 runner 的物理退出证明成立，而保存的任务仍为 running/dispatched 时，显示“进程已退出，Graph 状态待核对”，不再列为活动成员，也不能从该成员发送消息。原 phase/status 和文件不变，不自动验收、恢复或重派。continuation 仅完整封存且最终 generation/ledger 一致的证明可确认；needs_attention 缺完整封存时只显示“退出证据未核实”，不能据此断言进程已退出。缺失、旧身份、worker-only、单独 stopped 状态或请求超时均不是可信 runner 退出证明。
+
+
+不活动邮箱的 `send/reply/ack/wait` 返回明确的非成功回执：`code=mailbox_inactive`、`delivery=not_sent`、`taskRestarted=false`、`canRetry=false`。仅 Graph 已处于终态才提示任务已结束；运行中或未知状态提示核对运行状态。紧凑与展开界面都会说明消息未发送，不可自动重试；`receive/read/status` 仍可只读检查历史。后续要求交给主会话，先核对既有结果，再仅安排剩余工作；子任务结束不等于总目标完成，等待人工授权不应创建 watcher 或重派。跨会话 owner 校验及已关闭收件人规则不变。
 
 ### CLI 信息层级（2026-09-09）
 
@@ -468,7 +486,7 @@ Host 使用本机私有 Unix socket 和每次提交的运行 lease 校验；只�
 
 ### Graph 状态摘要与活动详情
 
-Graph 自有摘要显示整体状态与分类计数，最多两条运行岗位、实际模型和当前或最近完成工具；已有岗位名时不重复任务 ID，字段缺失直接省略。更多运行只显示数量，排队只给数量或有明确依赖的下一项；不猜测并发、权限或额度原因，也不自动翻译任务 ID。最近最多三个 Graph 各自显示摘要，其他 Graph 仍可通过 `/graphs` 查看；收起摘要不停止任务。
+统一面板始终保留任务 ID，并显示岗位、已观测实际模型和当前或最近工具；缺失字段省略。最多两名实际活动 Agent，更多成员显示数量。当前活动图优先；其他本会话已观测记录及待处理图合并为可打开的计数，不展开多个历史警告。总计划与 Graph 验收分别统计，不猜测并发、权限或额度原因。收起摘要不停止任务。
 
 在 `/graphs` 中选中任务并按 Enter，查看真实观测的工具、路径、工具调用次数、实际模型及最近活动绝对时间；工具展开视图也显示这些事实。缺失信息明确标注未观测到，已结束任务标注最后观测，异常或未来时间标注待核对。时间久远本身不意味着失败或无响应；具体异常沿用已有监管证据。显示不修改执行状态，也不启动额外计时器。`m/o/l/Esc` 保持原有行为。
 
@@ -487,21 +505,21 @@ Graph 自有摘要显示整体状态与分类计数，最多两条运行岗位�
 
 ### 摘要、完整结果与分页读取
 
-顶部最近三个 Graph 按运行实例及稳定摘要更新顺序排列。活动时间、工具计数等详情仍随新快照更新，但不会单独把 Graph 挤入最近三个；阶段、任务数量或排队原因的摘要变化仍会更新顺序。Inspector 保留当前选中任务，新快照用于刷新详情。
+摘要聚焦真实活动任务所在的 Graph；无活动任务时显示最近需处理记录，其他本会话已观测记录通过计数和历史入口查看。Inspector 详情保留选中任务供核对；成员列表在活动任务退出后选择下一名可见成员。
 
 在节点详情按 `o` 阅读已校验的保存产物，按 `f` 阅读固定执行尝试的原生结果；`n` 继续下一页，`Esc` 返回详情。`f` 会标明 `native_capture`（原生捕获）或 `fallback`（既有尝试记录回退），并显示 `complete:true`（完整性已验证）、`complete:null`（完整性未证明）或 `complete:false`（已截断）。缺少原生捕获时不会重新执行任务，也不会扩大既有保存产物约 64 KiB 的存储上限；读至来源末尾不等于模型原输出必然完整。
 
 工具 `graph action=result` 和 `action=attention` 按 Unicode 字符分页，默认 4096、最大 8192，字节预算可能缩短单页。严格复制返回的整个 `nextRequest`，直到它为 `null`；其中 `expectedSha256` 固定整份来源的内容版本，节点结果同时固定 `attempt`。来源改变或缓存无法恢复时返回 `source_changed`、`recoverable:true`、`isError:false` 和不含正文的恢复指令。丢弃已收集旧页，完整复制 `restartRequest` 从 offset 0 自动重读最多一次，保持 limit，无需再问用户授权；不要重跑、停止或回放任务。若同一读取再次要求恢复，停止该路径循环，转 `/graphs` 详情或报告原因。attention 和不带 node 的 result 使用独立只读快照，逐页保持原始内容和哈希；有效续页刷新120秒闲置期限，最长寿命10分钟。缓存最多32条、总16MiB，冷启动、容量淘汰或过期会明确要求重新读取。带 node/attempt 的结果始终重新校验真实证据与digest，不缓存以掩盖篡改。权限、非法参数和完整性错误仍为真实错误。固定快照的续页必须完整复制 `nextRequest`，不支持缺少 expectedSha256 的裸 offset 续页。仅节点结果读取兼容旧裸 offset，该用法不能保证多页属于同一版本。
 
-这些改进参考 [pi-maestro-flow](https://github.com/catlog22/pi-maestro-flow) 的 [completion ownership](https://github.com/catlog22/pi-maestro-flow/blob/master/packages/pi-maestro-teammate/src/completion-outbox/coordinator.ts)、[内容身份](https://github.com/catlog22/pi-maestro-flow/blob/master/packages/pi-maestro-teammate/src/public/v1/completion-durability.ts) 与 [冲突保护](https://github.com/catlog22/pi-maestro-flow/blob/master/packages/pi-maestro-teammate/src/completion-outbox/file-store.ts) 原则：异步读取前确定同一路径的接收顺序，已保存结果不被冲突覆盖，分页内容与摘要显示分别保持一致性。适配使用本项目自有 SDK runtime 契约，并未引入 Maestro API、outbox 或存储迁移。同路径到达顺序保证限于同进程中已绑定的接收器；跨进程及绑定前缓存不承诺全局到达顺序。
+这些改进确保：异步读取前确定同一路径的接收顺序，已保存结果不被冲突覆盖，分页内容与摘要显示分别保持一致性。适配使用本项目自有 SDK runtime 契约。同路径到达顺序保证限于同进程中已绑定的接收器；跨进程及绑定前缓存不承诺全局到达顺序。
 
-默认紧凑卡片隐藏任务全文、日志路径和工具参数路径；ctrl+o 展开仍保留原生详情。Graph 摘要保留岗位或短任务 ID、状态和真实问题，只在依赖明确时显示下一项。新运行不使用 native 维护清单；历史补丁备份不是安装步骤。
+默认紧凑卡片隐藏任务全文、日志路径和工具参数路径；ctrl+o 展开仍保留原生详情。Graph 摘要始终保留任务 ID，并显示岗位、已观测的实际模型、状态和真实问题，只在依赖明确时显示下一项。新运行不使用 native 维护清单；历史补丁备份不是安装步骤。
 
 ### 安全的运行时模型接替
 
-参考 Maestro 的错误分类、候选推进及不重放副作用原则，Graph 对新准入的 capability 路由节点支持有限的运行时模型接替。routing profile 明确配置 `budget.modelDegradations > 0`，或独立岗位配置明确提供 `fallbackModels` 时，在准入阶段冻结同岗位的合规备用模型；不会自动捕获主会话模型、思考级别或追加父模型备用；能力路由预算明确为0、显式fallbackModels:[]，或旧Graph未冻结候选时不启用。显式指定的模型是第一选择；常规按序策略只取配置列表中它后方的候选，candidatePool=all-compatible则从配置批准的其他兼容候选中冻结备用，并保持预算与能力守卫。候选须保持 Agent、工具和扩展合同一致，并满足图片输入能力、模型可用范围、跨模型家族，以及配置批准的供应商、模型范围及能力约束。启动前无法合规冻结的候选不会在运行时临时加入。
+Graph 对新准入的 capability 路由节点支持有限的运行时模型接替。routing profile 明确配置 `budget.modelDegradations > 0`，或独立岗位配置明确提供 `fallbackModels` 时，在准入阶段冻结同岗位的合规备用模型；不会自动捕获主会话模型、思考级别或追加父模型备用；能力路由预算明确为0、显式fallbackModels:[]，或旧Graph未冻结候选时不启用。显式指定的模型是第一选择；常规按序策略只取配置列表中它后方的候选，candidatePool=all-compatible则从配置批准的其他兼容候选中冻结备用，并保持预算与能力守卫。候选须保持 Agent、工具和扩展合同一致，并满足图片输入能力、模型可用范围、跨模型家族，以及配置批准的供应商、模型范围及能力约束。启动前无法合规冻结的候选不会在运行时临时加入。
 
-未启用新续接协议的已冻结计划，仍只认自有运行器完整的 `preActivityEvidence`：独立 worker 内的官方 Pi SDK session、订阅早于 prompt、一次内部 launch、零工具启动/assistant toolCall/孤立工具结果、原始 assistant error、prompt 结束与 commands/shutdown 正常完成、无取消/中断/超时/晚活动。Graph 另外核对真实进程退出、receipt/session/run/step 身份、已持久化的 Graph Guard workspace 绑定与实际模型。最终错误必须与该结构化供应商诊断一致；模型身份校验/结果结构校验失败，以及已报告文件修改或 mutation attempted/observed，均拒绝接替。界面 `toolCount=0`、日志未显示工具、任务正文里的错误、普通输出摘要均不能授权重放。本次 Kimi HTTP 403 的 “You've reached your 5-hour usage limit” 被识别为额度问题；不猜测额度恢复时间。
+未启用新续接协议的已冻结计划，仍只认自有运行器完整的 `preActivityEvidence`：独立 worker 内的官方 Pi SDK session、订阅早于 prompt、一次内部 launch、零工具启动/assistant toolCall/孤立工具结果、原始 assistant error、prompt 结束与 commands/shutdown 正常完成、无取消/中断/超时/晚活动。Graph 另外核对真实进程退出、receipt/session/run/step 身份、已持久化的 Graph Guard workspace 绑定与实际模型。最终错误必须与该结构化供应商诊断一致；模型身份校验/结果结构校验失败，以及已报告文件修改或 mutation attempted/observed，均拒绝接替。界面 `toolCount=0`、日志未显示工具、任务正文里的错误、普通输出摘要均不能授权重放。仅根据明确的供应商额度诊断判断，不猜测额度恢复时间。
 
 旧零活动路径通过证明后，先持久化失败 Attempt 和接替合同，再用新的 Attempt 与唯一派发身份启动下一冻结模型；静态 Graph/授权摘要不变，权限不扩大，失败模型在本节点接替链内不再回放。候选耗尽、节点累计用量不足或缺少用量证据、生命周期 Attempt 上限都会终止接替。尚未派发的备用任务遇到暂停会保留 prepared 记录、返回 paused 并释放运行所有权；恢复使用同一候选和派发身份。compact Graph 摘要只在备用运行期间显示一行接替原因，其余证据在 `/graphs`。
 
@@ -517,14 +535,9 @@ Graph 自有摘要显示整体状态与分类计数，最多两条运行岗位�
 
 更新磁盘代码不会自动热更新所有已打开 Pi 会话，也不会重写旧 Graph 的冻结链。等待当前任务结束后重启相应 Pi 会话，新建 Graph 或追加节点才使用新准入策略；旧授权、snapshot 和 digest 保持原样，不自动停止或重放旧任务。已完成工具不通过重新派发原任务来恢复。
 
-## 参考与来源
-
-任务编排、邮箱与完成归属的设计参考 [pi-maestro-flow](https://github.com/catlog22/pi-maestro-flow)，自有启动接口也参考原 [pi-subagents](https://github.com/nicobailon/pi-subagents) 契约。当前低层 utility 独立实现，没有整包安装、运行依赖或逐段源码移植；不把“允许参考 MIT 工具代码”描述为实际复制。Pi SDK 仍由宿主安装提供。
-
-
 ## 许可证
 
-本项目使用 [MIT License](LICENSE)，版权为 2026 HeathHe。运行依赖仍遵守各自许可证；设计参考不代表复制或安装相应项目。
+本项目使用 [MIT License](LICENSE)，版权为 2026 HeathHe。运行依赖仍遵守各自许可证。
 
 </details>
 
@@ -535,7 +548,7 @@ Graph 自有摘要显示整体状态与分类计数，最多两条运行岗位�
 
 Model and role configuration files are first-class entry points: edit the project's `.pi/graph-models.json`, the global `~/.pi/agent/graph-models.json`, and the corresponding `agents/<name>.md` directly. Copy the [JSON configuration](examples/graph-models.example.json) and [role Markdown](examples/agents/custom-worker.md); see [Independent model and role settings](docs/owned-model-settings.md) for all fields and precedence. `/graph-models` provides an interactive entry point for the same configuration format. Configuration affects only new Graphs; existing Graphs retain their frozen models, tools, prompts, and model definitions.
 
-This project directly manages the currently installed host Pi SDK at runtime: owned RPC, separate OS workers, guardian exit supervision, state/result evidence, and a durable mailbox. Neither `pi-subagents` nor `pi-intercom` is required; Maestro is neither installed nor a dependency. Required SDK APIs and session lifecycle capabilities are checked before startup. Missing capabilities cause an explicit refusal; another version from the extension's development dependencies cannot be substituted.
+This project directly manages the currently installed host Pi SDK at runtime: owned RPC, separate OS workers, guardian exit supervision, state/result evidence, and a durable mailbox. Neither `pi-subagents` nor `pi-intercom` is required. Required SDK APIs and session lifecycle capabilities are checked before startup. Missing capabilities cause an explicit refusal; another version from the extension's development dependencies cannot be substituted.
 
 The production entry point has three layers with clear boundaries; there is still just one V3 DAG core in the middle:
 
@@ -553,11 +566,11 @@ The extension entry point first reads `routing-policy.json`. Using `routingProfi
 
 It does not decompose the caller's goals, review plans, or require visual evidence. Before every parent Agent turn, the Pi extension injects a fixed, idempotent `PI-GRAPH Routing` contract requiring actual child Agent delegation to use `graph`: single tasks use one node; fan-out/fan-in, dependency chains, and implementation with independent testing/review use the corresponding multi-node structures. The same contract is used directly in the `graph` tool description to prevent divergence. This remains prompt guidance: it does not start Graphs itself or automatically convert already-started ordinary subagents into nodes. Without an actual `graph` call, DAG Core does not intervene. `/graphs doctor` and `graph doctor` show the contract version, SHA-256, and the most recent injection decision, without saving the system prompt or user content.
 
-See [docs/product-definition.md](docs/product-definition.md) for product boundaries, [docs/v3-technical-contract.md](docs/v3-technical-contract.md) for complete fields and recovery semantics, and [docs/graph-architecture.md](docs/graph-architecture.md) for implementation layers.
+See [model and role settings](docs/owned-model-settings.md) and [session continuation](docs/session-continuation.md) for configuration and recovery boundaries.
 
 ## Installation and runtime requirements
 
-0.2.0, the owned runtime release, is published on npm. 0.2.1 adds Chinese and English documentation on the same page without changing runtime logic. See the [npm release workflow](docs/npm-release.md) for validation and publication boundaries, and [CHANGELOG](CHANGELOG.md) for changes.
+0.2.2 updates terminal task presentation, host SDK compatibility, and bounded timeout continuation, and fixes a race between task completion and pause requests. See [CHANGELOG](CHANGELOG.md).
 
 Node.js `>=22.19.0` and an installed Pi are required. Runtime uses the host-provided Pi SDK and verifies required APIs and session lifecycle capabilities at startup. Development dependencies are pinned to `1.0.4`; this does not require the host to use that exact version. Missing required capabilities cause startup refusal, without silently switching to another SDK.
 
@@ -578,7 +591,7 @@ PI_CODING_AGENT_DIR="$release_agent_dir" pi -e /absolute/path/to/node_modules/pi
 
 `-e` does not write an installation declaration. The isolation variable prevents reuse of existing Pi configuration; `HOME` is unchanged. Check extension loading only: do not submit real model tasks or log in to model services. A `.tgz` is an npm package archive and cannot be loaded directly as a single Pi extension file. See the release workflow for complete commands and personal npm login steps.
 
-There is no need to install `pi-subagents`, `pi-intercom`, or Maestro. For existing duplicate extensions, first check their installation sources; users should remove them when no tasks are active, without directly deleting historical run data. Shell protection depends on macOS `sandbox-exec`; on other systems, or when that command is unavailable, the runner refuses unprotected shell execution. Read-only and other tools must still pass their own preflight checks. This does not promise complete functionality on other platforms or full security isolation from external services or the same OS user.
+There is no need to install `pi-subagents`, `pi-intercom`. For existing duplicate extensions, first check their installation sources; users should remove them when no tasks are active, without directly deleting historical run data. Shell protection depends on macOS `sandbox-exec`; on other systems, or when that command is unavailable, the runner refuses unprotected shell execution. Read-only and other tools must still pass their own preflight checks. This does not promise complete functionality on other platforms or full security isolation from external services or the same OS user.
 
 ## Core capabilities
 
@@ -833,10 +846,6 @@ Graph child communication consistently uses `graph_mailbox`; old `contact_superv
 
 When dispatching, Graph appends bounded execution context from the digest-bound shadow contract after the complete original task, preserving the original first line and every task/capsule byte: actual shadow cwd, relative read/write scopes, read-only state, and path restrictions. The inline task is the handoff unless it explicitly provides an in-scope handoff file. Children should not guess `../task-handoff.md` / `code-context.md`, access original source or `~` paths, or list directories outside scope. Paths are escaped JSON data; excessive or overly long entries are omitted in full with a count, rather than presenting shortened paths as permissions. Context explains existing Guard permissions without changing tool filtering or protected-directory rules. Untrusted-data markings on the original task and dependency capsule remain unchanged.
 
-## Relationship to dsh-graph
-
-V3's core architecture draws on `dsh-graph`: DAG compilation, ACCEPTED unlocking, OPEN/SEALED, revision CAS, conditional nodes, Attempt history, dependency capsules, versioned artifacts, and capsule templates. The Pi version is not a source port: it uses owned `pi-graph:runtime:v1` RPC, shadow workspaces, multi-file Authorization/Attempt evidence, and cross-process Supervisor fencing. See the technical contract's “dsh-graph alignment matrix” for precise differences.
-
 ## Development validation
 
 ```bash
@@ -863,7 +872,7 @@ Old run protocols retain results and read-only history, without automatic conver
 
 ### Pi native CLI task panel
 
-- The bottom shows a bounded, collapsible summary: state, category counts, at most two running roles, and merged reasons. Tool START displays only “Submitted”; WAIT displays only “Waiting for results / Waiting ended,” as a single line without background color. Expanded views retain detailed data.
+- A collapsible Todo widget above the editor shows the independent plan or Graph tasks; a separate tree below the editor shows actual active Agents. Plan completion and Graph acceptance are counted separately. Active work takes priority; other observed records and graphs needing attention remain accessible by count and details. Tool START displays only “Submitted”; WAIT displays only “Waiting for results / Waiting ended,” as a single line without background color. Expanded views retain detailed data.
 - `/graphs view` selects a Graph; `/graphs view <graph-id>` opens it directly. ↑↓ or j/k selects tasks, Enter shows details, l shows raw state JSON, PgUp/PgDn changes pages, Esc returns, and q closes.
 - The viewer is read-only and does not take over, rerun, or stop tasks. Raw record pages show current persisted state and failure evidence, not complete session logs. Failed refreshes retain the last state with an explicit notice.
 - Success, failure, not executed, running, queued, stopped, cancelled, and skipped are counted separately. “Stopped · includes N failures” appears only when both a stop request and node abort evidence exist. “Control probe responsive” means only that the runner can respond, not that the model is progressing.
@@ -871,6 +880,26 @@ Old run protocols retain results and read-only history, without automatic conver
 - Restart existing Pi sessions after tasks finish to load all new runtime code; new sessions load it directly.
 
 An interrupted main Agent response before startup explicitly displays “Not executed · main Agent response interrupted.” A graph tool that has not been called is not displayed as a failed child task execution. Graph does not change upstream display ownership or session identity.
+
+### Total plan, execution tasks, and Agents
+
+`Alt+G` opens the combined panel. In a list, `p` / `t` / `a` switches plan/tasks/Agents and `g` selects a Graph. Reliable command alternatives are `/graphs todo`, `/graphs tasks`, `/graphs agents`, and `/graphs history`; Option must send Meta for the shortcut. Enter on a plan item shows its links; select a link and press Enter for the existing task details.
+
+The parent-only `graph_todo` tool explicitly maintains the independent plan. It neither extracts plans from chat nor migrates other Todo plugins. Read `list` first; every mutation requires the current `expectedRevision`.
+
+```json
+{"action":"set","expectedRevision":0,"items":[{"id":"delivery","title":"Verify delivery","status":"pending"}]}
+```
+
+`set` replaces the plan, `update` changes one item's `title` / `status` by `id`, and `link` replaces its `links:[{graphId,runInstanceId,taskId}]`. Maximums are 128 items and 400 characters per title. Unlinked items are manual; manual completion is not Graph acceptance. Linked completion requires every referenced current node attempt to be accepted in the exact session and run. Missing, unreadable, or foreign evidence is unknown; links grant no execution permission.
+
+Plans use native `pi-graph-todo/1` session entries, with branch-local contents and session-wide revisions. Empty sessions may hold entries only in memory; the UI distinguishes durable, memory, and unconfirmed saves. Failed saves are not retried automatically. Viewing and refreshing append nothing and trigger no model or Graph action. Historical counts cover this session's observed collection, not all files on disk. An eight-row terminal keeps only status and the details entry point. After tasks finish, update the installation copy Pi actually loads, then restart normally. Editing a separate source checkout or merely restarting does not update that installed copy; do not replace or reload an active installation.
+
+
+Physical exit proof and Graph state are displayed separately. When proof matches the current session, Graph/run, task attempt, native run, and runner but the saved task remains running/dispatched, the UI shows “Process exited; Graph state needs verification” and excludes it from active members and messaging. Original phases, statuses, and files remain unchanged; no acceptance, resume, or redispatch is triggered. Continuations require a sealed final generation and matching ledger. Incomplete needs_attention seals are only “exit evidence unverified,” not confirmed exit. Missing or stale identity, worker-only exit, a stopped status alone, and request timeouts do not establish runner exit.
+
+
+Inactive mailbox `send/reply/ack/wait` returns an explicit unsuccessful receipt: `code=mailbox_inactive`, `delivery=not_sent`, `taskRestarted=false`, and `canRetry=false`. Only a terminal Graph status is described as ended; running or unknown status asks the user to check the run. Both compact and expanded views state that nothing was sent and automatic retry is inappropriate. `receive/read/status` remain read-only history inspection. Bring follow-up requirements to the parent session, inspect existing results, and arrange only remaining work. A finished child does not mean the overall goal is complete; waiting for human authorization must not create a watcher or redispatch. Owner checks and closed-recipient rules remain unchanged.
 
 ### CLI information hierarchy (2026-09-09)
 
@@ -990,7 +1019,7 @@ Details provide bounded saved-artifact previews. `o` opens a verified accepted s
 
 ### Graph state summaries and activity details
 
-Graph's owned summary shows overall state and category counts, at most two running roles, actual models, and current or most recently finished tools. Task IDs are not repeated when role names exist, and missing fields are omitted. Additional running tasks show only a count; queues show only a count or the next item with an explicit dependency. Concurrency, permissions, and quota causes are not guessed, and task IDs are not automatically translated. At most the three most recent Graphs each show a summary; others remain accessible through `/graphs`. Collapsing summaries does not stop tasks.
+The combined panel always retains task IDs alongside roles, observed actual models, and current or recent tools; missing fields are omitted. At most two actual active Agents are expanded, with additional members counted. Active work has priority; other observed records and graphs needing attention in this session are counted and remain accessible, without expanding multiple historical warnings. Plan completion and Graph acceptance are separate. Concurrency, permissions, or quota causes are not guessed. Collapsing the panel does not stop tasks.
 
 Select a task in `/graphs` and press Enter to view actually observed tools, paths, tool call counts, actual models, and the absolute time of latest activity. Expanded tool views also show these facts. Missing information explicitly says it was not observed; finished tasks show the last observation; abnormal or future timestamps are marked for inspection. Old timestamps alone do not mean failure or unresponsiveness; specific anomalies follow existing supervision evidence. Display does not change execution state or start extra timers. `m/o/l/Esc` retain their behavior.
 
@@ -1008,21 +1037,21 @@ Parse the response body as JSON, concatenate its `text` values in order, then **
 
 ### Summaries, full results, and paginated reading
 
-The top three recent Graphs are ordered by run instance and stable summary update order. Details such as activity times and tool counts still update with new snapshots, but do not alone move a Graph into the recent three. Summary changes to phases, task counts, or queue reasons still update the order. Inspector retains the selected task and refreshes its details with new snapshots.
+The summary focuses on a Graph with active tasks, or a recent record needing attention when none are active. Other observed records in this session remain accessible through counts and history. Inspector details retain the selected task for verification; the Agent list selects the next visible member when one exits.
 
 In node details, press `o` for verified saved artifacts and `f` for native results bound to a fixed execution attempt. `n` continues to the next page; `Esc` returns to details. `f` labels `native_capture` or `fallback` (existing Attempt record fallback), and displays `complete:true` (completeness verified), `complete:null` (completeness unproven), or `complete:false` (truncated). Missing native capture does not rerun tasks or increase the existing approximately 64 KiB saved-artifact storage limit. Reaching the end of a source does not establish that the original model output is necessarily complete.
 
 `graph action=result` and `action=attention` page by Unicode characters, default 4096 and maximum 8192; byte budgets may shorten a page. Copy the entire returned `nextRequest` exactly until it is `null`. Its `expectedSha256` fixes the content version of the entire source; node results also fix `attempt`. A changed source or unrecoverable cache returns `source_changed`, `recoverable:true`, `isError:false`, and recovery instructions without body text. Discard collected old pages and copy the complete `restartRequest` to automatically reread from offset 0 at most once, preserving limit, without requesting user authorization again. Do not rerun, stop, or replay tasks. If the same read again requests recovery, stop looping that path and use `/graphs` details or report the reason. attention and result without node use separate read-only snapshots, preserving original content and hash across pages. Valid continuation refreshes the 120-second idle expiry, with a maximum lifetime of 10 minutes. The cache holds at most 32 entries and 16 MiB total; cold starts, capacity eviction, or expiry explicitly request a restart of reading. Results with node/attempt always revalidate actual evidence and digests, without caching to hide tampering. Permission, invalid-argument, and integrity failures remain real errors. Fixed-snapshot continuation requires the full `nextRequest`; bare offsets without expectedSha256 are unsupported. Only node-result reading remains compatible with old bare offsets, which cannot guarantee multiple pages belong to one version.
 
-These improvements draw on [pi-maestro-flow](https://github.com/catlog22/pi-maestro-flow)'s [completion ownership](https://github.com/catlog22/pi-maestro-flow/blob/master/packages/pi-maestro-teammate/src/completion-outbox/coordinator.ts), [content identity](https://github.com/catlog22/pi-maestro-flow/blob/master/packages/pi-maestro-teammate/src/public/v1/completion-durability.ts), and [conflict protection](https://github.com/catlog22/pi-maestro-flow/blob/master/packages/pi-maestro-teammate/src/completion-outbox/file-store.ts) principles: determine same-path reception order before asynchronous reads, prevent conflicting overwrites of saved results, and maintain consistency separately for paginated content and summary displays. Adaptation uses this project's owned SDK runtime contract, without introducing Maestro APIs, outboxes, or storage migration. Same-path arrival-order guarantees apply only to already-bound receivers in the same process; no global arrival order is promised across processes or pre-binding caches.
+These improvements determine same-path reception order before asynchronous reads, prevent conflicting overwrites of saved results, and maintain consistency separately for paginated content and summary displays. Adaptation uses this project's owned SDK runtime contract. Same-path arrival-order guarantees apply only to already-bound receivers in the same process; no global arrival order is promised across processes or pre-binding caches.
 
-Compact cards hide complete task text, log paths, and tool argument paths by default; ctrl+o expansion retains native details. Graph summaries retain roles or short task IDs, state, and actual problems, showing a next item only for explicit dependencies. New runs do not use native maintenance manifests; historical patch backups are not installation steps.
+Compact cards hide complete task text, log paths, and tool argument paths by default; ctrl+o expansion retains native details. Graph summaries always retain task IDs alongside roles, observed actual models, state, and actual problems, showing a next item only for explicit dependencies. New runs do not use native maintenance manifests; historical patch backups are not installation steps.
 
 ### Safe runtime model replacement
 
-Drawing on Maestro's error classification, candidate advancement, and no-effect-replay principles, Graph supports limited runtime model replacement for newly admitted capability-routed nodes. When a routing profile explicitly sets `budget.modelDegradations > 0`, or independent role configuration explicitly provides `fallbackModels`, compliant backup models for the same role are frozen at admission. The main session model and reasoning level are not captured automatically, nor is the parent model appended as a backup. Replacement is disabled for explicit zero capability-routing budget, explicit fallbackModels:[], or old Graphs with no frozen candidates. An explicitly specified model is first choice. Ordinary ordered policy uses only candidates following it in the configuration list; candidatePool=all-compatible freezes backups from other configuration-approved compatible candidates while retaining budget and capability guards. Candidates must preserve Agent, tool, and extension contracts and satisfy image-input capabilities, available model scope, model-family separation, and configuration-approved provider, model-scope, and capability constraints. Candidates that cannot be compliantly frozen before startup are not added ad hoc at runtime.
+Graph supports limited runtime model replacement for newly admitted capability-routed nodes. When a routing profile explicitly sets `budget.modelDegradations > 0`, or independent role configuration explicitly provides `fallbackModels`, compliant backup models for the same role are frozen at admission. The main session model and reasoning level are not captured automatically, nor is the parent model appended as a backup. Replacement is disabled for explicit zero capability-routing budget, explicit fallbackModels:[], or old Graphs with no frozen candidates. An explicitly specified model is first choice. Ordinary ordered policy uses only candidates following it in the configuration list; candidatePool=all-compatible freezes backups from other configuration-approved compatible candidates while retaining budget and capability guards. Candidates must preserve Agent, tool, and extension contracts and satisfy image-input capabilities, available model scope, model-family separation, and configuration-approved provider, model-scope, and capability constraints. Candidates that cannot be compliantly frozen before startup are not added ad hoc at runtime.
 
-Frozen plans not using the new continuation protocol still recognize only the owned runner's complete `preActivityEvidence`: an official Pi SDK session in a separate worker, subscription before prompt, one internal launch, zero tool starts/assistant toolCall/orphan tool results, original assistant error, prompt completion and normal commands/shutdown completion, and no cancellation/interruption/timeout/late activity. Graph additionally checks actual process exit, receipt/session/run/step identities, persisted Graph Guard workspace binding, and actual model. The final error must match structured provider diagnostics. Model identity/result structure validation failures, reported file modifications, or mutation attempted/observed all refuse replacement. UI `toolCount=0`, logs without tools, errors in task text, and ordinary output summaries cannot authorize replay. The observed Kimi HTTP 403 “You've reached your 5-hour usage limit” is classified as quota failure; quota recovery time is not guessed.
+Frozen plans not using the new continuation protocol still recognize only the owned runner's complete `preActivityEvidence`: an official Pi SDK session in a separate worker, subscription before prompt, one internal launch, zero tool starts/assistant toolCall/orphan tool results, original assistant error, prompt completion and normal commands/shutdown completion, and no cancellation/interruption/timeout/late activity. Graph additionally checks actual process exit, receipt/session/run/step identities, persisted Graph Guard workspace binding, and actual model. The final error must match structured provider diagnostics. Model identity/result structure validation failures, reported file modifications, or mutation attempted/observed all refuse replacement. UI `toolCount=0`, logs without tools, errors in task text, and ordinary output summaries cannot authorize replay. Quota failures require explicit provider diagnostics; quota recovery time is not guessed.
 
 After the old zero-activity path is proven, failed Attempt and replacement contract are persisted first; the next frozen model starts with a new Attempt and unique dispatch identity. Static Graph/authorization digests remain unchanged, permissions do not expand, and the failed model is not replayed within this node's replacement chain. Exhausted candidates, insufficient cumulative node usage allowance or missing usage evidence, and the lifecycle Attempt limit terminate replacement. A pause before backup dispatch retains its prepared record, returns paused, and releases runtime ownership; resume uses the same candidate and dispatch identity. Compact Graph summaries show one replacement-reason line only while the backup runs; other evidence is in `/graphs`.
 
@@ -1038,12 +1067,92 @@ Normal uses of parent context remain, including the parent tool ceiling and excl
 
 Updating disk code does not hot-update all open Pi sessions or rewrite old Graphs' frozen chains. After current tasks finish, restart the corresponding Pi session; new Graphs or appended nodes then use new admission policy. Old authorization, snapshots, and digests remain unchanged, without automatic stop or replay. Completed tools are not recovered by redispatching the original task.
 
-## References and sources
-
-Task orchestration, mailbox, and completion-ownership design draw on [pi-maestro-flow](https://github.com/catlog22/pi-maestro-flow); owned launch interfaces also draw on the original [pi-subagents](https://github.com/nicobailon/pi-subagents) contract. Current low-level utilities are independently implemented, without whole-package installation, runtime dependencies, or section-by-section source porting. Permission to reference MIT tool code is not described as actual copying. The Pi SDK remains provided by the host installation.
-
 ## License
 
-This project uses the [MIT License](LICENSE), copyright 2026 HeathHe. Runtime dependencies retain their respective licenses; design references do not imply copying or installing the referenced projects.
+This project uses the [MIT License](LICENSE), copyright 2026 HeathHe. Runtime dependencies retain their respective licenses.
 
 </details>
+
+
+### 终端常驻任务堆栈 / Native terminal task stack
+
+Todo 常驻输入框上方，摘要显示完成数量；展开后每个任务独立成行，显示可读任务、责任岗位、实际模型与依赖等待。下方直接显示Agent树行与工具活动，不增加Agent或Graph标题层。默认展开；`Alt+T` 原地展开/收起，或使用 `/graphs expand`、`/graphs collapse`、`/graphs toggle`。展开显示已知依赖、受阻原因与责任岗位。独立总计划优先；没有总计划时明确显示 Graph 任务，不将人工完成计作 Graph 验收。
+
+`Alt+Shift+T` 打开总计划详情，`Alt+R` 打开成员详情；`Alt+G` 与 `/graphs todo/tasks/agents/history` 保留。快捷键需要终端正确发送 Option/Meta，命令可作为可靠替代。下方只统计真实派发且未确认退出的成员；主会话状态单独标示，不计入成员数。模型、工具名和时长仅来自实际观测，长行优先保留状态与任务身份。没有新增模型请求，也不修改输入草稿。
+
+Todo stays above the editor with completion counts. Expanded tasks occupy separate rows showing readable task descriptions, responsible roles, actual models and dependency waits. Below the editor, Agent tree rows and tool activity render directly, without Agent or Graph header rows. Tasks are expanded by default; `Alt+T` expands/collapses in place; `/graphs expand`, `/graphs collapse`, and `/graphs toggle` are command alternatives. Expanded rows show known dependencies, blocking reasons and responsible roles. An independent plan takes priority; without one, the widget explicitly shows Graph tasks. Manual completion remains separate from Graph acceptance.
+
+`Alt+Shift+T` opens plan details, `Alt+R` opens Agent details, and existing `Alt+G` and `/graphs todo/tasks/agents/history` navigation remains available. Terminal Option/Meta configuration affects shortcuts; commands remain reliable alternatives. Only actually dispatched, non-exited child agents count as members. Parent activity is separate; models, tool names and durations use observed facts. Rendering preserves editor drafts and makes no model requests.
+
+
+### Complete goal plans and event receipts / 完整目标计划与事件回执
+
+For a confirmed goal spanning three or more stages, dependencies, turns or Graphs, the parent first calls `graph_todo list`, then CAS `set` for the full plan before dispatch. Optional `assignee` is an explicit role/name (for example `root`); `dependsOn` lists item IDs in this same plan. References must exist, be unique and acyclic. Existing records without these fields remain supported. Link real Graph/run/task IDs after dispatch; manual completion is not Graph acceptance. Human approval remains blocked, without a watcher or replay. A one-node Graph fallback explicitly means no overall plan has been established.
+
+已确认目标涉及三个以上阶段、依赖、跨轮次或多个Graph时，父会话先`graph_todo list`，再按revision建立完整计划。可选`assignee`明确责任岗位/名称（例如`root`），`dependsOn`引用同计划项ID，禁止不存在、重复或成环引用；旧记录兼容。派发后用真实Graph/run/task关联，人工完成不冒充Graph验收。等待人类授权保持受阻，不建watcher或重放。单Graph回退明确表示尚未建立总计划，不会从旧聊天自动补写。
+
+```json
+{"action":"set","expectedRevision":0,"items":[{"id":"design","title":"确认设计","status":"pending","assignee":"root"},{"id":"build","title":"实现并验证","status":"pending","assignee":"backend-developer","dependsOn":["design"]}]}
+```
+
+Tool results own their native rendering after arrival, replacing the pending call row. Event labels require observed dispatch or acceptance; reading output alone never proves completion. Errors, attention, unfinished waits and pagination remain visible, with original machine content and result references preserved. In-memory receipt evidence does not fabricate identity when an old transcript lacks it.
+
+工具返回后接管原生回执，收起重复调用行。启动/验收事件只使用对应证据；读取结果不等于任务完成。错误、待处理、尚未结束的等待及分页保持可见，原机器数据和结果入口保留。旧会话缺少身份资料时不会猜测。
+
+A symbolic-link scope failure must be addressed by narrowing authorized read/write scopes to required source files/directories. Do not delete normal pnpm links, follow them automatically, or disable isolation checks. Browser-only tasks must not default to whole-repository `.`; required input documents need explicit read scopes.
+
+隔离范围包含符号链接时，应由业务父会话核对剩余工作并缩小必要读写范围；不能删除正常pnpm链接、自动跟随或关闭隔离检查。浏览器任务不能兜底扫描整仓`.`，输入文档须明确列入读取范围。此次仅显示提示，不自动重派失败任务。
+
+### 完整目标计划 → 绑定派发 → 验收进度
+
+对已确认的多阶段目标，先 `graph_todo list`，再一次 `set` 完整计划；可选 `goal` 是用户确认的目标描述。每次 `set` 生成新的 `planId`，后续 `update/link` 保持它；旧 v1 记录仍可读取。不要把旧计划或旧聊天自动当作本轮目标。
+
+```json
+{"action":"set","expectedRevision":0,"goal":"实现并验收已确认的改动","items":[{"id":"build","title":"实现","status":"pending","assignee":"developer"},{"id":"review","title":"独立验收","status":"pending","dependsOn":["build"],"assignee":"reviewer"},{"id":"deliver","title":"主会话核对并交付","status":"pending","dependsOn":["review"],"assignee":"root"}]}
+```
+
+随后调用 `graph` 的 `start`，在 **GraphSpec 外层**添加：
+
+```json
+{"action":"start","spec":{"schemaVersion":3,"goal":"实现与独立验收","nodes":[{"taskId":"implement","agent":"developer","task":"已确认的实现合同","sideEffect":"shadow_write"},{"taskId":"verify","agent":"reviewer","task":"独立验收合同","sideEffect":"none","dependsOn":["implement"]}]},"todoBinding":{"expectedRevision":1,"bindings":[{"todoId":"build","taskIds":["implement"]},{"todoId":"review","taskIds":["verify"]}]}}
+```
+
+例中岗位名、任务合同、作用域及授权须替换为本项目真实配置；示例不新增权限。绑定预检在派发前拒绝过期 revision、无效 ID、已完成/未知状态、已有 Graph links 的计划项。已有 links 的工作先核对旧结果，只把剩余工作建立新计划项，不清除记录或重跑。一个计划项可映射本次多个节点；同批计划依赖要求编译后的 Graph 中，每个下游节点都有通往所有相应上游节点的 accepted 依赖路径。
+
+成功启动后，用真实 `graphId/runInstanceId/taskId` 一次 CAS 批量追加 links，不把子进程退出当成验收。`graph_todo list` 持续读取 Graph accepted 证据派生进度；主会话完成自己的交付项后，再按当前 revision 显式 `update`。人工状态与 Graph 验收来源分别显示。
+
+Graph 存储与 Pi 会话记录不是跨存储原子事务。若启动已完成、关联保存未确认，工具返回**已启动、不可重派**的部分成功回执与真实运行身份；折叠和展开回执都提示先 `graph status/result`、`graph_todo list` 核对，再人工修复 links。系统不会因关联失败重启、自动停止或跨分支补写；用户明确 Escape 仍停止对应任务。相同 toolCall 复用已提交回执，不启动第二次。
+
+每轮只读计划摘要有项数/总字符上限，优先 root/parent 未完成项，再其他未完成项；已完成计划明确属于历史。标题和目标仅作为不可信数据，不是新指令或授权；摘要不读取旧聊天、不调用 Host、不写会话。子 Agent 不获得此父计划指导。旧 `start` 不带绑定仍兼容：若有未完成计划，只提醒未关联，不自动修改它。
+
+The parent plan is explicit: `list → set(goal, items) → graph start.todoBinding → list derived acceptance → update parent-owned work`. Bindings are outside GraphSpec and never reach children. A committed Graph with an unconfirmed plan append is a partial success with `started:true` and `canRetry:false`, not permission to replay. Existing linked items cannot start a second run. Completed plans are history; the bounded per-turn snapshot is untrusted read-only data, never authority for a new objective.
+
+### 可读待办与安静回执
+
+待办默认展开，每个任务独立一行；`Alt+T` 收起，`Alt+Shift+T` 查看详情。优先展示总计划中的明确标题；没有总计划时，仅显示“当前任务（未建总计划）”，从同一运行经过身份与摘要核验的授权记录读取目标。多节点缺少精确标题时标明岗位分工概括；目标缺失则明确“目标待补充”，不会拿内部任务编号或任务提示词冒充标题。内部 ID 仍在详情中可查。小窗口优先保留任务及溢出提示，不挤掉编辑器。
+
+正常且身份、节点覆盖、监管证据齐全的 start/wait 回执默认不占行（包括等待中的流式更新）；展开仍可查看。失败、阻塞、用户输入、历史监管异常、退出证据、停止未确认、关联未确认/未绑定提醒及覆盖不完整始终保留。只改变界面，不改变原始工具内容、模型可见结果、计划绑定、Graph 验收或通知行为。
+
+The Todo widget expands into readable task rows by default. Verified authorization goals supply display-only titles; unknown titles remain explicit. Healthy, fully covered start/wait receipts are quiet even during streaming; warnings remain visible, and expanded/raw receipts retain the original facts.
+
+### Agent 与实际模型身份
+
+默认成员栏优先保留规范 Agent 名和实际 `provider/model`，工具次数、时间和 token 只使用剩余空间。`Agent` 表示运行器已上报的实际岗位；只有计划/解析岗位时标为“分配Agent”，完全缺失则显示“Agent待上报”。模型只取实际观测值，缺失明确显示“实际模型待上报”，不会用请求或计划模型代替。
+
+窄窗口可将两项身份拆成两行；高度有限时每项保留可读份额并用省略号标明截短，`Alt+R` 查看完整详情。只要至少有两行可用且存在工作与活动子Agent，待办和子Agent各保留一行；主会话状态与统计不能抢占子Agent的唯一身份行。更小的物理空间仅显示受限标记和详情入口，不承诺无法容纳的完整信息。正常工具回执静默规则不变，内部 taskId 不放回默认成员行。
+
+
+### 只读定义与精简回执
+只读检查使用 `readScope` 指明必要输入，不声明 `writeScope`。`writeScope` 仅适用于已有写入授权的 `local_write`，且必须提供 `validationCommands`。定义冲突会保留原错误码和字段并给出修正说明；不会自动删范围、升级权限或重试，也不说明已有 Graph 从未启动。
+正常 start/wait 回执默认静默。监管 `unknown` 本身只表示尚无进展结论；已验收且确认正常退出也不作为警告。真实错误、探测失败、监管请求、退出或身份矛盾、覆盖不足仍显示简短中文提示。展开保留真实身份、用量和原始证据，成员栏继续显示实际 Agent 与模型。
+
+
+### Todo 身份与完整宿主布局
+关联 Todo 同时展示岗位与已上报的实际模型，已验收记录也保留；关联必须精确匹配当前会话、Graph、运行实例和任务，不从最近任务借模型。多成员保持身份配对并显示溢出数量；未启动/未上报明确区分，人工主会话待办不附加子模型。输入下仍只显示运行成员树。
+仅由正常未完成前置产生的等待使用中性样式；人工阻塞、未知及真实错误仍提醒。依赖说明只出现一次。宿主会压缩上下组件，长草稿和其他组件在极小窗口可能挤掉整行；完整身份仍可从详情读取，不能保证8行窗口容纳全部内容。
+
+### 有界的同模型请求续接
+
+新准入的 continuation-v1 多候选任务冻结 `transientRetryLimit: 1`：整个 logical run 遇到明确的 assistant 请求超时或连接中断，只有会话已闲置、工具调用与结果完整配对、没有排队/晚到事件、用量已知且权限/部署/模型身份不变时，最多发送一次短继续消息。沿用同一会话、模型与思考级别，保留已完成工具记录，不重派原任务。额外请求计入原 token/cost/turn 预算；持久化预留后即消耗次数，停止或进程崩溃不退还，后续合法模型切换/checkpoint 不重置次数。SDK 内置重试仍关闭。
+
+旧冻结计划未声明该策略时默认不启用；单候选、关闭备用的旧执行路径不自动获得续接能力。已经失败退出的历史 Graph 不迁移、不重跑；工具结果不明、进程异常退出、用户停止、权限或硬预算失败仍拒绝。此功能不保证上游服务不再超时，也不承诺外部副作用恰好一次；重复工具 ID 在执行前拒绝，未知结果不能据此重试。

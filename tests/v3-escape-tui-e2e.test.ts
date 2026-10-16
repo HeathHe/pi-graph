@@ -40,14 +40,14 @@ test("real Escape cancels Graph/child; inspector, menus and reload preserve canc
  try{
   await until(screen,(s:string)=>s.length>0,"TUI initialized");
   start("escape-observer");await until(()=>snapshot("escape-observer"),s=>s.nodes.child.phase==="running","real child running");await until(async()=>events,e=>e.some((v:any)=>v.event==="child_request"),"actual HTTP child request");
-  send("/graphs view escape-observer");await until(screen,(s:string)=>s.includes("q 关闭"),"inspector open");key("\x1b");await sleep(500);
+  send("/graphs view escape-observer");await until(screen,(s:string)=>/q\s*关闭/.test(s),"inspector open");key("\x1b");await sleep(500);
   assert.notEqual((await control("escape-observer")).desiredState,"stopped","closing inspector must not stop");
   send("/model");await sleep(400);key("\x1b");await sleep(300);assert.notEqual((await control("escape-observer")).desiredState,"stopped","closing model menu must not stop");
   send("/reload");await until(()=>control("escape-observer"),s=>s.desiredState==="paused","reload suspends instead of stopping");
   await until(screen,(s:string)=>s.includes("Reloaded keybindings"),"reload completed");await sleep(600);
   start("escape-wait");await until(()=>snapshot("escape-wait"),s=>s.nodes.child.phase==="running","fresh child after reload");
-  send("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify({action:"wait",id:"escape-wait"}));await until(screen,(s:string)=>s.includes("正在等待结果"),"foreground graph wait");
-  send("/graphs view escape-wait");await until(screen,(s:string)=>s.includes("q 关闭"),"busy inspector");key("\x1b");await sleep(300);assert.notEqual((await control("escape-wait")).desiredState,"stopped","busy inspector close does not abort graph");
+  send("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify({action:"wait",id:"escape-wait"}));await until(parentState,s=>!s.isIdle && s.activeTools?.includes("graph"),"foreground graph wait tool is actually active");
+  send("/graphs view escape-wait");await until(screen,(s:string)=>/q\s*关闭/.test(s),"busy inspector");key("\x1b");await sleep(300);assert.notEqual((await control("escape-wait")).desiredState,"stopped","busy inspector close does not abort graph");
   send("/model");await sleep(350);key("\x1b");await sleep(250);assert.notEqual((await control("escape-wait")).desiredState,"stopped","busy model close does not abort graph");
   const waitParentBeforeCancel=await parentState();key("\x1b");
   const stopped=await until(()=>snapshot("escape-wait"),s=>s.status==="stopped","stop terminal evidence");
@@ -59,7 +59,7 @@ test("real Escape cancels Graph/child; inspector, menus and reload preserve canc
   await writeFile(join(capture,"wait-escape.txt"),await screen());
   // A graph yielded for supervisor attention remains associated while the parent
   // starts another ordinary model turn. Escape of that turn must stop its child.
-  start("escape-attention",true);await until(screen,(s:string)=>s.includes("等待用户处理")&&s.includes("child"),"native attention");
+  start("escape-attention",true);await until(screen,(s:string)=>s.includes("等待用户")&&s.includes("fixture-local/local"),"native attention");
   await until(parentState,s=>s.isIdle,"attention start parent idle");
   const attentionWaitBefore=await parentState();
   send("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify({action:"wait",id:"escape-attention"}));

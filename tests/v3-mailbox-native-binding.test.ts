@@ -1,3 +1,4 @@
+import {captureHostSdkIdentity} from '../src/runtime/host-sdk.ts';
 import assert from "node:assert/strict";
 import test,{before,after} from "node:test";
 import {mkdtemp,mkdir,realpath,writeFile,readFile,rm} from "node:fs/promises";
@@ -42,7 +43,7 @@ test("owned actual SDK child accepts dispatch bindings and refuses malformed nam
  const saved={NODE_ENV:process.env.NODE_ENV,PI_GRAPH_CHILD:process.env.PI_GRAPH_CHILD,PI_GRAPH_EXTENSION_BINDINGS:process.env.PI_GRAPH_EXTENSION_BINDINGS};process.env.NODE_ENV='test';
  try{
   const contract=await preflight(preflightInput(fixture.bindings));if(!contract.ok)throw Error(contract.message);assert.equal(contract.ok,true);
-  const intent:any={version:1,runId:'bindings-fixture',asyncDir:join(fixture.root,'owned-child'),sessionId:'owner',runnerProcessInstanceId:'instance',params:{...fixture.params,model:'openai/gpt-4o',extensionBindings:fixture.bindings},agent:{name:fixture.params.agent},launchContract:contract.contract};
+  const intent:any={hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'bindings-fixture',asyncDir:join(fixture.root,'owned-child'),sessionId:'owner',runnerProcessInstanceId:'instance',params:{...fixture.params,model:'openai/gpt-4o',extensionBindings:fixture.bindings},agent:{name:fixture.params.agent},launchContract:contract.contract};
   const child=await openOwnedChild(intent,()=>{},'success');
   try{assert.deepEqual(JSON.parse(process.env.PI_GRAPH_EXTENSION_BINDINGS!),normalize(fixture.bindings)!.value);assert.ok(child.acknowledged.has('pi-graph-guard'));}finally{await child.shutdown();}
   await assert.rejects(openOwnedChild({...intent,params:{...intent.params,extensionBindings:bad()}},()=>{},'success'),/package-like.*positive-version/);

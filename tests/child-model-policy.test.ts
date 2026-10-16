@@ -1,3 +1,4 @@
+import {captureHostSdkIdentity} from '../src/runtime/host-sdk.ts';
 import {assertChildModelAllowed,childPolicyFromSettings} from '../src/runtime/child-model-policy.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,7 +19,7 @@ for(const project of [{subagents:{modelScope:{enforce:false,allow:['inherit','te
 
 async function owned(f:Awaited<ReturnType<typeof setup>>,model:string|undefined='kimi-coding/k3',extra:any={}){
  const dir=join(f.root,'run');await mkdir(dir,{recursive:true});await mkdir(join(dir,'fixture-agent'),{recursive:true});await writeFile(join(dir,'fixture-agent/settings.json'),JSON.stringify({subagents:{modelScope:{denyFamilies:['gpt','codex']}}}));
- const intent:any={version:1,runId:'fixture',asyncDir:dir,runnerProcessInstanceId:'fixture',sessionId:'fixture',params:{cwd:f.cwd,model,...extra.params},agent:{name:'worker'},launchContract:{childModelPolicy:{denyFamilies:['gpt','codex']},inheritSkills:false,inheritGlobalContext:false,inheritProjectContext:false,tools:{effectiveAllowlist:['read'],extensionArgs:extra.paths??[]}},...extra.intent};
+ const intent:any={hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'fixture',asyncDir:dir,runnerProcessInstanceId:'fixture',sessionId:'fixture',params:{cwd:f.cwd,model,...extra.params},agent:{name:'worker'},launchContract:{childModelPolicy:{denyFamilies:['gpt','codex']},inheritSkills:false,inheritGlobalContext:false,inheritProjectContext:false,tools:{effectiveAllowlist:['read'],extensionArgs:extra.paths??[]}},...extra.intent};
  const events:any[]=[];const old=process.env.NODE_ENV;process.env.NODE_ENV='test';try{return {child:await openOwnedChild(intent,e=>events.push(e),'success'),events};}finally{if(old===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=old;}
 }
 test('real SDK blocks denied initial resolved model before transport',async()=>{const f=await setup();try{for(const m of ['test/gpt-6-astra','test/GPT-6.1-SOL:high','test/CODEX-auto-review:high'])await assert.rejects(owned(f,m),/family.*denied/);}finally{await f.close();}});

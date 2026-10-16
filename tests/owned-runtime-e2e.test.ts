@@ -46,9 +46,22 @@ test('controller reload preserves same identity without replay; durable completi
 test('independent guardian persists real child close after cold host process exits',async()=>{
  const f=await fixture();try{
   const {spawn}=await import('node:child_process');const moduleUrl=new URL('../src/runtime/controller.ts',import.meta.url).href;
-  const code=`import {GraphRuntimeController}from ${JSON.stringify(moduleUrl)};const bus={on(){return()=>{}},emit(){}};const c=new GraphRuntimeController(bus,()=>({sessionId:'owner'}),'success');const result=await c.call('spawn',${JSON.stringify(f.params)},'cold-host');process.stdout.write(JSON.stringify(result.details));process.exit(0);`;
+  const code=`process.argv[1]=${JSON.stringify(process.argv[1])};import {GraphRuntimeController}from ${JSON.stringify(moduleUrl)};const bus={on(){return()=>{}},emit(){}};const c=new GraphRuntimeController(bus,()=>({sessionId:'owner'}),'success');const result=await c.call('spawn',${JSON.stringify(f.params)},'cold-host');process.stdout.write(JSON.stringify(result.details));process.exit(0);`;
   const parent=spawn(process.execPath,['--experimental-strip-types','--input-type=module','-e',code],{env:process.env,stdio:['ignore','pipe','pipe']});let output='',error='';parent.stdout.on('data',b=>output+=b);parent.stderr.on('data',b=>error+=b);assert.equal(await new Promise(r=>parent.once('close',r)),0,error);const id=JSON.parse(output);
   const r=await waitForNativeAsyncRun({...id,events:f.bus,probeIntervalMs:20});assert.equal(r.state,'complete');const proof=JSON.parse(await readFile(join(id.asyncDir,'process-terminal.json'),'utf8'));assert.equal(confirmedProcessExit(proof,id.asyncId),true);assert.notEqual(proof.instances[0].pid,parent.pid);
   const again=await f.rpc.spawn(f.params,'cold-host');assert.equal(again.asyncId,id.asyncId);assert.equal(again.asyncDir,id.asyncDir);
  }finally{await f.close()}
+});
+
+test('caller SDK params and environment cannot replace the trusted parent capture',async()=>{
+ const f=await fixture();const previous=process.env.PI_GRAPH_HOST_SDK_ROOT;process.env.PI_GRAPH_HOST_SDK_ROOT='/invalid/task-selected-sdk';
+ try{const a=await f.rpc.spawn({...f.params,hostSdkRoot:'/invalid/task-selected-sdk',hostSdkIdentity:{root:'/invalid/task-selected-sdk'}},'untrusted-sdk');const r=await waitForNativeAsyncRun({...a,events:f.bus,probeIntervalMs:20});assert.equal(r.state,'complete');const intent=JSON.parse(await readFile(join(a.asyncDir,'intent.json'),'utf8'));assert.notEqual(intent.hostSdkIdentity.root,'/invalid/task-selected-sdk');assert.ok(intent.hostSdkIdentity.packageVersion);}
+ finally{if(previous===undefined)delete process.env.PI_GRAPH_HOST_SDK_ROOT;else process.env.PI_GRAPH_HOST_SDK_ROOT=previous;await f.close();}
+});
+test('failed host capture leaves no run directory and a repeated request does not become ambiguous',async()=>{
+ const f=await fixture(),argv=process.argv[1];try{
+  process.argv[1]=join(f.root,'missing-host-cli');
+  for(let n=0;n<2;n++)await assert.rejects(f.rpc.spawn(f.params,'host-missing'),/Cannot locate host Pi SDK/);
+  assert.deepEqual(await readdir(join(f.root,'runtime/async-subagent-runs')).catch(()=>[]),[]);
+ }finally{process.argv[1]=argv;await f.close();}
 });

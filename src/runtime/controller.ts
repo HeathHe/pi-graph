@@ -1,3 +1,4 @@
+import {captureHostSdkIdentity} from './host-sdk.ts';
 import {ownedContinuationAuthority} from "./session-continuation.ts";
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -67,6 +68,9 @@ export class GraphRuntimeController {
  }
  private async launch(params:any,requestId:string){
   const id='owned-'+createHash('sha256').update(requestId).digest('hex').slice(0,40),dir=join(subagentAsyncRoot(),id),digest=canonicalDigest(params);
+  const existing=await readNativeJson(join(dir,'intent.json'));
+  if(existing){if(existing.requestId!==requestId||existing.requestDigest!==digest||existing.sessionId!==this.owner().sessionId)throw Error('Existing launch intent is ambiguous; never replaying');return {details:{asyncId:id,asyncDir:dir,runtimeKind:OWNED_RUNTIME_KIND}};}
+  const hostSdkIdentity=await captureHostSdkIdentity();
   await mkdir(subagentAsyncRoot(),{recursive:true});
   try{await mkdir(dir);}catch(error){
    if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error;
@@ -93,7 +97,7 @@ export class GraphRuntimeController {
    }
    continuation={...authority,contracts};
   }
-  const intent={version:1,runtimeKind:OWNED_RUNTIME_KIND,runId:id,asyncDir:dir,runnerProcessInstanceId:instance,sessionId:owner.sessionId,sessionFile:owner.sessionFile,requestId,requestDigest:digest,params,agent,launchContract:resolved.contract,...(continuation?{continuation}: {})};
+  const intent={hostSdkIdentity,version:1,runtimeKind:OWNED_RUNTIME_KIND,runId:id,asyncDir:dir,runnerProcessInstanceId:instance,sessionId:owner.sessionId,sessionFile:owner.sessionFile,requestId,requestDigest:digest,params,agent,launchContract:resolved.contract,...(continuation?{continuation}: {})};
   await atomicWriteJson(join(dir,'intent.json'),intent);
   await atomicWriteJson(join(dir,'status.json'),{version:3,runtimeKind:OWNED_RUNTIME_KIND,runId:id,sessionId:owner.sessionId,cwd:params.cwd,state:'queued',steps:[]});
   const childEnv={...process.env,PI_GRAPH_CHILD:'1',PI_GRAPH_EXTENSION_BINDINGS:JSON.stringify(params.extensionBindings??{})};

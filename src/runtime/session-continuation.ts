@@ -73,23 +73,52 @@ export function eligibleSegment(last:any,proof:any,flags:any):{eligible:boolean;
  return classifyProviderFailure(last.errorMessage);
 }
 
+/** Only a settled assistant transport error, never tool/task text or a host deadline. */
+export function transientFailureKind(last:any):string|undefined {
+ if(last?.stopReason!=='error'||typeof last.errorMessage!=='string')return;
+ const message=last.errorMessage.trim();
+ if(/^(?:Request timed out\.?|Connection error\.?|fetch failed|(?:read )?ECONNRESET|ETIMEDOUT|socket hang up)$/i.test(message))return /timed out|ETIMEDOUT/i.test(message)?'request_timeout':'connection_failure';
+}
+export function eligibleTransientSegment(last:any,proof:any,flags:any):boolean {
+ try{validateSegmentProof(proof);}catch{return false;}
+ return !flags.stopped&&!flags.timedOut&&!flags.error&&!!transientFailureKind(last);
+}
+
 export function validateContinuationResult(intent:any,result:any,checkpoint=false){
  const l=result?.continuationEvidence,p=intent.continuation?.plan;
  validateRuntimeFallbackPlan(p);
  if(result.usageUnknown)throw Error('Unknown provider usage cannot be sealed as complete accounting');
- if(!l||!p||l.version!==1||l.kind!=='pi-graph-session-continuation/1'||l.planDigest!==p.digest||!checkpoint&&(l.final!==true||l.digest!==canonicalDigest({...l,digest:undefined}))||l.initialCandidateIndex!==intent.continuation.candidateIndex||!Array.isArray(l.transitions)||!Array.isArray(l.segments)||l.transitions.length>p.modelDegradations)throw Error('Continuation result ledger invalid');
+ if(!l||!p||l.version!==1||l.kind!=='pi-graph-session-continuation/1'||l.planDigest!==p.digest||!checkpoint&&(l.final!==true||l.digest!==canonicalDigest({...l,digest:undefined}))||l.initialCandidateIndex!==intent.continuation.candidateIndex||!Array.isArray(l.transitions)||!Array.isArray(l.segments)||l.transitions.length>p.modelDegradations+(p.transientRetryLimit??0))throw Error('Continuation result ledger invalid');
  if(!Array.isArray(l.modelDefinitions)||l.modelDefinitions.length!==p.candidates.length||p.candidates.some((c:any,i:number)=>{const d=l.modelDefinitions[i];return d?.model!==c.resolvedModel||`${d.definition?.provider}/${d.definition?.id}`!==c.resolvedModel.replace(/:(off|minimal|low|medium|high|xhigh|max)$/u,'');}))throw Error('Continuation model-definition identities differ from admission');
  for(const [i,c] of p.candidates.entries())assertCandidateModelCapabilities(c,l.modelDefinitions[i].definition,p.requirements);
  if(l.segments.length&&typeof l.sessionId!=='string')throw Error('Continuation SDK session identity missing');
  if(l.continuationDisabledReason!==undefined&&(l.continuationDisabledReason!=='uncontrolled_extensions'||l.transitions.length))throw Error('Continuation was disabled for these extensions');
- let candidate=l.initialCandidateIndex;for(const t of l.transitions){assertContinuationCandidate(intent,t.to);if(t.from!==candidate||t.to!==candidate+1||!['live','checkpoint'].includes(t.mode)||!['intent','acknowledged'].includes(t.state)||!p.candidates[t.to]||typeof t.segmentDigest!=='string')throw Error('Continuation transition chain invalid');candidate=t.to;}
+ const retries=l.transitions.filter((t:any)=>t.mode==='transient');
+ if(retries.length>(p.transientRetryLimit??0)||(p.transientRetryLimit!==undefined||l.transientRetries!==undefined)&&l.transientRetries!==retries.length)throw Error('Transient retry count differs from frozen policy');
+ let candidate=l.initialCandidateIndex;let previousSource=-1;
+ for(const t of l.transitions){
+  assertContinuationCandidate(intent,t.to);
+  const transient=t.mode==='transient';
+  if(t.version!==1||t.from!==candidate||t.to!==(transient?candidate:candidate+1)||!['live','checkpoint','transient'].includes(t.mode)||!['intent','acknowledged'].includes(t.state)||!p.candidates[t.to]||typeof t.segmentDigest!=='string')throw Error('Continuation transition chain invalid');
+  const source=t.sourceSegmentIndex??(p.transientRetryLimit===undefined?l.segments.findIndex((s:any)=>s.candidateIndex===t.from):-1),s=l.segments[source];
+  if(!Number.isSafeInteger(source)||source<=previousSource||!s||s.candidateIndex!==t.from)throw Error('Missing or duplicate continuation predecessor');previousSource=source;
+  validateSegmentProof(s.proof);
+  if((t.mode==='live'||transient)&&t.generation!==s.generation||t.mode==='checkpoint'&&(t.generation!==s.generation+1||!/^([a-f0-9]{64})$/.test(t.checkpointDigest??'')))throw Error('Continuation transition generation mismatch');
+  if(s.stopReason!=='error'||t.segmentDigest!==canonicalDigest(s.proof)||t.diagnostic!==s.diagnostic||(transient?!transientFailureKind({stopReason:s.stopReason,errorMessage:t.diagnostic}):!classifyProviderFailure(t.diagnostic??'').eligible))throw Error('Continuation transition lacks matching settled provider failure');
+  if(transient&&(t.runId!==intent.runId||t.sessionId!==l.sessionId))throw Error('Transient retry run/session identity mismatch');
+  if(transient&&(t.retryOrdinal!==retries.indexOf(t)+1||t.retryOrdinal>1))throw Error('Invalid transient retry ordinal');
+  const next=l.segments[source+1];
+  if(next&&(t.state!=='acknowledged'||next.candidateIndex!==t.to||next.generation!==t.generation))throw Error('Continuation transition acknowledgement mismatch');
+  candidate=t.to;
+ }
  if(candidate!==l.candidateIndex)throw Error('Continuation candidate index mismatch');
- for(const t of l.transitions){const s=l.segments.find((s:any)=>s.candidateIndex===t.from);if(!s)throw Error('Missing continuation predecessor');validateSegmentProof(s.proof);if(t.mode==='live'&&t.generation!==s.generation||t.mode==='checkpoint'&&(t.generation!==s.generation+1||!/^([a-f0-9]{64})$/.test(t.checkpointDigest??'')))throw Error('Continuation transition generation mismatch');if(t.segmentDigest!==canonicalDigest(s.proof)||t.diagnostic!==s.diagnostic||!classifyProviderFailure(t.diagnostic??'').eligible)throw Error('Continuation transition lacks a settled provider failure');}
  let previous=l.initialCandidateIndex-1;const totals:any={input:0,output:0,totalTokens:0,cacheRead:0,cacheWrite:0,totalCost:0,turnCount:0,toolCount:0};
  const completedIds=new Set<string>();
  for(const [i,s] of l.segments.entries()){
   assertContinuationCandidate(intent,s.candidateIndex);validateSegmentProof(s.proof);if(s.toolCount!==s.proof.toolsStarted||!Number.isSafeInteger(s.generation)||s.generation<0)throw Error('Continuation segment tool/generation accounting mismatch');const frozenThinking=candidateThinking(p.candidates[s.candidateIndex]);if(frozenThinking!==undefined&&s.thinking!==frozenThinking||!supportedThinking(l.modelDefinitions[s.candidateIndex]?.definition,s.thinking))throw Error('Continuation candidate thinking mismatch');for(const id of s.proof.resultIds){if(completedIds.has(id))throw Error('Duplicate completed tool ID across segments');completedIds.add(id);}
-  if(s.index!==i||s.sessionId!==l.sessionId||s.candidateIndex<=previous||s.model!==p.candidates[s.candidateIndex]?.resolvedModel||s.candidateIndex>candidate)throw Error('Continuation segment identity mismatch');previous=s.candidateIndex;
+  if(s.index!==i||s.sessionId!==l.sessionId||s.candidateIndex<previous||s.model!==p.candidates[s.candidateIndex]?.resolvedModel||s.candidateIndex>candidate)throw Error('Continuation segment identity mismatch');previous=s.candidateIndex;
+  if(i===0&&s.candidateIndex!==l.initialCandidateIndex)throw Error('Initial continuation segment mismatch');
+  if(i>0){const transition=l.transitions.find((t:any)=>(t.sourceSegmentIndex??(p.transientRetryLimit===undefined?l.segments.findIndex((v:any)=>v.candidateIndex===t.from):-1))===i-1);if(!transition||transition.state!=='acknowledged'||transition.to!==s.candidateIndex||transition.from!==l.segments[i-1].candidateIndex)throw Error('Continuation segment lacks acknowledged transition');if(transition.mode==='transient'&&(s.model!==l.segments[i-1].model||s.thinking!==l.segments[i-1].thinking))throw Error('Transient retry changed model or thinking');}
   for(const k of ['input','output','totalTokens','cacheRead','cacheWrite']){if(!Number.isFinite(s.tokens?.[k])||s.tokens[k]<0)throw Error('Unknown continuation usage');totals[k]+=s.tokens[k];}
   for(const k of ['totalCost','turnCount','toolCount']){if(!Number.isFinite(s[k])||s[k]<0)throw Error('Unknown continuation usage');totals[k]+=s[k];}
  }

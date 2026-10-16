@@ -1,3 +1,4 @@
+import {nodeProcessExit,nodeExitUnverified,type UiProcessExit} from "./process-exit.ts";
 import { classifyProviderFailure, isOAuthRefreshNetworkFailure } from "../failure-policy.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -6,12 +7,17 @@ import type { GraphSnapshotV3, V3NodeProjection, V3ChildSupervision } from "../t
 
 export type GraphTheme = ExtensionContext["ui"]["theme"];
 export interface DisplayEvidence {
+ goal?: string;
+ goalIdentity?: string;
+ expectedTaskIds?: string[];
  stopRequested?: boolean;
  failures: Record<string, string>;
  failureTimes?: Record<string,string>;
  localAuth?: Record<string,LocalAuthRecord>;
  neverDispatched: Set<string>;
  readError?: string;
+ exitUnverified?:string[];
+ processExits?: Record<string,UiProcessExit>;
 }
 const evidence = new WeakMap<GraphSnapshotV3, DisplayEvidence>();
 export function setDisplayEvidence(snapshot: GraphSnapshotV3, value: DisplayEvidence): void { evidence.set(snapshot, value); }
@@ -20,32 +26,41 @@ export function displayEvidence(snapshot: GraphSnapshotV3): DisplayEvidence | un
 export function safeText(value: unknown): string {
  return String(value ?? "").replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
 }
+/** Shared display identity; actual models must never fall back to requested/planned models. */
+export function nodeIdentity(id: string, n: V3NodeProjection): { task: string; role: string; model: string } {
+ return { task: safeText(id), role: safeText(n.observation?.actualAgent) || safeText(n.observation?.resolvedAgent) || safeText(n.agent), model: safeText(n.observation?.actualModel) };
+}
 export function pad(value: string, width: number): string {
  const text = truncateToWidth(value, Math.max(0, width));
  return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
 }
 export const phaseOf = (n: V3NodeProjection): string => n.terminalStatus ?? n.phase;
-export const activeNode = (n: V3NodeProjection): boolean => ["prepared", "dispatched", "running", "verifying", "applying"].includes(phaseOf(n));
+export const activeNode = (n: V3NodeProjection): boolean => !nodeProcessExit(n) && !nodeExitUnverified(n) && ["prepared", "dispatched", "running", "verifying", "applying"].includes(phaseOf(n));
 /** Only explicit fail-fast evidence can turn a stored failure into "not executed". */
 export function displayPhase(snapshot: GraphSnapshotV3, id: string, n: V3NodeProjection): string {
  const e = evidence.get(snapshot);
+ if(nodeProcessExit(n))return "exit_unreconciled";
+ if(nodeExitUnverified(n))return "exit_unverified";
  if (phaseOf(n) === "running" && n.observation?.supervision?.attention === "waiting_user") return "waiting_user";
  return phaseOf(n) === "failed" && e?.neverDispatched.has(id) && e.failures[id] === "Graph failed fast before this node started." ? "not_started" : phaseOf(n);
 }
 export function orderedNodes(snapshot: GraphSnapshotV3): Array<[string, V3NodeProjection]> {
  const priority = (id: string, n: V3NodeProjection) => {
   const p = displayPhase(snapshot,id,n);
-  return p === "failed" || p === "needs_attention" || n.observation?.supervision?.attention ? 0 : activeNode(n) ? 1 : p === "blocked" || p === "not_started" ? 2 : 3;
+  return p === "exit_unverified" || p === "exit_unreconciled" || p === "failed" || p === "needs_attention" || n.observation?.supervision?.attention ? 0 : activeNode(n) ? 1 : p === "blocked" || p === "not_started" ? 2 : 3;
  };
  return Object.entries(snapshot.nodes ?? {}).sort(([a,x],[b,y]) => priority(a,x)-priority(b,y));
 }
 export function phaseLabel(n: V3NodeProjection, snapshot?: GraphSnapshotV3, id?: string): string {
+ if(nodeProcessExit(n))return "退出待核对";
+ if(nodeExitUnverified(n))return "退出证据待核实";
  if (phaseOf(n) === "running" && n.observation?.supervision?.attention === "waiting_user") return "等待用户";
  if (phaseOf(n) === "aborted" && snapshot && id && evidence.get(snapshot)?.neverDispatched.has(id)) return "未启动";
  if (snapshot && id && displayPhase(snapshot,id,n) === "not_started") return "未执行";
  return ({ queued: "排队", prepared: "准备", dispatched: "已派发", running: "运行", verifying: "验收", applying: "应用", accepted: "成功", failed: "失败", aborted: "已停止", needs_attention: "待处理", skipped: "跳过", blocked: "未执行", cancelled: "已取消" } as Record<string,string>)[phaseOf(n)] ?? phaseOf(n);
 }
 export function phaseColor(n: V3NodeProjection, snapshot?: GraphSnapshotV3, id?: string): Parameters<GraphTheme["fg"]>[0] {
+ if(nodeProcessExit(n)||nodeExitUnverified(n))return "warning";
  if (snapshot && id && displayPhase(snapshot,id,n) === "not_started") return "muted";
  return phaseOf(n) === "failed" ? "error" : phaseOf(n) === "accepted" ? "success" : phaseOf(n) === "needs_attention" || n.observation?.supervision?.attention ? "warning" : activeNode(n) ? "accent" : "muted";
 }
@@ -54,13 +69,14 @@ export function counts(snapshot: GraphSnapshotV3): string {
  const groups: Array<[string,string[]]> = [
   ["成功",["accepted"]], ["运行",["prepared","dispatched","running","verifying","applying"]], ["失败",["failed"]],
   ["未执行",["not_started","blocked"]], ["排队",["queued"]], ["停止",["aborted"]],
-  ["等待用户",["waiting_user"]], ["待处理",["needs_attention"]], ["取消",["cancelled"]], ["跳过",["skipped"]],
+  ["待核对",["exit_unreconciled","exit_unverified"]], ["等待用户",["waiting_user"]], ["待处理",["needs_attention"]], ["取消",["cancelled"]], ["跳过",["skipped"]],
  ];
  return groups.flatMap(([label,phases]) => { const count=values.filter(p=>phases.includes(p)).length; return count ? [`${label} ${count}`] : []; }).join(" · ") || "暂无任务";
 }
 
 export function graphLabel(snapshot: GraphSnapshotV3): string {
  const nodes = Object.values(snapshot.nodes ?? {});
+ if(nodes.some(n=>nodeProcessExit(n)||nodeExitUnverified(n)))return nodes.some(activeNode)?"运行中 · 含待核对":"Graph 状态待核对";
  const failed = Object.entries(snapshot.nodes ?? {}).filter(([id,n]) => displayPhase(snapshot,id,n) === "failed").length;
  // A failed node plus an aborted sibling alone is not proof of operator intent.
  if (evidence.get(snapshot)?.stopRequested && nodes.some(n => phaseOf(n) === "aborted") && nodes.every(n => !activeNode(n) && phaseOf(n) !== "queued")) return `已停止${failed ? ` · 含 ${failed} 项失败` : ""}`;
@@ -99,6 +115,7 @@ export function localTimestamp(value: string): string {
  return Number.isNaN(date.getTime()) ? safeText(value) : date.toLocaleString("zh-CN", {hour12:false, timeZoneName:"short"});
 }
 export function nodeNextStep(snapshot: GraphSnapshotV3, id: string, n: V3NodeProjection): string | undefined {
+ if(nodeProcessExit(n)||nodeExitUnverified(n))return "核对原始状态、退出证据和已有结果；此提示不代表已验收，不自动重派。";
  if (n.observation?.supervision?.attention === "result_unavailable") return "先核对运行器兼容性和已有结果；验收前不要重跑或写回。";
  const p = displayPhase(snapshot,id,n);
  if (p === "not_started" || p === "blocked") return "先处理失败的任务，再决定是否继续。";
@@ -121,6 +138,10 @@ export function nodeNextStep(snapshot: GraphSnapshotV3, id: string, n: V3NodePro
 export function nodeReason(snapshot: GraphSnapshotV3, id: string, n: V3NodeProjection): string {
  const phase = displayPhase(snapshot,id,n), s = n.observation?.supervision;
  const error = evidence.get(snapshot)?.failures[id] ?? s?.error;
+ if(error?.includes("Graph scope contains a symbolic link:"))return evidence.get(snapshot)?.neverDispatched.has(id)?"隔离范围包含符号链接，子任务未启动":"隔离范围包含符号链接，执行状态请核对详情";
+
+ if(nodeExitUnverified(n))return `退出证据未核实，Graph 状态待核对${error?`；原记录：${errorSummary(error)}`:""}`;
+ if(nodeProcessExit(n))return `进程已退出，Graph 状态待核对${error?`；原记录：${errorSummary(error)}`:""}`;
  if (phase === "queued") {
   if (snapshot.status === "paused") return "Graph 已暂停，等待恢复";
   if (snapshot.status === "waiting_input") return "Graph 等待输入";
@@ -186,20 +207,20 @@ export function compactGraphLines(snapshot: GraphSnapshotV3): string[] {
  const active = rows.filter(([,n]) => activeNode(n));
  // While work is running, only unresolved needs_attention and live issues on running nodes stay current causes; terminated failed/aborted history stays in the counts and /graphs details instead of misleading the present state.
  const stalePhase = new Set(["failed","accepted","cancelled","skipped","aborted","not_started"]);
- const issues = rows.filter(([id,n]) => (["failed","needs_attention"].includes(displayPhase(snapshot,id,n)) || n.observation?.supervision?.attention || (activeNode(n) && (evidence.get(snapshot)?.failures[id] || n.observation?.supervision?.error))) && displayPhase(snapshot,id,n) !== "accepted" && (!active.length || !stalePhase.has(displayPhase(snapshot,id,n))));
+ const issues = rows.filter(([id,n]) => (["failed","needs_attention","exit_unreconciled","exit_unverified"].includes(displayPhase(snapshot,id,n)) || n.observation?.supervision?.attention || (activeNode(n) && (evidence.get(snapshot)?.failures[id] || n.observation?.supervision?.error))) && displayPhase(snapshot,id,n) !== "accepted" && (!active.length || !stalePhase.has(displayPhase(snapshot,id,n))));
  const groups = new Map<string,number>();
  for (const [id,n] of issues) { const reason=nodeReason(snapshot,id,n); groups.set(reason,(groups.get(reason) ?? 0)+1); }
  const out = [`◆ Graph 摘要 · ${graphLabel(snapshot)} · ${counts(snapshot)}`];
- // Owned runtime observations are facts; omit unavailable fields and keep at most two task rows.
+ // Owned runtime observations are facts; omit unavailable fields and keep at most two tasks.
  if (active.length > 1) out.push(`  并行 ${active.length} 项`);
  const compact = (value: unknown, width: number) => safeText(truncateToWidth(safeText(value), width));
  for (const [id,n] of active.slice(0,2)) {
-  const role = n.observation?.actualAgent ?? n.agent;
-  const model = n.observation?.actualModel;
+  const identity = nodeIdentity(id,n);
   const progress = n.observation?.progress;
   const tool = progress?.currentTool ?? progress?.lastTool;
-  const facts = [compact(role || id,20), model ? compact(model,26) : "", tool ? `${progress?.currentTool ? "工具" : "最近工具"} ${compact(tool,12)}` : ""].filter(Boolean);
-  out.push(`  当前：${facts.join(" · ")}`);
+  out.push(`  当前：${compact(identity.task,40)}${identity.role ? ` · ${compact(identity.role,24)}` : ""}`);
+  const facts = [identity.model ? `模型：${compact(identity.model,40)}` : "", tool ? `${progress?.currentTool ? "工具" : "最近工具"} ${compact(tool,12)}` : ""].filter(Boolean);
+  if (facts.length) out.push(`    ${facts.join(" · ")}`);
  }
  if (active.length > 2) out.push(`  另有 ${active.length-2} 项运行，/graphs 查看`);
  const readError = evidence.get(snapshot)?.readError;
@@ -228,4 +249,57 @@ export function compactGraphLines(snapshot: GraphSnapshotV3): string[] {
 }
 export function colorCompactLine(line: string, index: number, theme: GraphTheme): string {
  return line.startsWith("◆ Graph") ? theme.bold(theme.fg(/未完成|部分失败|需要处理/.test(line) ? "warning" : /已完成/.test(line) ? "success" : "accent", line)) : /^\s+原因/.test(line) ? theme.fg("warning", line) : line.includes("/graphs") ? theme.fg("dim", line) : theme.fg("muted", line);
+}
+
+export const displayGoalIdentity=(s:GraphSnapshotV3)=>JSON.stringify([s.graphId,s.runInstanceId,s.sessionId,s.graphDigest,s.sourceGraphSpecDigest]);
+/** Display-only metadata; never task prompt interpretation or execution authority. */
+export function setGraphDisplayGoal(snapshot:GraphSnapshotV3,goal:unknown,taskIds:readonly string[]):void {
+ const text=typeof goal==='string'?safeText(goal).slice(0,1200):'';
+ setDisplayEvidence(snapshot,{failures:{},neverDispatched:new Set(),...displayEvidence(snapshot),...(text?{goal:text}:{}),expectedTaskIds:[...taskIds],goalIdentity:displayGoalIdentity(snapshot)});
+}
+const roleNames:Record<string,string>={'product-manager':'产品经理','backend':'后端','backend-developer':'后端开发','frontend':'前端','frontend-developer':'前端开发','reviewer':'审查','code-reviewer':'代码审查','qa':'测试','qa-engineer':'测试','root':'主会话','parent':'主会话','generalist':'综合执行','general-purpose':'综合执行','browser-operator':'浏览器操作','researcher':'研究'};
+export const readableRole=(role:string)=>roleNames[role]??safeText(role);
+export function readableNodeTitle(snapshot:GraphSnapshotV3,id:string,node:V3NodeProjection):string {
+ const e=displayEvidence(snapshot),goal=e?.goalIdentity===displayGoalIdentity(snapshot)?e.goal:undefined,role=readableRole(nodeIdentity(id,node).role)||'执行';
+ return goal?Object.keys(snapshot.nodes??{}).length===1?goal:`${role}分工（概括）：${goal}`:`${role}任务（目标待补充）`;
+}
+
+/** Pure display identity: planned Agent is labelled, only observed actualModel is a model. */
+export function agentDisplayIdentity(n:V3NodeProjection):{agent:string;model:string;actualAgent:boolean;actualModel:boolean}{
+ const actual=safeText(n.observation?.actualAgent),assigned=safeText(n.observation?.resolvedAgent)||safeText(n.agent),model=safeText(n.observation?.actualModel);
+ return {agent:actual?`Agent ${actual}`:assigned?`分配Agent ${assigned}`:'Agent待上报',model:model?`模型 ${model}`:'实际模型待上报',actualAgent:!!actual,actualModel:!!model};
+}
+/** Two mandatory identity shares; truncation never silently removes either one. */
+export function agentIdentityRows(n:V3NodeProjection,width:number,twoLines=false):{lines:string[];clipped:boolean}{
+ const identity=agentDisplayIdentity(n),limit=Math.max(0,width),separator=' · ';
+ const model=(budget:number)=>{
+  if(visibleWidth(identity.model)<=budget)return identity.model;
+  if(!identity.actualModel)return truncateToWidth('模型待报',budget,'…');
+  const value=safeText(n.observation?.actualModel),label='模型 ',available=budget-visibleWidth(label),slash=value.lastIndexOf('/');
+  if(!value||slash<1||available<5)return truncateToWidth(identity.model,budget,'…');
+  const provider=value.slice(0,slash),id=value.slice(slash+1),left=Math.max(2,Math.min(visibleWidth(provider),Math.floor((available-1)*0.4))),right=Math.max(1,available-left-1);
+  return label+truncateToWidth(provider,left,'…')+'/'+truncateToWidth(id,right,'…');
+ };
+ if(twoLines){const a=truncateToWidth(identity.agent,limit,'…'),b=model(limit);return {lines:[a,b],clipped:a!==identity.agent||b!==identity.model};}
+ const joined=identity.agent+separator+identity.model;
+ if(visibleWidth(joined)<=limit)return {lines:[joined],clipped:false};
+ const available=Math.max(0,limit-visibleWidth(separator));let aBudget=Math.floor(available/2),bBudget=available-aBudget;
+ if(visibleWidth(identity.agent)<aBudget){bBudget+=aBudget-visibleWidth(identity.agent);aBudget=visibleWidth(identity.agent);}
+ if(visibleWidth(identity.model)<bBudget){aBudget+=bBudget-visibleWidth(identity.model);bBudget=visibleWidth(identity.model);}
+ return {lines:[truncateToWidth(identity.agent,aBudget,'…')+separator+model(bBudget)],clipped:true};
+}
+
+/** Display-only classification; unknown progress is not a failure or proof of health. */
+export function supervisionWarning(n:V3NodeProjection):string|undefined {
+ const s=n.observation?.supervision;if(!s)return;
+ if(s.error)return errorSummary(s.error);
+ if(s.attention)return attentionReason(s.attention)??safeText(s.attention);
+ if(s.runtimeFailure)return '运行器报告失败，请核对退出记录';
+ if(s.probe==='unreachable'||(s.failedProbes??0)>0)return '控制探测未成功，请核对运行状态';
+ if((s.repeatedErrors??0)>0)return '存在重复工具错误，请查看详情';
+ if(s.health==='suspected_unresponsive')return '疑似无响应，请核对运行状态';
+ if(s.health==='exited'||s.processExitConfirmed){
+  if(phaseOf(n)==='accepted'&&s.health==='exited'&&s.processExitConfirmed===true)return;
+  return s.processExitConfirmed?'进程已退出，但任务状态尚需核对':'退出状态缺少确认，请查看证据';
+ }
 }

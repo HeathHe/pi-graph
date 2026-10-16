@@ -1,3 +1,4 @@
+import {safeText} from "./presentation.ts";
 type RecordValue = Record<string, unknown>;
 const detailEntry = "展开查看详情。";
 function record(value: unknown): value is RecordValue {
@@ -22,7 +23,7 @@ function readableError(text: string, body: RecordValue | undefined): string {
  const raw = typeof body?.message === "string" ? body.message : typeof body?.error === "string" ? body.error : text;
  const translations: Array<[RegExp, string]> = [
   [/owner mismatch|identity.*no longer active|identity.*mismatch|not authorized/i, "当前会话无权访问这项信息。"],
-  [/inactive mailbox.*read-only/i, "任务已结束，邮箱仅可读取，不能继续发送。"],
+  [/inactive mailbox.*read-only/i, "邮箱不活动，仅可读取，不能继续发送。"],
   [/source.*missing|result evidence missing|message unavailable|result unavailable/i, "所需记录暂不可用。"],
   [/recipient.*closed|recipient.*stale/i, "收件任务已结束或已进入新的执行轮次。"],
   [/idempotency conflict/i, "这次消息与先前发送的内容不一致。"],
@@ -47,6 +48,11 @@ function readableError(text: string, body: RecordValue | undefined): string {
 export function compactToolReceipt(action: string, text: string, details: unknown, isError: boolean): string {
  const metadata = record(details) ? details : undefined;
  const body = parse(text);
+ if(metadata?.code === "mailbox_inactive" || body?.code === "mailbox_inactive") {
+  return (metadata?.taskEnded === true || body?.taskEnded === true)
+   ? "任务已结束，消息未发送；请把后续要求交给主会话。不可自动重试，不会重启旧任务。展开查看详情。"
+   : "当前邮箱只读，消息未发送；请核对运行状态。不可自动重试，不会自动重启或重发。展开查看详情。";
+ }
  if (metadata?.code === "source_changed" || body?.code === "source_changed") {
   return "读取快照已更新或失效，请从第一页重新读取。展开查看重读入口。";
  }
@@ -79,7 +85,8 @@ export function compactToolReceipt(action: string, text: string, details: unknow
   if (hasNext(body) || hasNext(metadata)) return `结果片段已读取，仍有后续内容。${detailEntry}`;
   if (body?.complete === false) return `结果已读取，记录不完整。${detailEntry}`;
   if (body?.complete === null) return `结果已读取，完整性尚未确认。${detailEntry}`;
-  return `结果已读取。${detailEntry}`;
+  const preview=typeof body?.text==="string"?body.text.split("\n").slice(0,6).map(line=>safeText(line).slice(0,240)).join("\n"):"";
+  return preview?`${preview}\n结果已读取 · 验收待确认 · ${detailEntry}`:`结果已读取 · 验收待确认。${detailEntry}`;
  }
  return `操作信息已返回。${detailEntry}`;
 }

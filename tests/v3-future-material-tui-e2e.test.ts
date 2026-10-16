@@ -52,9 +52,9 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
   assert.ok(evidence.some(row=>row.includes('"mode":"consumer"')&&row.includes("REAL_PRODUCER_MATERIAL")),"actual consumer read must return producer bytes");
   await writeFile(join(capture,"material-complete.txt"),await screen());
   send("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify({action:"start",spec:{schemaVersion:3,graphId:"future-cli-ask",goal:"Real native supervisor",nodes:[{taskId:"ask",agent:"worker",task:"FUTURE_ASK",sideEffect:"none"}]}}));
-  await until(screen,s=>s.includes("等待用户处理")&&s.includes("ask"),"widget auto waiting",60000);
+  await until(screen,s=>s.includes("等待用户")&&s.includes("fixture-local/local"),"widget auto waiting",60000);
   await writeFile(join(capture,"widget-waiting.txt"),await screen());
-  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("等待用户")&&s.includes("future-cli-ask")&&s.includes("q 关闭")&&s.includes("关闭只返回输入，不停止任务"),"inspector waiting");
+  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("等待用户")&&s.includes("future-cli-ask")&&/q\s*关闭/.test(s)&&s.includes("关闭只返回输入，不停止任务"),"inspector waiting");
   await writeFile(join(capture,"inspector-waiting.txt"),await screen());child.stdin.write("q");await sleep(300);
   const pending=await until<{id:string}|null>(async()=>{
    const state=JSON.parse(await readFile(join(runs,"future-cli-ask/mailbox-v1/state.json"),"utf8"));
@@ -63,8 +63,8 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
   assert.ok(pending);send("PI_GRAPH_REPLY "+JSON.stringify({graphId:"future-cli-ask",messageId:pending.id}));
   const finished=await until(()=>snapshot("future-cli-ask"),s=>["complete","failed","needs_attention"].includes(s.status),"reply child complete",60000);
   assert.equal(finished.status,"complete",JSON.stringify(finished));assert.ok(evidence.some(row=>row.includes('"mode":"ask"')&&row.includes("CONTINUE_REAL_CHILD")));
-  await until(screen,s=>!s.includes("◆ Graph · 等待用户处理"),"widget clears waiting after reply");
-  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("已完成")&&s.includes("ask")&&!s.includes("等待用户处理"),"inspector resolved");
+  await until(screen,s=>!s.includes("等待用户 Agent worker"),"widget clears waiting after reply");
+  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("已完成")&&s.includes("ask")&&!s.includes("等待用户"),"inspector resolved");
   await writeFile(join(capture,"inspector-resolved.txt"),await screen());child.stdin.write("q");await sleep(300);
   send("ORDINARY_PI_CHECK");await until(screen,s=>s.includes("ORDINARY_PI_OK"),"ordinary Pi turn");
   await writeFile(join(capture,"ordinary-pi.txt"),await screen());

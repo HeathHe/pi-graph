@@ -354,7 +354,9 @@ export class V3GraphRunner {
 					});
 					inFlight.set(node.taskId, promise);
 				}
-				if (inFlight.size === 0) break;
+				// A child may settle while control/topology reads are in flight.
+				// Re-evaluate durable control before declaring that the run is done.
+				if (inFlight.size === 0) continue;
 				await Promise.race([...inFlight.values(), sleep(RESUME_POLL_MS)]);
 			}
 			return await this.persistSnapshot();
@@ -917,7 +919,7 @@ export class V3GraphRunner {
 		const supervision = latest.child?.observation?.supervision;
 		if (supervision?.runtimeFailure && !retryable) {
 			if (supervision.processExitConfirmed) this.isolatedAttention.add(node.taskId);
-			await this.recordTerminal(node, attempt, "needs_attention", { failure: { kind: failureError.kind, message: `${failureError.message} Automatic recovery is unsafe or exhausted; reconcile the existing run before retrying.`, at }, ...childEvidence });
+			await this.recordTerminal(node, attempt, "needs_attention", { failure: { kind: failureError.kind, message: `${failureError.message} 未自动重派：${supervision.version!==2?'当前子进程协议未提供重新派发所需的恢复证明':supervision.observedMutation!==false?'无法证明此前未产生副作用':supervision.runtimeRetries!==0?'运行时重试次数缺失或非零':'当前任务或尝试不符合安全重派条件'}。请保留已完成工作并核对原结果，不要重跑原任务。`, at }, ...childEvidence });
 			return;
 		}
 		if (retryable) {

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 — 2026-10-16
+
+- 增加独立总计划与 Graph 任务联动，终端按任务显示责任岗位、实际模型、运行活动和依赖等待；正常等待使用中性提示，失败与待处理状态保留警告。
+- 整理工具回执与详情，保留原始结果、分页和验收证据；输出读取不等于验收，不重复追加同一完成通知。
+- 修正宿主 Pi SDK 定位、模型定义与会话身份校验，运行跟随当前宿主，开发依赖不替代宿主运行时。
+- 新准入且具备完整安全证明的 continuation-v1 任务，可在同一会话及模型下对短暂传输故障续接最多一次；次数先持久化，停止、未知效果、预算不足和重复失败仍安全停止。旧失败 Graph 不自动迁移或重跑。
+- 修复暂停请求与最后一个运行任务结束同时发生时错误返回 running 的竞态；任务结束后重新读取持久控制状态，保持 paused，并以同一已准备身份恢复。
+- npm 包仅保留运行文件、配置示例和用户指南，排除内部设计与发布资料；保留 MIT 许可证。
+- Add plan-linked terminal task rows, observed Agent/model identities, neutral dependency waits, structured receipts, host SDK compatibility checks, and at most one proof-gated same-session transient retry for newly admitted continuation-v1 runs. Old failed runs are not replayed automatically.
+
 ## 0.2.1 — 2026-10-13
 
 - 同一 npm README 提供完整 English / 简体中文可折叠区块，默认展开英文；保留全部技术规则、示例和安全边界。

@@ -8,16 +8,16 @@ import {validateNativePreActivityProof} from "../src/v3/runtime-fallback.ts";
 import {canonicalDigest} from "../src/v3/digests.ts";
 import {openOwnedChild} from "../src/runtime/child-session.ts";
 import {createOwnedActivityProof,ownedChildBrand} from "../src/runtime/activity-proof.ts";
-import {loadHostSdk} from "../src/runtime/host-sdk.ts";
+import {loadHostSdk,captureHostSdkIdentity,resolveHostDependencyRoot} from "../src/runtime/host-sdk.ts";
 const {root:sdkRoot}=await loadHostSdk();
-const {createAssistantMessageEventStream}: any = await import(pathToFileURL(join(sdkRoot,"node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js")).href);
+const {createAssistantMessageEventStream}: any = await import(pathToFileURL(join(await resolveHostDependencyRoot(sdkRoot,"@earendil-works/pi-ai"),"dist/utils/event-stream.js")).href);
 const diagnostic = `403 {"error":{"type":"permission_error","message":"You've reached your 5-hour usage limit"}}`;
 async function fixture(mode = "clean") {
  const root=mkdtempSync(join(tmpdir(),"owned-proof-"));
  const saved={NODE_ENV:process.env.NODE_ENV,PI_GRAPH_CHILD:process.env.PI_GRAPH_CHILD,PI_GRAPH_EXTENSION_BINDINGS:process.env.PI_GRAPH_EXTENSION_BINDINGS};
  process.env.NODE_ENV='test';
  const binding={schemaVersion:1,graphId:"graph-test",taskId:"task-test",attempt:1,workspaceCwd:root,contractDigest:"a".repeat(64)};
- const intent:any={version:1,runId:"fixture-run",asyncDir:root,runnerProcessInstanceId:"instance",sessionId:"owner",params:{cwd:root,task:"Fixture"},agent:{name:"test-agent",systemPrompt:"Fixture only"},launchContract:{launchContractDigest:"b".repeat(64),inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}};
+ const intent:any={hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:"fixture-run",asyncDir:root,runnerProcessInstanceId:"instance",sessionId:"owner",params:{cwd:root,task:"Fixture"},agent:{name:"test-agent",systemPrompt:"Fixture only"},launchContract:{launchContractDigest:"b".repeat(64),inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}};
  const activity=createOwnedActivityProof({...intent,params:{...intent.params,extensionBindings:{"pi-graph/1":binding}}});
  let child:any;
  try{

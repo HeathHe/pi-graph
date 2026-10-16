@@ -10,16 +10,17 @@ import {validateCustomGraphModel} from "./custom-models.ts";
 import { join, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { realpath } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { loadHostSdk,assertContinuationCapabilities,assertHostSessionCapabilities,assertHostModelRuntimeCapabilities } from './host-sdk.ts';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadFrozenHostSdk,resolveHostDependencyRoot,type HostSdkIdentity,assertContinuationCapabilities,assertHostSessionCapabilities,assertHostModelRuntimeCapabilities } from './host-sdk.ts';
 export interface OwnedChildIntent {
  version:1;runId:string;asyncDir:string;runnerProcessInstanceId:string;sessionId:string;
- continuation?:any;resumeCheckpoint?:any;generation?:number;workerInstanceId?:string;params:Record<string,any>;agent:Record<string,any>;launchContract:Record<string,any>;hostSdkRoot?:string;
+ continuation?:any;resumeCheckpoint?:any;generation?:number;workerInstanceId?:string;params:Record<string,any>;agent:Record<string,any>;launchContract:Record<string,any>;hostSdkRoot?:string;hostSdkIdentity?:HostSdkIdentity;
 }
 /** One isolated OS worker owns one SDK session and its extension lifecycle. */
 export async function openOwnedChild(intent:OwnedChildIntent, onEvent:(event:any)=>void, fixture?:'success'|'quota'|'tool'|'pending'|'continuation'|'checkpoint'|'route-fallback') {
  if(fixture&&process.env.NODE_ENV!=='test')throw new Error('Owned SDK fixtures require NODE_ENV=test.');
- const {sdk,root}=await loadHostSdk();
+ const {sdk,root}=await loadFrozenHostSdk(intent.hostSdkIdentity);
+ onEvent({type:'owned_startup_stage',stage:'session_setup'});
  const params=intent.params, contract=intent.launchContract, plan=contract.tools??{};
  normalizeExtensionBindings(params.extensionBindings);
  const tools=params.tools??plan.effectiveAllowlist??plan.effectiveToolAllowlist;
@@ -145,19 +146,21 @@ export async function openOwnedChild(intent:OwnedChildIntent, onEvent:(event:any
  if(!fixture){const expected=(params.model??contract.model)?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/u,'');const actual=`${session.model?.provider}/${session.model?.id}`;if(expected!==actual){unsubscribe();session.dispose();throw new Error('Resolved child model differs from frozen model.');}}
  if(explicitThinking!==undefined&&session.thinkingLevel!==explicitThinking){unsubscribe();session.dispose();throw new Error('Effective thinking level is unsupported by the frozen model; refusing silent SDK clamping.');}
  if(fixture){
-  const {createAssistantMessageEventStream}=await import(new URL(`file://${root}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`).href);
+  const {createAssistantMessageEventStream}=await import(pathToFileURL(join(await resolveHostDependencyRoot(root,"@earendil-works/pi-ai"),"dist/utils/event-stream.js")).href);
   let streamCalls=0;const continuationFixture=fixture==='continuation'||fixture==='checkpoint';
   session.agent.streamFunction=async()=>{
    const stream=createAssistantMessageEventStream();
    if(fixture==='pending'){await new Promise<void>(r=>session.agent.state?.isStreaming?setTimeout(r,50):r());}
    const n=streamCalls++;const model=session.model;
    const completed=session.messages.filter((m:any)=>m.role==='toolResult').length;
-   const duplicate=continuationFixture&&['duplicate-id','new-id'].includes(params.fixtureScenario)&&model.provider==='kimi-coding'&&completed===14;
+   const duplicate=continuationFixture&&completed===14&&(['duplicate-id','new-id'].includes(params.fixtureScenario)&&model.provider==='kimi-coding'||params.fixtureScenario==='transient-duplicate'&&session.messages.some((m:any)=>m.role==='assistant'&&m.stopReason==='error'));
    const call=continuationFixture?completed<14||duplicate:fixture==='tool'&&n===0;
-   const quota=fixture==='quota'||fixture==='route-fallback'&&model.provider==='kimi-coding'||continuationFixture&&!call&&(params.fixtureScenario==='completed-tool-error'?model.provider==='glm':params.fixtureScenario==='non-gpt-policy'?model.provider!=='xai':!model.provider.startsWith('parent')||params.fixtureScenario==='exhausted');
-   const toolId=duplicate&&params.fixtureScenario==='duplicate-id'?'fixture-tool-0':continuationFixture?`fixture-tool-${completed}`:'fixture-tool';
+   const transient=continuationFixture&&!call&&params.fixtureScenario?.startsWith('transient-')&&(params.fixtureScenario==='transient-twice'||session.messages.filter((m:any)=>m.role==='assistant'&&m.stopReason==='error').length===0);
+   const quota=transient||(!params.fixtureScenario?.startsWith('transient-')||params.fixtureScenario==='transient-provider')&&(fixture==='quota'||fixture==='route-fallback'&&model.provider==='kimi-coding'||continuationFixture&&!call&&(params.fixtureScenario==='completed-tool-error'?model.provider==='glm':params.fixtureScenario==='non-gpt-policy'?model.provider!=='xai':!model.provider.startsWith('parent')||params.fixtureScenario==='exhausted'));
+   const toolId=duplicate&&['duplicate-id','transient-duplicate'].includes(params.fixtureScenario)?'fixture-tool-0':continuationFixture?`fixture-tool-${completed}`:'fixture-tool';
    const content=call?[{type:'toolCall',id:toolId,name:continuationFixture&&(completed===0||duplicate)?'write':'read',arguments:continuationFixture&&(completed===0||duplicate)?{path:join(cwd,'written.txt'),content:duplicate?'REPLAYED':'written-once'}:{path:join(cwd,params.fixtureScenario==='handled-tool-error'||params.fixtureScenario==='completed-tool-error'&&completed===1?'missing.txt':'fixture.txt')}}]:[{type:'text',text:quota?'':'Owned fixture response'}];
-   const msg={role:'assistant',api:model.api,provider:model.provider,model:model.id,content,stopReason:quota?'error':call?'toolUse':'stop',...(quota?{errorMessage:model.provider==='glm'?'HTTP 400 InvalidSubscription: CodingPlan expired':'429 quota exceeded'}:{}),timestamp:Date.now(),usage:{input:2,output:3,cacheRead:0,cacheWrite:0,totalTokens:5,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
+   const msg={role:'assistant',api:model.api,provider:model.provider,model:model.id,content,stopReason:quota?'error':call?'toolUse':'stop',...(quota?{errorMessage:transient?'Request timed out':model.provider==='glm'?'HTTP 400 InvalidSubscription: CodingPlan expired':'429 quota exceeded'}:{}),timestamp:Date.now(),usage:{input:2,output:3,cacheRead:0,cacheWrite:0,totalTokens:5,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
+   if(params.fixtureScenario==='transient-unknown-usage'&&transient)(msg as any).usage=undefined;
    stream.push({type:'start',partial:msg});stream.push(quota?{type:'error',reason:'error',error:msg}:{type:'done',reason:call?'toolUse':'stop',message:msg});stream.end();return stream;
   };
  }

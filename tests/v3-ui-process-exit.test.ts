@@ -1,0 +1,90 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createJiti } from "jiti";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+const jiti=createJiti(import.meta.url);
+const {canonicalDigest}=await jiti.import<any>("../src/v3/digests.ts");
+const {subagentAsyncRoot}=await jiti.import<any>("../src/v3/rpc.ts");
+const {readGraphView}=await jiti.import<any>("../src/v3/ui/read-view.ts");
+const {nodeProcessExit,nodeExitUnverified,copyUiProcessEvidence}=await jiti.import<any>("../src/v3/ui/process-exit.ts");
+const {counts,nodeReason,graphLabel,activeNode,displayPhase}=await jiti.import<any>("../src/v3/ui/presentation.ts");
+const {cockpitLines,cockpitFocus,liveAgent,emptyTodo}=await jiti.import<any>("../src/v3/ui/cockpit.ts");
+const {projectTodo}=await jiti.import<any>("../src/v3/ui/todo.ts");
+const {GraphInspector}=await jiti.import<any>("../src/v3/ui/inspector.ts");
+async function fixture(continuation=false){
+ const root=await mkdtemp(join(tmpdir(),"ui-exit-")),graphId="graph-proof",runId="run-proof",taskId="work",sessionId="owner",at="2026-10-14T00:00:00.000Z",requestId=randomUUID(),asyncId=`owned-${createHash("sha256").update(requestId).digest("hex").slice(0,40)}`,dir=join(subagentAsyncRoot(),asyncId),runDir=join(root,graphId),attemptDir=join(runDir,"nodes",taskId,"attempts","1"),runner=randomUUID();
+ await mkdir(dir,{recursive:true});await mkdir(attemptDir,{recursive:true});
+ const params={extensionBindings:{"pi-graph/1":{schemaVersion:1,graphId,taskId,attempt:1,workspaceCwd:"fixture",contractDigest:"c".repeat(64)}},task:"PRIVATE_PROMPT_NOT_FOR_UI"};
+ const intent:any={version:1,runtimeKind:"pi-graph-sdk/1",runId:asyncId,asyncDir:dir,sessionId,runnerProcessInstanceId:runner,requestId,requestDigest:canonicalDigest(params),params,...(continuation?{continuation:{graphId,runInstanceId:runId}}:{})};
+ const node={phase:"running",attempt:1,agent:"worker",dependsOn:[],observation:{asyncId,observedAt:at,actualModel:"fixture/model",supervision:{activity:"active",checkedAt:at,probe:"unreachable",runtimeLimit:"unlimited",error:"Original diagnostic"}}};
+ const snapshot:any={schemaVersion:3,graphId,runInstanceId:runId,sessionId,graphDigest:"a".repeat(64),sourceGraphSpecDigest:"b".repeat(64),supervisorEpoch:"epoch",createdAt:at,updatedAt:at,status:"running",nodes:{work:node,later:{phase:"queued",attempt:0,dependsOn:["work"]}}};
+ const attempt:any={schemaVersion:1,graphId,runInstanceId:runId,taskId,attempt:1,attemptNonce:"nonce",phase:"running",supervisorEpoch:"epoch",createdAt:at,updatedAt:at,dispatchIntent:{requestId,requestDigest:intent.requestDigest,state:"emitting",preparedAt:at,emittedAt:at},dispatch:{asyncId,asyncDir:dir,requestDigest:intent.requestDigest,dispatchedAt:at}};
+ const terminal:any={runnerProcessInstanceId:runner,...(continuation?{generation:2,ledgerDigest:"d".repeat(64)}:{})};
+ const status:any={version:3,runtimeKind:"pi-graph-sdk/1",runId:asyncId,sessionId,runnerProcessInstanceId:runner,state:"stopped",processTerminal:terminal,...(continuation?{generation:2}:{})};
+ const proof:any={version:1,runtimeKind:"pi-graph-sdk/1",state:"observed",runId:asyncId,...terminal,observedAt:42,instances:[{kind:"runner",processInstanceId:runner,pid:99999,closeObservedAt:42,exitCode:1,signal:null}]};
+ const seal:any={version:1,state:"sealed",generation:2,ledgerDigest:"d".repeat(64)};
+ const save=async()=>{await Promise.all([[join(runDir,"snapshot.json"),snapshot],[join(attemptDir,"attempt.json"),attempt],[join(dir,"intent.json"),intent],[join(dir,"status.json"),status],[join(dir,"process-terminal.json"),proof],...(continuation?[[join(dir,"generation-state.json"),seal]]:[])].map(([p,v])=>writeFile(p as string,JSON.stringify(v))));};await save();
+ return {root,runDir,dir,attemptDir,snapshot,attempt,intent,status,proof,seal,save,read:()=>readGraphView(root,graphId,undefined,sessionId),cleanup:async()=>{await rm(root,{recursive:true,force:true});await rm(dir,{recursive:true,force:true});}};
+}
+async function bytes(root:string):Promise<Record<string,string>>{const out:Record<string,string>={};async function walk(p:string){for(const e of await readdir(p,{withFileTypes:true})){const file=join(p,e.name);if(e.isDirectory())await walk(file);else out[file]=createHash("sha256").update(await readFile(file)).digest("hex");}}await walk(root);return out;}
+test("matching runner proof projects exit consistently without changing persisted or input state",async()=>{
+ const f=await fixture();try{const before={...await bytes(f.root),...await bytes(f.dir)},input=JSON.stringify(f.snapshot),s=await f.read();assert.equal(s.status,"running");assert.equal(s.nodes.work.phase,"running");assert.equal(displayPhase(s,"work",s.nodes.work),"exit_unreconciled");assert.equal(liveAgent(s.nodes.work),false);assert.equal(activeNode(s.nodes.work),false);assert.match(counts(s),/待核对 1/);assert.doesNotMatch(counts(s),/运行/);assert.match(graphLabel(s),/状态待核对/);assert.match(nodeReason(s,"work",s.nodes.work),/进程已退出，Graph 状态待核对；原记录：Original diagnostic/);
+ const text=cockpitLines([s],emptyTodo(),120,40).join("\n");assert.match(text,/进程已退出，Graph 状态待核对/);assert.doesNotMatch(text,/Agent · work|PRIVATE_PROMPT/);
+ const plan=await projectTodo([{id:"goal",title:"Goal",status:"done",links:[{graphId:s.graphId,runInstanceId:s.runInstanceId,taskId:"work"}]}],"owner",async()=>s);assert.equal(plan[0].derivedStatus,"blocked");assert.equal(JSON.stringify(f.snapshot),input);assert.deepEqual({...await bytes(f.root),...await bytes(f.dir)},before);
+ const p=new GraphInspector({snapshot:s,theme:{fg:(_:string,x:string)=>x,bg:(_:string,x:string)=>x,bold:(x:string)=>x},rows:()=>30,requestRender(){},onClose(){},read:f.read});try{assert.match(p.render(120).join("\n"),/退出待核对/);p.handleInput("\r");assert.match(p.render(120).join("\n"),/进程已退出，Graph 状态待核对/);}finally{p.dispose();}
+ }finally{await f.cleanup();}
+});
+test("identity mismatches, worker-only and status-only records never prove physical runner exit",async()=>{
+ for(const change of [(f:any)=>f.attempt.runInstanceId="old",(f:any)=>f.attempt.attempt=2,(f:any)=>f.intent.sessionId="foreign",(f:any)=>f.proof.runId="old",(f:any)=>f.status.runnerProcessInstanceId="other",(f:any)=>f.proof.runnerProcessInstanceId="old",(f:any)=>f.snapshot.nodes.work.observation.asyncId="other",(f:any)=>f.intent.params.extensionBindings["pi-graph/1"].taskId="other",(f:any)=>f.proof.instances=[{kind:"pi-writer",closeObservedAt:42,processTree:{state:"observed"}}]]){const f=await fixture();try{change(f);await f.save();const s=await f.read();assert.equal(nodeProcessExit(s.nodes.work),undefined);assert.equal(liveAgent(s.nodes.work),true);}finally{await f.cleanup();}}
+ const f=await fixture();try{await rm(join(f.dir,"process-terminal.json"));const s=await f.read();assert.equal(nodeProcessExit(s.nodes.work),undefined);assert.equal(s.status,"running");}finally{await f.cleanup();}
+});
+test("continuation uses only a consistent sealed final runner generation and ledger",async()=>{
+ const good=await fixture(true);try{assert.equal(nodeProcessExit((await good.read()).nodes.work)?.generation,2);}finally{await good.cleanup();}
+ for(const change of [(f:any)=>f.proof.generation=1,(f:any)=>f.proof.ledgerDigest="e".repeat(64),(f:any)=>f.status.generation=1,(f:any)=>f.status.processTerminal.generation=1,(f:any)=>f.seal.state="running",(f:any)=>f.seal.state="needs_attention",(f:any)=>f.intent.continuation.runInstanceId="old",(f:any)=>f.seal.ledgerDigest=undefined]){const f=await fixture(true);try{change(f);await f.save();assert.equal(nodeProcessExit((await f.read()).nodes.work),undefined);}finally{await f.cleanup();}}
+});
+test("accepted and queued nodes stay unchanged; a genuinely live graph has focus over stale exit",async()=>{
+ const f=await fixture();try{for(const phase of ["accepted","queued"]){f.snapshot.nodes.work.phase=phase;if(phase==="accepted")f.snapshot.nodes.work.terminalStatus="accepted";else delete f.snapshot.nodes.work.terminalStatus;await f.save();const s=await f.read();assert.equal(nodeProcessExit(s.nodes.work),undefined);assert.equal(displayPhase(s,"work",s.nodes.work),phase);}f.snapshot.nodes.work.phase="running";await f.save();const stale=await f.read(),live=structuredClone(stale);live.graphId="live";live.updatedAt="2026-10-13T00:00:00.000Z";assert.equal(cockpitFocus([stale,live]).graphId,"live");}finally{await f.cleanup();}
+});
+test("symlink evidence and malformed files are refused without following snapshot-provided paths",async()=>{
+ for(const kind of ["proof","attempt-dir","runtime-dir","malformed"]){const f=await fixture();try{if(kind==="proof"){await rm(join(f.dir,"process-terminal.json"));await symlink(join(f.dir,"status.json"),join(f.dir,"process-terminal.json"));}else if(kind==="attempt-dir"){const target=join(f.root,"other-attempt");await mkdir(target);await writeFile(join(target,"attempt.json"),JSON.stringify(f.attempt));await rm(f.attemptDir,{recursive:true});await symlink(target,f.attemptDir);}else if(kind==="runtime-dir"){f.attempt.dispatch.asyncDir="/not-an-owned-runtime";await f.save();}else await writeFile(join(f.dir,"process-terminal.json"),"{bad");assert.equal(nodeProcessExit((await f.read()).nodes.work),undefined);}finally{await f.cleanup();}}
+});
+
+test("unsealed continuation exit remains explicitly unverified, not live or completed",async()=>{
+ const f=await fixture(true);try{f.seal.state="needs_attention";delete f.seal.ledgerDigest;delete f.proof.ledgerDigest;delete f.status.processTerminal.ledgerDigest;await f.save();const s=await f.read();assert.equal(nodeProcessExit(s.nodes.work),undefined);assert.equal(nodeExitUnverified(s.nodes.work),true);assert.equal(liveAgent(s.nodes.work),false);assert.match(nodeReason(s,"work",s.nodes.work),/退出证据未核实/);assert.doesNotMatch(nodeReason(s,"work",s.nodes.work),/进程已退出/);const plan=await projectTodo([{id:"goal",title:"Goal",status:"done",links:[{graphId:s.graphId,runInstanceId:s.runInstanceId,taskId:"work"}]}],"owner",async()=>s);assert.equal(plan[0].derivedStatus,"unknown");assert.equal(s.nodes.work.phase,"running");}finally{await f.cleanup();}
+});
+test("periodic UI path reads new physical proof and discards results after generation changes",async()=>{
+ const {refreshObservedGraphViews}=await jiti.import<any>("../src/v3/ui/read-view.ts");const f=await fixture();try{await rm(join(f.dir,"process-terminal.json"));const cached=await f.read();assert.equal(liveAgent(cached.nodes.work),true);await f.save();let current=true;const commits:any[]=[];const input={runsDir:f.root,snapshots:[cached],sessionId:"owner",isCurrent:()=>current,commit:(s:any)=>commits.push(s)};await refreshObservedGraphViews(input);assert.equal(commits.length,1);assert.equal(liveAgent(commits[0].nodes.work),false);assert.match(counts(commits[0]),/待核对/);const pending=refreshObservedGraphViews(input);current=false;await pending;assert.equal(commits.length,1);}finally{await f.cleanup();}
+});
+test("registered Inspector and aboveEditor agree on confirmed exit and refuse the message action",async()=>{
+ const {default:register}=await jiti.import<any>("../extensions/pi-graph.ts");const {interactionUiCapture}=await jiti.import<any>("./helpers/interaction-ui-capture.ts");const f=await fixture();const home=join(f.root,"agent");await mkdir(home);await writeFile(join(home,"settings.json"),JSON.stringify({graph:{enabled:true,runsDir:f.root}}));const old=process.env.PI_CODING_AGENT_DIR;process.env.PI_CODING_AGENT_DIR=home;
+ const commands=new Map<string,any>();let appends=0,hostCalls=0,widget:any;const theme={fg:(_:string,x:string)=>x,bg:(_:string,x:string)=>x,bold:(x:string)=>x};
+ try{register({events:{on(){return()=>{};},emit(){hostCalls++;throw Error("UI must not call runtime");}},on(){},registerTool(){},registerCommand(name:string,c:any){commands.set(name,c);},appendEntry(){appends++;}});const capture=interactionUiCapture([["m","\r","q"]]);Object.assign(capture.ui,{theme,setWidget:(_:string,factory:any)=>{widget=factory?.({terminal:{rows:40}},theme);}});const ctx={mode:"tui",cwd:f.root,sessionManager:{getSessionId:()=>"owner",getSessionFile:()=>undefined,getEntries:()=>[],getBranch:()=>[]},ui:capture.ui};const before={...await bytes(f.root),...await bytes(f.dir)};await commands.get("graphs").handler("view graph-proof",ctx);assert.equal(capture.inputCount,0);assert.equal(capture.customCount,1);assert.match(capture.trace.filter((x:any)=>x.kind==="render").map((x:any)=>x.text).join("\n"),/退出待核对/);assert.match(widget.render(120).join("\n"),/进程已退出，Graph 状态待核对/);assert.equal(appends,0);assert.equal(hostCalls,0);assert.deepEqual({...await bytes(f.root),...await bytes(f.dir)},before);}finally{if(old===undefined)delete process.env.PI_CODING_AGENT_DIR;else process.env.PI_CODING_AGENT_DIR=old;await f.cleanup();}
+});
+
+test("registered receipt capture preserves verified and unverified physical-exit proof across clone without reading newer state",async()=>{
+ const {default:register,graphWaitResultV3}=await jiti.import<any>("../extensions/pi-graph.ts");let tool:any;register({events:{on(){return()=>{};},emit(){throw Error("no RPC");}},on(){},registerCommand(){},registerTool(t:any){if(t.name==="graph")tool=t;}});
+ for(const mode of ["confirmed","unverified","live"]){const f=await fixture(mode==="unverified");try{
+  if(mode==="unverified"){f.seal.state="needs_attention";await f.save();}if(mode==="live")await rm(join(f.dir,"process-terminal.json"));
+  const s=await f.read(),before={...await bytes(f.root),...await bytes(f.dir)};
+  for(const mutate of [(c:any)=>c.runInstanceId="other",(c:any)=>c.sessionId="other",(c:any)=>c.nodes.work.attempt=2,(c:any)=>c.nodes.work.observation.asyncId="other"]){const copy=structuredClone(s);mutate(copy);copyUiProcessEvidence(s,copy);assert.equal(nodeProcessExit(copy.nodes.work),undefined);assert.equal(nodeExitUnverified(copy.nodes.work),false);}
+  const receipt=await graphWaitResultV3(s.graphId,{reason:"attention_required",snapshot:s},f.root),machine=JSON.stringify(receipt);
+  const context={args:{action:"wait"},state:{},toolCallId:mode,isError:false},theme={fg:(_:string,t:string)=>t};
+  const text=tool.renderResult(receipt,{expanded:false,isPartial:false},theme,context).render(240).join("\n");
+  if(mode==="live"){assert.match(text,/Original diagnostic/);assert.match(text,/监管请求或诊断/);assert.doesNotMatch(text,/进程已退出|退出证据未核实/);}else{assert.match(text,mode==="confirmed"?/进程已退出，Graph 状态待核对/:/退出证据未核实/);assert.doesNotMatch(text,/agent-started|活动 1/);}
+  const statusText=tool.renderResult(receipt,{expanded:false,isPartial:false},theme,{...context,args:{action:"status"},state:{}}).render(80).join("\n");assert.match(statusText,/系统回执/);if(mode!=="live"){assert.match(statusText,mode==="confirmed"?/进程已退出/:/退出证据未核实/);assert.doesNotMatch(statusText,/agent-started|已验收 1/);}
+  const expandedText=tool.renderResult(receipt,{expanded:true,isPartial:false},theme,{...context,toolCallId:"call_proof|fc_proof",state:{}}).render(80).join("\n");if(mode!=="live"){assert.match(expandedText,mode==="confirmed"?/进程已退出/:/退出证据未核实/);assert.doesNotMatch(expandedText,/agent-started|已验收 1/);}assert.match(expandedText,/原始回执/);
+  const historical=tool.renderResult(JSON.parse(machine),{expanded:false,isPartial:false},theme,{...context,state:{}}).render(240).join("\n");assert.doesNotMatch(historical,/agent-started/);
+  assert.equal(JSON.stringify(receipt),machine);assert.deepEqual({...await bytes(f.root),...await bytes(f.dir)},before);
+ }finally{await f.cleanup();}}
+});
+
+test('authorization goal survives reopen only for exact safe identity and never derives from task prompts',async()=>{
+ const {compileGraphSpecV3}=await jiti.import<any>('../src/v3/compiler.ts');const {authorizationV4For}=await jiti.import<any>('../src/v3/authorization.ts');const {displayEvidence}=await jiti.import<any>('../src/v3/ui/presentation.ts');const {stackTasks}=await jiti.import<any>('../src/v3/ui/terminal-stack.ts');const root=await mkdtemp(join(tmpdir(),'goal-view-'));
+ try{const graph=compileGraphSpecV3({schemaVersion:3,graphId:'goal-view',goal:'核对筛选体验和业务可信度',nodes:[{taskId:'internal-opaque',agent:'backend',task:'SECRET PROMPT NEVER TITLE',sideEffect:'none'}]});const at='2026-10-15T00:00:00.000Z';const auth=authorizationV4For(graph,{runInstanceId:'run',sessionId:'owner',supervisorEpoch:'epoch',createdAt:at,sourceCwd:root,sourceRepository:{kind:'directory',root,device:'1',inode:'2'}});const dir=join(root,graph.graphId);await mkdir(dir);const s={schemaVersion:3,graphId:graph.graphId,runInstanceId:'run',sessionId:'owner',supervisorEpoch:'epoch',createdAt:at,updatedAt:at,graphDigest:graph.graphDigest,sourceGraphSpecDigest:graph.sourceGraphSpecDigest,status:'queued',nodes:{'internal-opaque':{phase:'queued',attempt:0,agent:'backend'}}};await writeFile(join(dir,'snapshot.json'),JSON.stringify(s));const file=join(dir,'authorization.json');await writeFile(file,JSON.stringify(auth));for(let i=0;i<2;i++){const reopened=await readGraphView(root,graph.graphId);assert.equal(displayEvidence(reopened).goal,graph.goal);assert.equal(stackTasks({snapshots:[reopened],plan:{items:[]},expanded:true})[0].title,graph.goal);assert.doesNotMatch(JSON.stringify(displayEvidence(reopened)),/SECRET PROMPT/);}
+ for(const field of ['sessionId','runInstanceId','graphDigest','sourceGraphSpecDigest']){await writeFile(file,JSON.stringify({...auth,[field]:'foreign'}));assert.equal(displayEvidence(await readGraphView(root,graph.graphId)).goal,undefined);}
+ await rm(file);assert.equal(displayEvidence(await readGraphView(root,graph.graphId)).goal,undefined);const target=join(root,'foreign-auth.json');await writeFile(target,JSON.stringify(auth));await symlink(target,file);const missing=await readGraphView(root,graph.graphId);assert.equal(displayEvidence(missing).goal,undefined);assert.match(stackTasks({snapshots:[missing],plan:{items:[]},expanded:true})[0].title,/后端任务（目标待补充）/);
+ }finally{await rm(root,{recursive:true,force:true});}
+});

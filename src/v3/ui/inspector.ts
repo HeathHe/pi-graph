@@ -1,7 +1,8 @@
+import { liveAgent, type CockpitTab } from "./cockpit.ts";
 import { selectedGraphTarget, terminalText, type GraphUiAction, type GraphUiTarget, type ArtifactPage, type NativeResultPage } from "./interaction.ts";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { GraphSnapshotV3 } from "../types.ts";
-import { nodeActivityLines, counts, localAuthLines, localTimestamp, displayPhase, orderedNodes, nodeNextStep, displayEvidence, graphLabel, nodeReason, pad, phaseColor, phaseLabel, safeText, type GraphTheme } from "./presentation.ts";
+import { nodeIdentity, nodeActivityLines, counts, localAuthLines, localTimestamp, displayPhase, orderedNodes, nodeNextStep, displayEvidence, graphLabel, nodeReason, pad, phaseColor, phaseLabel, safeText, type GraphTheme } from "./presentation.ts";
 
 interface InspectorOptions {
  snapshot: GraphSnapshotV3;
@@ -15,6 +16,11 @@ interface InspectorOptions {
  onSnapshot?: (snapshot: GraphSnapshotV3) => void;
  pollMs?: number;
  selectedId?:string;
+ initialTab?: "tasks"|"agents";
+ onNavigate?:(tab:CockpitTab)=>void;
+ onDetailBack?:()=>void;
+ onTabChange?:(tab:"tasks"|"agents")=>void;
+ onHistory?:()=>void;
  onAction?:(action:GraphUiAction)=>void;
  canMessage?:(target:GraphUiTarget)=>boolean;
  readResult?:(target:GraphUiTarget,offset:number,limit:number,digest?:string)=>Promise<NativeResultPage>;
@@ -23,6 +29,7 @@ interface InspectorOptions {
 /** Read-only view. It has no execution, stop, retry, or steering capabilities. */
 export class GraphInspector {
  private snapshot: GraphSnapshotV3;
+ private tab: "tasks"|"agents";
  private selectedId?: string;
  private mode: "list" | "detail" | "raw" | "artifact" | "native" = "list";
  private artifact?:ArtifactPage | NativeResultPage;
@@ -43,8 +50,8 @@ export class GraphInspector {
  private unsubscribe?: () => void;
  private options: InspectorOptions;
  constructor(options: InspectorOptions) {
-  this.options = options; this.snapshot = options.snapshot;
-  this.selectedId = options.selectedId && this.snapshot.nodes?.[options.selectedId] ? options.selectedId : orderedNodes(this.snapshot)[0]?.[0];
+  this.options = options; this.snapshot = options.snapshot; this.tab=options.initialTab??"tasks";
+  this.selectedId = options.selectedId && this.listRows().some(([id])=>id===options.selectedId) ? options.selectedId : this.listRows()[0]?.[0];
   this.unsubscribe = options.subscribe?.(snapshot => this.accept(snapshot));
   this.timer = setInterval(() => void this.refresh(), options.pollMs ?? 1500);
   this.timer.unref?.();
@@ -61,7 +68,8 @@ export class GraphInspector {
    if(this.mode==="native"||this.mode==="artifact")this.mode="detail";
   }
   this.snapshot = snapshot;
-  if (!this.selectedId || !snapshot.nodes?.[this.selectedId]) this.selectedId = orderedNodes(snapshot)[0]?.[0];
+  if (this.mode === "list") this.correctSelection();
+  else if (!this.selectedId || !snapshot.nodes?.[this.selectedId]) this.selectedId = orderedNodes(snapshot)[0]?.[0];
   this.options.onSnapshot?.(snapshot);
   this.options.requestRender();
  }
@@ -89,6 +97,8 @@ export class GraphInspector {
   }catch(error){if(!this.closed&&version===this.requestVersion)this.artifactError=terminalText(error instanceof Error?error.message:error);}
   finally{if(version===this.requestVersion){this.artifactLoading=false;if(!this.closed)this.options.requestRender();}}
  }
+ private correctSelection(){if(!this.listRows().some(([id])=>id===this.selectedId))this.selectedId=this.listRows()[0]?.[0];}
+ private listRows(){const rows=orderedNodes(this.snapshot);return this.tab==="agents"?rows.filter(([,n])=>liveAgent(n)):rows;}
  private close(): void { this.dispose(); this.options.onClose(); }
  invalidate(): void {}
  handleInput(data: string): void {
@@ -96,10 +106,12 @@ export class GraphInspector {
   if (data.includes("\x1b[200~") || data.includes("\x1b[201~")) return;
   const key = (action: string, fallback: Parameters<typeof matchesKey>[1]) => this.options.keybindings?.matches(data, action) ?? matchesKey(data, fallback);
   if (data === "q" || matchesKey(data, "ctrl+c")) { this.close(); return; }
+  if(this.mode==="list" && ["p","t","a"].includes(data)){if(data==="p"){this.options.onNavigate?.("plan");return;}this.tab=data==="a"?"agents":"tasks";this.options.onTabChange?.(this.tab);this.selectedId=this.listRows()[0]?.[0];this.listOffset=0;this.options.requestRender();return;}
+  if(this.mode==="list"&&data==="g"){this.options.onHistory?.();return;}
   if (key("tui.select.cancel", "escape")) {
    this.invalidateArtifactRequest();
    if (this.mode === "raw" || this.mode === "artifact" || this.mode === "native") this.mode = "detail";
-   else if (this.mode === "detail") this.mode = "list";
+   else if (this.mode === "detail") {if(this.options.onDetailBack){this.options.onDetailBack();return;}this.mode = "list";this.correctSelection();}
    else { this.close(); return; }
    this.scroll = 0;
   } else if (data === "m" && this.mode!=="artifact" && this.mode!=="native" && this.selectedId && this.options.onAction) {
@@ -109,7 +121,8 @@ export class GraphInspector {
   else if (data === "n" && (this.mode === "artifact"||this.mode === "native") && this.artifact?.nextOffset!=null) {void this.loadArtifact(true,this.artifact.nextOffset,this.mode==="native");}
   else if (data === "r") { void this.refresh(); }
   else if (this.mode === "list") {
-   const ids = orderedNodes(this.snapshot).map(([id])=>id); let index = Math.max(0, ids.indexOf(this.selectedId ?? ""));
+   this.correctSelection();
+   const ids = this.listRows().map(([id])=>id); let index = Math.max(0, ids.indexOf(this.selectedId ?? ""));
    if (key("tui.select.up", "up") || data === "k") index--;
    else if (key("tui.select.down", "down") || data === "j") index++;
    else if (key("tui.select.pageUp", "pageUp")) index -= this.pageSize;
@@ -136,22 +149,23 @@ export class GraphInspector {
   const t = this.options.theme, height = Math.max(1, this.options.rows()-2), inner = Math.max(1,width-4);
   if (width < 40 || height < 9) return ["终端过小，请扩大窗口。", "Esc / q 关闭，任务继续运行。"].slice(0,height).map(l => truncateToWidth(l,width));
   const s = this.snapshot;
-  const header = [t.bold(t.fg("accent", `◆ PI-GRAPH / ${safeText(s.graphId)}`)), t.fg("muted", graphLabel(s) + " · " + counts(s)), t.fg("dim", this.error ?? `记录更新：${localTimestamp(s.updatedAt)} · ${["failed","complete","stopped"].includes(s.status) ? "历史任务记录" : "只读任务状态"}`), t.fg("borderMuted", "─".repeat(inner))];
+  const header = [t.bold(t.fg("accent", `◆ PI-GRAPH / ${safeText(s.graphId)} · ${this.tab==="agents"?"成员":"执行任务"}`)), t.fg("muted", graphLabel(s) + " · " + counts(s)), t.fg("dim", this.error ?? `记录更新：${localTimestamp(s.updatedAt)} · ${["failed","complete","stopped"].includes(s.status) ? "历史任务记录" : "只读任务状态"}`), t.fg("borderMuted", "─".repeat(inner))];
   const room = Math.max(1, height - header.length - 3); this.pageSize = room;
   let content: string[] = [], footer: string;
   if (this.mode === "list") {
-   const rows = orderedNodes(s), index = Math.max(0,rows.findIndex(([id]) => id === this.selectedId));
+   const rows = this.listRows(), index = Math.max(0,rows.findIndex(([id]) => id === this.selectedId));
    if (index < this.listOffset) this.listOffset = index;
    if (index >= this.listOffset + room) this.listOffset = index - room + 1;
    for (const [id,n] of rows.slice(this.listOffset, this.listOffset + room)) {
     const selected = id === this.selectedId;
     const label = `${selected ? ">" : " "} ${t.fg(phaseColor(n,s,id),pad(phaseLabel(n,s,id),8))}`;
-    const idWidth = Math.min(30, Math.max(16, Math.floor(inner * .42)));
-    const text = inner >= 66 ? label + pad(safeText(id), idWidth) + "  " + t.fg("muted",nodeReason(s,id,n)) : label + safeText(id);
+    const identity = nodeIdentity(id,n);
+    const facts = [identity.task, identity.role, identity.model].filter(Boolean).join(" · ");
+    const text = inner >= 66 ? label + facts + " · " + t.fg("muted",nodeReason(s,id,n)) : label + identity.task;
     content.push(selected ? t.bg("selectedBg",pad(text,inner)) : text);
    }
-   if (!rows.length) content = ["暂无任务；开放 Graph 可以继续追加任务。"];
-   footer = `↑↓/jk 选择  Enter 详情  m 消息  q 关闭  ${rows.length ? index+1 : 0}/${rows.length}`;
+   if (!rows.length) content = [this.tab==="agents"?"暂无活动执行者；t查看全部任务。":"暂无任务；开放 Graph 可以继续追加任务。"];
+   footer = `p计划 t任务 a成员 g选图 · ↑↓/jk 选择 Enter详情 m消息 q关闭  ${rows.length ? index+1 : 0}/${rows.length}`;
   } else {
    const id = this.selectedId!, n = s.nodes?.[id];
    if (!n) { this.mode = "list"; return this.render(width); }
@@ -178,7 +192,7 @@ export class GraphInspector {
     const next = nodeNextStep(s,id,n);
     if (next) raw.push("",t.fg("accent","下一步"),next);
     if (error) raw.push("",t.fg("dim","原始错误已保留，按 l 查看。"));
-    raw.push("", "Agent      " + safeText(o?.actualAgent ?? o?.resolvedAgent ?? n.agent ?? "未观测到"));
+    raw.push("", "Agent      " + (nodeIdentity(id,n).role || "未观测到"));
     raw.push(...nodeActivityLines(n));
     if (o?.requestedModel) raw.push("请求模型   " + safeText(o.requestedModel));
     if (o?.resolvedModel) raw.push("解析模型   " + safeText(o.resolvedModel));

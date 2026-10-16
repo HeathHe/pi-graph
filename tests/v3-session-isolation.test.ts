@@ -125,6 +125,7 @@ test("extension startup, new, fork, resume, and reload respect Pi session identi
 		const hooks = new Map<string, (event: unknown, ctx?: unknown) => Promise<void>>();
 		const states: GraphSnapshotV3[] = [];
 		const widgets: unknown[] = [];
+  const widgetLines = () => widgets.flatMap((factory:any) => factory ? factory({terminal:{rows:40,columns:120},requestRender(){}},{fg:(_:string,s:string)=>s,bold:(s:string)=>s}).render(120) : []);
 		const wakes: unknown[] = [];
   let graphTool:any;
 		f.mock.on("pi-graph:state", value => states.push(value as GraphSnapshotV3));
@@ -133,7 +134,7 @@ test("extension startup, new, fork, resume, and reload respect Pi session identi
 		shutdown = async () => { await hooks.get("session_shutdown")!({ type: "session_shutdown", reason: "new" }); };
 		const context = (sessionId: string) => ({
 			cwd: f.sourceDir, mode: "tui",
-			sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(f.root, `${sessionId}.jsonl`), getBranch: () => [] },
+			sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(f.root, `${sessionId}.jsonl`), getBranch: () => [], getEntries: () => [] },
 			ui: { theme: { fg: (_: string, value: string) => value }, setStatus() {}, setWidget: (_key: string, widget: unknown) => widgets.push(widget), notify() {} },
 		});
 		for (const reason of ["startup", "new", "fork"] as const) {
@@ -141,7 +142,7 @@ test("extension startup, new, fork, resume, and reload respect Pi session identi
 			states.length = widgets.length = wakes.length = 0;
 			await hooks.get("session_start")!({ type: "session_start", reason }, context(`new-${reason}`));
 			assert.deepEqual(states, [], `${reason}: no old graph state must be published`);
-			assert.ok(widgets.every(widget => widget === undefined), `${reason}: no old summary must appear`);
+			assert.ok(widgetLines().length === 0, `${reason}: no old summary must appear ${JSON.stringify(widgetLines())}`);
 			assert.deepEqual(wakes, [], `${reason}: no old graph should enter background work`);
 			assert.deepEqual(await filesAt(runDir), before);
 			await shutdown();
@@ -152,7 +153,7 @@ test("extension startup, new, fork, resume, and reload respect Pi session identi
 			const deadline = Date.now() + 5_000;
 			while (!states.some(snapshot => snapshot.status === "idle") && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
 			assert.ok(states.some(snapshot => snapshot.graphId === "saved-open" && snapshot.status === "idle"), `${reason}: the original Graph must recover`);
-			assert.ok(widgets.every(widget => widget === undefined), `${reason}: idle graphs do not occupy the live widget`);
+			assert.ok(widgetLines().length === 0, `${reason}: idle graphs do not occupy the live widget`);
    const visible=await graphTool.execute("restored-status",{action:"status",id:"saved-open"},undefined,undefined,context("original-session"));
    assert.notEqual(visible.isError,true,JSON.stringify(visible));
    assert.match(visible.content[0].text,/saved-open/,`${reason}: restored Graph remains visible through public status`);

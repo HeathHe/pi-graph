@@ -1,6 +1,8 @@
+import {spawn} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile, realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
@@ -302,4 +304,23 @@ for(const active of [false,true])test(`strict provider Connection error. ${activ
 test('Connection error classification is exact and does not accept tool/task/abort prose',()=>{
  assert.deepEqual(classifyProviderFailure('Connection error.'),{eligible:true,kind:'provider'});
  for(const message of ['tool error: Connection error.','task text: Connection error.','user asked Connection error.','Connection error. cancelled','Connection error during read','timeout','terminated'])assert.equal(classifyProviderFailure(message).eligible,false);
+});
+
+test('new admission freezes one transient retry and rejects altered policy digest',async()=>{const f=await fixture({exactRole:true});try{const plan=f.graph.nodes[0]!.launch!.runtimeFallback!;assert.equal(plan.transientRetryLimit,1);validateRuntimeFallbackPlan(plan);assert.throws(()=>validateRuntimeFallbackPlan({...plan,transientRetryLimit:0}),/digest/);for(const value of [-1,2,'1']){const base={...plan,transientRetryLimit:value};const forged={...base,digest:canonicalDigest({...base,digest:undefined})};assert.throws(()=>validateRuntimeFallbackPlan(forged),/retry limit/);}const {transientRetryLimit,...old}=plan;const legacy={...old,digest:canonicalDigest({...old,digest:undefined})};validateRuntimeFallbackPlan(legacy);}finally{await f.mock.dispose();}});
+
+// Load-only scheduling barriers keep the original pause/resume assertions intact.
+// The stale control value is an actual read; the child parks before it is consumed.
+test('scheduler rechecks durable pause when fallback settles during a control read',{timeout:30000},async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'fallback-pause-race-'));
+ const loader=join(dir,'barrier.mjs');
+ const source="import {registerHooks} from 'node:module';\nimport {readFileSync} from 'node:fs';\nregisterHooks({load(url,context,next){\n const result=next(url,context);\n if(url.endsWith('/src/v3/runner.ts'))return {...result,source:readFileSync(new URL(url),'utf8').replace('const control = await readV3RunControl(this.options.runDir);',`const control = await readV3RunControl(this.options.runDir);if(globalThis.__pauseProbe)await globalThis.__pauseProbe(control);`)};\n if(url.endsWith('/tests/v3-runtime-fallback.test.ts'))return {...result,source:readFileSync(new URL(url),'utf8').replace('let ready!:()=>void;const paused=new Promise<void>(r=>ready=r);',`let ready!:()=>void;const paused=new Promise<void>(r=>ready=r);let release;const gate=new Promise(r=>release=r);let blocked=false;let settled=false;const execute=f.runner.executeNode.bind(f.runner);f.runner.executeNode=async(...args)=>{try{return await execute(...args)}finally{settled=true}};globalThis.__pauseProbe=async(value)=>{if(blocked&&value.desiredState==='running'){globalThis.__pauseProbe=undefined;release();await paused;while(!settled)await new Promise(r=>setImmediate(r));await new Promise(r=>setImmediate(r));console.log('DETERMINISTIC_STALE_CONTROL',value.desiredState);}};`).replace('if(i.cwd.includes(\"node-2\")) {await updateV3RunControl',`if(i.cwd.includes(\"node-2\")) {blocked=true;settled=false;await gate;await updateV3RunControl`)};\n return result;\n}});\n";
+ await writeFile(loader,source);
+ const env={...process.env};delete env.NODE_TEST_CONTEXT;
+ const child=spawn(process.execPath,['--experimental-strip-types','--import',loader,'--test','--test-name-pattern=^pause after fallback preparation preserves same attempt and resumes one dispatch$',fileURLToPath(import.meta.url)],{env,stdio:['ignore','pipe','pipe']});
+ let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);
+ const timer=setTimeout(()=>child.kill('SIGTERM'),25000);
+ try{
+  const code=await new Promise<number|null>((resolve,reject)=>{child.once('error',reject);child.once('close',resolve)});
+  assert.equal(code,0,output);assert.match(output,/DETERMINISTIC_STALE_CONTROL running/);
+ }finally{clearTimeout(timer);if(child.exitCode===null&&child.signalCode===null)child.kill('SIGTERM');await rm(dir,{recursive:true,force:true});}
 });
