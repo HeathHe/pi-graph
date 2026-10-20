@@ -113,7 +113,7 @@ test("PI-GRAPH routing guidance is explicit, idempotent, and config-gated", () =
 	assert.match(PI_GRAPH_ROUTING_GUIDANCE, /synthesize the settled node results/u);
 	assert.ok(PI_GRAPH_TOOL_DESCRIPTION.includes(PI_GRAPH_ROUTING_GUIDANCE), "the graph tool description must reuse the exact parent-routing contract");
 	assert.equal(PI_GRAPH_TOOL_DESCRIPTION.split(PI_GRAPH_ROUTING_SENTINEL).length - 1, 1);
-	assert.equal(PI_GRAPH_ROUTING_GUIDANCE_VERSION, "11");
+	assert.equal(PI_GRAPH_ROUTING_GUIDANCE_VERSION, "13");
 	assert.match(PI_GRAPH_ROUTING_GUIDANCE, /readScope and requiredMaterials before start/u);
 	assert.match(PI_GRAPH_ROUTING_GUIDANCE, /prose MustRead grants and copies nothing/u);
 	assert.match(PI_GRAPH_ROUTING_GUIDANCE, /Do not add task or reply runtime deadlines unless the user explicitly asks/u);
@@ -834,7 +834,7 @@ test("Current Pi RPC loads the extension and runs the graphs doctor command", { 
 		await completed;
 		assert.equal(messages.some((message) => message.type === "extension_ui_request" && String(message.message).includes("Graph doctor:")), true);
 		assert.equal(messages.some((message) => message.type === "extension_ui_request"
-			&& String(message.message).includes("Routing guidance: version=11 hash=")
+			&& String(message.message).includes("Routing guidance: version=13 hash=")
 			&& String(message.message).includes("observed=false enabled=true graphVisible=unknown injected=unknown")), true);
 	} finally {
 		if (child.exitCode === null) child.kill("SIGTERM");

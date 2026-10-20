@@ -6,7 +6,7 @@ import { readV3AttemptEvidence } from "../attempt.ts";
 import { readV3RunControl } from "../control.ts";
 import { readAtomicRegularFile } from "../safe-read.ts";
 import { validateGraphSnapshotV3 } from "../snapshot.ts";
-import type { GraphSnapshotV3 } from "../types.ts";
+import type { GraphSnapshotV3, GraphWhenV3 } from "../types.ts";
 import { setDisplayEvidence, displayEvidence, displayGoalIdentity, safeText, type DisplayEvidence } from "./presentation.ts";
 
 import { validateAuthorizationV4 } from "../authorization.ts";
@@ -21,7 +21,7 @@ export async function enrichGraphView(snapshot: GraphSnapshotV3, runsDir: string
  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Graph run must be a regular directory.");
  const original=displayEvidence(snapshot);
  const prior=original?.goalIdentity===displayGoalIdentity(snapshot)?original:undefined;
- const display: DisplayEvidence = { ...(prior?.goal?{goal:prior.goal,goalIdentity:prior.goalIdentity}:{}),...(prior?.expectedTaskIds?{expectedTaskIds:[...prior.expectedTaskIds]}:{}),failures: {}, failureTimes: {}, neverDispatched: new Set() };
+ const display: DisplayEvidence = { ...(prior?.goal?{goal:prior.goal,goalIdentity:prior.goalIdentity}:{}),...(prior?.expectedTaskIds?{expectedTaskIds:[...prior.expectedTaskIds]}:{}),...(prior?.project?{project:prior.project}:{}),failures: {}, failureTimes: {}, neverDispatched: new Set() };
  try {
   const parent=await realpath(runDir);
   const raw=await readAtomicRegularFile(join(runDir,'authorization.json'),{maxBytes:32*1024*1024,expectedParentRealpath:parent,invalidMessage:'Invalid display authorization.'});
@@ -32,7 +32,14 @@ export async function enrichGraphView(snapshot: GraphSnapshotV3, runsDir: string
   display.goal=safeText(auth.graph.goal).slice(0,1200);
   display.goalIdentity=displayGoalIdentity(snapshot);
   display.expectedTaskIds=auth.graph.nodes.map(n=>n.taskId);
- } catch { /* No trustworthy goal: preserve only same-object previously validated display evidence. */ }
+  // Display-only project identity from the same identity-checked authorization; the basename of the bound sourceCwd, never the viewer's own cwd.
+  const sourceCwd=safeText(auth.sourceCwd),base=sourceCwd.split(/[\\/]+/).filter(Boolean).pop();
+  if(base)display.project=base;
+  // Display-only dependency conditions from the same identity-checked authorization; a dynamic node without authorized evidence simply has no condition.
+  const conditions: Record<string,GraphWhenV3> = {};
+  for (const n of auth.graph.nodes) if (n.when) conditions[n.taskId] = { node: n.when.node, status: n.when.status };
+  display.conditions=conditions;
+ } catch { /* No trustworthy authorization this read: keep only same-identity previously validated display evidence (goal, expected task ids, bound project). A successful identity-checked authorization above has already overwritten them, a different run/session/digest never inherits them, and the viewer's own cwd is never a substitute. */ }
  try {
   const control = await readV3RunControl(runDir);
   if (control.runInstanceId === snapshot.runInstanceId && control.graphId === snapshot.graphId) display.stopRequested = control.desiredState === "stopped";

@@ -2,6 +2,9 @@
 
 ## 0.2.3 — 2026-10-20
 
+- 增加显式分层总计划与叶项绑定校验；Todo 按终端可用宽度自适应，标题在左、已观测项目/Agent/模型靠右，窄屏有界换行。保留稳定编号、真实异常与实际身份，完成项原位显示。
+- Add explicit nested plans with validated leaf bindings and adaptive terminal Todo rows: titles stay left, observed project/Agent/model identities align right, and narrow views wrap safely. Preserve stable numbering, real warnings and observed identities; completed items remain in place.
+
 - 等待收尾消费严格核验的子进程退出证据并返回待处理状态；单次读取、取消、清理与回执有界，不设置任务总时限、不自动重试，也不自动回写旧任务状态。
 - Graph wait consumes strictly verified child-exit proof and yields attention. Individual reads, cancellation, cleanup and receipts are bounded, without a task-wide deadline, automatic retry or automatic rewriting of old durable state.
 

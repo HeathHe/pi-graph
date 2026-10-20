@@ -4,14 +4,16 @@ import { readFileSync, statSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { GraphSnapshotV3 } from "../types.ts";
 import { safeText, phaseOf } from "./presentation.ts";
+import { buildTodoTree, type TodoTree } from "./todo-tree.ts";
 
 export const TODO_ENTRY = "pi-graph-todo/1";
 export type TodoStatus = "pending" | "in_progress" | "blocked" | "done";
 export interface TodoLink { graphId: string; runInstanceId: string; taskId: string }
-export interface TodoItem { id: string; title: string; status: TodoStatus; links: TodoLink[]; dependsOn?: string[]; assignee?: string }
+export interface TodoItem { id: string; title: string; status: TodoStatus; links: TodoLink[]; dependsOn?: string[]; assignee?: string; parentId?: string }
 export interface TodoSnapshot { version: 1; revision: number; updatedAt: string; planId?: string; goal?: string; items: TodoItem[] }
-export type TodoMutation = { action: "set"; expectedRevision: number; goal?:string; items: TodoItem[] } | { action: "update"; expectedRevision: number; id: string; title?: string; status?: TodoStatus; dependsOn?: string[]; assignee?: string } | { action: "link"; expectedRevision: number; id: string; links: TodoLink[] };
-export interface TodoViewItem extends TodoItem { derivedStatus: TodoStatus | "unknown"; source: "人工" | "Graph验收"; reason?: string }
+export type TodoMutation = { action: "set"; expectedRevision: number; goal?:string; items: TodoItem[] } | { action: "update"; expectedRevision: number; id: string; title?: string; status?: TodoStatus; dependsOn?: string[]; assignee?: string; parentId?: string | null } | { action: "link"; expectedRevision: number; id: string; links: TodoLink[] };
+export interface TodoRollup { total: number; done: number; manualDone: number; running: number; waiting: number; blocked: number; unknown: number }
+export interface TodoViewItem extends TodoItem { derivedStatus: TodoStatus | "unknown"; source: "人工" | "Graph验收" | "分组汇总"; reason?: string; rollup?: TodoRollup }
 export interface TodoView { revision: number; planId?:string; goal?:string; items: TodoViewItem[]; persistence: "memory" | "durable" | "unconfirmed"; error?: string }
 export type TodoManager = Pick<ExtensionContext["sessionManager"], "getSessionId" | "getSessionFile" | "getBranch" | "getEntries">;
 const statuses = new Set(["pending", "in_progress", "blocked", "done"]);
@@ -37,11 +39,19 @@ export function validateLinks(value: unknown): TodoLink[] {
 }
 export function validateItems(value: unknown): TodoItem[] {
  if (!Array.isArray(value) || value.length > 128) throw new Error("总计划最多128项");
- const items = value.map(v => { const x=object(v,["id","title","status","links","dependsOn","assignee"]); if(x.dependsOn!==undefined&&(!Array.isArray(x.dependsOn)||x.dependsOn.length>128))throw new Error("计划依赖须为最多128项的数组"); const dependsOn=x.dependsOn?.map(id); if(dependsOn&&new Set(dependsOn).size!==dependsOn.length)throw new Error("计划依赖不能重复"); return {id:id(x.id),title:title(x.title),status:status(x.status),links:validateLinks(x.links ?? []),...(dependsOn!==undefined?{dependsOn}:{}),...(x.assignee!==undefined?{assignee:id(x.assignee)}:{})}; });
+ const items = value.map(v => { const x=object(v,["id","title","status","links","dependsOn","assignee","parentId"]); if(x.dependsOn!==undefined&&(!Array.isArray(x.dependsOn)||x.dependsOn.length>128))throw new Error("计划依赖须为最多128项的数组"); const dependsOn=x.dependsOn?.map(id); if(dependsOn&&new Set(dependsOn).size!==dependsOn.length)throw new Error("计划依赖不能重复"); return {id:id(x.id),title:title(x.title),status:status(x.status),links:validateLinks(x.links ?? []),...(dependsOn!==undefined?{dependsOn}:{}),...(x.assignee!==undefined?{assignee:id(x.assignee)}:{}),...(x.parentId!==undefined?{parentId:id(x.parentId)}:{})}; });
  if (new Set(items.map(x=>x.id)).size !== items.length) throw new Error("计划 ID 不能重复");
+ const tree=buildTodoTree(items);
+ validateTreeItems(items,tree);
  const byId=new Map(items.map(i=>[i.id,i]));const visiting=new Set<string>(),done=new Set<string>();
  const visit=(key:string)=>{if(visiting.has(key))throw new Error("计划依赖不能成环或自引用");if(done.has(key))return;const item=byId.get(key);if(!item)throw new Error("计划依赖引用不存在");visiting.add(key);for(const dep of item.dependsOn??[])visit(dep);visiting.delete(key);done.add(key);};for(const item of items)visit(item.id);
  return items;
+}
+function validateTreeItems(items: readonly TodoItem[],tree: TodoTree<TodoItem>): void {
+ for(const item of items){
+  if(tree.groupIds.has(item.id)&&(item.status!=="pending"||item.links.length||item.dependsOn?.length||item.assignee!==undefined))throw new Error("分组只能是 pending 汇总项，不能有责任人、Graph关联或执行依赖");
+  for(const dep of item.dependsOn??[])if(tree.groupIds.has(dep))throw new Error("计划依赖只能引用叶项，不能引用分组");
+ }
 }
 export function validateTodoSnapshot(value: unknown): TodoSnapshot {
  const x=object(value,["version","revision","updatedAt","items","planId","goal"]);
@@ -49,22 +59,25 @@ export function validateTodoSnapshot(value: unknown): TodoSnapshot {
  return {version:1,revision:x.revision,updatedAt:x.updatedAt,...(x.planId!==undefined?{planId:id(x.planId)}:{}),...(x.goal!==undefined?{goal:title(x.goal)}:{}),items:validateItems(x.items)};
 }
 export function reduceTodo(current: TodoItem[], revision: number, input: unknown): TodoItem[] {
- const x=object(input,["action","expectedRevision","items","id","title","status","links","dependsOn","assignee","goal","bindings"]);
+ const x=object(input,["action","expectedRevision","items","id","title","status","links","dependsOn","assignee","parentId","goal","bindings"]);
  if (!Number.isSafeInteger(x.expectedRevision) || x.expectedRevision !== revision) throw new Error(`计划版本冲突：当前 revision=${revision}；先 list 再更新`);
  if (revision >= Number.MAX_SAFE_INTEGER) throw new Error("计划修订号已达上限");
  if (x.action === "set") { object(x,["action","expectedRevision","items","goal"]);if(x.goal!==undefined)title(x.goal); return validateItems(x.items); }
  if(x.action==="linkBatch"){
   object(x,["action","expectedRevision","bindings"]);if(!Array.isArray(x.bindings)||!x.bindings.length||x.bindings.length>128)throw Error("批量关联数量无效");
-  const items=structuredClone(current),seen=new Set<string>();for(const raw of x.bindings){const b=object(raw,["id","links","assignee"]),key=id(b.id);if(seen.has(key))throw Error("批量关联计划项重复");seen.add(key);const item=items.find(i=>i.id===key);if(!item)throw Error("找不到计划项");const links=validateLinks(b.links);item.links=validateLinks([...new Map([...item.links,...links].map(l=>[JSON.stringify(l),l])).values()]);if(b.assignee!==undefined&&item.assignee===undefined)item.assignee=id(b.assignee);}
+  const tree=buildTodoTree(current),items=structuredClone(current),seen=new Set<string>();for(const raw of x.bindings){const b=object(raw,["id","links","assignee"]),key=id(b.id);if(seen.has(key))throw Error("批量关联计划项重复");seen.add(key);const item=items.find(i=>i.id===key);if(!item)throw Error("找不到计划项");if(tree.groupIds.has(key))throw Error("分组不能关联Graph，只能绑定叶项");const links=validateLinks(b.links);item.links=validateLinks([...new Map([...item.links,...links].map(l=>[JSON.stringify(l),l])).values()]);if(b.assignee!==undefined&&item.assignee===undefined)item.assignee=id(b.assignee);}
   return validateItems(items);
  }
  if (x.action !== "update" && x.action !== "link") throw new Error("未知计划操作");
- object(x,x.action === "link" ? ["action","expectedRevision","id","links"] : ["action","expectedRevision","id","title","status","dependsOn","assignee"]);
+ object(x,x.action === "link" ? ["action","expectedRevision","id","links"] : ["action","expectedRevision","id","title","status","dependsOn","assignee","parentId"]);
  const key=id(x.id), items=structuredClone(current), item=items.find(i=>i.id===key);
  if (!item) throw new Error("找不到计划项");
- if (x.action === "link") item.links=validateLinks(x.links);
- else { if(x.title===undefined&&x.status===undefined&&x.dependsOn===undefined&&x.assignee===undefined)throw new Error("update需要title/status/dependsOn/assignee"); if(x.title!==undefined)item.title=title(x.title);if(x.status!==undefined)item.status=status(x.status);if(x.dependsOn!==undefined)item.dependsOn=x.dependsOn;if(x.assignee!==undefined)item.assignee=x.assignee; }
- return validateItems(items);
+ const beforeTree=buildTodoTree(current);
+ if (x.action === "link") {if(beforeTree.groupIds.has(key))throw Error("分组不能关联Graph，只能绑定叶项");item.links=validateLinks(x.links);}
+ else { if(x.title===undefined&&x.status===undefined&&x.dependsOn===undefined&&x.assignee===undefined&&x.parentId===undefined)throw new Error("update需要title/status/dependsOn/assignee/parentId"); if(x.title!==undefined)item.title=title(x.title);if(x.status!==undefined)item.status=status(x.status);if(x.dependsOn!==undefined)item.dependsOn=x.dependsOn;if(x.assignee!==undefined)item.assignee=x.assignee;if(x.parentId===null)delete item.parentId;else if(x.parentId!==undefined)item.parentId=id(x.parentId); }
+ const valid=validateItems(items),afterTree=buildTodoTree(valid);
+ if(x.action==="update"&&[...beforeTree.groupIds].some(group=>!afterTree.groupIds.has(group)))throw Error("不能移走分组最后一个子项后把空组变成执行项；请用set明确重建计划并去掉空父项");
+ return valid;
 }
 export function restoreTodo(manager: TodoManager): { snapshot?: TodoSnapshot; revision: number; error?: string } {
  let revision=0, snapshot:TodoSnapshot|undefined;
@@ -86,8 +99,10 @@ export class TodoPersistence {
  }
 }
 export async function projectTodo(items: TodoItem[], sessionId: string, read: (link: TodoLink)=>Promise<GraphSnapshotV3>): Promise<TodoViewItem[]> {
+ const tree=buildTodoTree(items);validateTreeItems(items,tree);
  const cache=new Map<string,Promise<GraphSnapshotV3>>();
  const projected:TodoViewItem[]=await Promise.all(items.map(async item=>{
+  if(tree.groupIds.has(item.id))return {...item,source:"分组汇总" as const,derivedStatus:"pending" as const};
   if(!item.links.length)return {...item,source:"人工" as const,derivedStatus:item.status};
   try {
    const nodes=await Promise.all(item.links.map(async link=>{
@@ -101,8 +116,14 @@ export async function projectTodo(items: TodoItem[], sessionId: string, read: (l
    return {...item,source:"Graph验收" as const,derivedStatus};
   }catch(error){return {...item,source:"Graph验收" as const,derivedStatus:"unknown" as const,reason:safeText(error instanceof Error?error.message:error)};}
  }));
- const byId=new Map(projected.map(i=>[i.id,i])),assessed=new Set<string>();
- const assess=(item:TodoViewItem):void=>{if(assessed.has(item.id))return;assessed.add(item.id);for(const key of item.dependsOn??[]){const dep=byId.get(key);if(dep)assess(dep);}const pending=(item.dependsOn??[]).filter(key=>byId.get(key)?.derivedStatus!=="done");if(pending.length&&item.derivedStatus==="pending"){item.derivedStatus="blocked";item.reason=`计划前置项未完成：${pending.map(key=>byId.get(key)?.title??key).join("、")}`;}};for(const item of projected)assess(item);
+ const byId=new Map(projected.map(i=>[i.id,i])),assessed=new Set<string>(),healthyWaiting=new Set<string>();
+ const assess=(item:TodoViewItem):void=>{if(assessed.has(item.id))return;assessed.add(item.id);for(const key of item.dependsOn??[]){const dep=byId.get(key);if(dep)assess(dep);}const pending=(item.dependsOn??[]).filter(key=>byId.get(key)?.derivedStatus!=="done");if(pending.length&&item.derivedStatus==="pending"){item.derivedStatus="blocked";item.reason=`计划前置项未完成：${pending.map(key=>byId.get(key)?.title??key).join("、")}`;if(pending.every(key=>healthyWaiting.has(key)||["pending","in_progress"].includes(byId.get(key)?.derivedStatus??"")))healthyWaiting.add(item.id);}};for(const id of tree.leafIds)assess(byId.get(id)!);
+ for(const id of tree.groupIds){
+  const item=byId.get(id)!,leaves=tree.descendantLeafIds(id).map(key=>byId.get(key)!);
+  const rollup:TodoRollup={total:leaves.length,done:0,manualDone:0,running:0,waiting:0,blocked:0,unknown:0};
+  for(const leaf of leaves){if(leaf.derivedStatus==="done"){rollup.done++;if(leaf.source==="人工")rollup.manualDone++;}else if(leaf.derivedStatus==="unknown")rollup.unknown++;else if(leaf.derivedStatus==="in_progress")rollup.running++;else if(leaf.derivedStatus==="blocked"&&!healthyWaiting.has(leaf.id))rollup.blocked++;else rollup.waiting++;}
+  item.rollup=rollup;item.derivedStatus=rollup.unknown?"unknown":rollup.blocked?"blocked":rollup.running?"in_progress":rollup.done===rollup.total?"done":"pending";
+ }
  return projected;
 }
 export class TodoReadSupersededError extends Error { constructor(){super("计划读取已过期，已丢弃旧结果");this.name="TodoReadSupersededError";} }

@@ -123,6 +123,32 @@ PI_CODING_AGENT_DIR="$release_agent_dir" pi -e /absolute/path/to/node_modules/pi
 
 中止这次工具调用只会停止 watching；Graph 继续在后台运行。真正停止执行必须显式调用 `stop`。
 
+## 分层总计划
+
+一个总目标写在 `graph_todo set.goal`。任务仍以一个 flat `items` 数组保存，使用可选 `parentId` 明确父子关系；不从标题、旧聊天或现有 Graph 自动猜分组。最多 **8 层任务项、128 项（含分组）**，总目标本身不计层数。旧的 flat 计划保持原样。
+
+```json
+{"action":"set","expectedRevision":0,"goal":"完成登录接入","items":[
+  {"id":"prepare","title":"核对接入条件","status":"pending"},
+  {"id":"contract","parentId":"prepare","title":"核对平台契约","status":"pending","assignee":"backend-developer"},
+  {"id":"implementation","title":"实施与验证","status":"pending"},
+  {"id":"implement","parentId":"implementation","title":"实现接入","status":"pending","dependsOn":["contract"],"assignee":"backend-developer"},
+  {"id":"parent-review","parentId":"implementation","title":"主会话审核证据","status":"pending","dependsOn":["implement"],"assignee":"parent"}
+]}
+```
+
+有子项的项是**分组**：保存的 `status` 必须是 `pending`，不设置 `assignee`、Graph `links` 或非空 `dependsOn`。分组只从后代叶项汇总，不是执行者，不能手工标为完成，也不能 `link` 或用于 `graph start.todoBinding`。显示的分组完成数与总进度只计算不同叶项，不把父组再计一遍；人工叶的完成仍与 Graph 验收区分。
+
+依赖只允许**叶 → 叶**，可以跨组，不能引用分组；层级不自动产生派发先后关系。批量绑定叶项时，仍必须证明对应 Graph 节点具有真实 accepted 依赖路径。显示号如 `#1.2` 由同父项在原数组中的顺序生成；状态、标题和折叠不改号。操作 API 使用稳定 `id`，不使用显示号。
+
+`update` 省略 `parentId` 保持位置；字符串明确移动；`parentId:null` 明确移到根（记录中移除此字段）。不能把已有 Graph 关联或执行状态的叶静默改成分组，也不能用 `update` 把分组最后一个子项移走留下空组。需要整体调整时用 `set` 明确重建并去掉空父项：它仍是新的计划周期，旧记录保留为历史，不能冒充旧任务已完成。
+
+原生终端按实际可用宽度自适应显示树、稳定编号和编号旁状态。标题置左，项目、Agent 与实际模型在空间充足时同排靠右；窄屏先完整换行标题，再把身份信息靠右显示。完成项保持原位置、正常字体，不自动折叠；空间不足优先保留活跃项和真实异常，并提供详情入口。不会用计划模型冒充实际模型。
+
+`Alt+T` 控制整体展开/收起，`Alt+Shift+T` 打开总计划详情；详情中的分组收展只改变界面，不修改计划记录或重新派发任务。
+
+记录沿用 `pi-graph-todo/1` 与 `version:1`，新增字段为可选。新版本读取旧 flat 记录无需迁移；**旧二进制不能读取含 `parentId` 的新树记录**，会按严格校验显示计划待核实，不会静默退回旧完成状态。降级前应使用支持树结构的版本查看与整理计划。
+
 ## 动态图
 
 OPEN 图可以从空拓扑开始。每次变更都必须提交调用方刚读取到的 `revision`；过期 revision 会返回冲突，不会覆盖别人的变更。

@@ -3,7 +3,7 @@ import { classifyProviderFailure, isOAuthRefreshNetworkFailure } from "../failur
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAuthError, type LocalAuthRecord } from "./auth-view.ts";
-import type { GraphSnapshotV3, V3NodeProjection, V3ChildSupervision } from "../types.ts";
+import type { GraphSnapshotV3, V3NodeProjection, V3ChildSupervision, GraphWhenV3 } from "../types.ts";
 
 export type GraphTheme = ExtensionContext["ui"]["theme"];
 export interface DisplayEvidence {
@@ -15,6 +15,10 @@ export interface DisplayEvidence {
  failureTimes?: Record<string,string>;
  localAuth?: Record<string,LocalAuthRecord>;
  neverDispatched: Set<string>;
+ /** Display-only authorized when-conditions, bound to the same run/session/digest identity as the rest of this evidence. Never written to snapshot, authorization, or execution state. */
+ conditions?: Record<string,GraphWhenV3>;
+ /** Display-only project name derived from the identity-checked authorization's sourceCwd (basename). Absent means unbound/unknown; never read from the current tool cwd. */
+ project?: string;
  readError?: string;
  exitUnverified?:string[];
  processExits?: Record<string,UiProcessExit>;
@@ -54,7 +58,7 @@ export function orderedNodes(snapshot: GraphSnapshotV3): Array<[string, V3NodePr
 export function phaseLabel(n: V3NodeProjection, snapshot?: GraphSnapshotV3, id?: string): string {
  if(nodeProcessExit(n))return "退出待核对";
  if(nodeExitUnverified(n))return "退出证据待核实";
- if (phaseOf(n) === "running" && n.observation?.supervision?.attention === "waiting_user") return "等待用户";
+ if (phaseOf(n) === "running" && n.observation?.supervision?.attention === "waiting_user") return "待主 Agent 决策";
  if (phaseOf(n) === "aborted" && snapshot && id && evidence.get(snapshot)?.neverDispatched.has(id)) return "未启动";
  if (snapshot && id && displayPhase(snapshot,id,n) === "not_started") return "未执行";
  return ({ queued: "排队", prepared: "准备", dispatched: "已派发", running: "运行", verifying: "验收", applying: "应用", accepted: "成功", failed: "失败", aborted: "已停止", needs_attention: "待处理", skipped: "跳过", blocked: "未执行", cancelled: "已取消" } as Record<string,string>)[phaseOf(n)] ?? phaseOf(n);
@@ -69,7 +73,7 @@ export function counts(snapshot: GraphSnapshotV3): string {
  const groups: Array<[string,string[]]> = [
   ["成功",["accepted"]], ["运行",["prepared","dispatched","running","verifying","applying"]], ["失败",["failed"]],
   ["未执行",["not_started","blocked"]], ["排队",["queued"]], ["停止",["aborted"]],
-  ["待核对",["exit_unreconciled","exit_unverified"]], ["等待用户",["waiting_user"]], ["待处理",["needs_attention"]], ["取消",["cancelled"]], ["跳过",["skipped"]],
+  ["待核对",["exit_unreconciled","exit_unverified"]], ["待主 Agent 决策",["waiting_user"]], ["待处理",["needs_attention"]], ["取消",["cancelled"]], ["跳过",["skipped"]],
  ];
  return groups.flatMap(([label,phases]) => { const count=values.filter(p=>phases.includes(p)).length; return count ? [`${label} ${count}`] : []; }).join(" · ") || "暂无任务";
 }
@@ -80,7 +84,7 @@ export function graphLabel(snapshot: GraphSnapshotV3): string {
  const failed = Object.entries(snapshot.nodes ?? {}).filter(([id,n]) => displayPhase(snapshot,id,n) === "failed").length;
  // A failed node plus an aborted sibling alone is not proof of operator intent.
  if (evidence.get(snapshot)?.stopRequested && nodes.some(n => phaseOf(n) === "aborted") && nodes.every(n => !activeNode(n) && phaseOf(n) !== "queued")) return `已停止${failed ? ` · 含 ${failed} 项失败` : ""}`;
- if (snapshot.status === "running" && nodes.some(n => phaseOf(n) === "running" && n.observation?.supervision?.attention === "waiting_user")) return "等待用户处理";
+ if (snapshot.status === "running" && nodes.some(n => phaseOf(n) === "running" && n.observation?.supervision?.attention === "waiting_user")) return "待主 Agent 决策";
  if (snapshot.status === "running" && failed) return "部分失败，其余继续";
  return ({ queued: "等待启动", running: "运行中", idle: "等待追加任务", stopping: "正在停止", complete: "已完成", failed: "未完成", stopped: "已停止", paused: "已暂停", waiting_input: "等待输入", needs_attention: "需要处理" })[snapshot.status];
 }
@@ -145,7 +149,7 @@ export function nodeReason(snapshot: GraphSnapshotV3, id: string, n: V3NodeProje
  if (phase === "queued") {
   if (snapshot.status === "paused") return "Graph 已暂停，等待恢复";
   if (snapshot.status === "waiting_input") return "Graph 等待输入";
-  if (s?.attention === "waiting_user") return "等待用户处理";
+  if (s?.attention === "waiting_user") return "待主 Agent 决策";
   const pending = (n.dependsOn ?? []).filter(task => !snapshot.nodes?.[task] || phaseOf(snapshot.nodes[task]!) !== "accepted");
   const describe = (task: string) => {
    const dependency = snapshot.nodes?.[task];
@@ -173,7 +177,7 @@ export function nodeReason(snapshot: GraphSnapshotV3, id: string, n: V3NodeProje
  if (s?.attention) return attentionReason(s.attention) + (s.attention === "suspected_unresponsive" ? "，任务保持运行" : "");
  if (activeNode(n) && error) return `最近异常：${errorSummary(error)}`;
  if (n.observation?.progress?.currentTool) return `工具：${safeText(n.observation.progress.currentTool)}`;
- return ({ receiving: "接收模型响应", waiting_model: "等待模型响应", streaming_model: "接收模型响应", requesting: "等待模型响应", tool_running: "执行工具", retrying: "正在重试", starting: "正在启动", waiting_user: "等待用户处理" } as Record<string,string>)[s?.phase ?? ""] ?? (activeNode(n) ? `执行阶段：${safeText(s?.phase ?? n.phase)}` : "等待调度");
+ return ({ receiving: "接收模型响应", waiting_model: "等待模型响应", streaming_model: "接收模型响应", requesting: "等待模型响应", tool_running: "执行工具", retrying: "正在重试", starting: "正在启动", waiting_user: "待主 Agent 决策" } as Record<string,string>)[s?.phase ?? ""] ?? (activeNode(n) ? `执行阶段：${safeText(s?.phase ?? n.phase)}` : "等待调度");
 }
 /** Display facts only: no clock is stored in Graph state or execution input. */
 export function nodeActivityLines(n: V3NodeProjection, now = Date.now()): string[] {
@@ -200,7 +204,7 @@ export function nodeActivityLines(n: V3NodeProjection, now = Date.now()): string
  return lines;
 }
 function attentionReason(attention: NonNullable<V3ChildSupervision["attention"]>): string {
- return ({ waiting_user: "等待用户处理", suspected_unresponsive: "疑似无响应", repeated_errors: "重复工具错误，需要检查", storage_error: "状态保存异常", observation_unavailable: "暂时无法读取监管状态", result_unavailable: "子任务已结束，但缺少最终结果，尚未验收", runtime_exited: "进程已退出，需要核对" })[attention];
+ return ({ waiting_user: "待主 Agent 决策", suspected_unresponsive: "疑似无响应", repeated_errors: "重复工具错误，需要检查", storage_error: "状态保存异常", observation_unavailable: "暂时无法读取监管状态", result_unavailable: "子任务已结束，但缺少最终结果，尚未验收", runtime_exited: "进程已退出，需要核对" })[attention];
 }
 export function compactGraphLines(snapshot: GraphSnapshotV3): string[] {
  const rows = orderedNodes(snapshot);
@@ -229,7 +233,7 @@ export function compactGraphLines(snapshot: GraphSnapshotV3): string[] {
  if (fallback) out.push(`  模型接替：${fallback.reason === "quota" ? "额度用尽" : "模型不可用"} → ${safeText(fallback.to)}`);
  const waiting = active.some(([,n]) => n.observation?.supervision?.attention === "waiting_user");
  if (["paused", "waiting_input"].includes(snapshot.status) || waiting) {
-  out.push(`  ${snapshot.status === "paused" ? "已暂停，等待恢复" : "等待用户处理"}`);
+  out.push(`  ${snapshot.status === "paused" ? "已暂停，等待恢复" : "待主 Agent 决策"}`);
  } else if (["running", "queued"].includes(snapshot.status) && !rows.some(([,n]) => n.observation?.supervision?.attention || phaseOf(n) === "needs_attention")) {
   const queued = rows.filter(([id,n]) => displayPhase(snapshot,id,n) === "queued");
   const ready = queued.filter(([,n]) => n.dependsOn !== undefined && n.dependsOn.every(id => snapshot.nodes?.[id] && phaseOf(snapshot.nodes[id]) === "accepted"));

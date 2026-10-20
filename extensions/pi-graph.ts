@@ -1,9 +1,10 @@
 import {readUiProcessExits} from '../src/v3/ui/process-exit.ts';
 import {boundedGraphObservation,WaitObservationUnavailable} from '../src/v3/wait-observation.ts';
+import {buildTodoTree} from '../src/v3/ui/todo-tree.ts';
 import {TodoBindingSchema,hasPlanManager,validateTodoBinding,validateBindingNodes,bindingLinks,planContext,removePlanContext,type TodoBinding} from '../src/v3/plan-flow.ts';
 import {ExpandedReceipt,RawReceiptViewer,findRawReceipt,receiptId} from '../src/v3/ui/expanded-receipt.ts';
 import {visibleWidth} from "@earendil-works/pi-tui";
-import {terminalStack,type StackInput,type ParentActivity} from "../src/v3/ui/terminal-stack.ts";
+import {terminalStack,stackTasks,safelyCompletedTask,type StackInput,type ParentActivity} from "../src/v3/ui/terminal-stack.ts";
 import {nodeProcessExit,nodeExitUnverified} from "../src/v3/ui/process-exit.ts";
 import {registerGraphTodo} from "./graph-todo.ts";
 import {TodoController,TodoReadCoordinator,TodoReadSupersededError,type TodoView,type TodoLink} from "../src/v3/ui/todo.ts";
@@ -198,6 +199,8 @@ Human input is a blocked handoff, not executable work. Before starting a child, 
 
 For a simple isolated execution task, use a single-node Graph with an explicit role. The parent may answer ordinary questions and perform read-only review directly. If no specialist fits, define a narrow contract and explicitly assign the existing generalist; do not silently map an unknown capability or enable temporary agents. If the Capability Contract mandates shadow isolation, use Graph or report the conflict.
 
+Maintain one explicit graph_todo goal for the current confirmed objective. Represent major work areas as parentId groups and executable items as leaves; nested groups are organizational summaries, never execution tasks. Allow at most 8 item levels (excluding goal) and 128 items including groups. Groups retain pending with no links, dependencies or assignee. Omitted parentId keeps position, a string reparents, and null moves to root; use explicit set to rebuild/remove a group when moving its last child. Only leaves may carry Graph links, dependencies or assignees, and dependencies must point to leaves. Keep the tree updated through graph_todo with expectedRevision; do not infer or rewrite old flat plans, replay completed work, or treat group progress as Graph acceptance.
+
 PI-GRAPH does not start itself; the parent Agent must explicitly call the \`graph\` tool. Child Agents are started and controlled by the owned Graph runtime.
 
 \`graph\` action \`start\` is asynchronous. If the current turn needs the graph's results, call \`graph\` with \`action: "wait"\` after \`start\`, then synthesize the settled node results before answering the user.
@@ -212,7 +215,7 @@ Final delivery: after waiting, integrate all settled results into one self-conta
 
 User-facing CLI reports: lead with what was completed and what remains, then the root cause and at most one immediate decision needed from the user. Group identical service errors; distinguish tasks that failed from tasks that never ran due to fail-fast or unmet dependencies, using execution evidence. By default use a short paragraph or up to three bullets; preserve substantive findings the user asked for. Keep raw errors, state JSON, run IDs, workspace paths and Git hashes out of the reply unless needed to act or explicitly requested. The live summary and \`/graphs\` inspector hold operational detail; do not repeat their counters and command in every message. Ask a single next-step question only when authorization or information is actually missing; do not bundle unrelated business questions into failure recovery. Do not retry or switch models solely to improve the displayed status.`;
 
-export const PI_GRAPH_ROUTING_GUIDANCE_VERSION = "11";
+export const PI_GRAPH_ROUTING_GUIDANCE_VERSION = "13";
 export const PI_GRAPH_ROUTING_GUIDANCE_HASH = createHash("sha256").update(PI_GRAPH_ROUTING_GUIDANCE, "utf8").digest("hex");
 
 export interface PiGraphRoutingDiagnosticsV3 {
@@ -1299,7 +1302,8 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
  let composingGraphMessage=false;
  let uiGeneration=0;let closeActivePanel:(()=>void)|undefined;
  let todoIdentitySnapshots:GraphSnapshotV3[]=[];
- const invalidateCockpit=()=>{todoIdentitySnapshots=[];uiGeneration++;mountedGeneration=-1;parentActivity={active:false};parentToolsInFlight.clear();closeActivePanel?.();closeActivePanel=undefined;inspectorOpen=false;};
+ const foldedTodoIds=new Set<string>(),expandedCompletedGroupIds=new Set<string>();let recentCompletedIds:string[]=[];const previousCompleted=new Map<string,boolean>();let foldedTodoScope='';const planSelection:{id?:string}={};
+ const invalidateCockpit=()=>{foldedTodoIds.clear();expandedCompletedGroupIds.clear();recentCompletedIds=[];previousCompleted.clear();foldedTodoScope='';delete planSelection.id;todoIdentitySnapshots=[];uiGeneration++;mountedGeneration=-1;parentActivity={active:false};parentToolsInFlight.clear();closeActivePanel?.();closeActivePanel=undefined;inspectorOpen=false;};
  const todoController=new TodoController();let todoView:TodoView=emptyTodo();let cockpitFingerprint="",cockpitPreferred:string|undefined,planRefreshSequence=0;
  const readTodoLink=async(link:TodoLink,ctx:ExtensionContext)=>{const config=await loadV3GraphConfig();return readGraphView(config.runsDir,link.graphId,undefined,trustedSessionId(ctx),ctx.sessionManager.getSessionFile());};
  let parentEventsEnabled=false;const parentToolsInFlight=new Map<string,string>();
@@ -1311,13 +1315,18 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
   try{if(typeof ctx.isIdle==="function"){const active=!ctx.isIdle();if(!active){parentToolsInFlight.clear();parentActivity={active:false};}else parentActivity={...parentActivity,active:true};}}catch{/* Stale UI context cannot fail a turn. */}
  };
  const mountCockpit=()=>{
-  const ctx=uiContext;if(!ctx||ctx.mode!=="tui"||inspectorOpen)return;
+  const ctx=uiContext;if(!ctx||ctx.mode!=="tui")return;
+  const scope=JSON.stringify([trustedSessionId(ctx),ctx.sessionManager.getSessionFile(),todoView.planId??'legacy']);if(scope!==foldedTodoScope){foldedTodoIds.clear();expandedCompletedGroupIds.clear();recentCompletedIds=[];previousCompleted.clear();delete planSelection.id;foldedTodoScope=scope;}const groups=buildTodoTree(todoView.items).groupIds;for(const id of foldedTodoIds)if(!groups.has(id))foldedTodoIds.delete(id);
   reconcileParentIdle(ctx);
   const observed=liveGraphUi.values().filter(s=>s.sessionId===trustedSessionId(ctx));
   const visible=observed.filter(s=>hiddenGraphs.get(displayKey(s))!==attentionKey(s));
   displayedGraph=cockpitFocus(visible,cockpitPreferred);
-  stackProjection={sessionId:trustedSessionId(ctx),snapshots:visible,identitySnapshots:todoIdentitySnapshots,plan:structuredClone(todoView),expanded:todoExpanded,preferred:cockpitPreferred,parent:{...parentActivity,sessionId:trustedSessionId(ctx)}};
-  const fingerprint=JSON.stringify([uiGeneration,visible.map(s=>[s,displayEvidence(s)]),todoIdentitySnapshots.map(s=>[s,displayEvidence(s)]),todoView,todoExpanded,parentActivity]);
+  const currentTasks=stackTasks({sessionId:trustedSessionId(ctx),snapshots:visible,identitySnapshots:todoIdentitySnapshots,plan:todoView,expanded:todoExpanded}),ids=new Set(currentTasks.map(t=>t.id));
+  for(const t of currentTasks.filter(t=>!t.group)){const completed=safelyCompletedTask(t);if(completed&&previousCompleted.get(t.id)===false)recentCompletedIds=[...recentCompletedIds.filter(id=>id!==t.id),t.id].slice(-2);previousCompleted.set(t.id,t.status==='completed');}
+  for(const id of previousCompleted.keys())if(!ids.has(id))previousCompleted.delete(id);recentCompletedIds=recentCompletedIds.filter(id=>ids.has(id)&&previousCompleted.get(id));for(const id of expandedCompletedGroupIds)if(id!=='@root'&&!groups.has(id))expandedCompletedGroupIds.delete(id);
+  if(inspectorOpen)return;
+  stackProjection={sessionId:trustedSessionId(ctx),snapshots:visible,identitySnapshots:todoIdentitySnapshots,plan:structuredClone(todoView),expanded:todoExpanded,foldedIds:new Set(foldedTodoIds),recentCompletedIds:[...recentCompletedIds],expandedCompletedGroupIds:new Set(expandedCompletedGroupIds),preferred:cockpitPreferred,parent:{...parentActivity,sessionId:trustedSessionId(ctx)}};
+  const fingerprint=JSON.stringify([uiGeneration,visible.map(s=>[s,displayEvidence(s)]),todoIdentitySnapshots.map(s=>[s,displayEvidence(s)]),todoView,todoExpanded,[...foldedTodoIds],[...expandedCompletedGroupIds],recentCompletedIds,parentActivity]);
   if(fingerprint===cockpitFingerprint&&mountedGeneration===uiGeneration)return;
   if(mountedGeneration!==uiGeneration){
    stackRenderers.clear();const generation=uiGeneration;
@@ -1707,7 +1716,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
      const chooseGraph=async()=>{const views=(await guarded(listGraphViews(config.runsDir,trustedSessionId(ctx),ctx.sessionManager.getSessionFile()))).filter(v=>v.sessionId===trustedSessionId(ctx));if(!views.length)return undefined;const labels=views.map(v=>`${v.graphId} · ${graphLabel(v)}`);const choice=await guarded(ctx.ui.select("当前会话已观测/可读 Graph（仅查看）",labels));return choice?views[labels.indexOf(choice)]?.graphId:undefined;};
      const openPlan=async():Promise<"close"|"tasks"|"agents"|"history"|"link">=>{
       uiContext=ctx;await refreshTodo(ctx).catch(error=>{if(!(error instanceof TodoReadSupersededError))check();});check();let panel:PlanInspector|undefined;inspectorOpen=true;
-      try{ctx.ui.setWidget("pi-graph",undefined);ctx.ui.setWidget("pi-graph-agents",undefined);mountedGeneration=-1;return await ctx.ui.custom((tui,theme,_keys,complete)=>{let finished=false;const done=(value:"close"|"tasks"|"agents"|"history"|"link")=>{if(!finished){finished=true;complete(value);}};check();closeActivePanel=()=>{panel?.dispose();done("close");};panel=new PlanInspector({view:todoView,theme,rows:()=>tui.terminal.rows,requestRender:()=>tui.requestRender(),close:()=>done("close"),navigate:next=>done(next==="agents"?"agents":"tasks"),history:()=>done("history"),openLink:link=>{planLink=link;returnToPlan=true;done("link");},read:()=>refreshTodo(ctx)});return panel;},{overlay:true,overlayOptions:{anchor:"center",width:"92%",maxHeight:"90%",margin:0}});}finally{panel?.dispose();if(valid()){closeActivePanel=undefined;inspectorOpen=false;cockpitFingerprint="";mountCockpit();}}
+      try{ctx.ui.setWidget("pi-graph",undefined);ctx.ui.setWidget("pi-graph-agents",undefined);mountedGeneration=-1;return await ctx.ui.custom((tui,theme,_keys,complete)=>{let finished=false;const done=(value:"close"|"tasks"|"agents"|"history"|"link")=>{if(!finished){finished=true;complete(value);}};check();closeActivePanel=()=>{panel?.dispose();done("close");};panel=new PlanInspector({view:todoView,theme,selection:planSelection,getExpandedCompleted:()=>expandedCompletedGroupIds,toggleCompleted:id=>{if(expandedCompletedGroupIds.has(id))expandedCompletedGroupIds.delete(id);else expandedCompletedGroupIds.add(id);cockpitFingerprint='';mountCockpit();},getFoldedIds:()=>foldedTodoIds,toggleGroup:id=>{if(!buildTodoTree(todoView.items).groupIds.has(id))return;if(foldedTodoIds.has(id))foldedTodoIds.delete(id);else foldedTodoIds.add(id);cockpitFingerprint="";mountCockpit();},tasks:()=>stackTasks({...stackProjection,plan:todoView,identitySnapshots:todoIdentitySnapshots}),rows:()=>tui.terminal.rows,requestRender:()=>tui.requestRender(),close:()=>done("close"),navigate:next=>done(next==="agents"?"agents":"tasks"),history:()=>done("history"),openLink:link=>{planLink=link;returnToPlan=true;done("link");},read:()=>refreshTodo(ctx)});return panel;},{overlay:true,overlayOptions:{anchor:"center",width:"92%",maxHeight:"90%",margin:0}});}finally{panel?.dispose();if(valid()){closeActivePanel=undefined;inspectorOpen=false;cockpitFingerprint="";mountCockpit();}}
      };
      if(tab==="plan"){const next=await guarded(openPlan());if(next==="close")return;tab=next==="agents"?"agents":"tasks";if(next==="history")selectedId=await guarded(chooseGraph());if(next==="link"&&planLink){selectedId=planLink.graphId;selectedTask=planLink.taskId;}}
 
