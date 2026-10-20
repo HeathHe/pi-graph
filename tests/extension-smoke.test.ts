@@ -443,9 +443,9 @@ test("V3 graph wait abort and session shutdown stop watching only", { timeout: 2
 	assert.equal(abortRegistry.size, 0);
 	const abortedResult = await graphWaitResultV3("cancel-graph", abortedOutcome, "/tmp/pi-graph-wait-tests");
 	assert.match(abortedResult.content[0].text, /Stopped watching/u);
-	assert.match(abortedResult.content[0].text, /Graph continues running/u);
+	assert.doesNotMatch(abortedResult.content[0].text, /Graph continues running|children continue running/u);
 	assert.equal(abortedResult.details.watching, false);
-	assert.equal(abortedResult.details.graphContinuesRunning, true);
+	assert.equal(Object.hasOwn(abortedResult.details, "graphContinuesRunning"), false);
 	assert.equal(abortedResult.details.snapshot.status, "running");
 
 	const shutdownRegistry = new V3GraphWaitRegistry();
@@ -847,7 +847,7 @@ test("Graph wait yields for current attention without stopping tasks, ignores ca
  const running:any={graphId:"g",status:"running",updatedAt:"2026-09-09T00:00:00Z",nodes:{t:{phase:"running",observation:{asyncId:"child",supervision:{attention:"waiting_user"}}}}};
  let disposed=0;const options={graphId:"g",readStatus:async()=>running,subscribe:()=>()=>{disposed++;}};
  const outcome=await waitForGraphSnapshotV3(options);assert.equal(outcome.reason,"attention_required");assert.equal(disposed,1);assert.equal(running.status,"running");
- const result=await graphWaitResultV3("g",outcome,"/unused");assert.equal(result.details.graphContinuesRunning,true);assert.match(result.content[0].text,/not task completion/);
+ const result=await graphWaitResultV3("g",outcome,"/unused");assert.equal(Object.hasOwn(result.details,"graphContinuesRunning"),false);assert.doesNotMatch(result.content[0].text,/children continue running/);assert.match(result.content[0].text,/not task completion|不代表任务完成/);
  const completed={...running,status:"complete",updatedAt:"2026-09-09T00:00:01Z"};
  assert.equal((await waitForGraphSnapshotV3({...options,initialSnapshot:running,readStatus:async()=>completed})).reason,"graph_settled");
 });

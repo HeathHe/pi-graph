@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 — 2026-10-20
+
+- 等待收尾消费严格核验的子进程退出证据并返回待处理状态；单次读取、取消、清理与回执有界，不设置任务总时限、不自动重试，也不自动回写旧任务状态。
+- Graph wait consumes strictly verified child-exit proof and yields attention. Individual reads, cancellation, cleanup and receipts are bounded, without a task-wide deadline, automatic retry or automatic rewriting of old durable state.
+
+
 ## 0.2.2 — 2026-10-16
 
 - 增加独立总计划与 Graph 任务联动，终端按任务显示责任岗位、实际模型、运行活动和依赖等待；正常等待使用中性提示，失败与待处理状态保留警告。

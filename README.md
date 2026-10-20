@@ -389,6 +389,9 @@ Graph 自己的运行观察提醒按持久状态去重，已结束任务不会�
 
 `graph wait` 遇到运行中节点的 `waiting_user`、`suspected_unresponsive`、`storage_error`、`repeated_errors`、`result_unavailable` 或 `runtime_exited` 时返回 `attention_required`，让主 Agent 能处理问题。它只结束当前等待，不停止 Graph 或子任务，也不设置任务总时长。处理后继续等待，最后给出完整、自包含的综合结论。
 
+等待也会消费只读、严格身份匹配的物理退出证据：子进程已退出但 Graph 尚未收尾时返回 `attention_required`，不把退出当作验收成功。`waitEvidence.kind` 区分 `confirmed_exit`、`exit_unverified`、`observation_unavailable` 和 `supervisor_attention`；无法确认时省略 `graphContinuesRunning`，不能据旧 running 状态宣称全部子任务仍运行。每次状态、证据和回执读取最多等待 5 秒；这是单次读取保护，不是任务总时限。取消只停止等待，读取失败或监督租约释放都不单独证明退出，不会自动重试、恢复或重新派发。
+
+
 ### 无默认任务期限、主子对话与只读材料
 
 自有 guardian/child 不添加默认任务 deadline，保留用户停止、RPC 握手、退出监管和单次操作故障检查。原 native 安装补丁不参与新 Graph 运行。

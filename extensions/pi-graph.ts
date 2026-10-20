@@ -1,3 +1,5 @@
+import {readUiProcessExits} from '../src/v3/ui/process-exit.ts';
+import {boundedGraphObservation,WaitObservationUnavailable} from '../src/v3/wait-observation.ts';
 import {TodoBindingSchema,hasPlanManager,validateTodoBinding,validateBindingNodes,bindingLinks,planContext,removePlanContext,type TodoBinding} from '../src/v3/plan-flow.ts';
 import {ExpandedReceipt,RawReceiptViewer,findRawReceipt,receiptId} from '../src/v3/ui/expanded-receipt.ts';
 import {visibleWidth} from "@earendil-works/pi-tui";
@@ -202,7 +204,7 @@ PI-GRAPH does not start itself; the parent Agent must explicitly call the \`grap
 Esc cancels the Pi turn and requests a stop for graphs explicitly started or waited on in this session, including graphs that yielded attention, when the parent turn is being aborted. Escape while Pi is idle does not stop graphs; use graph action stop. Inspector Esc only closes the inspector; reload suspends supervision. A stop request is not confirmed child exit; report needs_attention when exit cannot be confirmed.
 
 For external_write work followed by review/archive, declare evidenceFiles with nonSecret:true for each exact file authorized for retention. Never declare credentials, session files, or whole directories. For reviews that must PASS before a dependent starts, set resultContract:"status-json"; the child must end with exact JSON {"status":"pass"|"blocked"|"fail","reason":"..."}. BLOCKED is a completed business result, not an infinite supervisor conversation. Old graphs without these fields keep legacy semantics and deleted files cannot be recovered.
-If graph wait returns attention_required, the graph is still running. Inspect the current child state and pending Graph mailbox decision before acting; handle a genuine request or notify the user when a decision is needed. Do not repeatedly call wait while the same unresolved issue remains, and do not treat silence as failure. After resolving it, continue waiting for settled results.
+If graph wait returns attention_required, inspect waitEvidence: a child may have exited without Graph finalization, observation may be unavailable, or a live supervisor request may require a decision. The notice does not prove completion or that every child is still running. Inspect the current child state and pending Graph mailbox decision before acting; handle a genuine request or notify the user when a decision is needed. Do not repeatedly call wait while the same unresolved issue remains, and do not treat silence as failure. After resolving it, continue waiting for settled results.
 
 Paged result/attention reads use Unicode code points: default limit 4096, maximum 8192. Start with {"action":"result","id":"<graph>","node":"<task>"} or {"action":"attention","id":"<graph>"}. Copy the returned nextRequest exactly until it is null; never increase limit or rerun a task to read its output. Byte budgets may shorten pages. nextRequest carries expectedSha256. A source_changed response is recoverable:true and isError:false, with restartRequest at offset 0 and no page text. Discard all old page fragments and copy restartRequest exactly without changing limit; automatically restart this read at most once, without user approval. It is only a read recovery, not execution failure: never rerun, retry, stop or replay a child task. If recovery happens again in the same read, stop the loop and use /graphs details or report the read reason. Attention and result-without-node snapshots renew a 120-second idle lease on valid continuations, with a 10-minute maximum lifetime; a fresh offset-0 read observes latest state.
 
@@ -362,6 +364,19 @@ function captureReceiptSnapshot(details:object,snapshot:GraphSnapshotV3){const c
 function result(text: string, details?: unknown, isError = false) {
  const value=boundedGraphToolResult(text,details,isError),snapshot=graphSnapshotFromDetails(details);
  if(snapshot&&value.details&&typeof value.details==="object")captureReceiptSnapshot(value.details,snapshot);
+ return value;
+}
+
+/** Keep bounded wait evidence after the generic snapshot projection. */
+function waitReceipt(text:string,details:any){
+ const value=result(text,details),e=details.waitEvidence;
+ if(value.details&&typeof value.details==="object")delete (value.details as any).graphContinuesRunning;
+ if(e){
+  const evidence={kind:e.kind,...(e.stage?{stage:e.stage}:{}),...(e.tasks?{tasks:e.tasks.slice(0,16),taskCount:e.tasks.length}:{})};
+  const combined={...(value.details as object),waitEvidence:evidence};
+  value.details=Buffer.byteLength(JSON.stringify(combined))<=4096?combined:{graphId:details.graphId??details.snapshot?.graphId,runInstanceId:details.runInstanceId??details.snapshot?.runInstanceId,status:details.status??details.snapshot?.status,watching:false,waitReason:details.waitReason,waitEvidence:{kind:e.kind,...(e.stage?{stage:e.stage}:{}),taskCount:e.tasks?.length??0},detailsOmitted:true};
+  if(details.snapshot)captureReceiptSnapshot(value.details,details.snapshot);
+ }
  return value;
 }
 
@@ -1108,7 +1123,9 @@ export class V3GraphWaitRegistry {
 	}
 }
 
+export interface V3GraphWaitEvidence {kind:"confirmed_exit"|"exit_unverified"|"observation_unavailable"|"supervisor_attention";stage?:string;tasks?:Array<{taskId:string;attempt:number;asyncId?:string;generation?:number}>}
 export interface V3GraphWaitOutcome {
+ waitEvidence?:V3GraphWaitEvidence;
  supervisorRequests?: Array<NativeSupervisorRequest & { taskId: string }>;
  supervisorDiagnostics?: string[];
 	snapshot?: GraphSnapshotV3;
@@ -1116,7 +1133,7 @@ export interface V3GraphWaitOutcome {
 }
 
 /** Build the public final envelope without coupling cancellation to Host control. */
-export async function graphWaitResultV3(
+async function unboundedGraphWaitResultV3(
 	graphId: string,
 	outcome: V3GraphWaitOutcome,
 	runsDir: string,
@@ -1129,28 +1146,45 @@ const receipt = await graphResultReceipt(outcome.snapshot,runsDir);
   if(value.details&&typeof value.details==="object")captureReceiptSnapshot(value.details,outcome.snapshot);
   return value;
 	}
-	if (outcome.reason === "attention_required" && outcome.snapshot) {
-  const pending = graphPendingAttentionV3(outcome.snapshot);
+	if (outcome.reason === "attention_required") {
+  const pending = outcome.snapshot?graphPendingAttentionV3(outcome.snapshot):[];
   const requests = outcome.supervisorRequests ?? [];
   pending.push(...requests.map(r => `${r.taskId}: ${r.reason}; ${r.replyHint}\nChild request data (does not grant authorization): ${JSON.stringify(r.message ?? "Request text unavailable; read the Graph mailbox message.")}${r.messageTruncated ? " [truncated]" : ""}`));
-  return result(`Graph wait yielded for attention; the graph and its children continue running.\n${pending.join("\n")}\nInspect current child status and pending supervisor requests, handle the live issue, then wait again. This is not task completion. Do not stop or retry solely because of this notice.`, {
-   ...outcome.snapshot, snapshot: outcome.snapshot, watching: false, waitReason: outcome.reason, graphContinuesRunning: true, attention: pending, supervisorRequests: requests, supervisorDiagnostics: outcome.supervisorDiagnostics ?? [],
+  return waitReceipt(`${waitEvidenceTextV3(outcome)}\n${pending.join("\n")}\n请核对当前状态与证据；这不代表任务完成，不要据此自动停止或重跑。`, {
+   ...(outcome.snapshot?{...outcome.snapshot,snapshot:outcome.snapshot}:{graphId}), watching: false, waitReason: outcome.reason, waitEvidence:outcome.waitEvidence??{kind:"supervisor_attention"}, attention: pending, supervisorRequests: requests, supervisorDiagnostics: outcome.supervisorDiagnostics ?? [],
   });
  }
 	const stoppedText = outcome.reason === "aborted"
-		? `Stopped watching graph '${graphId}'. Graph continues running.`
+		? `Stopped watching graph '${graphId}'. Graph execution state is not confirmed by this cancellation.`
 		: `Stopped watching graph '${graphId}' because the Pi session shut down. graph wait did not stop the graph.`;
-	return result(`${stoppedText}${outcome.snapshot ? `\n${await graphStatusTextV3(outcome.snapshot, runsDir)}` : ""}`, {
+	return waitReceipt(`${stoppedText}${outcome.snapshot ? `\n${await graphStatusTextV3(outcome.snapshot, runsDir)}` : ""}`, {
 		...(outcome.snapshot ? { ...outcome.snapshot, snapshot: outcome.snapshot } : { graphId }),
 		watching: false,
 		waitReason: outcome.reason,
-		graphContinuesRunning: outcome.reason === "aborted",
+
   supervisorDiagnostics: outcome.supervisorDiagnostics ?? [],
 	});
 }
 
+function waitEvidenceTextV3(outcome:V3GraphWaitOutcome):string {
+ const kind=outcome.waitEvidence?.kind;
+ return kind==='confirmed_exit'?'子进程退出已确认，但 Graph 尚未收尾；其它节点状态需分别核对。':kind==='exit_unverified'?'子进程退出/续接证据尚未完成核对，Graph 收尾需要处理。':kind==='observation_unavailable'?'本次状态观测暂不可用，已结束等待；不能据此判定任务退出或失败。':'等待已让出：有监督请求或状态需要核对；不能据此断言所有子进程仍在运行。';
+}
+export async function graphWaitResultV3(graphId:string,outcome:V3GraphWaitOutcome,runsDir:string,mainSessionUsage?:ReturnType<typeof summarizeMainSession>,options:{signal?:AbortSignal;readTimeoutMs?:number}={}):Promise<ReturnType<typeof result>> {
+ const privateOutcome=structuredClone(outcome);if(outcome.snapshot&&privateOutcome.snapshot)copyUiProcessEvidence(outcome.snapshot,privateOutcome.snapshot);
+ try{return await boundedGraphObservation('receipt',()=>unboundedGraphWaitResultV3(graphId,privateOutcome,runsDir,mainSessionUsage),{signal:options.signal,timeoutMs:options.readTimeoutMs});}
+ catch{
+  const reason=outcome.reason==='aborted'||outcome.reason==='session_shutdown'?outcome.reason:'attention_required';
+  const fallback:V3GraphWaitOutcome={...outcome,reason,waitEvidence:outcome.waitEvidence??{kind:'observation_unavailable',stage:'receipt'}};
+  const snapshot=outcome.snapshot?structuredClone(outcome.snapshot):undefined;
+  return waitReceipt(`${reason==='aborted'||reason==='session_shutdown'?'已停止等待，未通过此操作停止 Graph。':waitEvidenceTextV3(fallback)}\n回执补充读取不可用，请核对状态；不要自动重跑。`,{...(snapshot?{...snapshot,snapshot}:{graphId}),watching:false,waitReason:reason,waitEvidence:fallback.waitEvidence,supervisorDiagnostics:['Final receipt observation unavailable.']});
+ }
+}
+
 interface WaitForGraphSnapshotV3Options {
  expectedIdentity?: {sessionId: string; runInstanceId: string};
+ readTimeoutMs?:number;
+ readEvidence?:(snapshot:GraphSnapshotV3)=>Promise<void>;
  readAttention?: (snapshot: GraphSnapshotV3) => ReturnType<typeof readGraphSupervisorRequests>;
  subscribeAttention?: (invalidate: () => void) => (() => void);
 	graphId: string;
@@ -1181,116 +1215,52 @@ export function graphPendingAttentionV3(snapshot: GraphSnapshotV3): string[] {
 }
 
 export function waitForGraphSnapshotV3(options: WaitForGraphSnapshotV3Options): Promise<V3GraphWaitOutcome> {
-	const pollIntervalMs = Math.max(25, Math.min(options.pollIntervalMs ?? 750, 10_000));
-	return new Promise<V3GraphWaitOutcome>((resolveWait, rejectWait) => {
-		let latest = options.initialSnapshot?.graphId === options.graphId && (!options.expectedIdentity || (options.initialSnapshot.sessionId === options.expectedIdentity.sessionId && options.initialSnapshot.runInstanceId === options.expectedIdentity.runInstanceId)) ? options.initialSnapshot : undefined;
-		let latestSerialized: string | undefined;
-		let eventGeneration = 0;
-		let pollInFlight = false;
-		let finished = false;
-		let stopRequested: V3GraphWaitStopReason | undefined;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		let unsubscribe = () => {};
-  let unsubscribeAttention = () => {};
-  let supervisorRequests: V3GraphWaitOutcome["supervisorRequests"] = [];
-  let supervisorDiagnostics: string[] = [];
-
-		const cleanup = (): void => {
-			if (timer !== undefined) clearTimeout(timer);
-			unsubscribe();
-   unsubscribeAttention();
-			options.signal?.removeEventListener("abort", onAbort);
-		};
-		const finish = (reason: V3GraphWaitOutcome["reason"]): void => {
-			if (finished) return;
-			finished = true;
-			cleanup();
-			resolveWait({ ...(latest ? { snapshot: latest } : {}), reason, supervisorRequests, supervisorDiagnostics });
-		};
-		const fail = (error: unknown): void => {
-			if (finished) return;
-			finished = true;
-			cleanup();
-			rejectWait(error);
-		};
-		const notify = (snapshot: GraphSnapshotV3): void => {
-			const serialized = JSON.stringify(snapshot);
-			if (serialized === latestSerialized) return;
-			latestSerialized = serialized;
-			try {
-				options.onUpdate?.(snapshot);
-			} catch {
-				// Tool update rendering is observational and cannot fail the wait.
-			}
-		};
-		const accept = (snapshot: GraphSnapshotV3, source: "event" | "poll" | "initial", pollGeneration = eventGeneration): void => {
-			if (finished || snapshot.graphId !== options.graphId) return;
-   if (options.expectedIdentity && (snapshot.sessionId !== options.expectedIdentity.sessionId || snapshot.runInstanceId !== options.expectedIdentity.runInstanceId)) return;
-			if (latest) {
-				const ordering = snapshot.updatedAt.localeCompare(latest.updatedAt);
-				if (ordering < 0 || (source === "poll" && pollGeneration !== eventGeneration && ordering <= 0)) return;
-			}
-			latest = snapshot;
-			notify(snapshot);
-			if (stopRequested) finish(stopRequested);
-			else if (isGraphWaitSettledV3(snapshot.status)) finish("graph_settled");
-   else if (source !== "initial" && (!options.readAttention || source === "poll") && (supervisorRequests!.length > 0 || graphPendingAttentionV3(snapshot).length > 0)) finish("attention_required");
-		};
-		const schedulePoll = (): void => {
-			if (finished || timer !== undefined) return;
-			timer = setTimeout(() => {
-				timer = undefined;
-				void poll();
-			}, pollIntervalMs);
-		};
-		const poll = async (): Promise<void> => {
-			if (finished || pollInFlight) return;
-			pollInFlight = true;
-			const generation = eventGeneration;
-			try {
-				let snapshot = await options.readStatus();
-    if (options.readAttention) {
-     const fresh = await options.readAttention(snapshot);
-     if (finished) return;
-     if (generation !== eventGeneration) return;
-     snapshot = fresh.snapshot; supervisorRequests = fresh.requests; supervisorDiagnostics = fresh.diagnostics;
-    }
-    accept(snapshot, "poll", generation);
-			} catch (error) {
-				if (stopRequested) finish(stopRequested);
-				else fail(error);
-				return;
-			} finally {
-				pollInFlight = false;
-    if (!finished) schedulePoll();
-			}
-		};
-		const onSnapshot = (snapshot: GraphSnapshotV3): void => {
-			eventGeneration += 1;
-			accept(snapshot, "event");
-   if (options.readAttention) void poll();
-		};
-		const onStop = (reason: V3GraphWaitStopReason): void => {
-			stopRequested = reason;
-			if (latest) finish(reason);
-			else void poll();
-		};
-		function onAbort(): void {
-			onStop("aborted");
-		}
-
-		unsubscribeAttention = options.subscribeAttention?.(() => { eventGeneration += 1; void poll(); }) ?? (() => {});
-  unsubscribe = options.subscribe(onSnapshot, onStop);
-		if (finished) {
-			unsubscribe();
-   unsubscribeAttention();
-			return;
-		}
-		options.signal?.addEventListener("abort", onAbort, { once: true });
-		if (options.signal?.aborted) onAbort();
-		if (latest) accept(latest, "initial");
-		if (!finished) void poll();
-	});
+ const interval=Math.max(25,Math.min(options.pollIntervalMs??750,10_000));
+ return new Promise((resolve,reject)=>{
+  const valid=(s:GraphSnapshotV3)=>s.graphId===options.graphId&&(!options.expectedIdentity||(s.sessionId===options.expectedIdentity.sessionId&&s.runInstanceId===options.expectedIdentity.runInstanceId));
+  let latest=options.initialSnapshot&&valid(options.initialSnapshot)?options.initialSnapshot:undefined,serial:string|undefined,eventGeneration=0,finished=false,inFlight=false,timer:ReturnType<typeof setTimeout>|undefined;
+  let requests:V3GraphWaitOutcome['supervisorRequests']=[],diagnostics:string[]=[],evidence:V3GraphWaitEvidence|undefined;
+  let unsubscribe:()=>void=()=>{},unsubscribeAttention:()=>void=()=>{};const reads=new AbortController();
+  const cleanup=()=>{if(timer)clearTimeout(timer);timer=undefined;options.signal?.removeEventListener('abort',abort);reads.abort();for(const key of ['status','attention']){const off=key==='status'?unsubscribe:unsubscribeAttention;if(key==='status')unsubscribe=()=>{};else unsubscribeAttention=()=>{};try{off();}catch{diagnostics.push('Observation subscription cleanup failed.');}}};
+  const finish=(reason:V3GraphWaitOutcome['reason'])=>{if(finished)return;finished=true;cleanup();resolve({...(latest?{snapshot:latest}:{}),reason,supervisorRequests:requests,supervisorDiagnostics:diagnostics,...(evidence?{waitEvidence:evidence}:{})});};
+  const stop=(reason:V3GraphWaitStopReason)=>finish(reason);function abort(){stop('aborted');}
+  const unavailable=(stage:string)=>{evidence={kind:'observation_unavailable',stage};finish('attention_required');};
+  const notify=(s:GraphSnapshotV3)=>{const next=JSON.stringify(s);if(next===serial)return;serial=next;try{options.onUpdate?.(s);}catch{}};
+  const accept=(s:GraphSnapshotV3,source:'event'|'poll'|'initial',generation=eventGeneration)=>{
+   if(finished||!valid(s))return;
+   if(latest){const order=s.updatedAt.localeCompare(latest.updatedAt);if(order<0||(source==='poll'&&generation!==eventGeneration&&order<=0))return;}
+   if(source==='poll'&&generation!==eventGeneration)return;
+   latest=s;notify(s);
+   if(isGraphWaitSettledV3(s.status)){finish('graph_settled');return;}
+   if(source!=='poll'&&(options.readAttention||options.readEvidence))return;
+   if(source==='initial')return;
+   const exited=Object.entries(s.nodes??{}).flatMap(([taskId,n])=>{const p=nodeProcessExit(n);return p?[{taskId,attempt:n.attempt,asyncId:p.asyncId,...(p.generation===undefined?{}:{generation:p.generation})}]:[];});
+   const unverified=Object.entries(s.nodes??{}).filter(([,n])=>nodeExitUnverified(n)).map(([taskId,n])=>({taskId,attempt:n.attempt,asyncId:n.observation?.asyncId}));
+   if(exited.length||unverified.length){evidence={kind:exited.length?'confirmed_exit':'exit_unverified',tasks:exited.length?exited:unverified};finish('attention_required');}
+   else if(requests?.length||graphPendingAttentionV3(s).length){evidence={kind:'supervisor_attention'};finish('attention_required');}
+  };
+  const schedule=()=>{if(!finished&&!timer)timer=setTimeout(()=>{timer=undefined;void poll();},interval);};
+  const read=<T>(stage:string,fn:()=>Promise<T>)=>boundedGraphObservation(stage,fn,{signal:reads.signal,timeoutMs:options.readTimeoutMs});
+  const poll=async()=>{
+   if(finished||inFlight)return;inFlight=true;const generation=eventGeneration;
+   try{
+    let s=await read('status',options.readStatus);if(finished||generation!==eventGeneration)return;if(!valid(s)){unavailable('identity');return;}
+    // Proof readers may attach WeakMap evidence: keep their late writes isolated from events/public receipts.
+    s=structuredClone(s);
+    if(options.readAttention){const fresh=await read('attention',()=>options.readAttention!(s));if(finished||generation!==eventGeneration)return;s=fresh.snapshot;if(!valid(s)){unavailable('identity');return;}requests=fresh.requests;diagnostics=fresh.diagnostics;}
+    if(options.readEvidence){await read('process_exit',()=>options.readEvidence!(s));if(finished||generation!==eventGeneration)return;}
+    accept(s,'poll',generation);
+   }catch(error){if(!finished){if(generation!==eventGeneration)return;unavailable(error instanceof WaitObservationUnavailable?error.stage:'read_error');}}
+   finally{inFlight=false;schedule();}
+  };
+  const onSnapshot=(s:GraphSnapshotV3)=>{if(!valid(s)||finished)return;eventGeneration++;accept(s,'event');if(!finished)void poll();};
+  try{
+   unsubscribe=options.subscribe(onSnapshot,stop);if(finished){cleanup();return;}
+   unsubscribeAttention=options.subscribeAttention?.(()=>{if(!finished){eventGeneration++;void poll();}})??(()=>{});if(finished){cleanup();return;}
+   options.signal?.addEventListener('abort',abort,{once:true});if(options.signal?.aborted){abort();return;}
+   if(latest)accept(latest,'initial');if(!finished)void poll();
+  }catch{if(!finished)unavailable('subscription');else cleanup();}
+ });
 }
 
 export function graphParentTools(active:readonly string[]):string[]{return active.filter(name=>name!=="graph_todo");}
@@ -1480,7 +1450,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 						if (!attention) { attentionNotifications.delete(key); continue; }
 						if (attention === "observation_unavailable" || attentionNotifications.get(key) === attention) continue;
 						attentionNotifications.set(key, attention);
-						const label: Record<string, string> = { waiting_user: "等待用户处理", suspected_unresponsive: "控制探测连续未响应，任务保持运行，请检查", repeated_errors: "重复遇到相同工具错误，请检查", storage_error: "状态保存异常，请检查", result_unavailable: "缺少最终结果，需要核对", runtime_exited: "运行进程已退出" };
+						const label: Record<string, string> = { waiting_user: "待主 Agent 决策", suspected_unresponsive: "控制探测连续未响应，任务保持运行，请检查", repeated_errors: "重复遇到相同工具错误，请检查", storage_error: "状态保存异常，请检查", result_unavailable: "缺少最终结果，需要核对", runtime_exited: "运行进程已退出" };
 						try { uiContext?.ui.notify(`Graph ${snapshot.graphId} / ${taskId}: ${label[attention] ?? attention}`, "warning"); } catch {}
 					}
 				},
@@ -1979,8 +1949,20 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					}, report.issues.length > 0);
 				}
 				if (!params.id) return result(`graph ${action} requires id.`, undefined, true);
-				const current = await configuredHost(trustedSessionId(ctx), ctx.sessionManager.getSessionFile());
-				if (!await current.host.isV3Run(current.host.runDirFor(params.id))) return result(`'${params.id}' is not a V3 graph run.`, undefined, true);
+    let current: {config:V3GraphConfig;host:V3GraphHost};
+    if(action==="wait"){
+     const preparation=new AbortController();let stopped:V3GraphWaitStopReason|undefined;
+     const abort=()=>{stopped='aborted';preparation.abort();};
+     const off=graphWaiters.subscribe(params.id,()=>{},reason=>{stopped=reason;preparation.abort();});
+     signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
+     try{
+      const config=await boundedGraphObservation('configuration',()=>loadV3GraphConfig(),{signal:preparation.signal});
+      if(preparation.signal.aborted)throw new WaitObservationUnavailable('configuration',true);
+      current={config,host:ensureHost(config,trustedSessionId(ctx),ctx.sessionManager.getSessionFile())};
+      if(!await boundedGraphObservation('run_identity',()=>current.host.isV3Run(current.host.runDirFor(params.id!)),{signal:preparation.signal}))return result(`'${params.id}' is not a V3 graph run.`,undefined,true);
+     }catch(error){return waitReceipt(stopped?'已停止等待；未通过此操作停止 Graph。':'等待准备阶段观测不可用；请核对状态，不要自动重跑。',{graphId:params.id,watching:false,waitReason:stopped??'attention_required',waitEvidence:{kind:'observation_unavailable',stage:error instanceof WaitObservationUnavailable?error.stage:'preparation'}});}
+     finally{try{off();}catch{}signal?.removeEventListener('abort',abort);}
+    }else{current=await configuredHost(trustedSessionId(ctx),ctx.sessionManager.getSessionFile());if(!await current.host.isV3Run(current.host.runDirFor(params.id)))return result(`'${params.id}' is not a V3 graph run.`,undefined,true);}
 				if(action === "mailbox") {
      const active=activeMailboxes.get(mailboxRegistryKey(current.host.runDirFor(params.id)));
      if(!params.mailbox)return result("mailbox request required",undefined,true);
@@ -2024,8 +2006,14 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
      const waitToken:{graphId:string;runInstanceId?:string;sessionId:string;generation:number}={graphId:params.id,sessionId:trustedSessionId(ctx),generation:waitingGeneration};
      pendingWaits.add(waitToken);
      try {
-     const waitingSnapshot = await current.host.status(params.id);
-     await enrichGraphView(waitingSnapshot,current.config.runsDir).catch(()=>{});
+     const startupReads=new AbortController();let startupStop:V3GraphWaitStopReason|undefined;
+     const startupAbort=()=>{startupStop='aborted';startupReads.abort();};
+     const startupOff=graphWaiters.subscribe(params.id,()=>{},reason=>{startupStop=reason;startupReads.abort();});
+     signal?.addEventListener('abort',startupAbort,{once:true});if(signal?.aborted)startupAbort();
+     let waitingSnapshot:GraphSnapshotV3;
+     try{waitingSnapshot=await boundedGraphObservation('initial_status',()=>current.host.status(params.id!),{signal:startupReads.signal});}
+     catch{return await graphWaitResultV3(params.id,{reason:startupStop??'attention_required',waitEvidence:{kind:'observation_unavailable',stage:'initial_status'}},current.config.runsDir,undefined,{signal:signal});}
+     finally{try{startupOff();}catch{}signal?.removeEventListener('abort',startupAbort);}
      if(host!==current.host || waitingGeneration!==uiGeneration) throw new Error("Graph wait session changed before observation began.");
      projectReadGraphUi(waitingSnapshot);
      waitToken.runInstanceId=waitingSnapshot.runInstanceId;
@@ -2035,6 +2023,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 						graphId: params.id,
       expectedIdentity: {sessionId: waitingSnapshot.sessionId, runInstanceId: waitingSnapshot.runInstanceId},
 						readStatus: () => current.host.status(params.id!),
+      readEvidence: async snapshot=>{await readUiProcessExits(snapshot,current.host.runDirFor(snapshot.graphId));},
       readAttention: snapshot => readGraphSupervisorRequests(snapshot, trustedSessionId(ctx), ctx.sessionManager.getSessionFile(), current.host.runDirFor(snapshot.graphId)),
       subscribeAttention: invalidate => { const off = pi.events.on(NATIVE_SUPERVISOR_EVENT, invalidate); return typeof off === "function" ? off : () => {}; },
 						subscribe: (onSnapshot, onStop) => graphWaiters.subscribe(params.id!, onSnapshot, onStop),
@@ -2055,15 +2044,14 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
      if (outcome.reason === "aborted" && escapedTurn && interruptGraphs.has(params.id)) {
       try {
        const snapshot = await stopAssociatedGraph(params.id, current.host);
-       return result(`Graph cancellation requested by the interrupted Pi turn.\n${await graphStatusTextV3(snapshot, current.config.runsDir)}`, {
+       return result(`Graph cancellation requested by the interrupted Pi turn.\n${await boundedGraphObservation("stop_receipt",()=>graphStatusTextV3(snapshot, current.config.runsDir))}`, {
         ...snapshot, snapshot, watching: false, waitReason: "aborted", stopRequested: true,
-        graphContinuesRunning: snapshot.status === "needs_attention",
        });
       } catch (error) {
-       return result(`Graph stop_requested / needs_attention: child exit is not confirmed. ${String(error)}`, {watching: false, waitReason: "aborted", stopRequested: true, graphContinuesRunning: true}, true);
+       return result(`Graph stop_requested / needs_attention: child exit is not confirmed. ${String(error)}`, {watching: false, waitReason: "aborted", stopRequested: true}, true);
       }
      }
-     const receipt=await graphWaitResultV3(params.id, outcome, current.config.runsDir, summarizeMainSession(ctx.sessionManager));
+     const receipt=await graphWaitResultV3(params.id, outcome, current.config.runsDir, summarizeMainSession(ctx.sessionManager),{signal});
      if (!signal?.aborted && (outcome.reason==="graph_settled"||outcome.reason==="attention_required") && outcome.snapshot && host===current.host && waitingGeneration===uiGeneration && outcome.snapshot.sessionId===trustedSessionId(ctx)) wakeFingerprints.set(params.id,wakeFingerprint(outcome.snapshot));
      return receipt;
      } finally {
@@ -2170,6 +2158,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
     binding?.state==='unconfirmed'?'! Graph 已启动 · 计划关联未确认；勿重派，先 status/result 与 graph_todo list 核对。':binding?.reminder?'! 本次 Graph 未绑定当前计划；计划未改动，请先核对是否属于当前目标。':undefined,
     receiptDetails?.stopRequested?'! 已提交停止请求，是否退出以状态/证据为准。':undefined,
     ['aborted','session_shutdown'].includes(receiptDetails?.waitReason)?'! 已停止等待，Graph可能继续运行；请核对状态。':undefined,
+    receiptDetails?.waitEvidence?`! ${waitEvidenceTextV3({reason:'attention_required',waitEvidence:receiptDetails.waitEvidence})}`:undefined,
     receiptDetails?.waitReason==='attention_required'||receiptDetails?.supervisorRequests?.length||receiptDetails?.supervisorDiagnostics?.length||receiptDetails?.attention?.length?'! 有待处理监管请求或诊断，请查看详情；正常验收不消除此提醒。':undefined,
    ].filter(Boolean);
    const notice=notices.length?notices.join('\n'):undefined;
