@@ -36,13 +36,22 @@ Pi Observability / TUI
 
 要求 Node.js `>=22.19.0` 和已安装的 Pi。运行使用宿主提供的 Pi SDK，启动时核验必要 API 与会话生命周期；开发依赖固定为 `1.0.4`，不是要求宿主必须使用这一精确版本。缺少必要能力时拒绝启动，不偷偷切换另一个 SDK。
 
-核实所需 registry 版本后，在终端执行：
+安装 npm 上已发布的稳定版（`latest`），在终端执行：
 
 ```bash
-pi install npm:pi-graph@0.2.1
+pi install npm:pi-graph
 ```
 
 默认安装会记录到 Pi 的用户配置。新会话加载扩展后应能看到 `graph` 工具及 `/graphs`、`/graph-models` 命令。已有会话先等待任务结束，再重新启动 Pi；不要在活跃 Graph 中替换运行时代码。
+
+更新前先等待所有任务结束并退出 Pi；在终端按需选择一条命令执行，更新后重新启动 Pi：
+
+```bash
+pi update --extensions                 # 更新全部已安装扩展
+pi update --extension npm:pi-graph      # 只更新 Pi Graph
+```
+
+单数 `--extension` 后必须提供安装来源。此前使用固定版本（如 `npm:pi-graph@0.2.1`）的用户，先在原安装范围重新执行 `pi install npm:pi-graph`，改为跟随稳定版；原来用 `-l` 安装的，仍在原项目目录执行 `pi install npm:pi-graph -l`。只有 npm 发布了更高版本才会有新更新；同版本不会获取本机尚未发布的修复。
 
 发布前可在隔离目录用 `npm install /absolute/path/pi-graph-0.2.1.tgz` 检查真实包，再使用独立空 Pi 配置目录临时加载：
 
@@ -603,13 +612,22 @@ See [model and role settings](docs/owned-model-settings.md) and [session continu
 
 Node.js `>=22.19.0` and an installed Pi are required. Runtime uses the host-provided Pi SDK and verifies required APIs and session lifecycle capabilities at startup. Development dependencies are pinned to `1.0.4`; this does not require the host to use that exact version. Missing required capabilities cause startup refusal, without silently switching to another SDK.
 
-After verifying the desired registry version, run in a terminal:
+To install the published stable release (`latest`) from npm, run in a terminal:
 
 ```bash
-pi install npm:pi-graph@0.2.1
+pi install npm:pi-graph
 ```
 
 By default, installation is recorded in Pi's user configuration. After a new session loads the extension, the `graph` tool and `/graphs`, `/graph-models` commands should be available. For existing sessions, wait for tasks to finish, then restart Pi; do not replace runtime code during an active Graph.
+
+Before updating, wait for all tasks to finish and exit Pi. Choose one of these commands in a terminal, then restart Pi:
+
+```bash
+pi update --extensions                 # Update all installed extensions
+pi update --extension npm:pi-graph      # Update Pi Graph only
+```
+
+The singular `--extension` requires a source argument. If you previously installed a pinned version (such as `npm:pi-graph@0.2.1`), rerun `pi install npm:pi-graph` in the same installation scope to follow stable releases; if you used `-l`, run `pi install npm:pi-graph -l` from the original project directory. New updates require a higher version published to npm; the same version will not fetch unpublished local fixes.
 
 Before publication, inspect the actual package in an isolated directory with `npm install /absolute/path/pi-graph-0.2.1.tgz`, then load it temporarily using a separate, empty Pi configuration directory:
 
