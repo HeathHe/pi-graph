@@ -52,10 +52,10 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
   assert.ok(evidence.some(row=>row.includes('"mode":"consumer"')&&row.includes("REAL_PRODUCER_MATERIAL")),"actual consumer read must return producer bytes");
   await writeFile(join(capture,"material-complete.txt"),await screen());
   send("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify({action:"start",spec:{schemaVersion:3,graphId:"future-cli-ask",goal:"Real native supervisor",nodes:[{taskId:"ask",agent:"worker",task:"FUTURE_ASK",sideEffect:"none"}]}}));
-  await until(screen,s=>s.includes("等待用户")&&s.includes("fixture-local/local"),"widget auto waiting",60000);
+  await until(screen,s=>s.includes("待主 Agent 决策")&&s.includes("fixture-local/local"),"widget auto waiting",60000);
   await writeFile(join(capture,"widget-waiting.txt"),await screen());
-  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("等待用户")&&s.includes("future-cli-ask")&&/q\s*关闭/.test(s)&&s.includes("关闭只返回输入，不停止任务"),"inspector waiting");
-  await writeFile(join(capture,"inspector-waiting.txt"),await screen());child.stdin.write("q");await sleep(300);
+  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("待主 Agent 决策")&&s.includes("future-cli-ask")&&/q\s*关闭/.test(s)&&s.includes("关闭只返回输入，不停止任务"),"inspector waiting");
+  await writeFile(join(capture,"inspector-waiting.txt"),await screen());child.stdin.write("q");await until(screen,s=>!/q\s*关闭/.test(s)&&!s.includes("PI-GRAPH / future-cli-ask"),"inspector closed before editor input");
   const pending=await until<{id:string}|null>(async()=>{
    const state=JSON.parse(await readFile(join(runs,"future-cli-ask/mailbox-v1/state.json"),"utf8"));
    return state.messages.find((m:any)=>m.to==="@parent"&&m.text==="FUTURE_TUI_DECISION")??null;
@@ -63,9 +63,9 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
   assert.ok(pending);send("PI_GRAPH_REPLY "+JSON.stringify({graphId:"future-cli-ask",messageId:pending.id}));
   const finished=await until(()=>snapshot("future-cli-ask"),s=>["complete","failed","needs_attention"].includes(s.status),"reply child complete",60000);
   assert.equal(finished.status,"complete",JSON.stringify(finished));assert.ok(evidence.some(row=>row.includes('"mode":"ask"')&&row.includes("CONTINUE_REAL_CHILD")));
-  await until(screen,s=>!s.includes("等待用户 Agent worker"),"widget clears waiting after reply");
-  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("已完成")&&s.includes("ask")&&!s.includes("等待用户"),"inspector resolved");
-  await writeFile(join(capture,"inspector-resolved.txt"),await screen());child.stdin.write("q");await sleep(300);
+  await until(screen,s=>!s.includes("待主 Agent 决策 Agent worker"),"widget clears waiting after reply");
+  send("/graphs view future-cli-ask");await until(screen,s=>s.includes("PI-GRAPH / future-cli-ask")&&/q\s*关闭/.test(s)&&s.includes("运行已结束")&&s.includes("已完成")&&!s.includes("待主 Agent 决策"),"inspector resolved");
+  await writeFile(join(capture,"inspector-resolved.txt"),await screen());child.stdin.write("q");await until(screen,s=>!/q\s*关闭/.test(s)&&!s.includes("PI-GRAPH / future-cli-ask"),"inspector closed before editor input");
   send("ORDINARY_PI_CHECK");await until(screen,s=>s.includes("ORDINARY_PI_OK"),"ordinary Pi turn");
   await writeFile(join(capture,"ordinary-pi.txt"),await screen());
   console.log(JSON.stringify({result:"PASS",root,material:"real write -> apply -> requiredMaterials -> real read",supervisor:"actual mailbox send/wait -> widget/inspector -> actual reply -> complete",ordinary:"ORDINARY_PI_OK"}));
@@ -77,7 +77,9 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
   throw new Error(detail,{cause:e});
  }
  finally{
-  // Persist failure details before shutdown, so a stuck CLI cannot hide them.
+  // Evidence collection cannot bypass cleanup of this fixture's own resources.
+  let evidenceError:unknown;
+  try{
   await writeFile(join(capture,"model-evidence.jsonl"),evidence.join("\n"));await writeFile(join(capture,"terminal-output.txt"),output);
   const destination=process.env.PI_GRAPH_NATIVE_TUI_EVIDENCE_DIR ?? (failed ? join(repo,".test-evidence",`future-tui-${Date.now()}`) : undefined);
   if(destination){
@@ -86,6 +88,8 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
    await cp(runs,join(destination,"runs"),{recursive:true});
    console.error("TUI_E2E_EVIDENCE " + destination);
   }
+  }catch(error){evidenceError=error;console.error("TUI_E2E_EVIDENCE_COPY_FAILED "+String(error));}
+  finally{
   const exited=()=>child.exitCode!==null||child.signalCode!==null;
   child.kill("SIGTERM");
   const deadline=Date.now()+3000;
@@ -98,5 +102,7 @@ test("real Pi TUI: future material producer/consumer, mailbox decision wait/repl
   child.stdin.destroy();child.stdout.destroy();child.stderr.destroy();child.unref();
   await Promise.race([new Promise<void>(done=>{server.close(()=>done());server.closeAllConnections();}),sleep(1000)]);
   await rm(root,{recursive:true,force:true});
+  }
+  if(evidenceError&&!failed)throw evidenceError;
  }
 });

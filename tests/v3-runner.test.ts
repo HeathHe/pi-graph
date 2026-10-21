@@ -691,3 +691,33 @@ test("runner drains an already started heartbeat before releasing its lease", as
   await assert.rejects(lstat(join(f.runDir,"lease.json.gate")),{code:"ENOENT"});
  } finally {unblock();await mock.dispose();await import("node:fs/promises").then(fs=>fs.rm(f.sandbox,{recursive:true,force:true}));}
 });
+
+
+test("missing required screenshots preserve a complete free-form child report as validation failure", async () => {
+ const info=await setupRun(),mock=new MockSubagents();const output="**blocked：当前为登录页，按约定不截图，无法进行页面视觉验收。**";
+ mock.behaviors.set("MISSING_SCREENSHOTS",input=>completeChild({...input,output}));
+ mock.behaviors.set("AFTER_SCREENSHOTS",input=>completeChild(input));mock.start();
+ try {
+  const {snapshot,runDir}=await launch(info,{schemaVersion:3,permissionPolicy:"inherited",parentToolAllowlist:["read","write","bash"],goal:"required screenshot gate",nodes:[
+   {taskId:"browser-check",agent:"test-agent",task:"MISSING_SCREENSHOTS",sideEffect:"external_read",evidenceFiles:[{path:"evidence/desktop.png",nonSecret:true},{path:"evidence/mobile.png",nonSecret:true}]},
+   {taskId:"after",agent:"test-agent",task:"AFTER_SCREENSHOTS",sideEffect:"none",dependsOn:["browser-check"]}
+  ]},mock,{preflightAgent:async()=>{}});
+  assert.equal(snapshot.status,"failed");assert.equal(mock.spawned.length,1);
+  const attempt=(await readLatestV3Attempt(runDir,"browser-check"))!.evidence;
+  assert.equal(attempt.phase,"failed");assert.equal(attempt.failure?.kind,"validation");
+  assert.match(attempt.failure!.message,/未生成必需验收文件：evidence\/desktop\.png/);
+  assert.equal(attempt.child?.terminal,"complete");assert.equal(attempt.child?.output,output);
+  assert.equal(attempt.evidenceManifestDigest,undefined);assert.equal(await readV3AcceptanceEvidence(runDir,"browser-check",1),undefined);
+  assert.equal(await readLatestV3Attempt(runDir,"after"),undefined);
+ } finally {await mock.dispose();}
+});
+
+test("missing the workspace root remains an internal failure with the child result preserved", async()=>{
+ const info=await setupRun(),mock=new MockSubagents(),output="child complete without a workspace";
+ mock.behaviors.set("MISSING_ROOT",async input=>{const {rm}=await import("node:fs/promises");await rm(input.cwd,{recursive:true});await completeChild({...input,output});});mock.start();
+ try {
+  const {snapshot,runDir}=await launch(info,{schemaVersion:3,permissionPolicy:"inherited",parentToolAllowlist:["read","write","bash"],goal:"root integrity",nodes:[{taskId:"browser-check",agent:"test-agent",task:"MISSING_ROOT",sideEffect:"external_read",evidenceFiles:[{path:"evidence/desktop.png",nonSecret:true}]}]},mock,{preflightAgent:async()=>{}});
+  assert.equal(snapshot.status,"failed");const attempt=(await readLatestV3Attempt(runDir,"browser-check"))!.evidence;
+  assert.equal(attempt.failure?.kind,"internal");assert.equal(attempt.child?.output,output);assert.equal(await readV3AcceptanceEvidence(runDir,"browser-check",1),undefined);
+ } finally {await mock.dispose();}
+});

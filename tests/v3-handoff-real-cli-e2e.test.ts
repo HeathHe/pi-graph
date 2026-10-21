@@ -122,8 +122,8 @@ test("real Pi: existing/new mailbox decisions, public reply, persistent declared
   for(const status of ["BLOCKED","FAIL","INVALID"]){
    const id=`handoff-${status.toLowerCase()}`,before=requests.length;
    const start=await graph({action:"start",spec:spec(id,[{taskId:"gate",agent:"worker",task:`HANDOFF_${status}`,sideEffect:"external_write",resultContract:"status-json",retryPolicy:{maxAttempts:3,retryOn:["task_failed","validation"],backoffMs:0}},{taskId:"downstream",agent:"worker",task:"HANDOFF_DOWNSTREAM",sideEffect:"none",dependsOn:["gate"]}])});assert.equal(start.result.isError,undefined,JSON.stringify(start.result));
-   const waited=await graph({action:"wait",id});assert.equal(waited.result.details?.status,"failed",JSON.stringify(waited.result));
-   const final=await terminal(id);assert.equal(final.nodes.gate.phase,"failed");assert.notEqual(final.nodes.downstream.phase,"accepted");
+   const waited=await graph({action:"wait",id});if(waited.result.details?.status!=="failed"){assert.equal(waited.result.details?.status,"running",JSON.stringify(waited.result));assert.equal(waited.result.details?.waitReason,"attention_required");assert.equal(waited.result.details?.waitEvidence?.kind,"confirmed_exit");assert.notEqual(waited.result.details?.graphContinuesRunning,true);}
+   const final=await terminal(id);assert.equal(final.status,"failed");assert.equal(final.nodes.gate.phase,"failed");assert.notEqual(final.nodes.downstream.phase,"accepted");
    assert.equal(requests.slice(before).filter(r=>r.task===status).length,1,"business/invalid results must never replay external operation");assert.equal(requests.slice(before).filter(r=>r.task==="DOWNSTREAM").length,0);
    assert.match(JSON.stringify((await turn("ORDINARY_PI_CHECK")).events),/ORDINARY_PI_OK/);
   }

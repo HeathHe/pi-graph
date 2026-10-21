@@ -8,6 +8,15 @@ import type { GraphEvidenceFileV3 } from "./types.ts";
 
 const MAX_BYTES = 32 * 1024 * 1024;
 const digest = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+export class V3RequiredEvidenceMissingError extends Error {
+ readonly code = "REQUIRED_EVIDENCE_MISSING";
+ readonly path: string;
+ constructor(path: string, cause: unknown) {
+  super(`未生成必需验收文件：${path}；验收未通过，请查看已保留的子任务结果确认阻塞原因。`, {cause});
+  this.name = "V3RequiredEvidenceMissingError";
+  this.path = path;
+ }
+}
 export function parseBusinessResult(output: string): { status: "pass" | "blocked" | "fail"; reason: string } {
  let raw;
  try { raw = JSON.parse(output); } catch { throw new Error("resultContract status-json requires exact final JSON, without Markdown fences."); }
@@ -56,7 +65,14 @@ export async function persistEvidenceFiles(runDir: string, taskId: string, attem
  let totalBytes = 0;
  for (const entry of files) {
   if (entry.nonSecret !== true) throw new Error("Evidence retention requires explicit nonSecret:true authorization.");
-  const bytes = await safeBytes(root, entry.path);
+  let bytes: Buffer;
+  try { bytes = await safeBytes(root, entry.path); }
+  catch (error) {
+   if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+   // A lost/unsafe workspace is an internal integrity problem, not a missing deliverable.
+   await safeDirectories(root);
+   throw new V3RequiredEvidenceMissingError(entry.path, error);
+  }
   totalBytes += bytes.length;
   if (totalBytes > 64 * 1024 * 1024) throw new Error("Declared evidence exceeds total 64 MiB limit.");
   await immutable(join(destination, "files", entry.path), bytes);

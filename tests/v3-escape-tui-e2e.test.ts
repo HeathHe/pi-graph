@@ -59,7 +59,7 @@ test("real Escape cancels Graph/child; inspector, menus and reload preserve canc
   await writeFile(join(capture,"wait-escape.txt"),await screen());
   // A graph yielded for supervisor attention remains associated while the parent
   // starts another ordinary model turn. Escape of that turn must stop its child.
-  start("escape-attention",true);await until(screen,(s:string)=>s.includes("等待用户")&&s.includes("fixture-local/local"),"native attention");
+  start("escape-attention",true);await until(screen,(s:string)=>s.includes("待主 Agent 决策")&&s.includes("fixture-local/local"),"native attention");
   await until(parentState,s=>s.isIdle,"attention start parent idle");
   const attentionWaitBefore=await parentState();
   send("PI_GRAPH_PUBLIC_RPC_E2E "+JSON.stringify({action:"wait",id:"escape-attention"}));

@@ -5,7 +5,7 @@ import {
 	fauxAssistantMessage,
 	fauxToolCall,
 	type FauxResponseFactory,
-} from "../../node_modules/@earendil-works/pi-ai/dist/providers/faux.js";
+} from "@earendil-works/pi-ai";
 
 const COMMAND_PREFIX = "PI_GRAPH_PUBLIC_RPC_E2E ";
 

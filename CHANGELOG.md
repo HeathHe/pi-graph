@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4 — 2026-10-21
+
+- 增加当前/历史 Todo 义务与交付显示生命周期：精确接替、暂缓和恢复使用原生会话记录；未交付任务默认可见，明确收起与成功交付才收敛，未知副作用不自动重试或清除。
+- 修复已消费结果重复唤醒，固定显示当前执行与精确实际身份，保留多关联历史风险、完整宽度和 Inspector 本面板完成项显隐。
+- 支持显式授权 projectRoot 创建独立项目 Graph；缺少必需验收文件归类为 validation 失败，保留原结果与路径安全检查。改进安装宿主 CLI 的离线测试发现。
+- Add native-session Todo lifecycle metadata for exact replacement, scope and delivery; unresolved current tasks remain visible unless explicitly collapsed. Preserve unknown side-effect safeguards and existing Graph acceptance rules.
+- Avoid redundant wake turns after exact result consumption, keep current execution and observed identities visible, support authorized project roots, and report missing required evidence as validation failure. Improve installed-host CLI test discovery.
+
 ## 0.2.3 — 2026-10-20
 
 - 增加显式分层总计划与叶项绑定校验；Todo 按终端可用宽度自适应，标题在左、已观测项目/Agent/模型靠右，窄屏有界换行。保留稳定编号、真实异常与实际身份，完成项原位显示。

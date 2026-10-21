@@ -1,3 +1,4 @@
+import {nodeProcessExit,nodeExitUnverified} from './process-exit.ts';
 import {buildTodoTree} from './todo-tree.ts';
 import {truncateToWidth,visibleWidth,wrapTextWithAnsi} from "@earendil-works/pi-tui";
 import type {GraphSnapshotV3,V3NodeProjection,GraphWhenV3} from "../types.ts";
@@ -9,6 +10,8 @@ export interface StackTheme {fg(color:any,text:string):string;bold?(text:string)
 export interface ParentActivity {active:boolean;tool?:string;sessionId?:string}
 export interface StackInput {snapshots:readonly GraphSnapshotV3[];identitySnapshots?:readonly GraphSnapshotV3[];plan:TodoView;expanded:boolean;foldedIds?:ReadonlySet<string>;recentCompletedIds?:readonly string[];expandedCompletedGroupIds?:ReadonlySet<string>;preferred?:string;parent?:ParentActivity;reservedRows?:number;sessionId?:string}
 interface Segment {text:string;priority:number;clip?:boolean}
+// Independently implemented terminal grammar, informed by pi-cockpit fd83ac0.
+// No Maestro runtime, store, plugin or source module is imported by the product.
 function fit(segments:Segment[],width:number,separator=" "):string{
  const remaining=segments.map(s=>({...s}));
  while(visibleWidth(remaining.map(s=>s.text).join(separator))>width&&remaining.length){
@@ -19,9 +22,14 @@ function fit(segments:Segment[],width:number,separator=" "):string{
  }
  return truncateToWidth(remaining.map(s=>s.text).join(separator),Math.max(0,width),"…");
 }
-export interface StackTask {group?:boolean;depth?:number;number?:string;label?:string;tone?:string;tail?:string;failedNumbers?:string[];phase?:string;manualBlocked?:boolean;reference?:{graphId:string;runInstanceId:string};id:string;title:string;status:string;assignees:string[];dependencies:Array<{id?:string;graphId?:string;runInstanceId?:string;planId?:string;number?:string;targetId?:string;title:string;status:string}>;reason?:string;critical?:boolean;source:string;identities?:Array<{node:V3NodeProjection;taskId:string;phase?:string;project?:string}>;identityMissing?:boolean;waiting?:boolean;when?:GraphWhenV3&{graphId:string;runInstanceId:string;taskId:string};hasError?:boolean}
+export interface StackTask {active?:boolean;activeLabel?:string;group?:boolean;depth?:number;number?:string;label?:string;tone?:string;tail?:string;failedNumbers?:string[];phase?:string;manualBlocked?:boolean;reference?:{graphId:string;runInstanceId:string};id:string;title:string;status:string;assignees:string[];dependencies:Array<{sourceNodeId?:string;id?:string;graphId?:string;runInstanceId?:string;planId?:string;number?:string;targetId?:string;title:string;status:string}>;reason?:string;critical?:boolean;source:string;identities?:Array<{node:V3NodeProjection;taskId:string;phase?:string;project?:string;current?:boolean}>;identityMissing?:boolean;waiting?:boolean;when?:GraphWhenV3&{graphId:string;runInstanceId:string;taskId:string};hasError?:boolean}
 const inactiveLabels:Record<string,string>={cancelled:"已取消",skipped:"已跳过",not_started:"未启动"};
 const normalize=(status:string)=>inactiveLabels[status]?status:status==="accepted"||status==="done"?"completed":["running","dispatched","prepared","applying","verifying","in_progress"].includes(status)?"in_progress":["blocked","failed","needs_attention","exit_unreconciled","exit_unverified","unknown","aborted"].includes(status)?"blocked":"pending";
+// One execution predicate shared by the pinned current area and linked plan rows.
+function currentExecution(s:GraphSnapshotV3,id:string,n:V3NodeProjection):boolean{
+ const phase=displayPhase(s,id,n);
+ return ['applying','verifying'].includes(phase)||(['dispatched','running'].includes(phase)&&!nodeProcessExit(n)&&!nodeExitUnverified(n)&&n.observation?.supervision?.health!=='exited'&&!n.observation?.supervision?.processExitConfirmed);
+}
 export function stackTasks(input:StackInput):StackTask[]{
  const focus=cockpitFocus(input.snapshots,input.preferred),sessions=[...new Set(input.snapshots.map(s=>s.sessionId))];
  const session=input.sessionId??input.parent?.sessionId??(sessions.length===1?sessions[0]:undefined);
@@ -34,7 +42,7 @@ export function stackTasks(input:StackInput):StackTask[]{
   identityByRun.set(key,candidate);
  }
  const identitySources=[...identityByRun.values()];
- const nodeTask=(s:GraphSnapshotV3,id:string,n:V3NodeProjection):StackTask=>({id,phase:displayPhase(s,id,n),reference:{graphId:s.graphId,runInstanceId:s.runInstanceId},title:readableNodeTitle(s,id,n),status:normalize(displayPhase(s,id,n)),assignees:[nodeIdentity(id,n).role].filter(Boolean),identities:[{node:n,taskId:id,phase:displayPhase(s,id,n),project:displayEvidence(s)?.project}],dependencies:(n.dependsOn??[]).map(dep=>({id:dep,graphId:s.graphId,runInstanceId:s.runInstanceId,title:s.nodes?.[dep]?readableNodeTitle(s,dep,s.nodes[dep]):'前置任务（目标待补充）',status:s.nodes?.[dep]?normalize(displayPhase(s,dep,s.nodes[dep])):'unknown'})),when:(()=>{const w=displayEvidence(s)?.conditions?.[id];return w?{...w,graphId:s.graphId,runInstanceId:s.runInstanceId,taskId:id}:undefined;})(),critical:['failed','needs_attention','exit_unreconciled','exit_unverified','blocked'].includes(displayPhase(s,id,n))||!!n.observation?.supervision?.attention||!!n.observation?.supervision?.error||!!supervisionWarning(n),reason:inactiveLabels[displayPhase(s,id,n)]??(['failed','needs_attention','exit_unreconciled','exit_unverified','blocked'].includes(displayPhase(s,id,n))?`${phaseLabel(n,s,id)}：${nodeReason(s,id,n)}`:undefined),source:'Graph验收'});
+ const nodeTask=(s:GraphSnapshotV3,id:string,n:V3NodeProjection):StackTask=>({id,phase:displayPhase(s,id,n),reference:{graphId:s.graphId,runInstanceId:s.runInstanceId},title:readableNodeTitle(s,id,n),status:normalize(displayPhase(s,id,n)),assignees:[nodeIdentity(id,n).role].filter(Boolean),identities:[{node:n,taskId:id,phase:displayPhase(s,id,n),project:displayEvidence(s)?.project,current:input.snapshots.includes(s)&&currentExecution(s,id,n)}],dependencies:(n.dependsOn??[]).map(dep=>({sourceNodeId:id,id:dep,graphId:s.graphId,runInstanceId:s.runInstanceId,title:s.nodes?.[dep]?readableNodeTitle(s,dep,s.nodes[dep]):'前置任务（目标待补充）',status:s.nodes?.[dep]?normalize(displayPhase(s,dep,s.nodes[dep])):'unknown'})),when:(()=>{const w=displayEvidence(s)?.conditions?.[id];return w?{...w,graphId:s.graphId,runInstanceId:s.runInstanceId,taskId:id}:undefined;})(),critical:['failed','needs_attention','exit_unreconciled','exit_unverified','blocked'].includes(displayPhase(s,id,n))||!!n.observation?.supervision?.attention||!!n.observation?.supervision?.error||!!supervisionWarning(n),reason:inactiveLabels[displayPhase(s,id,n)]??(['failed','needs_attention','exit_unreconciled','exit_unverified','blocked'].includes(displayPhase(s,id,n))?`${phaseLabel(n,s,id)}：${nodeReason(s,id,n)}`:undefined),source:'Graph验收'});
  if(!input.plan.items.length)return decorateTasks(focus?Object.entries(focus.nodes??{}).map(([id,n])=>nodeTask(focus,id,n)):[],false);
  const byId=new Map(input.plan.items.map(item=>[item.id,item]));
  const refsById=new Map(input.plan.items.map(item=>[item.id,item.links.flatMap(ref=>{const matches=identitySources.filter(s=>s.sessionId===session&&s.graphId===ref.graphId&&s.runInstanceId===ref.runInstanceId),s=matches.length===1?matches[0]:undefined,n=s?.nodes?.[ref.taskId];return s&&n?[nodeTask(s,ref.taskId,n)]:[];})]));
@@ -53,7 +61,14 @@ export function stackTasks(input:StackInput):StackTask[]{
  const tree=buildTodoTree(input.plan.items),hierarchical=tree.groupIds.size>0;
  const leaves=decorateTasks(input.plan.items.filter(item=>!tree.groupIds.has(item.id)).map(item=>{
   const refs=refsById.get(item.id)??[];
-  const deps:StackTask["dependencies"]=[...(item.dependsOn??[]).map(id=>{const dep=input.plan.items.find(i=>i.id===id);return {id,planId:id,title:dep?safeText(dep.title):id,status:dep?normalize(dep.derivedStatus):'unknown'};}),...refs.flatMap(r=>r.dependencies).map(dep=>{const matches=input.plan.items.filter(candidate=>candidate.links.some(link=>link.graphId===dep.graphId&&link.runInstanceId===dep.runInstanceId&&link.taskId===dep.id));return matches.length===1?{...dep,planId:matches[0].id,title:safeText(matches[0].title)}:dep;})];
+  const deps:StackTask["dependencies"]=[...(item.dependsOn??[]).map(id=>{const dep=input.plan.items.find(i=>i.id===id);return {id,planId:id,title:dep?safeText(dep.title):id,status:dep?normalize(dep.derivedStatus):'unknown'};}),...refs.flatMap(r=>r.dependencies).map(dep=>{const matches=input.plan.items.filter(candidate=>candidate.links.some(link=>link.graphId===dep.graphId&&link.runInstanceId===dep.runInstanceId&&link.taskId===dep.id));return matches.length===1?{...dep,planId:matches[0].id,title:safeText(matches[0].title)}:dep;}).filter(dep=>{
+   if(dep.planId!==item.id||!dep.sourceNodeId||dep.id===dep.sourceNodeId||refs.length!==item.links.length)return true;
+   const snapshot=identitySources.find(s=>s.sessionId===session&&s.graphId===dep.graphId&&s.runInstanceId===dep.runInstanceId);
+   if(!snapshot?.nodes?.[dep.sourceNodeId]||!dep.id||!snapshot.nodes[dep.id])return true;
+   // Retain genuine Graph cycles or unverifiable edges, including cycles collapsed inside one leaf.
+   const seen=new Set<string>(),pending=[dep.id];while(pending.length){const id=pending.pop()!;if(id===dep.sourceNodeId||!snapshot.nodes[id])return true;if(seen.has(id))continue;seen.add(id);pending.push(...(snapshot.nodes[id].dependsOn??[]));}
+   return false; // Precisely bound different nodes inside this leaf: not a plan self-dependency.
+  })];
   // A plan edge and a Graph edge naming the same target merge into the precisely bound Graph edge; a bare plan id never carries condition identity.
  const depKey=(d:StackTask["dependencies"][number])=>d.planId??`${d.graphId}/${d.runInstanceId}/${d.id}`;
  const dependencies=[...deps.reduce((map,d)=>{const key=depKey(d),existing=map.get(key);if(!existing||(!existing.graphId&&d.graphId))map.set(key,d);return map;},new Map<string,StackTask["dependencies"][number]>()).values()];
@@ -66,7 +81,7 @@ export function stackTasks(input:StackInput):StackTask[]{
  const leafById=new Map(leaves.map(t=>[t.id,t]));
  return tree.preorder.map(id=>{
   if(!tree.groupIds.has(id))return leafById.get(id)!;
-  const item=tree.byId.get(id)!,children=tree.descendantLeafIds(id).map(key=>leafById.get(key)!);
+  const item=tree.byId.get(id)!,children=tree.descendantLeafIds(id).filter(key=>!input.plan.lifecycle?.historyIds.includes(key)).map(key=>leafById.get(key)!);
   // Group progress is a rollup of descendant leaves only; the group itself is never counted as a task.
   // Doubt (completed but unverified) is a real exception signal and must feed the group state too.
   const stats=leafStatusStats(children),issues=stats.failed+stats.attention+stats.doubt;
@@ -82,13 +97,14 @@ function decorateTasks(tasks:StackTask[],hasPlan:boolean):StackTask[]{
   if(target){dep.number=target.number;dep.targetId=target.id;}
  }
  const visiting=new Set<string>(),done=new Set<string>(),cycles=new Set<string>(),path:string[]=[];
+ const failureContext=new Map<string,string[]>();
  const classify=(t:StackTask):void=>{
   if(done.has(t.id))return;
   if(visiting.has(t.id)){for(const id of path.slice(path.indexOf(t.id)))cycles.add(id);return;}
   visiting.add(t.id);path.push(t.id);
   const nodes=(t.identities??[]).map(i=>i.node),phases=[t.phase,...(t.identities??[]).map(i=>i.phase)];
   const failed=phases.includes('failed'),user=phases.includes('waiting_user')||nodes.some(n=>n.observation?.supervision?.attention==='waiting_user');
-  const uncertain=t.identityMissing||t.manualBlocked||phases.some(p=>['unknown','needs_attention','exit_unreconciled','exit_unverified','aborted',...(!inactiveLabels[t.status]?['cancelled','skipped','not_started']:[])].includes(p??''))||nodes.some(n=>!!supervisionWarning(n)||!!n.observation?.supervision?.error||!!n.observation?.supervision?.attention);
+  const uncertain=t.identityMissing||t.manualBlocked||t.dependencies.some(d=>d.status==='unknown')||phases.some(p=>['unknown','needs_attention','exit_unreconciled','exit_unverified','aborted',...(!inactiveLabels[t.status]?['cancelled','skipped','not_started']:[])].includes(p??''))||nodes.some(n=>!!supervisionWarning(n)||!!n.observation?.supervision?.error||!!n.observation?.supervision?.attention);
   for(const edge of t.dependencies){const dep=edge.targetId?byId.get(edge.targetId):undefined;if(dep)classify(dep);}
   // A display-authorized when:failed condition satisfied by a verified failure is not treated as an ordinary accepted-dependency edge; full dependency detail stays in t.dependencies. An actual blocked/skipped phase remains the authoritative result.
   const authoritativeInactive=phases.some(p=>p==='blocked'||p==='skipped');
@@ -105,26 +121,35 @@ function decorateTasks(tasks:StackTask[],hasPlan:boolean):StackTask[]{
   };
   const pending=t.dependencies.filter(d=>!conditionSatisfied(d)).filter(d=>d.status!=='completed'||(d.targetId&&['error','warning'].includes(byId.get(d.targetId)?.tone??'')));
   const deps=pending.map(d=>d.targetId?byId.get(d.targetId):undefined);
+  const knownFailures=[...new Set(deps.flatMap(d=>d?[...(d.failedNumbers??[]),...(failureContext.get(d.id)??[])]:[]))];
+  failureContext.set(t.id,failed?[t.number!]:knownFailures);
+  const exactInactive=!t.identityMissing&&!t.manualBlocked&&nodes.length>0&&(t.identities??[]).every(i=>['blocked','skipped','cancelled','not_started'].includes(i.phase??''));
   if(failed){t.label='失败';t.tone='error';t.failedNumbers=[t.number!];t.tail=t.reason?.replace(/^失败[：:]\s*/u,'')||'请查看失败详情 · Alt+R';}
   else if(cycles.has(t.id)){t.label='待处理';t.tone='warning';t.tail='依赖循环，待核实'+(user?'；待主 Agent 决策':'')+' · Alt+R';}
   else if(user){const realIssue=nodes.map(n=>supervisionWarning(n)).find(w=>!!w&&w!=='待主 Agent 决策');t.hasError=!!realIssue;t.label='待主 Agent 决策';t.tone='warning';t.tail=realIssue?`待主 Agent 决策；${realIssue} · Alt+R`:'待主 Agent 决策 · Alt+R';}
-  else if(uncertain){t.label=t.status==='completed'?'已完成 · 待核实':t.status==='in_progress'?'执行中 · 需核实':'待处理';t.tone='warning';t.tail=t.identityMissing?'关联身份待核实 · Alt+R':nodes.map(n=>supervisionWarning(n)).find(Boolean)||(!t.reason?.startsWith('计划前置项未完成：')&&!Object.values(inactiveLabels).includes(t.reason??'')?t.reason:undefined)||'状态待核实 · Alt+R';}
+  else if(uncertain){t.label=t.status==='completed'?'已完成 · 待核实':exactInactive?(inactiveLabels[t.status]??'未执行'):t.status==='in_progress'?'执行中 · 需核实':'待处理';t.tone='warning';const cause=t.identityMissing?'关联身份待核实':nodes.map(n=>supervisionWarning(n)).find(Boolean)||(!t.reason?.startsWith('计划前置项未完成：')&&!Object.values(inactiveLabels).includes(t.reason??'')?t.reason:undefined)||'状态待核实';t.tail=(knownFailures.length?(exactInactive?`受阻于 ${knownFailures.join('、')} · 未执行；另有依赖待核实`:`前置 ${knownFailures.join('、')} 失败 · 执行条件待核实`)+`；${cause}`:cause)+' · Alt+R';}
   else if(t.status==='completed'){t.label=t.source==='人工'?'已完成 · 人工':'已完成';t.tone='success';}
   else if(inactiveLabels[t.status]){t.label=inactiveLabels[t.status];t.tone='muted';}
   else if(t.status==='in_progress'){t.label='执行中';t.tone='accent';}
   else if(deps.some(d=>d?.failedNumbers?.length)){
    const uncertainDependency=deps.some(d=>!d||d.tone==='warning'),failedNums=[...new Set(deps.flatMap(d=>d?.failedNumbers??[]))];
-   if(authoritativeInactive){t.label='未执行';t.tone=uncertainDependency?'warning':'muted';t.failedNumbers=failedNums;t.tail=`受阻于 ${failedNums.join('、')} · 未执行`+(uncertainDependency?'；另有依赖待核实 · Alt+R':'');}
+   if(exactInactive){t.label='未执行';t.tone=uncertainDependency?'warning':'muted';t.failedNumbers=failedNums;t.tail=`受阻于 ${failedNums.join('、')} · 未执行`+(uncertainDependency?'；另有依赖待核实 · Alt+R':'');}
    // Without an authorized satisfied condition or an authoritative blocked/skipped phase, a failed dependency alone never proves this queued branch did not or will not run.
    else{t.label='待处理';t.tone='warning';t.tail=`前置 ${failedNums.join('、')} 失败 · 执行条件待核实 · Alt+R`;}
   }
   else if(pending.length&&deps.some(d=>!d)||t.tail?.startsWith('依赖循环')){t.label='待处理';t.tone='warning';t.tail=t.tail?.startsWith('依赖循环')?t.tail:'依赖关联待核实 · Alt+R';}
-  else if(deps.some(d=>d?.tone==='warning'&&!(d.label==='待主 Agent 决策'&&!d.hasError))){t.label='待处理';t.tone='warning';t.tail='前置任务待核实 · Alt+R';}
+  else if(deps.some(d=>d?.tone==='warning'&&!(d.label==='待主 Agent 决策'&&!d.hasError))){t.label='待处理';t.tone='warning';t.tail=knownFailures.length?`前置 ${knownFailures.join('、')} 失败 · 执行条件待核实 · Alt+R`:'前置任务待核实 · Alt+R';}
   else if(pending.length&&deps.every(d=>!!d&&(['执行中','等待','就绪'].includes(d.label??'')||(d.label==='待主 Agent 决策'&&!d.hasError)))){t.label='等待';t.tone='muted';t.waiting=true;t.tail=`等待 ${pending.map(d=>d.number).join('、')} 完成`;}
   // Display-only release: a plan-level "prerequisite incomplete" derivation whose every dependency is now satisfied — including an authorized, exactly bound when:failed branch — reads as ready. Manual blocks, missing identities, mixed links and authoritative blocked/skipped phases never reach here; the plan and Graph stay untouched.
   else if(t.status==='blocked'&&!authoritativeInactive&&!t.manualBlocked&&!pending.length&&t.reason?.startsWith('计划前置项未完成：')){t.label='就绪';t.tone='muted';t.tail='等待调度';}
   else if(t.status==='blocked'||pending.length){t.label='待处理';t.tone='warning';t.tail='依赖状态待核实 · Alt+R';}
   else{t.label='就绪';t.tone='muted';t.tail='等待调度';}
+  const active=(t.identities??[]).filter(i=>i.current);
+  if(!active.length&&(t.identities??[]).some(i=>!i.current&&['running','dispatched','applying','verifying'].includes(i.phase??''))&&t.tone!=='error'){t.label='执行状态待核实';t.tone='warning';t.tail=t.tail??'当前观测未确认 · Alt+R';}
+  if(active.length){
+   t.active=true;t.activeLabel=active.every(i=>i.phase==='verifying')?'核验中':active.every(i=>i.phase==='applying')?'应用中':'执行中';
+   if(t.tone==='error'||t.tone==='warning')t.label=t.activeLabel+(t.tone==='error'?' · 有失败':' · 需核实');
+  }
   if(t.tone==='warning'||t.tone==='error')t.critical=true;
   path.pop();visiting.delete(t.id);done.add(t.id);
  };
@@ -133,9 +158,16 @@ function decorateTasks(tasks:StackTask[],hasPlan:boolean):StackTask[]{
 }
 /** Agent leads, then the model; identity pairs are never cross-joined. Only observed actualModel is shown as actual; requested/resolved models stay explicitly planned, and an active node without actualModel is reported as unobserved. The bound project comes from display evidence (authorization sourceCwd) and is honestly unbound when absent. */
 export function todoIdentity(t:StackTask,width:number):string {
- if(t.identityMissing)return truncateToWidth('关联身份待核实 · Alt+R',width,'…');
+ const current=(t.identities??[]).filter(i=>i.current);
+ if(t.identityMissing&&!current.length)return truncateToWidth('关联身份待核实 · Alt+R',width,'…');
+ const other=current.length?(t.identities??[]).filter(i=>!i.current):[];
+ const history=other.filter(i=>['accepted','failed','aborted','cancelled','skipped','not_started','exit_unreconciled','exit_unverified'].includes(i.phase??'')).length;
+ const remaining=other.length-history;
+ const counts=[history?`历史 ${history}`:'',remaining?`另 ${remaining} 关联`:''].filter(Boolean).join(' · ');
+ const note=t.identityMissing?' · 关联待核实 Alt+R':counts?` · ${counts} Alt+R`:'';
+ const totalWidth=width;width=Math.max(0,width-visibleWidth(note));
  const activePhases=['prepared','dispatched','running','verifying','applying','in_progress'];
- const pairs=(t.identities??[]).map(({node,phase,project})=>{
+ const pairs=(current.length?current:t.identities??[]).map(({node,phase,project})=>{
   const role=nodeIdentity('',node).role,actual=safeText(node.observation?.actualModel);
   const planned=safeText(node.observation?.resolvedModel)||safeText(node.observation?.requestedModel);
   const agent=role?(node.observation?.actualAgent?'@':'分配@')+role:'Agent待上报';
@@ -164,16 +196,16 @@ export function todoIdentity(t:StackTask,width:number):string {
    if(rendered.length)out=head+rendered.join(' · ')+` +${unique.length-rendered.length} Alt+R`;
    else{
     const room=Math.max(0,width-visibleWidth(suffix)),agentWidth=Math.min(visibleWidth(pair.agent),Math.max(8,Math.floor(room*.45))),modelWidth=Math.max(0,room-agentWidth-3);
-    const modelText=pair.short!==pair.model&&visibleWidth(pair.short)<=modelWidth?pair.short:pair.model;
+    const modelText=pair.model==='实际模型未观测'?'模型待报':pair.short;
     out=truncateToWidth(pair.agent,agentWidth,'…')+' · '+truncateToWidth(modelText,modelWidth,'…')+suffix;
    }
    break;
   }
   if(retry)continue;
   if(out===undefined)out=head+rendered.join(' · ');
-  if(visibleWidth(out)<=width)return out;
+  if(visibleWidth(out)<=width)return truncateToWidth(out+note,totalWidth,'…');
  }
- return truncateToWidth(unique.map(p=>pairText(p,false)).join(' · '),Math.max(0,width),'…');
+ return truncateToWidth(truncateToWidth(unique.map(p=>pairText(p,false)).join(' · '),Math.max(0,width),'…')+note,totalWidth,'…');
 }
 
 export function safelyCompletedTask(t:StackTask):boolean{return !t.group&&t.status==='completed'&&!t.critical&&!t.identityMissing&&!['warning','error'].includes(t.tone??'')&&(t.identities??[]).every(i=>i.phase==='accepted');}
@@ -211,19 +243,42 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
  const max=Math.max(0,width-1),total=Math.max(0,Math.min(input.expanded?24:8,height-(input.reservedRows??6)));
  if(!total)return {todo:[],agents:[]};
  const allTasks=stackTasks(input),tree=input.plan.items.length?buildTodoTree(input.plan.items):undefined;
- const byId=new Map(allTasks.map(t=>[t.id,t])),leaves=allTasks.filter(t=>!t.group);
+ const historical=new Set(input.plan.lifecycle?.historyIds??[]);
+ const byId=new Map(allTasks.map(t=>[t.id,t])),leaves=allTasks.filter(t=>!t.group&&!historical.has(t.id));
  // Completed leaves stay in place; only explicit group folding hides rows, and folding never changes numbering or counts.
  const folded=input.foldedIds??new Set<string>();
- const tasks=allTasks.filter(t=>!tree?.ancestorIds(t.id).some(id=>folded.has(id))),focus=cockpitFocus(input.snapshots,input.preferred);
+ const tasks=allTasks.filter(t=>input.plan.lifecycle?.display!=='hidden'&&!historical.has(t.id)&&(!t.group||tree?.descendantLeafIds(t.id).some(id=>!historical.has(id)))&&!tree?.ancestorIds(t.id).some(id=>folded.has(id))),focus=cockpitFocus(input.snapshots,input.preferred);
  const live=input.snapshots.flatMap(s=>orderedNodes(s).filter(([,n])=>liveAgent(n)).map(([id,n])=>({s,id,n}))).sort((a,b)=>Number(b.s===focus)-Number(a.s===focus));
- const hasTodo=tasks.length>0||!!input.plan.error;
+ const session=input.sessionId??input.parent?.sessionId??(new Set(input.snapshots.map(s=>s.sessionId)).size===1?input.snapshots[0]?.sessionId:undefined);
+ const current=input.snapshots.filter(s=>s.sessionId===session).flatMap(s=>orderedNodes(s).filter(([id,n])=>{
+  return currentExecution(s,id,n);
+ }).map(([id,n])=>{const linked=input.plan.items.find(item=>item.links.some(link=>link.graphId===s.graphId&&link.runInstanceId===s.runInstanceId&&link.taskId===id)),task=linked?allTasks.find(t=>t.id===linked.id):undefined;return {s,id,n,title:linked?safeText(linked.title):readableNodeTitle(s,id,n),number:task?.number,linked:!!linked};}));
+ const historicalRisk=!!input.plan.lifecycle&&(!!input.plan.lifecycle.historyOmitted||input.plan.lifecycle.history.some(h=>h.risks.length>0)||input.snapshots.some(s=>!input.plan.items.some(i=>i.links.some(l=>l.graphId===s.graphId&&l.runInstanceId===s.runInstanceId))&&graphIssues(s)>0));
+ const historicalRiskLabel=historicalRisk?'历史待核':'';
+ const hasTodo=tasks.length>0||!!input.plan.error||current.length>0;
  const minimumTodo=hasTodo?1:0;
  // Collapsed first guarantees the overview, two tasks with two identity rows and a more entry (6 rows); duplicate agent trees and telemetry share only what remains.
  const guaranteedTodo=hasTodo?(input.expanded?minimumTodo:Math.min(6,total)):0;
  const desiredAgentRows=live.length*(width<70?2:1)+Number(!!input.parent?.active)+1;
- const reservedAgents=live.length?Math.min(Math.max(0,total-guaranteedTodo),Math.max(1,Math.min(desiredAgentRows,Math.floor(total/2)))):input.parent?.active?Math.min(1,Math.max(0,total-minimumTodo)):0;
- const todoBudget=hasTodo?(input.expanded?total-reservedAgents:Math.max(1,Math.min(6,total-reservedAgents))):0;
- const agentBudget=total-todoBudget,todo:string[]=[],agents:string[]=[];
+ const reservedAgents=current.length?Math.min(total>=10?2:0,Math.max(0,total-6)):live.length?Math.min(Math.max(0,total-guaranteedTodo),Math.max(1,Math.min(desiredAgentRows,Math.floor(total/2)))):input.parent?.active?Math.min(1,Math.max(0,total-minimumTodo)):0;
+ const fullTodoBudget=hasTodo?(input.expanded?total-reservedAgents:Math.max(1,Math.min(6,total-reservedAgents))):0;
+ const currentRows:string[]=[];
+ // This region is independent of plan folding and history priority. Each row owns one exact node identity.
+ const activeCapacity=current.length?Math.max(1,fullTodoBudget-2):0;
+ for(const [index,item] of current.entries()){
+  const room=activeCapacity-currentRows.length;if(room<1)break;
+  const actualPhase=displayPhase(item.s,item.id,item.n),phase=actualPhase==='verifying'?'核验中':actualPhase==='applying'?'应用中':phaseLabel(item.n,item.s,item.id),head=`${item.number?item.number+' ':''}${phase} ${item.linked?'':'未关联总计划 · '}${item.title}`;
+  const identityTask:StackTask={id:item.id,title:item.title,status:'in_progress',source:'Graph观测',assignees:[],dependencies:[],identities:[{node:item.n,taskId:item.id,phase:displayPhase(item.s,item.id,item.n),project:displayEvidence(item.s)?.project}]};
+  const identity=todoIdentity(identityTask,max),whole=visibleWidth(head)+1+visibleWidth(identity)<=max;
+  const others=current.length-index-1,titleLines=wrapTextWithAnsi(head,max),canTwo=!whole&&room>=2+(others?1:0);
+  if(whole&&total>1){currentRows.push(head+' '.repeat(max-visibleWidth(head)-visibleWidth(identity))+identity);}
+  else if(canTwo){const titleRoom=room-1-(others?1:0);currentRows.push(...(titleLines.length<=titleRoom?titleLines:[truncateToWidth(head,max-visibleWidth(' · Alt+R'),'…')+' · Alt+R']),' '.repeat(Math.max(0,max-visibleWidth(identity)))+identity);}
+  else {const hint=' Alt+R',right=todoIdentity(identityTask,Math.max(8,Math.floor(max*.65)-visibleWidth(hint)))+hint,left=truncateToWidth((total===1?(historicalRisk?'历史待核 · 当前 ':'当前 '):'')+head,Math.max(0,max-visibleWidth(right)-1),'…');currentRows.push(left+' '.repeat(Math.max(1,max-visibleWidth(left)-visibleWidth(right)))+right);}
+  if(others&&activeCapacity-currentRows.length<=1){if(currentRows.length<activeCapacity)currentRows.push(`另 ${others} 项执行 · Alt+R`);else currentRows[currentRows.length-1]=truncateToWidth(currentRows.at(-1)!,Math.max(0,max-visibleWidth(` +${others} Alt+R`)),'…')+` +${others} Alt+R`;break;}
+ }
+ const currentHeader=current.length?`${historicalRisk?'历史待核 · ':''}当前执行 ${current.length} 项 · Alt+R`:'';
+ const currentReserved=current.length?Math.min(fullTodoBudget,currentRows.length+1):0;
+ const todoBudget=Math.max(0,fullTodoBudget-currentReserved),agentBudget=total-fullTodoBudget,todo:string[]=[],agents:string[]=[];
  const fg=(color:string,text:string)=>theme.fg(color,text),seg=(text:string,priority:number,clip=false):Segment=>({text,priority,clip});
  const priority=(t:StackTask)=>t.tone==='error'?0:t.tone==='warning'?1:t.label==='执行中'?2:t.label==='等待'?3:t.label==='未执行'?4:t.status==='completed'?6:5;
  const ordered=tasks.map((t,index)=>({t,index})).sort((a,b)=>priority(a.t)-priority(b.t)||Number(!!a.t.group)-Number(!!b.t.group)||a.index-b.index);
@@ -261,7 +316,7 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
  // Executing leaf rows get a shallow theme background (customMessageBg), padded to the available width.
  // Selection/focus styling (selectedBg) belongs to inspectors and is never used here, so focus and execution cannot be confused.
  const paintExecuting=(t:StackTask,line:string):string=>{
-  if(!theme.bg||t.group||t.label!=='执行中')return line;
+  if(!theme.bg||t.group||!t.active)return line;
   return theme.bg('customMessageBg',line+' '.repeat(Math.max(0,max-visibleWidth(line))));
  };
  const reasonRow=(t:StackTask):string|undefined=>{
@@ -280,7 +335,7 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
   const marker=t.group?(folded.has(t.id)?'▸ ':'▾ '):'',label=t.label??'',color=statusColor(t),number=t.number?`${t.number} `:'';
   const {prefix,indent:treeIndent}=treeLines(t,visibleWidth(marker+number)+(t.group?0:visibleWidth(label)+1)+2);
   // Completed titles keep the plain typeface per the approved design: a finished row is shown in place, never struck through.
-  const title=t.label==='执行中'?(theme.bold?.(t.title)??t.title):t.title;
+  const title=t.active?(theme.bold?.(t.title)??t.title):t.title;
   const lead=prefix+marker+number+(t.group?'':label?label+' ':''),groupTail=t.group&&label?label:'';
   // The title keeps its share on group rows; the aggregate stats label truncates first.
   const titleRoom=Math.max(1,max-visibleWidth(lead)),wrapped=titleRoom>=4?wrapTextWithAnsi(title,titleRoom):[truncateToWidth(title,titleRoom,'…')],shown=wrapped[0]??'';
@@ -325,18 +380,19 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
    const headRoom=Math.max(4,max-visibleWidth(lead)-visibleWidth('Alt+R')-2);
    return truncateToWidth(fg(t.tone??'muted',truncateToWidth(`${t.number} ${t.label}`,headRoom,'…')+' ')+lead+fg('muted','Alt+R'),max,'…');
   }
-  const tail=[t.tail?.startsWith('等待 #')||t.tail?.startsWith('受阻于 #')?t.tail:undefined,suffix].filter(Boolean).join(' · ');
+  const tail=[historicalRiskLabel||undefined,t.tail?.startsWith('等待 #')||t.tail?.startsWith('受阻于 #')?t.tail:undefined,suffix].filter(Boolean).join(' · ');
   const titleWidth=Math.min(12,Math.max(4,Math.floor(max*.2))),hasIdentity=!!(t.identityMissing||t.identities?.length);
   const identity=hasIdentity?todoIdentity(t,Math.max(8,max-visibleWidth(head+tail)-titleWidth-2)):'';
   const room=Math.max(0,max-visibleWidth(head+tail+identity)-(identity?2:1));
   const left=fg(t.tone??'muted',head)+truncateToWidth(t.title,room,'…')+(tail?' '+fg('muted',tail):'');
   return truncateToWidth(left+(identity?' '.repeat(Math.max(1,max-visibleWidth(left)-visibleWidth(identity)))+identity:''),max,'…');
  };
- if(total===1&&hasTodo)return {todo:[input.plan.error?fg('warning',truncateToWidth(`待处理 · 待核实 ${safeText(input.plan.error)} · Alt+R`,max,'…')):compactTask(ordered[0].t,tasks.length>1?`另${tasks.length-1}项 · Alt+R`:undefined)],agents:[]};
- if(input.plan.error)todo.push(fg('warning',truncateToWidth(`Todo · 待处理 ${safeText(input.plan.error)} · Alt+T`,max,'…')));
- else if(tasks.length){
+ const makeOverview=()=>{
   // Mutually exclusive real leaf states; waiting/ready/exception/inactive are never lumped into failure.
-  const stats=leafStatusStats(leaves),statsFull=formatLeafStats(stats),statsCompact=formatLeafStats(stats,true);
+  const historyCount=input.plan.lifecycle?.historyIds.length??0;
+  const historyLabel=historyCount?` · 历史 ${historyCount}`:'';
+  const riskPrefix=historicalRiskLabel?historicalRiskLabel+' · ':'';
+  const stats=leafStatusStats(leaves),statsFull=riskPrefix+formatLeafStats(stats)+historyLabel,statsCompact=riskPrefix+formatLeafStats(stats,true)+historyLabel;
   const hintFull=input.expanded?'Alt+T 收起':'已收起 · Alt+T 展开',hintShort=input.expanded?'Alt+T 收起':'Alt+T 展开';
   // Width degradation ladder: full counts → short-label counts → aggregate. The aggregate is a pair of
   // ORTHOGONAL dimensions — 需关注 N (失败+待处理+其中待核实; doubt is a subset of done/inactive, so the
@@ -346,8 +402,8 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
   // focus count, the completion fraction and the Alt+T entry always keep a visible share. The hint sheds
   // its state prefix down to a bare Alt+T before any count form is sacrificed.
   const issues=stats.failed+stats.attention+stats.doubt;
-  const statsAggregate=[...(issues?[`需关注 ${issues}`]:[]),`完成 ${stats.done}/${stats.total}`].join(' · ');
-  const statsAggregateShort=[...(issues?[`关注${issues}`]:[]),`完${stats.done}/${stats.total}`].join(' ');
+  const statsAggregate=riskPrefix+[...(issues?[`需关注 ${issues}`]:[]),`完成 ${stats.done}/${stats.total}`].join(' · ')+historyLabel;
+  const statsAggregateShort=riskPrefix+[...(issues?[`关注${issues}`]:[]),`完${stats.done}/${stats.total}`].join(' ')+(historyCount?` 历史${historyCount}`:'');
   const fits=(text:string,hint:string)=>visibleWidth(text)+visibleWidth(hint)+1<=max;
   let statsText=statsAggregateShort,hint='Alt+T';
   for(const candidate of [[statsFull,hintFull],[statsFull,hintShort],[statsCompact,hintFull],[statsCompact,hintShort],[statsAggregate,hintFull],[statsAggregate,hintShort],[statsAggregateShort,hintShort]] as const){
@@ -360,7 +416,13 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
   const goalText=goalRoom>=8?truncateToWidth(goalLabel,goalRoom,'…'):'';
   const headText=(goalText?goalText+' · ':'')+statsText;
   const head=fg('syntaxFunction',truncateToWidth(headText,Math.max(0,max-visibleWidth(hint)-1),'…'));
-  const overview=head+' '.repeat(Math.max(1,max-visibleWidth(head)-visibleWidth(hint)))+fg('dim',hint);
+  return head+' '.repeat(Math.max(1,max-visibleWidth(head)-visibleWidth(hint)))+fg('dim',hint);
+ };
+ if(total<=3&&current.length){const issues=leaves.filter(t=>t.critical||t.tone==='error'||t.tone==='warning').length;return {todo:[...(total>1?[fg('accent',truncateToWidth(`${currentHeader}${issues?` · 待处理${issues}`:''}`,max,'…'))]:[]),...currentRows].slice(0,total).map(line=>truncateToWidth(line,max,'…')),agents:[]};}
+ if(total===1&&hasTodo&&!input.plan.lifecycle)return {todo:[input.plan.error?fg('warning',truncateToWidth(`待处理 · 待核实 ${safeText(input.plan.error)} · Alt+R`,max,'…')):compactTask(ordered[0].t,tasks.length>1?`另${tasks.length-1}项 · Alt+R`:undefined)],agents:[]};
+ if(todoBudget>0&&input.plan.error)todo.push(fg('warning',truncateToWidth(`Todo · 待处理 ${safeText(input.plan.error)} · Alt+T`,max,'…')));
+ else if(todoBudget>0&&tasks.length){
+  const overview=makeOverview();
   const moreRow=(remaining:number)=>fg('dim',`  … 另 ${remaining} 项 · ${input.expanded?'Alt+Shift+T':'Alt+T 展开'}`);
   if(input.expanded){
    const header=todoBudget>=4?[overview]:[],available=todoBudget-header.length;
@@ -431,5 +493,26 @@ export function terminalStack(input:StackInput,width:number,height:number,theme:
  }
  // Historical problems remain reachable without adding permanent header rows.
  const others=input.snapshots.filter(s=>s!==focus);if(input.expanded&&others.length&&todo.length<todoBudget)todo.push(fit([seg(fg("dim",`其他记录${others.length}/待处理图${others.filter(s=>graphIssues(s)>0).length} · /graphs history`),80,true)],max));
- return {todo:todo.slice(0,todoBudget).map(l=>truncateToWidth(l,max)),agents:agents.slice(0,agentBudget).map(l=>truncateToWidth(l,max))};
+ let displayedTodo=todo.slice(0,todoBudget);
+ if(current.length){
+  const issues=leaves.filter(t=>t.critical||t.tone==='error'||t.tone==='warning').length;
+  const summary=makeOverview();
+  // Keep the overview first, then current work. History is summarized even when physical space is scarce.
+  const history=displayedTodo.filter(line=>!line.includes('Alt+T 收起')&&!line.includes('Alt+T 展开'));
+  displayedTodo=[summary,theme.fg('accent',currentHeader+(issues?` · 待处理 ${issues} 项`:'')),...currentRows,...history].slice(0,fullTodoBudget);
+ }
+ const lifecycle=input.plan.lifecycle;
+ if(lifecycle){
+  const crossRisks=lifecycle.history.flatMap(h=>h.risks);
+  const otherIssues=input.snapshots.filter(s=>!input.plan.items.some(i=>i.links.some(l=>l.graphId===s.graphId&&l.runInstanceId===s.runInstanceId))&&graphIssues(s)>0).length;
+  const notice=[lifecycle.display==='summary'?lifecycle.summary:'',crossRisks.length?`历史仍需核对 ${crossRisks.length} · Alt+Shift+T`:'',lifecycle.historyOmitted?`另 ${lifecycle.historyOmitted} 历史未核对 · 详情`:'',otherIssues?`其他Graph待处理 ${otherIssues} · Alt+R`:'' ].filter(Boolean).join(' · ');
+  if(lifecycle.display==='full'){
+   // History must never replace current pending/manual/waiting work. Only use spare rows.
+   if(notice&&(crossRisks.length||lifecycle.historyOmitted||otherIssues)&&displayedTodo.length<fullTodoBudget)displayedTodo.push(theme.fg('warning',truncateToWidth(notice,max)));
+  }else{
+   const preserved=current.length?[theme.fg('accent',currentHeader),...currentRows]:[];
+   displayedTodo=[...(notice?[theme.fg('warning',truncateToWidth(notice,max))]:[]),...preserved].slice(0,fullTodoBudget);
+  }
+ }
+ return {todo:displayedTodo.map(l=>truncateToWidth(l,max)),agents:agents.slice(0,agentBudget).map(l=>truncateToWidth(l,max))};
 }

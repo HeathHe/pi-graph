@@ -1,6 +1,8 @@
+import {TodoLifecycle} from "../src/v3/ui/todo-lifecycle.ts";
 import {readUiProcessExits} from '../src/v3/ui/process-exit.ts';
 import {boundedGraphObservation,WaitObservationUnavailable} from '../src/v3/wait-observation.ts';
 import {buildTodoTree} from '../src/v3/ui/todo-tree.ts';
+import {graphProjectScopeV3,graphProjectReceiptV3} from "./project-root.ts";
 import {TodoBindingSchema,hasPlanManager,validateTodoBinding,validateBindingNodes,bindingLinks,planContext,removePlanContext,type TodoBinding} from '../src/v3/plan-flow.ts';
 import {ExpandedReceipt,RawReceiptViewer,findRawReceipt,receiptId} from '../src/v3/ui/expanded-receipt.ts';
 import {visibleWidth} from "@earendil-works/pi-tui";
@@ -156,6 +158,7 @@ export const GraphSpecV3Schema = Type.Object({
 });
 
 export const Parameters = Type.Object({
+ projectRoot: Type.Optional(Type.String({minLength:1,description:"Authorized project directory for start, source-only load, or agents. Relative paths resolve against the parent cwd. Each Graph stays in one canonical project; omit to keep the parent cwd. Existing runs cannot change projectRoot."})),
  todoBinding:Type.Optional(TodoBindingSchema),
  mailbox: Type.Optional(Type.Object({action:Type.String(),to:Type.Optional(Type.String()),kind:Type.Optional(Type.String()),text:Type.Optional(Type.String()),idempotencyKey:Type.Optional(Type.String()),messageId:Type.Optional(Type.String()),offset:Type.Optional(Type.Integer({minimum:0}))},{additionalProperties:false})),
  expectedSha256: Type.Optional(Type.String({pattern:"^[a-fA-F0-9]{64}$",description:"Copy from nextRequest to bind continuation to the full source hash."})),
@@ -184,6 +187,8 @@ export const Parameters = Type.Object({
 
 export const PI_GRAPH_ROUTING_SENTINEL = "## PI-GRAPH Routing";
 export const PI_GRAPH_ROUTING_GUIDANCE = `${PI_GRAPH_ROUTING_SENTINEL}
+
+Use outer graph.projectRoot to select an explicitly authorized project for start, source-only load (spec/capsule/template), or agents. Omit it to use the parent cwd. Relative paths resolve against the parent cwd. Each Graph remains bound to one canonical project; this does not grant new permissions or change the parent session cwd/tool ceiling. Existing runs (including load by id, append, retry, resume, wait and status) cannot override their stored root. For cross-project work, create separate Graphs with distinct graphIds and coordinate them through the current graph_todo plan: wait for project A to be accepted, then start project B. Todo is orchestration history, not an automatic cross-Graph DAG or material transfer.
 
 For objectives with three or more stages, dependencies, multiple turns or multiple Graphs, first graph_todo list, then CAS set the complete confirmed goal plan with explicit assignee/dependsOn before dispatch. Set optional goal for a new plan cycle. Dispatch with outer start.todoBinding={expectedRevision,bindings:[{todoId,taskIds}]} to append real run links in one CAS; list derived progress after stages and update parent-owned manual items explicitly. Same-batch plan dependencies require actual accepted DAG dependency paths. A started-but-unconfirmed binding must be inspected, never relaunched. Maintain the plan after each stage; Graph completion is not goal completion. Never auto-backfill old chat or create watchers for human approval.
 
@@ -366,6 +371,10 @@ const receiptSnapshots=new WeakMap<object,GraphSnapshotV3>();
 function captureReceiptSnapshot(details:object,snapshot:GraphSnapshotV3){const copy=structuredClone(snapshot),e=displayEvidence(snapshot);if(e)setDisplayEvidence(copy,structuredClone(e));copyUiProcessEvidence(snapshot,copy);receiptSnapshots.set(details,copy);}
 function result(text: string, details?: unknown, isError = false) {
  const value=boundedGraphToolResult(text,details,isError),snapshot=graphSnapshotFromDetails(details);
+ if(typeof (details as any)?.projectRoot==="string"){
+  const project=graphProjectReceiptV3((details as any).projectRoot),combined={...(value.details as object),...project};
+  value.details=Buffer.byteLength(JSON.stringify(combined))<=4096?combined:{status:(details as any).status,...project,detailsOmitted:true};
+ }
  if(snapshot&&value.details&&typeof value.details==="object")captureReceiptSnapshot(value.details,snapshot);
  return value;
 }
@@ -386,7 +395,7 @@ function waitReceipt(text:string,details:any){
 /** Preserve start commitment metadata after the generic snapshot projection, still bounded. */
 function startReceipt(text:string,details:any){
  const value=result(text,details);const binding=details.todoBinding??{};
- const commitment={started:true,canRetry:false,runInstanceId:details.snapshot?.runInstanceId??details.runInstanceId,todoBinding:{state:binding.state,bindingCount:binding.bindings?.length??0,...(binding.expectedRevision!==undefined?{expectedRevision:binding.expectedRevision}:{}),...(binding.diagnostic?{diagnostic:binding.diagnostic}:{}),...(binding.reminder?{reminder:binding.reminder}:{})},...(details.stopRequested?{stopRequested:true}:{})};
+ const commitment={...graphProjectReceiptV3(details.projectRoot),started:true,canRetry:false,runInstanceId:details.snapshot?.runInstanceId??details.runInstanceId,todoBinding:{state:binding.state,bindingCount:binding.bindings?.length??0,...(binding.expectedRevision!==undefined?{expectedRevision:binding.expectedRevision}:{}),...(binding.diagnostic?{diagnostic:binding.diagnostic}:{}),...(binding.reminder?{reminder:binding.reminder}:{})},...(details.stopRequested?{stopRequested:true}:{})};
  const combined={...(value.details as object),...commitment};
  value.details=Buffer.byteLength(JSON.stringify(combined))<=4096?combined:{graphId:details.snapshot?.graphId??details.graphId,status:details.snapshot?.status,...commitment,result:{action:'result',id:details.snapshot?.graphId??details.graphId},detailsOmitted:true};
  if(details.snapshot)captureReceiptSnapshot(value.details,details.snapshot);
@@ -1280,17 +1289,24 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
  const displayKey = (s: GraphSnapshotV3) => JSON.stringify([s.sessionId,s.graphId,s.runInstanceId]);
 	let ownedRuntime: GraphRuntimeController | undefined;
  const parentWake = new GraphParentWake(pi);
- const wakeFingerprints = new Map<string,string>();
- const wakeFingerprint = (snapshot: GraphSnapshotV3): string => JSON.stringify([snapshot.sessionId,snapshot.graphId,snapshot.runInstanceId,snapshot.status,Object.entries(snapshot.nodes ?? {}).sort(([a],[b])=>a.localeCompare(b)).map(([id,n])=>[id,n.phase,n.terminalStatus,n.attempt,n.observation?.supervision?.attention ?? null])]);
+
+ const wakeFingerprint = (snapshot: GraphSnapshotV3): string => createHash("sha256").update(JSON.stringify([snapshot.sessionId,snapshot.graphId,snapshot.runInstanceId,snapshot.status,Object.entries(snapshot.nodes ?? {}).sort(([a],[b])=>a.localeCompare(b)).map(([id,n])=>[id,n.phase,n.terminalStatus,n.attempt,n.observation?.supervision?.attention ?? null,n.observation?.supervision?.attention ? [n.observation.supervision.phaseStartedAt ?? null,n.observation.supervision.runnerInstanceId ?? null] : null])])).digest("hex");
+ const wakeObservation = (snapshot:GraphSnapshotV3)=>({sessionId:snapshot.sessionId,graphId:snapshot.graphId,runInstanceId:snapshot.runInstanceId,fingerprint:wakeFingerprint(snapshot)});
  const pendingWaits = new Set<{graphId:string;runInstanceId?:string;sessionId:string;generation:number}>();
  const deferredWake = new Map<string,GraphSnapshotV3>();
  const notifyParentWake = (snapshot:GraphSnapshotV3):void => {
+  const latest=liveGraphUi.get(snapshot.graphId);if(latest&&latest!==snapshot&&wakeFingerprint(latest)!==wakeFingerprint(snapshot))return;
   if (!isGraphWaitSettledV3(snapshot.status) && !Object.values(snapshot.nodes ?? {}).some(n=>!!n.observation?.supervision?.attention)) return;
   if ([...pendingWaits].some(w=>w.generation===uiGeneration&&w.graphId===snapshot.graphId&&(!w.runInstanceId||w.runInstanceId===snapshot.runInstanceId)&&w.sessionId===snapshot.sessionId)) {deferredWake.set(snapshot.graphId,snapshot);return;}
-  const fingerprint=wakeFingerprint(snapshot);
-  if(wakeFingerprints.get(snapshot.graphId)!==fingerprint){wakeFingerprints.set(snapshot.graphId,fingerprint);parentWake.notify(`Graph ${snapshot.graphId}: ${snapshot.status}. Use graph status/result; do not replay completed work.`);}
+  parentWake.notify(`Graph ${snapshot.graphId}: ${snapshot.status}`,wakeObservation(snapshot));
  };
  pi.on("message_start", event => parentWake.messageStarted(event.message));
+ pi.on("input",event=>parentWake.input(event));
+ pi.on("agent_start",()=>parentWake.started());
+ pi.on("message_end",event=>parentWake.messageEnded(event.message));
+ pi.on("tool_execution_end",event=>parentWake.toolFinished(event.toolCallId,event.isError));
+ pi.on("agent_before_settle",event=>{parentWake.beforeSettle(event.outcome);});
+ pi.on("agent_settled",event=>{parentWake.settled("aborted" in event && event.aborted===true);});
 	const backgroundWorkWake = new V3GraphBackgroundWorkWakeProjection();
 	const graphWaiters = new V3GraphWaitRegistry();
 	let routingDiagnostics = piGraphRoutingDiagnosticsV3();
@@ -1303,7 +1319,8 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
  let uiGeneration=0;let closeActivePanel:(()=>void)|undefined;
  let todoIdentitySnapshots:GraphSnapshotV3[]=[];
  const foldedTodoIds=new Set<string>(),expandedCompletedGroupIds=new Set<string>();let recentCompletedIds:string[]=[];const previousCompleted=new Map<string,boolean>();let foldedTodoScope='';const planSelection:{id?:string}={};
- const invalidateCockpit=()=>{foldedTodoIds.clear();expandedCompletedGroupIds.clear();recentCompletedIds=[];previousCompleted.clear();foldedTodoScope='';delete planSelection.id;todoIdentitySnapshots=[];uiGeneration++;mountedGeneration=-1;parentActivity={active:false};parentToolsInFlight.clear();closeActivePanel?.();closeActivePanel=undefined;inspectorOpen=false;};
+ const invalidateCockpit=()=>{todoLifecycle.invalidate();foldedTodoIds.clear();expandedCompletedGroupIds.clear();recentCompletedIds=[];previousCompleted.clear();foldedTodoScope='';delete planSelection.id;todoIdentitySnapshots=[];uiGeneration++;mountedGeneration=-1;parentActivity={active:false};parentToolsInFlight.clear();closeActivePanel?.();closeActivePanel=undefined;inspectorOpen=false;};
+ const todoLifecycle=new TodoLifecycle();
  const todoController=new TodoController();let todoView:TodoView=emptyTodo();let cockpitFingerprint="",cockpitPreferred:string|undefined,planRefreshSequence=0;
  const readTodoLink=async(link:TodoLink,ctx:ExtensionContext)=>{const config=await loadV3GraphConfig();return readGraphView(config.runsDir,link.graphId,undefined,trustedSessionId(ctx),ctx.sessionManager.getSessionFile());};
  let parentEventsEnabled=false;const parentToolsInFlight=new Map<string,string>();
@@ -1348,12 +1365,17 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
   const sequence=planRefreshSequence,generation=uiGeneration;
   const key=JSON.stringify([generation,sequence,trustedSessionId(ctx),ctx.sessionManager.getSessionFile()]);
   return todoReads.read(key,async()=>{
-   try{const linkedViews=new Map<string,GraphSnapshotV3>();const next=await todoController.view(ctx.sessionManager,async link=>{const view=await readTodoLink(link,ctx);if(view.sessionId===trustedSessionId(ctx)&&view.graphId===link.graphId&&view.runInstanceId===link.runInstanceId&&view.nodes?.[link.taskId])linkedViews.set(displayKey(view),view);return view;});if(sequence===planRefreshSequence&&generation===uiGeneration&&uiContext===ctx){todoIdentitySnapshots=[...linkedViews.values()].filter(view=>next.items.some(item=>item.links.some(link=>link.graphId===view.graphId&&link.runInstanceId===view.runInstanceId&&!!view.nodes?.[link.taskId])));todoView=next;mountCockpit();}return next;}
+   try{const linkedViews=new Map<string,GraphSnapshotV3>();const rawNext=await todoController.view(ctx.sessionManager,async link=>{const view=await readTodoLink(link,ctx);if(view.sessionId===trustedSessionId(ctx)&&view.graphId===link.graphId&&view.runInstanceId===link.runInstanceId&&view.nodes?.[link.taskId])linkedViews.set(displayKey(view),view);return view;});const next=rawNext.error?rawNext:await todoLifecycle.decorate(ctx.sessionManager,rawNext,link=>readTodoLink(link,ctx));if(sequence===planRefreshSequence&&generation===uiGeneration&&uiContext===ctx){todoIdentitySnapshots=[...linkedViews.values()].filter(view=>next.items.some(item=>item.links.some(link=>link.graphId===view.graphId&&link.runInstanceId===view.runInstanceId&&!!view.nodes?.[link.taskId])));todoView=next;mountCockpit();}return next;}
    catch(error){if(error instanceof TodoReadSupersededError)throw error;if(sequence===planRefreshSequence&&generation===uiGeneration&&uiContext===ctx){todoIdentitySnapshots=[];todoView={...emptyTodo(),persistence:"unconfirmed",error:terminalText(error instanceof Error?error.message:error)};mountCockpit();}throw error;}
   });
  };
- registerGraphTodo(pi,{controller:todoController,read:readTodoLink,changed:(view,ctx)=>{planRefreshSequence++;todoIdentitySnapshots=[];uiContext=ctx;todoView=view;mountCockpit();void refreshTodo(ctx).catch(()=>{});}});
- pi.on("session_tree",async(_event,ctx)=>{invalidateCockpit();parentEventsEnabled=true;planRefreshSequence++;todoController.activate(ctx.sessionManager);uiContext=ctx;todoView=emptyTodo();cockpitFingerprint="";mountCockpit();await refreshTodo(ctx).catch(()=>{});});
+ pi.on("agent_start",(_event,ctx)=>{if(todoLifecycle.accepts(ctx.sessionManager))todoLifecycle.started();});
+ pi.on("message_end",(event,ctx)=>{if(todoLifecycle.accepts(ctx.sessionManager))todoLifecycle.messageEnded(event.message);});
+ pi.on("tool_execution_end",(event,ctx)=>{if(todoLifecycle.accepts(ctx.sessionManager))todoLifecycle.toolFinished(event.toolCallId,event.isError);});
+ pi.on("agent_before_settle",(event,ctx)=>{if(todoLifecycle.accepts(ctx.sessionManager))todoLifecycle.beforeSettle(event.outcome);});
+ pi.on("agent_settled",async(event,ctx)=>{if(!todoLifecycle.accepts(ctx.sessionManager))return;try{const changed=await todoLifecycle.settled(ctx.sessionManager,'aborted' in event&&event.aborted===true,link=>readTodoLink(link,ctx),typeof pi.appendEntry==='function'?(type,data)=>pi.appendEntry(type,data):undefined);if(changed&&uiContext===ctx)await refreshTodo(ctx);}catch{/* Unconfirmed lifecycle never hides a goal. */}});
+ registerGraphTodo(pi,{controller:todoController,lifecycle:todoLifecycle,read:readTodoLink,changed:(view,ctx)=>{planRefreshSequence++;todoIdentitySnapshots=[];uiContext=ctx;todoView=view;mountCockpit();void refreshTodo(ctx).catch(()=>{});}});
+ pi.on("session_tree",async(_event,ctx)=>{parentWake.bind(ctx);invalidateCockpit();parentEventsEnabled=true;planRefreshSequence++;todoController.activate(ctx.sessionManager);todoLifecycle.activate(ctx.sessionManager);uiContext=ctx;todoView=emptyTodo();cockpitFingerprint="";mountCockpit();await refreshTodo(ctx).catch(()=>{});});
 
  let attentionTimer: ReturnType<typeof setInterval> | undefined;
  let refreshingAttention = false;
@@ -1545,7 +1567,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 			const cleanPrompt=removePlanContext(event.systemPrompt);let systemPrompt = withPiGraphRoutingGuidanceV3(cleanPrompt, shouldInject);if(cleanPrompt!==event.systemPrompt)systemPrompt??=cleanPrompt;
    if(shouldInject&&process.env.PI_GRAPH_CHILD!=="1"&&hasPlanManager(ctx?.sessionManager)&&planGeneration===uiGeneration){
     const generation=planGeneration;let summary:TodoView|undefined;
-    try{summary=await todoController.view(ctx.sessionManager,link=>readTodoLink(link,ctx));}catch{summary={revision:0,items:[],persistence:"unconfirmed",error:"Plan read unavailable"};}
+    try{summary=await todoController.view(ctx.sessionManager,link=>readTodoLink(link,ctx));if(!summary.error)summary=await todoLifecycle.decorate(ctx.sessionManager,summary,link=>readTodoLink(link,ctx));}catch{summary={revision:0,items:[],persistence:"unconfirmed",error:"Plan read unavailable"};}
     if(generation===uiGeneration)systemPrompt=`${removePlanContext(systemPrompt??event.systemPrompt)}\n\n${planContext(summary)}`;
    }
 			routingDiagnostics = piGraphRoutingDiagnosticsV3(config.enabled, selectedTools, systemPrompt !== undefined);
@@ -1564,7 +1586,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
  pi.on("message_end", (event) => { rememberInterruptedCalls(event.message); });
 
 	pi.on("session_start", async (_event, ctx) => {
-  invalidateCockpit();parentEventsEnabled=true;const startingUiGeneration=uiGeneration;planRefreshSequence++;todoController.activate(ctx.sessionManager);todoView=emptyTodo();cockpitFingerprint="";
+  invalidateCockpit();parentEventsEnabled=true;const startingUiGeneration=uiGeneration;planRefreshSequence++;todoController.activate(ctx.sessionManager);todoLifecycle.activate(ctx.sessionManager);todoView=emptyTodo();cockpitFingerprint="";
   unsubscribeInterrupt?.(); unsubscribeInterrupt = undefined;
   for (const disarm of interruptArms) disarm(); interruptArms.clear();
   escapedTurn = false; interruptGraphs.clear(); interruptStops.clear();
@@ -1580,7 +1602,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 		routingDiagnostics = piGraphRoutingDiagnosticsV3();
 		uiContext = ctx;
   ownedRuntime?.dispose();
-  parentWake.bind(ctx); wakeFingerprints.clear();pendingWaits.clear();deferredWake.clear();
+  parentWake.bind(ctx); pendingWaits.clear();deferredWake.clear();
   ownedRuntime = new GraphRuntimeController(pi.events, () => ({sessionId:trustedSessionId(ctx),sessionFile:ctx.sessionManager.getSessionFile()}));
   if (ctx.mode === "tui") unsubscribeInterrupt = ctx.ui.onTerminalInput?.(data => {
    // Observational: native Escape still aborts the parent/returns to its editor.
@@ -1716,7 +1738,7 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
      const chooseGraph=async()=>{const views=(await guarded(listGraphViews(config.runsDir,trustedSessionId(ctx),ctx.sessionManager.getSessionFile()))).filter(v=>v.sessionId===trustedSessionId(ctx));if(!views.length)return undefined;const labels=views.map(v=>`${v.graphId} · ${graphLabel(v)}`);const choice=await guarded(ctx.ui.select("当前会话已观测/可读 Graph（仅查看）",labels));return choice?views[labels.indexOf(choice)]?.graphId:undefined;};
      const openPlan=async():Promise<"close"|"tasks"|"agents"|"history"|"link">=>{
       uiContext=ctx;await refreshTodo(ctx).catch(error=>{if(!(error instanceof TodoReadSupersededError))check();});check();let panel:PlanInspector|undefined;inspectorOpen=true;
-      try{ctx.ui.setWidget("pi-graph",undefined);ctx.ui.setWidget("pi-graph-agents",undefined);mountedGeneration=-1;return await ctx.ui.custom((tui,theme,_keys,complete)=>{let finished=false;const done=(value:"close"|"tasks"|"agents"|"history"|"link")=>{if(!finished){finished=true;complete(value);}};check();closeActivePanel=()=>{panel?.dispose();done("close");};panel=new PlanInspector({view:todoView,theme,selection:planSelection,getExpandedCompleted:()=>expandedCompletedGroupIds,toggleCompleted:id=>{if(expandedCompletedGroupIds.has(id))expandedCompletedGroupIds.delete(id);else expandedCompletedGroupIds.add(id);cockpitFingerprint='';mountCockpit();},getFoldedIds:()=>foldedTodoIds,toggleGroup:id=>{if(!buildTodoTree(todoView.items).groupIds.has(id))return;if(foldedTodoIds.has(id))foldedTodoIds.delete(id);else foldedTodoIds.add(id);cockpitFingerprint="";mountCockpit();},tasks:()=>stackTasks({...stackProjection,plan:todoView,identitySnapshots:todoIdentitySnapshots}),rows:()=>tui.terminal.rows,requestRender:()=>tui.requestRender(),close:()=>done("close"),navigate:next=>done(next==="agents"?"agents":"tasks"),history:()=>done("history"),openLink:link=>{planLink=link;returnToPlan=true;done("link");},read:()=>refreshTodo(ctx)});return panel;},{overlay:true,overlayOptions:{anchor:"center",width:"92%",maxHeight:"90%",margin:0}});}finally{panel?.dispose();if(valid()){closeActivePanel=undefined;inspectorOpen=false;cockpitFingerprint="";mountCockpit();}}
+      try{ctx.ui.setWidget("pi-graph",undefined);ctx.ui.setWidget("pi-graph-agents",undefined);mountedGeneration=-1;return await ctx.ui.custom((tui,theme,_keys,complete)=>{let finished=false;const done=(value:"close"|"tasks"|"agents"|"history"|"link")=>{if(!finished){finished=true;complete(value);}};check();closeActivePanel=()=>{panel?.dispose();done("close");};panel=new PlanInspector({view:todoView,theme,showPlan:async()=>{check();const lifecycle=todoView.lifecycle;if(!lifecycle)throw Error('当前无可恢复的生命周期记录');await todoLifecycle.operate(ctx.sessionManager,{action:'lifecycle',planEntryId:lifecycle.planEntryId,expectedRevision:todoView.revision,expectedLifecycleRevision:lifecycle.revision,operation:'show'},link=>readTodoLink(link,ctx),typeof pi.appendEntry==='function'?(type,data)=>pi.appendEntry(type,data):undefined,check);return refreshTodo(ctx);},selection:planSelection,getExpandedCompleted:()=>expandedCompletedGroupIds,toggleCompleted:id=>{if(expandedCompletedGroupIds.has(id))expandedCompletedGroupIds.delete(id);else expandedCompletedGroupIds.add(id);cockpitFingerprint='';mountCockpit();},getFoldedIds:()=>foldedTodoIds,toggleGroup:id=>{if(!buildTodoTree(todoView.items).groupIds.has(id))return;if(foldedTodoIds.has(id))foldedTodoIds.delete(id);else foldedTodoIds.add(id);cockpitFingerprint="";mountCockpit();},tasks:()=>stackTasks({...stackProjection,plan:todoView,identitySnapshots:todoIdentitySnapshots}),rows:()=>tui.terminal.rows,requestRender:()=>tui.requestRender(),close:()=>done("close"),navigate:next=>done(next==="agents"?"agents":"tasks"),history:()=>done("history"),openLink:link=>{planLink=link;returnToPlan=true;done("link");},read:()=>refreshTodo(ctx)});return panel;},{overlay:true,overlayOptions:{anchor:"center",width:"92%",maxHeight:"90%",margin:0}});}finally{panel?.dispose();if(valid()){closeActivePanel=undefined;inspectorOpen=false;cockpitFingerprint="";mountCockpit();}}
      };
      if(tab==="plan"){const next=await guarded(openPlan());if(next==="close")return;tab=next==="agents"?"agents":"tasks";if(next==="history")selectedId=await guarded(chooseGraph());if(next==="link"&&planLink){selectedId=planLink.graphId;selectedTask=planLink.taskId;}}
 
@@ -1826,23 +1848,25 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+   const wakeReadGeneration=uiGeneration;
 			try {
 				uiContext = ctx;
 
 
 				interruptedCalls.delete(toolCallId);
 				const action = params.action ?? "start";
+    if(params.projectRoot!==undefined && !(action==="start" || action==="agents" || action==="load" && params.id===undefined))return result("projectRoot is only valid for start, source-only load, or agents; existing runs keep their stored project root.",undefined,true);
     if(action!=="start"&&params.todoBinding!==undefined)return result("todoBinding is only valid for action=start.",undefined,true);
 
     if(action==="start"){
      const frozenParams=structuredClone(params);
-     const sessionId=trustedSessionId(ctx),generation=uiGeneration,manager=ctx.sessionManager;
+     const sessionId=trustedSessionId(ctx),generation=uiGeneration,manager=ctx.sessionManager,parentCwd=ctx.cwd;
      const branch=hasPlanManager(manager)?manager.getBranch().map((e:any)=>JSON.stringify(e.id??[e.type,e.customType,e.data])):[];
      const existing=startExecutions.get(toolCallId);
-     const signature=JSON.stringify({sessionId,sessionFile:manager.getSessionFile?.(),generation,branch:existing?.branch??branch,cwd:ctx.cwd,spec:frozenParams.spec,capsule:frozenParams.capsule,template:frozenParams.template,overrides:frozenParams.overrides,todoBinding:frozenParams.todoBinding});
+     const signature=JSON.stringify({sessionId,sessionFile:manager.getSessionFile?.(),generation,branch:existing?.branch??branch,cwd:parentCwd,projectRoot:frozenParams.projectRoot,spec:frozenParams.spec,capsule:frozenParams.capsule,template:frozenParams.template,overrides:frozenParams.overrides,todoBinding:frozenParams.todoBinding});
      if(existing){if(existing.signature!==signature||!existing.branch.every((id,i)=>branch[i]===id))return result("A graph start toolCallId cannot be reused with a different graph source, binding or session/branch scope. Inspect the original receipt; do not relaunch.",undefined,true);return await existing.promise;}
      const promise=Promise.resolve().then(async()=>{
-      let started:any,binding:TodoBinding|undefined,view:TodoView|undefined,bindingState='not_requested',stopRequested=false;
+      let started:any,projectRoot:string|undefined,binding:TodoBinding|undefined,view:TodoView|undefined,bindingState='not_requested',stopRequested=false;
       const scopeCheck=()=>{const now=hasPlanManager(manager)?manager.getBranch().map((e:any)=>JSON.stringify(e.id??[e.type,e.customType,e.data])):[];if(generation!==uiGeneration||trustedSessionId(ctx)!==sessionId||!branch.every((id,i)=>now[i]===id))throw Error('Session/branch changed during graph start');if(signal?.aborted)throw Error('Graph start call aborted');};
       const fence=hasPlanManager(manager)?todoController.fence(manager,frozenParams.todoBinding!==undefined):undefined;
       const check=()=>{scopeCheck();fence?.assert();};
@@ -1855,10 +1879,11 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
        const validateSource=(spec:{nodes:readonly any[]})=>{check();if(binding)validateBindingNodes(binding,view!,spec.nodes);};
        // Validate inline bindings before even consulting the model registry/preflight.
        if(frozenParams.spec&&binding)validateSource(frozenParams.spec as GraphSpecV3);
-       const source=await sourceSpecV3(frozenParams,ctx.cwd,{...bindingOptionsFromContextV3(ctx,config.allowTemporaryAgent),parentToolAllowlist:parentTools()},validateSource);check();
+       const project=await graphProjectScopeV3(frozenParams.projectRoot,parentCwd);check();projectRoot=project.explicit?project.cwd:undefined;
+       const source=await sourceSpecV3(frozenParams,project.cwd,{...bindingOptionsFromContextV3(ctx,config.allowTemporaryAgent),cwd:project.cwd,parentToolAllowlist:parentTools()},validateSource);check();await project.assertUnchanged();check();
        const compiled=compileGraphSpecV3(source.spec);if(binding)validateBindingNodes(binding,view!,compiled.nodes);check();
        const current={config,host:ensureHost(config,sessionId,manager.getSessionFile?.())};check();
-       started=await current.host.start(source.spec,ctx.cwd);
+       await project.assertUnchanged();check();started=await current.host.start(source.spec,project.cwd);
        if(generation===uiGeneration){interruptGraphs.add(started.snapshot.graphId);if(signal?.aborted&&escapedTurn){started.snapshot=await stopAssociatedGraph(started.snapshot.graphId,current.host);stopRequested=true;}}
        check();
        if(binding){
@@ -1871,12 +1896,12 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
        scopeCheck();const acceptedSnapshot=updateNativeGraphUi(started.snapshot,{preserveExistingOnTie:true});interruptGraphs.add(acceptedSnapshot.graphId);
        const text=await graphStatusTextV3(acceptedSnapshot,current.config.runsDir);scopeCheck();
        const reminder=!binding&&view?.items.some(i=>i.derivedStatus!=='done')?'Current plan has unfinished items; this start omitted todoBinding and did not change that plan. Use graph_todo list; only link if relevant to the confirmed goal.':undefined;
-       const receipt=startReceipt(`Graph accepted for asynchronous V3 execution.\n${text}${reminder?'\n'+reminder:''}`,{...acceptedSnapshot,runDir:started.runDir,snapshot:acceptedSnapshot,graph:graphCompileDetailsV3(started.graph),routingAdmission:source.routingAdmission,todoBinding:{state:bindingState,...(binding?{expectedRevision:binding.expectedRevision,bindings:binding.bindings}:{}),...(reminder?{reminder}:{})},...(source.capsule?{capsule:source.capsule}:{})});onUpdate?.(receipt);return receipt;
+       const receipt=startReceipt(`Graph accepted for asynchronous V3 execution.${projectRoot?`\nProject: ${safeText(projectRoot)}`:""}\n${text}${reminder?'\n'+reminder:''}`,{...acceptedSnapshot,...(projectRoot?{projectRoot}:{}),runDir:started.runDir,snapshot:acceptedSnapshot,graph:graphCompileDetailsV3(started.graph),routingAdmission:source.routingAdmission,todoBinding:{state:bindingState,...(binding?{expectedRevision:binding.expectedRevision,bindings:binding.bindings}:{}),...(reminder?{reminder}:{})},...(source.capsule?{capsule:source.capsule}:{})});onUpdate?.(receipt);return receipt;
       }catch(error){
        if(!started)throw error;
        // The Graph store has already committed. Never disguise this as zero side effects,
        // write a new branch, retry append/start, or stop the independent run automatically.
-       return startReceipt(`Graph 已启动${stopRequested?'，已提交用户 Escape 停止请求，是否退出以状态/证据为准':''}；计划关联${bindingState==='confirmed'?'已确认，但后续回执未完成':'未确认'}。不要重新派发。先 graph status/result 与 graph_todo list 只读核对，再按真实运行身份人工修复。\n${safeText(error instanceof Error?error.message:error).slice(0,500)}`,{started:true,stopRequested,graphId:started.snapshot.graphId,runInstanceId:started.snapshot.runInstanceId,runDir:started.runDir,snapshot:started.snapshot,todoBinding:{state:bindingState==='confirmed'?'confirmed':'unconfirmed',...(binding?{bindings:binding.bindings}:{}),diagnostic:safeText(error instanceof Error?error.message:error).slice(0,500)}});
+       return startReceipt(`Graph 已启动${stopRequested?'，已提交用户 Escape 停止请求，是否退出以状态/证据为准':''}；计划关联${bindingState==='confirmed'?'已确认，但后续回执未完成':'未确认'}。不要重新派发。先 graph status/result 与 graph_todo list 只读核对，再按真实运行身份人工修复。\n${safeText(error instanceof Error?error.message:error).slice(0,500)}`,{started:true,...(projectRoot?{projectRoot}:{}),stopRequested,graphId:started.snapshot.graphId,runInstanceId:started.snapshot.runInstanceId,runDir:started.runDir,snapshot:started.snapshot,todoBinding:{state:bindingState==='confirmed'?'confirmed':'unconfirmed',...(binding?{bindings:binding.bindings}:{}),diagnostic:safeText(error instanceof Error?error.message:error).slice(0,500)}});
       }
      });
      startExecutions.set(toolCallId,{signature,branch,promise});return await promise;
@@ -1890,17 +1915,20 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					return result(lines.join("\n"), { templates });
 				}
 				if (action === "agents") {
+     const project=await graphProjectScopeV3(params.projectRoot,ctx.cwd);
 					const [agents, capabilities] = await Promise.all([
-						listProjectAgentsV3(ctx.cwd),
+						listProjectAgentsV3(project.cwd),
 						listCapabilityBindingsV3(),
 					]);
+					await project.assertUnchanged();
 					const capabilityLines = capabilities?.entries.length
 						? ["Capability bindings:", ...capabilities.entries.map((entry) => `  ${entry.capabilityId} → ${entry.agent}`)]
 						: ["Capability bindings: no shared subagent-capabilities.json found."];
 					const agentLines = agents.length
 						? ["Project Agents (.pi/agents):", ...agents.map((agent) => `  ${agent.name} — ${agent.description}${agent.aliases?.length ? ` (aliases: ${agent.aliases.join(", ")})` : ""}`)]
 						: ["Project Agents (.pi/agents): none."];
-					return result([...capabilityLines, "", ...agentLines].join("\n"), {
+					return result([...(project.explicit?[`Project: ${safeText(project.cwd)}`, ""]:[]),...capabilityLines, "", ...agentLines].join("\n"), {
+      ...(project.explicit?{projectRoot:project.cwd}:{}),
 						scope: { capabilities: "subagent-capabilities.json", projectAgents: ".pi/agents" },
 						...(capabilities ? { capabilities } : {}),
 						agents,
@@ -1912,9 +1940,12 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 					}
 					if (params.id === undefined) {
 						const config = await loadV3GraphConfig();
-						const source = await sourceSpecV3(params, ctx.cwd, { ...bindingOptionsFromContextV3(ctx, config.allowTemporaryAgent), parentToolAllowlist: parentTools() });
+						const project=await graphProjectScopeV3(params.projectRoot,ctx.cwd);
+						const source = await sourceSpecV3(params, project.cwd, { ...bindingOptionsFromContextV3(ctx, config.allowTemporaryAgent), cwd:project.cwd,parentToolAllowlist: parentTools() });
+      await project.assertUnchanged();
 						const graph = compileGraphSpecV3(source.spec);
-					return result(`GraphSpec V3 compiled without execution.\n${graphCompileTextV3(graph)}`, {
+					return result(`GraphSpec V3 compiled without execution.${project.explicit?`\nProject: ${safeText(project.cwd)}`:""}\n${graphCompileTextV3(graph)}`, {
+      ...(project.explicit?{projectRoot:project.cwd}:{}),
 							status: "loaded",
 							revision: 0,
 							sealed: (graph.mode ?? "sealed") === "sealed",
@@ -2001,14 +2032,18 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
      return result(JSON.stringify(page),{graphId:params.id,requestCount:page.requestCount,nextOffset:page.nextOffset,readOnlySnapshot:true});
     }
     if(action === "result") {
-     let page;
+     let page;let observedResult:ReturnType<typeof wakeObservation>|undefined;
      if(params.node){page=await readGraphResult(current.config.runsDir,params.id,params.node,params.attempt,params.offset,params.limit,params.expectedSha256);}
      else {
       const snapshot=await current.host.status(params.id),runDir=current.host.runDirFor(params.id),raw=(await safeBytes(runDir,"snapshot.json")).toString("utf8"),persisted=validateGraphSnapshotV3(JSON.parse(raw));
       if(persisted.graphId!==params.id||persisted.runInstanceId!==snapshot.runInstanceId||persisted.sessionId!==snapshot.sessionId||persisted.graphDigest!==snapshot.graphDigest)throw new Error("Result snapshot identity mismatch");
+      observedResult=wakeObservation(persisted);
       page=attentionPages.readSnapshot({graphId:snapshot.graphId,runInstanceId:snapshot.runInstanceId,ownerSessionId:snapshot.sessionId,readerSessionId:trustedSessionId(ctx),readerSessionFile:ctx.sessionManager.getSessionFile(),runDir,authorization:snapshot.sessionId===trustedSessionId(ctx)?"owner":"readonly"},raw,params.offset,params.limit,params.expectedSha256);
      }
-     return result(JSON.stringify(page),{graphId:params.id,source:page.source,sha256:page.sha256,nextOffset:page.nextOffset});
+     const receipt=result(JSON.stringify(page),{graphId:params.id,source:page.source,sha256:page.sha256,nextOffset:page.nextOffset});
+     // A node/page read is not evidence that the parent received the entire Graph observation.
+     if(wakeReadGeneration===uiGeneration&&observedResult&&observedResult.sessionId===trustedSessionId(ctx)&&!signal?.aborted&&(params.offset??0)===0&&page.nextOffset==null)parentWake.observe(toolCallId,observedResult);
+     return receipt;
     }
     if (action === "wait") {
      const waitingGeneration = uiGeneration;
@@ -2061,7 +2096,8 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
       }
      }
      const receipt=await graphWaitResultV3(params.id, outcome, current.config.runsDir, summarizeMainSession(ctx.sessionManager),{signal});
-     if (!signal?.aborted && (outcome.reason==="graph_settled"||outcome.reason==="attention_required") && outcome.snapshot && host===current.host && waitingGeneration===uiGeneration && outcome.snapshot.sessionId===trustedSessionId(ctx)) wakeFingerprints.set(params.id,wakeFingerprint(outcome.snapshot));
+     const returnedSnapshot=receipt.details&&typeof receipt.details==="object"?receiptSnapshots.get(receipt.details):undefined;
+     if (!signal?.aborted && !receipt.isError && (outcome.reason==="graph_settled"||outcome.reason==="attention_required") && returnedSnapshot && Object.keys(returnedSnapshot.nodes??{}).length<=6 && !(receipt.details as {waitEvidence?:{kind:string}})?.waitEvidence?.kind?.includes("observation_unavailable") && !receipt.content.some(part=>part.type==="text"&&part.text.includes("[Preview bounded;")) && host===current.host && waitingGeneration===uiGeneration && returnedSnapshot.sessionId===trustedSessionId(ctx)) parentWake.observe(toolCallId,wakeObservation(returnedSnapshot));
      return receipt;
      } finally {
       pendingWaits.delete(waitToken);
@@ -2118,7 +2154,9 @@ export default function piGraphExtension(pi: ExtensionAPI): void {
 				}
 				if (action === "status") {
 					const snapshot = updateReadGraphUi(await current.host.status(params.id));
-					return result(await graphStatusTextV3(snapshot, current.config.runsDir), { ...snapshot, snapshot });
+     const observation=wakeObservation(snapshot),receipt=result(await graphStatusTextV3(snapshot, current.config.runsDir), { ...snapshot, snapshot });
+     if(wakeReadGeneration===uiGeneration&&!signal?.aborted&&Object.keys(snapshot.nodes??{}).length<=6&&!receipt.content.some(part=>part.type==="text"&&part.text.includes("[Preview bounded;"))&&snapshot.sessionId===trustedSessionId(ctx))parentWake.observe(toolCallId,observation);
+     return receipt;
 				}
 				if (action === "stop") {
 					const snapshot = updateNativeGraphUi(await current.host.stop(params.id));

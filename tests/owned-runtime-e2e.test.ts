@@ -59,9 +59,9 @@ test('caller SDK params and environment cannot replace the trusted parent captur
  finally{if(previous===undefined)delete process.env.PI_GRAPH_HOST_SDK_ROOT;else process.env.PI_GRAPH_HOST_SDK_ROOT=previous;await f.close();}
 });
 test('failed host capture leaves no run directory and a repeated request does not become ambiguous',async()=>{
- const f=await fixture(),argv=process.argv[1];try{
-  process.argv[1]=join(f.root,'missing-host-cli');
+ const f=await fixture(),argv=process.argv[1],execPath=process.execPath;try{
+  process.argv[1]=join(f.root,'missing-host-cli');process.execPath=join(f.root,'missing-node');
   for(let n=0;n<2;n++)await assert.rejects(f.rpc.spawn(f.params,'host-missing'),/Cannot locate host Pi SDK/);
   assert.deepEqual(await readdir(join(f.root,'runtime/async-subagent-runs')).catch(()=>[]),[]);
- }finally{process.argv[1]=argv;await f.close();}
+ }finally{process.argv[1]=argv;process.execPath=execPath;await f.close();}
 });

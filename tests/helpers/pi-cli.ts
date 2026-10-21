@@ -1,12 +1,9 @@
-import { join,resolve,relative,isAbsolute } from "node:path";
-import { readFile } from "node:fs/promises";
 import { resolveHostSdkRoot } from "../../src/runtime/host-sdk.ts";
-
-// CLI fixtures follow the installed package entry rather than an obsolete path.
-const root=await resolveHostSdkRoot();
-const pkg=JSON.parse(await readFile(join(root,"package.json"),"utf8"));
-const entry=typeof pkg.bin==='string'?pkg.bin:pkg.bin?.pi;
-if(typeof entry!=='string')throw new Error("Installed Pi SDK has no CLI entry");
-const path=resolve(root,entry),fromRoot=relative(root,path);
-if(fromRoot.startsWith('..')||isAbsolute(fromRoot))throw new Error("Pi CLI entry escapes its SDK root");
-export const piCliPath=path;
+import { discoverTestPiFromPath, testCliFromRoot } from "./pi-cli-discovery.ts";
+// Production host discovery remains unchanged. Node test argv needs a separate, test-only installed CLI path.
+let root:string|undefined;
+try { root=await resolveHostSdkRoot(); }
+catch(error){if(!(error instanceof Error)||error.message!=="Cannot locate host Pi SDK; refuse extension-owned SDK fallback.")throw error;}
+const installed=root?await testCliFromRoot(root):await discoverTestPiFromPath();
+export const piCliPath=installed.cli;
+export const piCliIdentity=installed;

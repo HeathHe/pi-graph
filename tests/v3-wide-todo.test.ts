@@ -117,7 +117,7 @@ test("folded group keeps a summary of hidden exceptions with an accurate count; 
  assert.match(out,/▸ #1 验证与交付 已完成 0\/4 · 失败 1 · 待处理 1 · 执行中 2/,"folded group row keeps the mutually exclusive rollup, exceptions leading");
  assert.match(out,/⚠ #1\.3 独立审查 · 失败 · 等 2 项需关注 · 组内 4 项已折叠 · Alt\+Shift\+T 详情/,"real exceptions keep an accurate folded count");
  assert.equal([...out.matchAll(/⚠/g)].length,1,"healthy running leaves are never listed as ⚠ exceptions");
- assert.doesNotMatch(out,/联调核对|回归核对/,"healthy hidden running work stays in the rollup counts, not the alert");
+ assert.doesNotMatch(out.split("\n").filter((line:string)=>line.includes("⚠")).join(""),/联调核对|回归核对/,"healthy current work is not mislabeled as a folded exception");assert.match(out,/当前执行/);
  assert.match(out,/#2 就绪 组外任务/,"numbering outside the folded group is unchanged");
  assert.equal(JSON.stringify(inp),before);
  // Without exception work a folded group needs no summary row, but the rollup stays.
@@ -284,7 +284,7 @@ test("existing operations survive in the new layout: Alt+T toggle hint, Alt+Shif
  const g2=snap("g-keys2",{a:node("running",{observation:{actualAgent:"qa",actualModel:"fixture/M1",supervision:activeSupervision()}}),b:node("queued",{})});
  const two=input({snapshots:[g2],plan:{revision:1,items:[item("p1","一",{status:"in_progress",derivedStatus:"in_progress",links:[link("g-keys2","a")]}),item("p2","二",{links:[link("g-keys2","b")]})],persistence:"memory"},expanded:true});
  const single=todoText(terminalStack(two,80,7,{...theme}));
- assert.match(single,/另1项 · Alt\+R/,"the single cramped row carries the one accurate count and the detail entry");
+ assert.match(single,/当前 #01 运行 一/);assert.match(single,/@qa · fixture\/M1 Alt\+R/);assert.equal(terminalStack(two,80,7,theme).todo.length,1);assert.equal(stackTasks(two).length,2);
 });
 
 test("completed titles are never struck through, even when the theme offers strikethrough",()=>{
@@ -322,7 +322,7 @@ test("folded group surfaces completed-with-doubt as a real exception: rollup, cr
   assert.match(folded,/⚠ #1\.2 存疑完成/,`the doubt leaf keeps a real ⚠ exception summary at w${w}`);
   assert.match(folded,/组内 3 项已折叠 · Alt\+Shift\+T 详情/,`accurate folded count with the detail entry at w${w}`);
   assert.equal([...folded.matchAll(/⚠/g)].length,1,`healthy running is never flagged ⚠ at w${w}`);
-  assert.doesNotMatch(folded,/健康执行/,`healthy hidden running work is not listed as an exception at w${w}`);
+  assert.doesNotMatch(folded.split("\n").filter((line:string)=>line.includes("⚠")).join(""),/健康执行/,`healthy current work is not an exception at w${w}`);assert.match(folded,/当前执行/);
  }
  // Narrow: the summary and rollup truncate gracefully but the exception itself is never dropped.
  const narrow=todoText(terminalStack(inp,45,40,theme));
@@ -330,7 +330,7 @@ test("folded group surfaces completed-with-doubt as a real exception: rollup, cr
  assert.match(narrow,/⚠ #1\.2 存疑完成/);
  assert.match(narrow,/其中待核/,"the doubt annotation keeps a recognizable share at w45");
  assert.equal([...narrow.matchAll(/⚠/g)].length,1);
- assert.doesNotMatch(narrow,/健康执行/);
+ assert.doesNotMatch(narrow.split("\n").filter((line:string)=>line.includes("⚠")).join(""),/健康执行/);
  assert.equal(JSON.stringify(inp),before);
 });
 
@@ -482,4 +482,20 @@ test("未执行 with an uncertain dependency counts once in the inactive bucket;
  assert.match(todo,/#02 未执行 下游未执行/);
  assert.match(todo,/另有依赖待核实/,"the uncertainty cause keeps its own visible row");
  assert.equal(JSON.stringify(inp),before);
+});
+test('inactive classification requires every exact linked node to be inactive; mixed and unverified leaves retain risk',()=>{
+ for(const variant of ['running','prepared','manual','missing','wrong-run']){
+  const g=snap('g-mixed',{a:node('blocked',{dependsOn:['ghost']}),b:node(variant==='running'?'running':'prepared',{observation:{actualAgent:'worker',actualModel:'fixture/M',supervision:activeSupervision()}})});
+  const refs=variant==='manual'?[link('g-mixed','a')]:[link('g-mixed','a'),variant==='missing'?link('g-mixed','absent'):variant==='wrong-run'?{...link('g-mixed','b'),runInstanceId:'foreign'}:link('g-mixed','b')];
+  const leaf=item('mixed','混合关联',{status:variant==='manual'?'blocked':'pending',derivedStatus:'blocked',links:refs});
+  const inp=input({snapshots:[g],plan:{revision:1,items:[leaf],persistence:'memory'}}),before=JSON.stringify(inp);
+  const t=stackTasks(inp)[0];assert.notEqual(t.label,'未执行',variant);assert.equal(t.tone,'warning',variant);assert.equal(leafStatusStats([t]).inactive,0,variant);assert.equal(JSON.stringify(inp),before);
+ }
+});
+
+
+test('mixed blocked and accepted identities do not imply the whole leaf never executed',()=>{
+ const g=snap('g-accepted-mixed',{root:node('failed'),blocked:node('blocked',{dependsOn:['root']}),accepted:node('accepted')});
+ const inp=input({snapshots:[g],plan:{revision:1,items:[item('root','真实失败',{links:[link(g.graphId,'root')]}),item('mixed','部分已执行',{derivedStatus:'blocked',dependsOn:['root'],links:[link(g.graphId,'blocked'),link(g.graphId,'accepted')]})],persistence:'memory'}}),before=JSON.stringify(inp);
+ const tasks=stackTasks(inp),t=tasks[1];assert.equal(tasks[0].tone,'error');assert.equal(t.label,'待处理');assert.equal(t.tone,'warning');assert.match(t.tail,/前置 #01 失败/);assert.equal(t.failedNumbers,undefined);const stats=leafStatusStats(tasks);assert.equal(stats.inactive,0);assert.equal(stats.attention,1);assert.equal(stats.failed,1);assert.equal(JSON.stringify(inp),before);
 });

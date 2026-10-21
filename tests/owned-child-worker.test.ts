@@ -70,7 +70,7 @@ test('unsupported frozen thinking rejects before provider activity',async()=>{
 });
 
 
-test('current actual SDK handles coalesced Graph wake as followUp while the parent is busy',async()=>{
+test('current actual SDK keeps busy Graph notifications outside followUp and consumes a returned observation',async()=>{
  const {openOwnedChild}=await import('../src/runtime/child-session.ts');const {GraphParentWake}=await import('../src/runtime/background-work.ts');
  const old=process.env.NODE_ENV;process.env.NODE_ENV='test';const dir=await mkdtemp(join(tmpdir(),'owned-busy-wake-'));const cwd=join(dir,'work');await mkdir(cwd);
  let unblock!:()=>void;let entered!:()=>void;const gate=new Promise<void>(r=>unblock=r),started=new Promise<void>(r=>entered=r);let child:any;
@@ -78,10 +78,12 @@ test('current actual SDK handles coalesced Graph wake as followUp while the pare
   child=await openOwnedChild({hostSdkIdentity:await captureHostSdkIdentity(),version:1,runId:'busy',asyncDir:dir,runnerProcessInstanceId:'busy-instance',sessionId:'parent',params:{cwd,task:'Fixture'},agent:{name:'fixture'},launchContract:{inheritSkills:false,inheritProjectContext:false,inheritGlobalContext:false,tools:{effectiveAllowlist:[],extensionArgs:[]}}},()=>{},'success');
   const original=child.session.agent.streamFunction;let calls=0;child.session.agent.streamFunction=async(...args:any[])=>{if(calls++===0){entered();await gate;}return original(...args);};
   const prompt=child.session.prompt('Parent work');await started;
-  let notifications=0;const scheduled:Promise<void>[]=[];const wake=new GraphParentWake({sendMessage(_msg:any,options:any){assert.equal(options.triggerTurn,false);notifications++;},sendUserMessage(text:string,options:any){assert.equal(options.deliverAs,'followUp');scheduled.push(child.session.followUp(text));}});
-  wake.bind({sessionManager:child.session.sessionManager});wake.notify('one');wake.notify('two');wake.notify('three');
-  await Promise.all(scheduled);assert.equal(notifications,3);assert.equal(child.session.getFollowUpMessages().length,1);
-  unblock();await prompt;await child.session.waitForIdle();assert.equal(child.session.pendingMessageCount,0);assert.equal(calls,2);
+  let notifications=0;const wake=new GraphParentWake({sendMessage(){notifications++;},sendUserMessage(){throw Error('Consumed busy notification must not request another turn');},appendEntry(type:string,data:any){child.session.sessionManager.appendCustomEntry(type,data);}});
+  const observation={sessionId:child.session.sessionManager.getSessionId(),graphId:'fixture',runInstanceId:'run',fingerprint:'f'.repeat(64)};
+  wake.bind({sessionManager:child.session.sessionManager,isIdle:()=>!child.session.isStreaming,hasPendingMessages:()=>child.session.pendingMessageCount>0});wake.started();wake.notify('one',observation);wake.notify('two',observation);wake.notify('three',observation);
+  assert.equal(notifications,0);assert.equal(child.session.getFollowUpMessages().length,0);
+  wake.observe('fixture-read',observation);wake.toolFinished('fixture-read',false);unblock();await prompt;await child.session.waitForIdle();wake.messageEnded({role:'assistant',stopReason:'stop',content:[{type:'text',text:'Fixture result integrated'}]});wake.beforeSettle('completed');wake.settled(false);assert.equal(child.session.pendingMessageCount,0);assert.equal(calls,1);
+
  }finally{unblock();await child?.shutdown();if(old===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=old;await rm(dir,{recursive:true,force:true});}
 });
 

@@ -89,7 +89,7 @@ for(const phase of ["running","failed","blocked","waiting_user","accepted","unkn
   if(phase!=="accepted")assert.match(reason,/active/);
   if(phase==="failed")assert.match(reason,/失败|未通过/);
   if(phase==="blocked")assert.match(reason,/未执行|受阻|阻塞/);
-  if(phase==="waiting_user")assert.match(reason,/等待用户/);
+  if(phase==="waiting_user")assert.match(reason,/待主 Agent 决策/);
   if(phase==="accepted")assert.match(text,/待调度|等待调度/);
  }finally{panel.dispose();}
 });}
@@ -180,7 +180,7 @@ test("queued Inspector detail contains waiting reason without an activity placeh
 test("registered tasks/agents/plan linked-detail roundtrip preserves tabs and cancelled history selection",async()=>{
  const root=await mkdtemp(join(tmpdir(),"graph-cockpit-tabs-")),home=join(root,"agent"),s=snapshot();await mkdir(home);await mkdir(join(root,s.graphId));await writeFile(join(root,s.graphId,"snapshot.json"),JSON.stringify(s));await writeFile(join(home,"settings.json"),JSON.stringify({graph:{enabled:true,runsDir:root}}));
  const old=process.env.PI_CODING_AGENT_DIR;process.env.PI_CODING_AGENT_DIR=home;const commands=new Map<string,any>(),tools=new Map<string,any>(),entries:any[]=[];let writes=0;
- try{register({events:{on(){return()=>{};},emit(){throw Error("unexpected runtime call");}},on(){},registerTool(t:any){tools.set(t.name,t);},registerCommand(name:string,c:any){commands.set(name,c);},appendEntry(customType:string,data:any){writes++;entries.push({type:"custom",customType,data});}});
+ try{register({events:{on(){return()=>{};},emit(){throw Error("unexpected runtime call");}},on(){},registerTool(t:any){tools.set(t.name,t);},registerCommand(name:string,c:any){commands.set(name,c);},appendEntry(customType:string,data:any){writes++;entries.push({id:`entry-${entries.length+1}`,type:"custom",customType,data});}});
  const capture=interactionUiCapture([["a","g"],["p"],["\r","\r"],["\x1b"],["q"]]);capture.ui.select=async()=>undefined;capture.ui.theme=theme;
  const ctx:any={mode:"tui",cwd:root,sessionManager:{getSessionId:()=>"session-a",getSessionFile:()=>undefined,getEntries:()=>entries,getBranch:()=>entries},ui:capture.ui};
  await tools.get("graph_todo").execute("set",{action:"set",expectedRevision:0,items:[{id:"goal",title:"独立总目标",status:"pending",links:[{graphId:s.graphId,runInstanceId:s.runInstanceId,taskId:"active"}]}]},undefined,undefined,ctx);

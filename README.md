@@ -132,6 +132,26 @@ PI_CODING_AGENT_DIR="$release_agent_dir" pi -e /absolute/path/to/node_modules/pi
 
 中止这次工具调用只会停止 watching；Graph 继续在后台运行。真正停止执行必须显式调用 `stop`。
 
+## 同一会话协调多个项目
+
+`graph` 的外层可选 `projectRoot` 可为新 Graph 选择用户已授权的项目目录，支持绝对路径，或相对于当前会话目录的路径。不传时沿用当前会话目录。它也适用于 `agents` 和仅编译源的 `load`（`spec`、`capsule` 或 `template`）。回执显示规范化后的实际项目路径。
+
+每个 Graph 仍只绑定一个项目；它不会更改主会话目录、扩大主会话工具权限或自动授予目录授权。已有 Graph 的 `load`（按 `id`）、`wait`、`status`、`retry`、`resume`、`append` 等操作不能传入 `projectRoot`，始终使用已保存的项目。`readScope`、`writeScope`、胶囊相对路径及项目 Agent 均基于选中的项目；原有路径隔离与校验照常执行。
+
+例如，同一会话先建立 Todo：`A 项目检查` → `B 项目修改`，然后分别提交两个 Graph（使用不同 `graphId`）：
+
+```json
+{"action":"start","projectRoot":"/authorized/project-a","spec":{"schemaVersion":3,"graphId":"check-a","goal":"检查 A","nodes":[{"taskId":"check","agent":"generalist","task":"只读检查授权范围","sideEffect":"none"}]}}
+```
+
+等待 A 真正验收完成，读取结果并更新或关联 Todo 后，再提交 B：
+
+```json
+{"action":"start","projectRoot":"/authorized/project-b","spec":{"schemaVersion":3,"graphId":"change-b","goal":"处理 B 的授权工作","nodes":[{"taskId":"inspect","agent":"generalist","task":"根据已核对的结论检查 B","sideEffect":"none"}]}}
+```
+
+示例 Agent 须在对应项目或用户 Agent 中真实存在；写操作仍需明确范围和验证命令。Todo 协调多个 Graph 的进度，不会自动把它们变成跨项目 DAG，也不会自动传送产物。需要物料时，先核对并显式准备目标项目内的输入，不跨根绕过隔离保护。
+
 ## 分层总计划
 
 一个总目标写在 `graph_todo set.goal`。任务仍以一个 flat `items` 数组保存，使用可选 `parentId` 明确父子关系；不从标题、旧聊天或现有 Graph 自动猜分组。最多 **8 层任务项、128 项（含分组）**，总目标本身不计层数。旧的 flat 计划保持原样。
@@ -152,9 +172,9 @@ PI_CODING_AGENT_DIR="$release_agent_dir" pi -e /absolute/path/to/node_modules/pi
 
 `update` 省略 `parentId` 保持位置；字符串明确移动；`parentId:null` 明确移到根（记录中移除此字段）。不能把已有 Graph 关联或执行状态的叶静默改成分组，也不能用 `update` 把分组最后一个子项移走留下空组。需要整体调整时用 `set` 明确重建并去掉空父项：它仍是新的计划周期，旧记录保留为历史，不能冒充旧任务已完成。
 
-原生终端按实际可用宽度自适应显示树、稳定编号和编号旁状态。标题置左，项目、Agent 与实际模型在空间充足时同排靠右；窄屏先完整换行标题，再把身份信息靠右显示。完成项保持原位置、正常字体，不自动折叠；空间不足优先保留活跃项和真实异常，并提供详情入口。不会用计划模型冒充实际模型。
+原生终端按实际可用宽度显示树、稳定编号和编号旁状态。标题在左，已观测项目、Agent 与实际模型在空间充足时同排靠右；窄屏先换行标题，再显示身份。完成项保持原位置与真实完成状态，不自动按旧观察顺序收起。总览之后固定显示当前执行任务；空间不足优先保当前身份与真实风险，并提供更多项目和详情入口，不用计划模型冒充实际模型。
 
-`Alt+T` 控制整体展开/收起，`Alt+Shift+T` 打开总计划详情；详情中的分组收展只改变界面，不修改计划记录或重新派发任务。
+`Alt+T` 控制整体展开/收起；`Alt+Shift+T` 打开总计划详情。分组收展只改变界面，不修改计划记录或重新派发。Inspector 中 `c` 仅隐藏/显示本面板的完成项，不改变底部任务状态；`h` 查看生命周期历史，`v` 恢复当前计划显示。输入草稿与原快捷键保留。
 
 记录沿用 `pi-graph-todo/1` 与 `version:1`，新增字段为可选。新版本读取旧 flat 记录无需迁移；**旧二进制不能读取含 `parentId` 的新树记录**，会按严格校验显示计划待核实，不会静默退回旧完成状态。降级前应使用支持树结构的版本查看与整理计划。
 
@@ -1203,3 +1223,18 @@ The Todo widget expands into readable task rows by default. Verified authorizati
 新准入的 continuation-v1 多候选任务冻结 `transientRetryLimit: 1`：整个 logical run 遇到明确的 assistant 请求超时或连接中断，只有会话已闲置、工具调用与结果完整配对、没有排队/晚到事件、用量已知且权限/部署/模型身份不变时，最多发送一次短继续消息。沿用同一会话、模型与思考级别，保留已完成工具记录，不重派原任务。额外请求计入原 token/cost/turn 预算；持久化预留后即消耗次数，停止或进程崩溃不退还，后续合法模型切换/checkpoint 不重置次数。SDK 内置重试仍关闭。
 
 旧冻结计划未声明该策略时默认不启用；单候选、关闭备用的旧执行路径不自动获得续接能力。已经失败退出的历史 Graph 不迁移、不重跑；工具结果不明、进程异常退出、用户停止、权限或硬预算失败仍拒绝。此功能不保证上游服务不再超时，也不承诺外部副作用恰好一次；重复工具 ID 在执行前拒绝，未知结果不能据此重试。
+
+
+### TODO 生命周期与历史义务
+
+`graph_todo` 的原 v1 计划仍兼容。`list` 返回当前义务与有界历史摘要；`history` 支持 `offset`、`limit`（最多 8 个旧计划）并返回 `nextOffset`，完整旧项不会每轮注入上下文。计划和生命周期使用各自的 revision，操作只写 Pi 原生会话元信息，不修改 Graph 的验收、权限或进程。
+
+`lifecycle` 入口使用 `planEntryId`、`expectedRevision`、`expectedLifecycleRevision`；`show/hide` 只管显示，`defer/not_needed/restore` 配合叶 ID 与原因调整当前归属；`replace` 使用 list/history 返回的旧、新叶引用及 `identityDigest`，只有同一运行/attempt 的新验收覆盖成立才将原义务移到历史。新失败、未知写入效果、仍待执行的关联任务不会被接替或隐藏洗成成功。`restore` 撤销该叶的范围结论和接替关系，不重跑任务。
+
+普通成功不要求逐项确认：本轮成功工具回执所观察的完整当前义务，在非空最终正文正常结束后重新核对一致，才记为交付并隐藏本目标；其他目标、未关联执行和未知风险仍保留入口。未交付的失败、受阻和待核实任务默认保留当前列表，Alt+T 仍可展开；只有明确 `hide` 或 `explain` 收起意图才使用摘要，普通问题计数不会自动隐藏任务。只有明确的 `explain` 原因意图及该工具成功返回、正常正文交付才记为已说明，已说明不等于已解决。`explain` 仅支持当前目标，历史目标会在写入前拒绝，需先明确整理当前目标。Inspector 的 `h` 查看历史摘要，`v` 恢复当前计划显示；工具 `show` 可同样恢复。旧计划不会根据标题或新任务成功自动推断接替。
+
+Lifecycle metadata is branch-scoped and separate from Graph facts. A successful, nonempty final response can acknowledge an exact successful plan observation; it cannot authorize retries or accept unknown side effects. History, scope changes and replacement are explicit, reversible metadata operations. Inspect `graph_todo history` for paged evidence and use lifecycle CAS revisions; hiding or cancelling an obligation never counts as successful execution.
+
+若原生生命周期追加抛错，显示保持“保存未确认”；重新打开原生会话后核对实际记录，不自动重放该写入。仅重新list不会解除当前实例的不确定保护。
+
+兼容边界：没有 `planId` 的旧 v1 记录仅按各自原生 entry 查看，不推断多个旧 revision 属于同一生命周期。需要长期接替/归属维护时，先显式 `set` 建立新计划周期，再精确关联旧义务；不会自动迁移旧聊天或永久继承无 ID 旧计划的归档状态。

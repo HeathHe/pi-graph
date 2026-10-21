@@ -14,7 +14,7 @@ export interface TodoSnapshot { version: 1; revision: number; updatedAt: string;
 export type TodoMutation = { action: "set"; expectedRevision: number; goal?:string; items: TodoItem[] } | { action: "update"; expectedRevision: number; id: string; title?: string; status?: TodoStatus; dependsOn?: string[]; assignee?: string; parentId?: string | null } | { action: "link"; expectedRevision: number; id: string; links: TodoLink[] };
 export interface TodoRollup { total: number; done: number; manualDone: number; running: number; waiting: number; blocked: number; unknown: number }
 export interface TodoViewItem extends TodoItem { derivedStatus: TodoStatus | "unknown"; source: "人工" | "Graph验收" | "分组汇总"; reason?: string; rollup?: TodoRollup }
-export interface TodoView { revision: number; planId?:string; goal?:string; items: TodoViewItem[]; persistence: "memory" | "durable" | "unconfirmed"; error?: string }
+export interface TodoView { lifecycle?: import("./todo-lifecycle.ts").LifecycleProjection & {history:Array<{planEntryId:string;planId?:string;goal?:string;items?:TodoViewItem[];observations?:import("./todo-lifecycle.ts").LeafObservation[];risks:string[];summary:string;delivered:boolean}>;historyOmitted:number;nextOffset:number|null}; revision: number; planId?:string; goal?:string; items: TodoViewItem[]; persistence: "memory" | "durable" | "unconfirmed"; error?: string }
 export type TodoManager = Pick<ExtensionContext["sessionManager"], "getSessionId" | "getSessionFile" | "getBranch" | "getEntries">;
 const statuses = new Set(["pending", "in_progress", "blocked", "done"]);
 function object(value: unknown, keys: string[]): Record<string, any> {

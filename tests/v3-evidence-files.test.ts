@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, realpath, writeFile, mkdir, symlink, link } from "node:fs/promises";
+import { mkdtemp, realpath, writeFile, readFile, mkdir, symlink, link } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistEvidenceFiles, verifyEvidenceFiles, parseBusinessResult, evidenceDirectory } from "../src/v3/evidence-files.ts";
@@ -31,4 +31,22 @@ test("explicit result and evidence schema fail closed",()=>{
  for (const evidenceFiles of [[{path:"../secret",nonSecret:true}],[{path:"/secret",nonSecret:true}],[{path:"report"}],[{path:"report",nonSecret:false}],[{path:"report",nonSecret:true},{path:"report",nonSecret:true}]]) assert.throws(()=>compileGraphSpecV3({...base,nodes:[{...base.nodes[0],evidenceFiles}]}));
  for (const output of ["PASS",'```json\n{"status":"pass","reason":"ok"}\n```','{"status":"PASS","reason":"ok"}','{"status":"pass","reason":""}']) assert.throws(()=>parseBusinessResult(output));
  assert.deepEqual(parseBusinessResult('{"status":"blocked","reason":"missing proof"}'),{status:"blocked",reason:"missing proof"});
+});
+
+
+test("missing declared evidence is typed only while its safe workspace root exists", async () => {
+ const f=await fixture();
+ for (const path of ["evidence/desktop.png", "missing.png"]) {
+  await assert.rejects(persistEvidenceFiles(f.run,"work",1,f.workspace,[{path,nonSecret:true}]), (error: unknown) => {
+   const value=error as Error & {path?:string;code?:string;cause?:NodeJS.ErrnoException};
+   assert.equal(value.name,"V3RequiredEvidenceMissingError");
+   assert.equal(value.code,"REQUIRED_EVIDENCE_MISSING");assert.equal(value.path,path);
+   assert.equal(value.cause?.code,"ENOENT");assert.match(value.message,/未生成必需验收文件/);return true;
+  });
+ }
+ await assert.rejects(readFile(join(f.workspace,"evidence/desktop.png")),{code:"ENOENT"});
+ const {rm}=await import("node:fs/promises");await rm(f.workspace,{recursive:true});
+ await assert.rejects(persistEvidenceFiles(f.run,"work",1,f.workspace,[{path:"evidence/desktop.png",nonSecret:true}]), (error:unknown)=>{
+  assert.equal((error as NodeJS.ErrnoException).code,"ENOENT");assert.notEqual((error as Error).name,"V3RequiredEvidenceMissingError");return true;
+ });
 });

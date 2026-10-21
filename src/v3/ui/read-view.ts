@@ -39,6 +39,7 @@ export async function enrichGraphView(snapshot: GraphSnapshotV3, runsDir: string
   const conditions: Record<string,GraphWhenV3> = {};
   for (const n of auth.graph.nodes) if (n.when) conditions[n.taskId] = { node: n.when.node, status: n.when.status };
   display.conditions=conditions;
+  display.sideEffects=Object.fromEntries(auth.graph.nodes.map(n=>[n.taskId,n.sideEffect]));
  } catch { /* No trustworthy authorization this read: keep only same-identity previously validated display evidence (goal, expected task ids, bound project). A successful identity-checked authorization above has already overwritten them, a different run/session/digest never inherits them, and the viewer's own cwd is never a substitute. */ }
  try {
   const control = await readV3RunControl(runDir);

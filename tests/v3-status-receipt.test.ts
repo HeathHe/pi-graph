@@ -13,7 +13,7 @@ test("native status tool frame separates following AssistantMessage and preserve
 });
 test("status observation retains waiting-user fail-fast and errors at narrow widths without claiming new completion",()=>{
  themes.initTheme("dark",false);const def=tool();for(const phase of ["needs_attention","failed","blocked","not_started","waiting_user"]){const s=snapshot();s.status="running";s.nodes.assess.phase=phase==="not_started"?"failed":phase==="waiting_user"?"running":phase;s.nodes.assess.observation.supervision={error:"Fixture evidence missing",...(phase==="waiting_user"?{attention:"waiting_user"}:{})};if(phase==="not_started")setDisplayEvidence(s,{failures:{assess:"Graph failed fast before this node started."},neverDispatched:new Set(["assess"])});
- const ctx={args:{action:"status"},state:{},toolCallId:phase,isError:false};const result={content:[{type:"text",text:"unaltered"}],details:{snapshot:s}};const text=def.renderResult(result,{expanded:false,isPartial:false},themes.theme,ctx).render(45).join("\n");assert.match(text,/系统回执/);assert.match(text,phase==="not_started"?/未启动/:phase==="waiting_user"?/等待用户/:/Fixture|前置/);assert.doesNotMatch(text,/agent-complete/);
+ const ctx={args:{action:"status"},state:{},toolCallId:phase,isError:false};const result={content:[{type:"text",text:"unaltered"}],details:{snapshot:s}};const text=def.renderResult(result,{expanded:false,isPartial:false},themes.theme,ctx).render(45).join("\n");assert.match(text,/系统回执/);assert.match(text,phase==="not_started"?/未启动/:phase==="waiting_user"?/待主 Agent 决策/:/Fixture|前置/);assert.doesNotMatch(text,/agent-complete/);
  }
 });
 

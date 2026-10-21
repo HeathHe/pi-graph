@@ -17,6 +17,8 @@ export interface DisplayEvidence {
  neverDispatched: Set<string>;
  /** Display-only authorized when-conditions, bound to the same run/session/digest identity as the rest of this evidence. Never written to snapshot, authorization, or execution state. */
  conditions?: Record<string,GraphWhenV3>;
+ /** Identity-checked authorization only; missing is unknown, never inferred from caller claims. */
+ sideEffects?: Record<string,string>;
  /** Display-only project name derived from the identity-checked authorization's sourceCwd (basename). Absent means unbound/unknown; never read from the current tool cwd. */
  project?: string;
  readError?: string;

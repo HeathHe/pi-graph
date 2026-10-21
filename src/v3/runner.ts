@@ -5,7 +5,7 @@ import { readNativeJson } from "./native-results.ts";
 import { GraphMailbox } from "./mailbox.ts";
 import { MailboxBroker } from "./mailbox-transport.ts";
 import { activeMailboxes, mailboxRegistryKey } from "./mailbox-runtime.ts";
-import { safeBytes, parseBusinessResult, persistEvidenceFiles, verifyEvidenceFiles, evidenceDirectory } from "./evidence-files.ts";
+import { safeBytes, parseBusinessResult, persistEvidenceFiles, verifyEvidenceFiles, evidenceDirectory, V3RequiredEvidenceMissingError } from "./evidence-files.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -862,6 +862,8 @@ export class V3GraphRunner {
 	private async handleFailure(node: CompiledGraphNodeV3, attempt: number, error: unknown, signal: AbortSignal): Promise<void> {
 		const failureError = error instanceof V3NodeFailureError
 			? error
+			: error instanceof V3RequiredEvidenceMissingError
+				? new V3NodeFailureError(node.taskId, attempt, "validation", error.message)
 			: error instanceof V3WorkspaceConflictError
 				? new V3NodeFailureError(node.taskId, attempt, "workspace_conflict", error.message)
 				: new V3NodeFailureError(node.taskId, attempt, "internal", error instanceof Error ? error.message : String(error));
