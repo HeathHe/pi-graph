@@ -1,0 +1,16 @@
+{
+  "name": "pi-graph-mcp-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./discovery": "./src/discovery.ts"
+  },
+  "dependencies": {},
+  "files": [
+    "src",
+    "LICENSE.upstream",
+    "PROVENANCE.json"
+  ]
+}

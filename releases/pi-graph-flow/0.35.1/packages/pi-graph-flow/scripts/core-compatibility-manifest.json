@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "patchId": "pi-core-0.5.91-native-owner-c13-r1",
+  "packageName": "maestro-flow",
+  "originalVersion": "0.5.91",
+  "metadataSHA256": "f9312b11c13016f5004f1079f3fad9c37c9b20486f8a8da087bc422ae5f91881",
+  "runtimePath": "dist/src/run/runtime.js",
+  "beforeSHA256": "48a9f33561cb875829599430be0caf64e0a99b9746565d64b17a6c3ad956383c",
+  "afterSHA256": "fdef1d770381e866f8c56454de884e90368cd120df9acb9d90089f7ce9b93ea1",
+  "payload": "runtime.js",
+  "license": "MIT",
+  "upstreamMetadataUnchanged": true,
+  "scope": "C12 native owner plus C13 native check diagnostics; dashboard runtime unchanged",
+  "provenance": {
+    "priorC12RuntimeSHA256": "d43c55f5b758f7c9c359c75dcc77c17691ca2a1f6f926c939050360a91848918",
+    "c13SourceReviewPacketSHA256": "6ca1325eab733fc3172a21eb5d44c3f1bb69f330b2b45d8587b4c9bd8becb69f",
+    "c12ProductDiffSHA256": "819940afe756e93f4b05dfe0e68ac4951ec1c911b295c2595f2b4471527de1d9"
+  },
+  "binPath": "bin/maestro.js",
+  "binSHA256": "5dfc317a1a1c16ad76933cbc5786a4d168fb6f1835ef660b9c9886389ba512cb"
+}

@@ -1,0 +1,278 @@
+/**
+ * MOA Pipeline Engine — executes a sequence of typed steps.
+ *
+ * Step types: reference, aggregate, transform, validate, loop.
+ * Variables are interpolated via {{name}} syntax from PipelineContext.
+ */
+import { agentLoop } from './agent-loop.js';
+import { createClient } from './llm.js';
+import { TOOL_SCHEMAS } from './tools.js';
+import { buildExplorePrompt } from './prompt-parser.js';
+import { computeCacheKey, readCache, writeCache } from './moa-cache.js';
+// ---------------------------------------------------------------------------
+// Variable interpolation
+// ---------------------------------------------------------------------------
+export function interpolate(template, ctx) {
+    return template.replace(/\{\{(\w+(?:\.\w+)*)\}\}/g, (_, key) => {
+        const parts = key.split('.');
+        if (parts[0] === 'step' && parts.length === 3 && parts[2] === 'output') {
+            return ctx.namedOutputs[parts[1]] ?? '';
+        }
+        if (key === 'query')
+            return ctx.query;
+        if (key === 'references')
+            return ctx.references;
+        if (key === 'lastOutput')
+            return ctx.lastOutput;
+        if (key === 'iteration')
+            return String(ctx.iteration);
+        if (key === 'supervisorFeedback')
+            return ctx.supervisorFeedback;
+        if (key === 'supervisorPass')
+            return String(ctx.supervisorPass);
+        return ctx.namedOutputs[key] ?? '';
+    });
+}
+// ---------------------------------------------------------------------------
+// Step executors
+// ---------------------------------------------------------------------------
+async function executeReference(step, ctx, params, stepIndex) {
+    const endpoints = step.endpoints
+        ? params.preset.referenceEndpoints.filter(ep => step.endpoints.includes(ep.name))
+        : params.preset.referenceEndpoints;
+    const prompt = step.prompt ? interpolate(step.prompt, ctx) : ctx.query;
+    const useTools = step.tools !== false;
+    const settled = await Promise.allSettled(endpoints.map(async (ep) => {
+        const start = Date.now();
+        if ((step.cache ?? params.cache) !== false) {
+            const key = computeCacheKey(prompt, params.cwd, ep.name, ep.llmConfig.model, stepIndex);
+            const cached = readCache(params.cwd, key, params.cacheTtlMs);
+            if (cached) {
+                params.onProgress?.(`[${stepIndex}] reference ${ep.name} — cache hit`);
+                return cached;
+            }
+        }
+        params.onProgress?.(`[${stepIndex}] reference ${ep.name}:${ep.llmConfig.model} — starting`);
+        try {
+            const { client, config } = createClient(ep.llmConfig);
+            const result = await agentLoop({
+                prompt: buildExplorePrompt(prompt),
+                systemPrompt: params.systemPrompt,
+                client,
+                llmConfig: config,
+                toolSchemas: useTools ? TOOL_SCHEMAS : [],
+                maxTurns: params.maxTurns,
+                cwd: params.cwd,
+                emitter: params.emitter,
+            });
+            params.onProgress?.(`[${stepIndex}] reference ${ep.name} — done`);
+            const output = {
+                endpointName: ep.name,
+                model: ep.llmConfig.model,
+                content: result.content,
+                durationMs: Date.now() - start,
+                usage: result.usage,
+            };
+            if ((step.cache ?? params.cache) !== false && output.content) {
+                writeCache(params.cwd, computeCacheKey(prompt, params.cwd, ep.name, ep.llmConfig.model, stepIndex), output, prompt, ep.name, ep.llmConfig.model, params.cacheTtlMs);
+            }
+            return output;
+        }
+        catch (err) {
+            params.onProgress?.(`[${stepIndex}] reference ${ep.name} — error`);
+            return {
+                endpointName: ep.name,
+                model: ep.llmConfig.model,
+                content: null,
+                error: err instanceof Error ? err.message : String(err),
+                durationMs: Date.now() - start,
+                usage: { inputTokens: 0, outputTokens: 0 },
+            };
+        }
+    }));
+    const refs = settled.map((s, i) => {
+        if (s.status === 'fulfilled')
+            return s.value;
+        const ep = endpoints[i];
+        return { endpointName: ep.name, model: ep.llmConfig.model, content: null, error: String(s.reason), durationMs: 0, usage: { inputTokens: 0, outputTokens: 0 } };
+    });
+    ctx.referenceOutputs = refs;
+    for (const ref of refs) {
+        ctx.totalUsage.references.push({ endpointName: ref.endpointName, model: ref.model, inputTokens: ref.usage.inputTokens, outputTokens: ref.usage.outputTokens });
+    }
+    const formatted = formatReferences(refs);
+    ctx.references = formatted;
+    storeOutput(ctx, step.as, formatted);
+}
+async function executeAggregate(step, ctx, params, stepIndex) {
+    const ep = step.endpoint
+        ? params.preset.referenceEndpoints.find(e => e.name === step.endpoint) ?? params.preset.aggregatorEndpoint
+        : params.preset.aggregatorEndpoint;
+    const prompt = step.prompt ? interpolate(step.prompt, ctx) : `${ctx.query}\n\n${ctx.references}`;
+    const useTools = step.tools !== false;
+    params.onProgress?.(`[${stepIndex}] aggregate ${ep.name} — starting`);
+    const result = await runSingleAgent(ep, prompt, useTools, params);
+    params.onProgress?.(`[${stepIndex}] aggregate ${ep.name} — done`);
+    ctx.totalUsage.aggregator = {
+        inputTokens: ctx.totalUsage.aggregator.inputTokens + result.usage.inputTokens,
+        outputTokens: ctx.totalUsage.aggregator.outputTokens + result.usage.outputTokens,
+    };
+    storeOutput(ctx, step.as, result.content);
+}
+function executeTransform(step, ctx, _stepIndex) {
+    const output = step.prompt ? interpolate(step.prompt, ctx) : ctx.lastOutput;
+    storeOutput(ctx, step.as, output);
+}
+async function executeValidate(step, ctx, params, stepIndex) {
+    const ep = step.endpoint
+        ? params.preset.referenceEndpoints.find(e => e.name === step.endpoint) ?? params.preset.aggregatorEndpoint
+        : params.preset.aggregatorEndpoint;
+    const prompt = step.prompt ? interpolate(step.prompt, ctx) : `Validate:\n${ctx.lastOutput}`;
+    const useTools = step.tools !== false;
+    params.onProgress?.(`[${stepIndex}] validate ${ep.name} — starting`);
+    const result = await runSingleAgent(ep, prompt, useTools, params);
+    params.onProgress?.(`[${stepIndex}] validate ${ep.name} — done`);
+    ctx.totalUsage.aggregator = {
+        inputTokens: ctx.totalUsage.aggregator.inputTokens + result.usage.inputTokens,
+        outputTokens: ctx.totalUsage.aggregator.outputTokens + result.usage.outputTokens,
+    };
+    storeOutput(ctx, step.as, result.content);
+}
+const SUPERVISOR_PROMPT_SUFFIX = `\n\nRespond with your verdict on the FIRST line: exactly "PASS" or "FAIL".\nIf FAIL, explain what's wrong or missing on subsequent lines.`;
+async function executeSupervisor(step, ctx, params, stepIndex) {
+    const ep = step.endpoint
+        ? params.preset.referenceEndpoints.find(e => e.name === step.endpoint) ?? params.preset.aggregatorEndpoint
+        : params.preset.aggregatorEndpoint;
+    const basePrompt = step.prompt
+        ? interpolate(step.prompt, ctx)
+        : `Review the following output for completeness and accuracy:\n\n${ctx.lastOutput}`;
+    const prompt = basePrompt + SUPERVISOR_PROMPT_SUFFIX;
+    const useTools = step.tools !== false;
+    params.onProgress?.(`[${stepIndex}] supervisor ${ep.name} — evaluating`);
+    const result = await runSingleAgent(ep, prompt, useTools, params);
+    ctx.totalUsage.aggregator = {
+        inputTokens: ctx.totalUsage.aggregator.inputTokens + result.usage.inputTokens,
+        outputTokens: ctx.totalUsage.aggregator.outputTokens + result.usage.outputTokens,
+    };
+    const firstLine = result.content.split('\n')[0].trim().toUpperCase();
+    const pass = firstLine.startsWith('PASS');
+    const feedback = pass ? '' : result.content.split('\n').slice(1).join('\n').trim() || result.content;
+    ctx.supervisorPass = pass;
+    ctx.supervisorFeedback = feedback;
+    params.onProgress?.(`[${stepIndex}] supervisor — ${pass ? 'PASS' : 'FAIL'}`);
+    storeOutput(ctx, step.as, result.content);
+}
+async function executeLoop(step, ctx, params, baseStepIndex) {
+    for (let i = 0; i < step.maxIterations; i++) {
+        ctx.iteration = i + 1;
+        params.onProgress?.(`[${baseStepIndex}] loop iteration ${ctx.iteration}/${step.maxIterations}`);
+        const prevOutput = ctx.lastOutput;
+        await executeSteps(step.steps, ctx, params, baseStepIndex * 100 + i * 10);
+        if (step.until === 'supervisorPass' && ctx.supervisorPass) {
+            params.onProgress?.(`[${baseStepIndex}] loop — supervisor approved`);
+            break;
+        }
+        if (step.until === 'noNewFindings' && prevOutput && ctx.lastOutput) {
+            const similarity = computeSimilarity(prevOutput, ctx.lastOutput);
+            if (similarity > 0.95) {
+                params.onProgress?.(`[${baseStepIndex}] loop converged (similarity ${(similarity * 100).toFixed(0)}%)`);
+                break;
+            }
+        }
+    }
+    ctx.iteration = 0;
+}
+// ---------------------------------------------------------------------------
+// Main pipeline executor
+// ---------------------------------------------------------------------------
+export async function executeSteps(steps, ctx, params, baseIndex = 0) {
+    for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const stepIndex = baseIndex + i;
+        switch (step.type) {
+            case 'reference':
+                await executeReference(step, ctx, params, stepIndex);
+                break;
+            case 'aggregate':
+                await executeAggregate(step, ctx, params, stepIndex);
+                break;
+            case 'transform':
+                executeTransform(step, ctx, stepIndex);
+                break;
+            case 'validate':
+                await executeValidate(step, ctx, params, stepIndex);
+                break;
+            case 'supervisor':
+                await executeSupervisor(step, ctx, params, stepIndex);
+                break;
+            case 'loop':
+                await executeLoop(step, ctx, params, stepIndex);
+                break;
+        }
+    }
+}
+export function createPipelineContext(query) {
+    return {
+        query,
+        references: '',
+        lastOutput: '',
+        iteration: 0,
+        supervisorPass: false,
+        supervisorFeedback: '',
+        namedOutputs: {},
+        referenceOutputs: [],
+        totalUsage: {
+            references: [],
+            aggregator: { inputTokens: 0, outputTokens: 0 },
+        },
+    };
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function storeOutput(ctx, as, value) {
+    ctx.lastOutput = value;
+    if (as)
+        ctx.namedOutputs[as] = value;
+}
+async function runSingleAgent(ep, prompt, useTools, params) {
+    const { client, config } = createClient(ep.llmConfig);
+    return agentLoop({
+        prompt: buildExplorePrompt(prompt),
+        systemPrompt: params.systemPrompt,
+        client,
+        llmConfig: config,
+        toolSchemas: useTools ? TOOL_SCHEMAS : [],
+        maxTurns: params.maxTurns,
+        cwd: params.cwd,
+        emitter: params.emitter,
+    });
+}
+function formatReferences(refs) {
+    const hasSuccess = refs.some(r => !r.error && r.content);
+    if (!hasSuccess)
+        return '';
+    let out = '--- Reference Analyses ---\n';
+    for (const ref of refs) {
+        if (ref.content) {
+            out += `\n### [Reference — ${ref.endpointName}: ${ref.model}]\n${ref.content}\n`;
+        }
+        else {
+            out += `\n### [Reference — ${ref.endpointName}: ${ref.model}] (unavailable: ${ref.error})\n`;
+        }
+    }
+    out += '\nUse the reference analyses above as context. Verify their claims against actual code.\n';
+    return out;
+}
+function computeSimilarity(a, b) {
+    if (a === b)
+        return 1;
+    const setA = new Set(a.split(/\s+/));
+    const setB = new Set(b.split(/\s+/));
+    let intersection = 0;
+    for (const w of setA)
+        if (setB.has(w))
+            intersection++;
+    return intersection / Math.max(setA.size, setB.size);
+}
+//# sourceMappingURL=moa-pipeline.js.map

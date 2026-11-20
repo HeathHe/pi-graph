@@ -1,0 +1,262 @@
+{
+  "name": "pi-maestro-teammate",
+  "version": "2.10.2",
+  "description": "Pi extension — teammate agent dispatch with DAG task graphs, RPC messaging, and compact TUI",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "pi-teammate-broker": "./bin/pi-teammate-broker.mjs",
+    "pi-teammate-models": "./bin/pi-teammate-models.mjs",
+    "pi-teammate-outbox": "./bin/pi-teammate-outbox.mjs",
+    "pi-teammate-remote": "./bin/pi-teammate-remote.mjs"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "teammate",
+    "agents"
+  ],
+  "scripts": {
+    "test": "node --experimental-transform-types --import ./test/setup.ts --test --test-concurrency=2 \"test/*.test.ts\"",
+    "test:host-observers-packed": "node --test test/host-observers-packed.test.mjs",
+    "typecheck": "tsc -p tsconfig.build.json",
+    "build:declarations": "tsc -p tsconfig.declarations.json",
+    "check:declarations": "node scripts/check-declarations.mjs",
+    "prepack": "npm run build:declarations && node ../../scripts/bundle-settings-core.mjs",
+    "postpack": "node ../../scripts/bundle-settings-core.mjs --clean",
+    "test:e2e": "node --experimental-transform-types --import ./test/setup.ts --test --test-timeout=300000 test/backend-registry-dsh.e2e.test.ts",
+    "refresh:acp-registry": "node scripts/refresh-acp-registry.mjs",
+    "check:acp-registry": "node scripts/refresh-acp-registry.mjs --check"
+  },
+  "main": "./src/index.ts",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.ts"
+    },
+    "./v1": {
+      "types": "./types/public/v1/index.d.ts",
+      "default": "./src/public/v1/index.ts"
+    },
+    "./v1/acp-cli": {
+      "types": "./types/backends/acp-cli.d.ts",
+      "default": "./src/backends/acp-cli.ts"
+    },
+    "./v1/agents": {
+      "types": "./types/public/v1/agents.d.ts",
+      "default": "./src/public/v1/agents.ts"
+    },
+    "./v1/backends": {
+      "types": "./types/public/v1/backends.d.ts",
+      "default": "./src/public/v1/backends.ts"
+    },
+    "./v1/child-extensions": {
+      "types": "./types/public/v1/child-extensions.d.ts",
+      "default": "./src/public/v1/child-extensions.ts"
+    },
+    "./v1/classify": {
+      "types": "./types/public/v1/classify.d.ts",
+      "default": "./src/public/v1/classify.ts"
+    },
+    "./v1/events": {
+      "types": "./types/public/v1/events.d.ts",
+      "default": "./src/public/v1/events.ts"
+    },
+    "./v1/external-agent-projections": {
+      "types": "./types/public/v1/external-agent-projections.d.ts",
+      "default": "./src/public/v1/external-agent-projections.ts"
+    },
+    "./v1/execution": {
+      "types": "./types/public/v1/execution.d.ts",
+      "default": "./src/public/v1/execution.ts"
+    },
+    "./v1/extension": {
+      "types": "./types/public/v1/extension.d.ts",
+      "default": "./src/public/v1/extension.ts"
+    },
+    "./v1/foreground-detach": {
+      "types": "./types/public/v1/foreground-detach.d.ts",
+      "default": "./src/public/v1/foreground-detach.ts"
+    },
+    "./v1/fabric-runtime": {
+      "types": "./types/public/v1/fabric-runtime.d.ts",
+      "default": "./src/public/v1/fabric-runtime.ts"
+    },
+    "./v1/codex-fast": {
+      "types": "./types/public/v1/codex-fast.d.ts",
+      "default": "./src/public/v1/codex-fast.ts"
+    },
+    "./v1/model-routing": {
+      "types": "./types/public/v1/model-routing.d.ts",
+      "default": "./src/public/v1/model-routing.ts"
+    },
+    "./v1/monitor-window-state": {
+      "types": "./types/public/v1/monitor-window-state.d.ts",
+      "default": "./src/public/v1/monitor-window-state.ts"
+    },
+    "./v1/cli-tools": {
+      "types": "./types/public/v1/cli-tools.d.ts",
+      "default": "./src/public/v1/cli-tools.ts"
+    },
+    "./v1/completion-durability": {
+      "types": "./types/public/v1/completion-durability.d.ts",
+      "default": "./src/public/v1/completion-durability.ts"
+    },
+    "./v1/mailbox": {
+      "types": "./types/public/v1/mailbox.d.ts",
+      "default": "./src/public/v1/mailbox.ts"
+    },
+    "./v1/observation": {
+      "types": "./types/public/v1/observation.d.ts",
+      "default": "./src/public/v1/observation.ts"
+    },
+    "./v1/progress-tree": {
+      "types": "./types/public/v1/progress-tree.d.ts",
+      "default": "./src/public/v1/progress-tree.ts"
+    },
+    "./v1/remote": {
+      "types": "./types/public/v1/remote.d.ts",
+      "default": "./src/public/v1/remote.ts"
+    },
+    "./v1/retry": {
+      "types": "./types/public/v1/retry.d.ts",
+      "default": "./src/public/v1/retry.ts"
+    },
+    "./v1/session-history": {
+      "types": "./types/public/v1/session-history.d.ts",
+      "default": "./src/public/v1/session-history.ts"
+    },
+    "./v1/scheduler": {
+      "types": "./types/public/v1/scheduler.d.ts",
+      "default": "./src/public/v1/scheduler.ts"
+    },
+    "./v1/sessions": {
+      "types": "./types/public/v1/sessions.d.ts",
+      "default": "./src/public/v1/sessions.ts"
+    },
+    "./v1/supervision": {
+      "types": "./types/public/v1/supervision.d.ts",
+      "default": "./src/public/v1/supervision.ts"
+    },
+    "./v1/ssh-hosts": {
+      "types": "./types/public/v1/ssh-hosts.d.ts",
+      "default": "./src/public/v1/ssh-hosts.ts"
+    },
+    "./v1/workspace-projections": {
+      "types": "./types/public/v1/workspace-projections.d.ts",
+      "default": "./src/public/v1/workspace-projections.ts"
+    },
+    "./v1/workspace-completion": {
+      "types": "./types/public/v1/workspace-completion.d.ts",
+      "default": "./src/public/v1/workspace-completion.ts"
+    },
+    "./v1/todo-context": {
+      "types": "./types/public/v1/todo-context.d.ts",
+      "default": "./src/public/v1/todo-context.ts"
+    },
+    "./v1/types": {
+      "types": "./types/public/v1/types.d.ts",
+      "default": "./src/public/v1/types.ts"
+    },
+    "./v2/runtime": {
+      "types": "./types/public/v2/runtime.d.ts",
+      "default": "./src/public/v2/runtime.ts"
+    },
+    "./v2/runtime-broker": {
+      "types": "./types/public/v2/runtime-broker.d.ts",
+      "default": "./src/public/v2/runtime-broker.ts"
+    },
+    "./src/*": "./src/*",
+    "./v1/task-dispatch-binding": {
+      "types": "./types/public/v1/task-dispatch-binding.d.ts",
+      "default": "./src/public/v1/task-dispatch-binding.ts"
+    }
+  },
+  "deprecatedSubpaths": {
+    "./src/*": "Compatibility only; use the versioned ./v1/* public API."
+  },
+  "files": [
+    "bin/*.mjs",
+    "src/**/*.{ts,mjs,json}",
+    "types/**/*.d.ts",
+    "agents/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extension/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.3.0",
+    "cross-spawn": "7.0.6",
+    "jiti": "2.7.0",
+    "pi-maestro-settings-core": "0.2.3",
+    "pi-maestro-backend-core": "0.1.5",
+    "pi-maestro-backends": "0.1.7",
+    "pi-maestro-fabric-core": "0.1.0",
+    "proper-lockfile": "4.1.2",
+    "ssh2": "1.17.0",
+    "zod": "4.4.3",
+    "pi-graph-model-role": "0.1.0",
+    "pi-graph-resources": "0.1.0",
+    "pi-graph-verification": "0.1.0",
+    "pi-graph-observability": "0.1.0",
+    "pi-graph-host-compat": "0.1.0",
+    "pi-graph-provider-backend": "0.1.0"
+  },
+  "bundledDependencies": [
+    "pi-graph-host-compat",
+    "pi-graph-model-role",
+    "pi-graph-observability",
+    "pi-graph-resources",
+    "pi-graph-verification",
+    "pi-maestro-backend-core",
+    "pi-maestro-backends",
+    "pi-maestro-fabric-core",
+    "pi-maestro-settings-core",
+    "pi-graph-provider-backend"
+  ],
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.99.0",
+    "@types/cross-spawn": "6.0.6",
+    "@earendil-works/pi-ai": "0.99.0",
+    "@earendil-works/pi-coding-agent": "0.99.0",
+    "@earendil-works/pi-tui": "0.99.0",
+    "@types/ssh2": "1.15.5",
+    "typebox": "1.3.27"
+  },
+  "directories": {
+    "test": "test"
+  },
+  "author": "",
+  "license": "ISC"
+}

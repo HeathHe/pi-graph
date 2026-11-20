@@ -1,0 +1,29 @@
+{
+  "name": "pi-graph-collaboration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "M13 Fabric contracts and host-independent runtime extracted from fixed Pi Maestro upstream.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE.upstream",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "./src/runtime/index.ts",
+  "exports": {
+    ".": "./src/runtime/index.ts",
+    "./contracts": "./src/contracts/index.ts",
+    "./contracts/v1": "./src/contracts/public/v1/index.ts",
+    "./contracts/v1/*": "./src/contracts/public/v1/*.ts",
+    "./runtime": "./src/runtime/index.ts",
+    "./runtime/*": "./src/runtime/*.ts"
+  },
+  "files": [
+    "src/**/*.ts",
+    "PROVENANCE.json",
+    "LICENSE.upstream"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --experimental-transform-types --test test/*.test.ts"
+  }
+}

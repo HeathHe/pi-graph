@@ -1,0 +1,150 @@
+/**
+ * KG Context Builder — code structure sections for prompt context
+ *
+ * Injects Knowledge Graph code structure context (callers, callees, exported
+ * symbols) using MaestroGraph as the data source. The keyword prompt injector
+ * owns composition and budgeting; this module only builds KG sections.
+ */
+import { truncateMaestroContext, wrapMaestroContext } from './context-format.js';
+// ---------------------------------------------------------------------------
+// Extraction helpers
+// ---------------------------------------------------------------------------
+const FILE_RE = /([\w\/\\.-]+\.(ts|tsx|js|jsx|py|go|rs|java))/g;
+const BACKTICK_SYMBOL_RE = /`(\w+)`/g;
+const CODE_SYMBOL_RE = /\b[a-z]+[A-Z][a-zA-Z0-9]*\b|\b[a-z]+_[a-z0-9_]+\b/g;
+function extractFilePaths(text) {
+    const seen = new Set();
+    for (const m of text.matchAll(FILE_RE)) {
+        const p = m[1].replace(/\\/g, '/');
+        if (!seen.has(p))
+            seen.add(p);
+    }
+    return [...seen];
+}
+/**
+ * Symbols the prompt marked as code by backticking them. Used as the gate for
+ * opening the graph at all — see `buildKgContextSections`.
+ */
+function extractBacktickedSymbols(text) {
+    const seen = new Set();
+    for (const m of text.matchAll(BACKTICK_SYMBOL_RE)) {
+        const s = m[1];
+        if (s.length >= 3 && !/^(the|and|for|not|but|has|get|set|new|var|let|use)$/i.test(s)) {
+            if (!seen.has(s))
+                seen.add(s);
+        }
+    }
+    return [...seen];
+}
+function extractSymbols(text) {
+    const seen = new Set(extractBacktickedSymbols(text));
+    for (const symbol of text.match(CODE_SYMBOL_RE) ?? []) {
+        if (!seen.has(symbol))
+            seen.add(symbol);
+    }
+    return [...seen];
+}
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+function formatCaller(c) {
+    const loc = c.node.filePath ? `${c.node.filePath}:${c.node.startLine}` : '';
+    const name = c.node.name;
+    return loc ? `${name} (${loc}) --${c.edge.kind}-->` : `${name} --${c.edge.kind}-->`;
+}
+function formatCallee(c) {
+    const loc = c.node.filePath ? `${c.node.filePath}:${c.node.startLine}` : '';
+    const name = c.node.name;
+    return loc ? `--> ${name} (${loc})` : `--> ${name}`;
+}
+function buildRichSymbolSection(node, callers, callees) {
+    const lines = [];
+    const loc = node.filePath ? ` ${node.filePath}:${node.startLine}` : '';
+    const sig = node.signature ? ` — ${node.signature}` : '';
+    lines.push(`${node.name} (${node.kind})${loc}${sig}`);
+    if (callers.length > 0) {
+        const shown = callers.slice(0, 5).map(formatCaller).join('; ');
+        const more = callers.length > 5 ? ` (+${callers.length - 5} more)` : '';
+        lines.push(`callers: ${shown}${more}`);
+    }
+    if (callees.length > 0) {
+        const shown = callees.slice(0, 5).map(formatCallee).join('; ');
+        const more = callees.length > 5 ? ` (+${callees.length - 5} more)` : '';
+        lines.push(`callees: ${shown}${more}`);
+    }
+    return { label: `kg-calls[${node.name}]`, lines };
+}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+const MAX_CONTENT = 3072;
+const MAX_SYMBOLS = 3;
+const MAX_FILES = 2;
+/** Build KG sections for the shared UserPromptSubmit context pipeline. */
+export async function buildKgContextSections(prompt, projectPath) {
+    const files = extractFilePaths(prompt).slice(0, MAX_FILES);
+    // CODE_SYMBOL_RE matches any camelCase / snake_case token, ordinary prose words
+    // included, so a plain-symbol gate is satisfied by nearly every prompt. Opening
+    // the graph for those costs ~80ms (engine import + sqlite open) to look up words
+    // that were never symbols. Require one high-confidence anchor first — a
+    // backticked identifier or an explicit file path. Loose tokens are still resolved
+    // below, once the graph is open and they are nearly free.
+    if (extractBacktickedSymbols(prompt).length === 0 && files.length === 0)
+        return [];
+    const symbols = extractSymbols(prompt).slice(0, MAX_SYMBOLS);
+    try {
+        const { MaestroGraph } = await import('../graph/kg/engine.js');
+        if (!MaestroGraph.isInitialized(projectPath))
+            return [];
+        const mg = await MaestroGraph.open(projectPath);
+        try {
+            const sections = [];
+            for (const sym of symbols) {
+                const results = mg.searchCode(sym, { limit: 1 });
+                if (results.length === 0)
+                    continue;
+                const node = results[0];
+                const callers = mg.getCallers(node.id, 1);
+                const callees = mg.getCallees(node.id, 1);
+                sections.push(buildRichSymbolSection(node, callers, callees));
+            }
+            for (const fp of files) {
+                const fileNodes = mg.getQueryBuilder().getNodesByFile(fp);
+                const exported = fileNodes
+                    .filter(node => node.isExported)
+                    .slice(0, 8)
+                    .map(node => `${node.kind}:${node.name}`);
+                if (exported.length > 0) {
+                    sections.push({
+                        label: `kg-file[${fp}]`,
+                        lines: [`exports: ${exported.join(', ')}`],
+                    });
+                }
+            }
+            return sections;
+        }
+        finally {
+            try {
+                mg.close();
+            }
+            catch { /* best-effort */ }
+        }
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * Compatibility wrapper for direct consumers. New hook paths should compose
+ * buildKgContextSections() with the other prompt context sections instead.
+ */
+export async function evaluateKgContextInjection(_agentType, prompt, projectPath) {
+    const sections = await buildKgContextSections(prompt, projectPath);
+    if (sections.length === 0)
+        return { inject: false, reason: 'no-matches' };
+    const usedChars = sections.reduce((sum, section) => sum + section.lines.reduce((acc, line) => acc + line.length, 0), 0);
+    let content = wrapMaestroContext(sections, { used: usedChars, max: MAX_CONTENT });
+    content = truncateMaestroContext(content, MAX_CONTENT);
+    return { inject: true, content };
+}
+//# sourceMappingURL=kg-context-injector.js.map

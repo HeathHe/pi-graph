@@ -1,0 +1,43 @@
+{
+  "repository": "https://github.com/catlog22/pi-maestro-flow",
+  "commit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "files": [
+    {
+      "source": "packages/pi-maestro-settings-core/src/public/v1/events.ts",
+      "destination": "packages/pi-graph-settings/src/public/v1/events.ts",
+      "beforeSha256": "56461f4dded91828afba56c2c529db61780e6b713051026b593b281391fb59d6"
+    },
+    {
+      "source": "packages/pi-maestro-settings-core/src/public/v1/provider.ts",
+      "destination": "packages/pi-graph-settings/src/public/v1/provider.ts",
+      "beforeSha256": "3f1e05e841d6c3d4313b2afff7847429463f0791b249f444d2cbbb525db6292e"
+    },
+    {
+      "source": "packages/pi-maestro-settings-core/src/public/v1/schema.ts",
+      "destination": "packages/pi-graph-settings/src/public/v1/schema.ts",
+      "beforeSha256": "c5f44293c9c5fdf49df907f27d8a4f87ce2216e633d56f03d55fa6cc4f689c9a"
+    },
+    {
+      "source": "packages/pi-maestro-settings-core/src/public/v1/i18n.ts",
+      "destination": "packages/pi-graph-settings/src/public/v1/i18n.ts",
+      "beforeSha256": "47b94687926b5d41409c071f37671f51de794589689589cbaecd6b13afc43b57",
+      "note": "platform key formatting remains M14 compatibility implementation"
+    },
+    {
+      "source": "packages/pi-cockpit/src/settings/registry.ts",
+      "destination": "packages/pi-graph-settings/src/registry.ts",
+      "beforeSha256": "6127c66c34ab99f6790ef6609f43b63e9978759b0d9c2b49330aa98eb0419fd6"
+    },
+    {
+      "source": "packages/pi-cockpit/src/settings/coordinator.ts",
+      "destination": "packages/pi-graph-settings/src/coordinator.ts",
+      "beforeSha256": "df888a72072c1db20108530367102a76faa0b23ee2ba7de112aa179155fec90d"
+    }
+  ],
+  "sourcePackageLicenseDeclarations": {
+    "pi-maestro-settings-core@0.2.3": "ISC",
+    "pi-cockpit@0.24.5": "MIT"
+  },
+  "upstreamRootLicense": "Original MIT copyright and permission notice copied verbatim as LICENSE.upstream",
+  "scope": "M17.C01 bounded extraction; UI/host/physical stores remain with their owners"
+}

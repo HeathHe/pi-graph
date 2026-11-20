@@ -1,0 +1,23 @@
+{
+  "upstreamCommit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "archive": "artifacts/pi-maestro-comparison-20261103/upstream",
+  "license": "LICENSE.upstream",
+  "derivedAlgorithms": {
+    "execution": [
+      "public/v1/observation.ts",
+      "extension/background-status-heartbeat.ts",
+      "extension/workspace-session-observation.ts",
+      "extension/workspace-turns-observation.ts",
+      "extension/remote-observation-projection.ts",
+      "runs/host-observers.ts"
+    ],
+    "usage": [
+      "pi-maestro-flow/src/providers/usage-history.ts",
+      "pi-cockpit/src/usage/core.ts"
+    ],
+    "title": [
+      "pi-cockpit/src/title-gen.ts"
+    ]
+  },
+  "changes": "Independent owners, injected time/storage/provider ports, bounded scoped journal, epoch/deadline fencing; Phase B not wired."
+}

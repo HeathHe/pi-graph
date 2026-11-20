@@ -1,0 +1,696 @@
+// ---------------------------------------------------------------------------
+// Component Definitions — single source of truth for CLI and Dashboard.
+//
+// Both `maestro install` (CLI) and the Dashboard wizard import from here.
+// ---------------------------------------------------------------------------
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { createRequire } from 'node:module';
+import { paths } from '../config/paths.js';
+import { DEFAULT_ENTRY_STEPS } from './entry-command-generator.js';
+import { buildCodexAgents } from './skill-converter.js';
+const require = createRequire(import.meta.url);
+// ---------------------------------------------------------------------------
+// Skill registries — built-in vs optional extras
+// ---------------------------------------------------------------------------
+const BUILTIN_TEAM_SKILLS = new Set([
+    'team-arch-opt', 'team-coordinate', 'team-issue',
+    'team-lifecycle-v4', 'team-perf-opt', 'team-review',
+    'team-swarm', 'team-testing',
+]);
+// Former extra team skills — removed from the repo (2026-07). The bundle ID
+// is retained only for manifest-replay migration (unknown IDs are hard errors
+// in forceInstall); its fileFilter matches nothing, so it never installs.
+const EXTRA_TEAM_SKILLS = [];
+// Former meta-skill bundle members — removed or moved into the core `skills`
+// component (skill-generator / skill-iter-tune / skill-simplify / skill-tuning
+// / workflow-skill-designer are now always-installed; codify-to-knowhow was
+// removed 2026-07). Bundle ID retained for manifest-replay migration only.
+const META_SKILLS = [];
+// Legacy names kept for manifest-replay migration (migrateComponentIds).
+// Deleted skills map to their former group bundle, which is a no-op today.
+const LEGACY_EXTRA_TEAM_SKILL_NAMES = [
+    'team-arch-opt', 'team-brainstorm', 'team-designer', 'team-frontend',
+    'team-frontend-debug', 'team-interactive-craft', 'team-issue',
+    'team-motion-design', 'team-perf-opt', 'team-planex', 'team-roadmap-dev',
+    'team-ui-polish', 'team-uidesign', 'team-ultra-analyze', 'team-ux-improve',
+    'team-visual-a11y',
+];
+const LEGACY_META_SKILL_NAMES = [
+    'skill-generator', 'skill-simplify', 'skill-tuning',
+    'prompt-generator', 'delegation-check',
+];
+const SCHOLAR_SKILLS = [
+    { name: 'scholar-anti-ai-writing', label: 'Anti-AI Writing', description: 'Remove AI writing patterns' },
+    { name: 'scholar-citation-verify', label: 'Citation Verify', description: 'Citation verification' },
+    { name: 'scholar-experiment', label: 'Experiment Analysis', description: 'Experimental results analysis' },
+    { name: 'scholar-ideation', label: 'Research Ideation', description: 'Research gap analysis & planning' },
+    { name: 'scholar-latex-organizer', label: 'LaTeX Organizer', description: 'LaTeX template cleanup' },
+    { name: 'scholar-publish', label: 'Scholar Publish', description: 'Post-acceptance preparation' },
+    { name: 'scholar-rebuttal-pro', label: 'Rebuttal Pro', description: 'Review response with CLI analysis' },
+    { name: 'scholar-review', label: 'Scholar Review', description: 'Paper review & rebuttal' },
+    { name: 'scholar-thesis-docx', label: 'Thesis DOCX', description: 'Thesis Word formatting' },
+    { name: 'scholar-writing', label: 'Scholar Writing', description: 'End-to-end paper writing' },
+];
+const NON_CORE_SKILL_NAMES = new Set([
+    ...BUILTIN_TEAM_SKILLS,
+    ...EXTRA_TEAM_SKILLS.map((s) => s.name),
+    ...SCHOLAR_SKILLS.map((s) => s.name),
+    ...META_SKILLS.map((s) => s.name),
+]);
+const EXTRA_TEAM_SKILL_NAMES = new Set(EXTRA_TEAM_SKILLS.map((s) => s.name));
+const SCHOLAR_SKILL_NAMES = new Set(SCHOLAR_SKILLS.map((s) => s.name));
+const META_SKILL_NAMES = new Set(META_SKILLS.map((s) => s.name));
+// ---------------------------------------------------------------------------
+// Definitions
+// ---------------------------------------------------------------------------
+export const COMPONENT_DEFS = [
+    {
+        id: 'workflows',
+        label: 'Workflows',
+        description: 'Workflow definitions (~/.maestro/workflows/)',
+        sourcePath: 'workflows',
+        target: () => join(paths.home, 'workflows'),
+        alwaysGlobal: true,
+        mandatory: true,
+        platform: 'shared',
+    },
+    {
+        id: 'prepare',
+        label: 'Prepare',
+        description: 'Step prepare files (~/.maestro/prepare/)',
+        sourcePath: 'prepare',
+        target: () => join(paths.home, 'prepare'),
+        alwaysGlobal: true,
+        mandatory: true,
+        platform: 'shared',
+    },
+    {
+        id: 'ref',
+        label: 'Ref',
+        description: 'Shared reference documents (~/.maestro/ref/)',
+        sourcePath: 'ref',
+        target: () => join(paths.home, 'ref'),
+        alwaysGlobal: true,
+        mandatory: true,
+        platform: 'shared',
+        // Mirrors the `!ref/zvec-grep` entry in package.json files — a locally
+        // vendored reference clone, never shipped or installed.
+        fileFilter: (name) => name !== 'zvec-grep',
+    },
+    {
+        id: 'arch-kb',
+        label: 'Arch-KB',
+        description: 'Architecture knowledge base (~/.maestro/arch-kb/) — from awesome-architecture',
+        sourcePath: join('resources', 'arch-kb'),
+        target: () => join(paths.home, 'arch-kb'),
+        alwaysGlobal: true,
+        mandatory: true,
+        platform: 'shared',
+    },
+    {
+        id: 'templates',
+        label: 'Templates',
+        description: 'Prompt & task templates (~/.maestro/templates/)',
+        sourcePath: 'templates',
+        target: () => join(paths.home, 'templates'),
+        alwaysGlobal: true,
+        mandatory: true,
+        platform: 'shared',
+    },
+    {
+        id: 'overlays',
+        label: 'Overlays',
+        description: 'Command overlay packs (~/.maestro/overlays/_shipped/)',
+        sourcePath: join('overlays', '_shipped'),
+        target: () => join(paths.home, 'overlays', '_shipped'),
+        alwaysGlobal: true,
+        mandatory: true,
+        platform: 'shared',
+    },
+    {
+        id: 'commands',
+        label: 'Commands',
+        description: 'All Claude slash commands (maestro, maestro-issue, maestro-odyssey, maestro-learn, maestro-spec, quality, security)',
+        sourcePath: join('.claude', 'commands'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'commands')
+            : join(projectPath, '.claude', 'commands'),
+        alwaysGlobal: false,
+        mandatory: true,
+        category: 'commands',
+        platform: 'claude',
+    },
+    {
+        id: 'commands-entry',
+        label: 'Entry Commands (run steps)',
+        description: 'Thin slash-command wrappers that drive `maestro run` for selected steps (grill, collab). Fine-grained: maestro install entry-commands --steps ...',
+        sourcePath: 'prepare',
+        sourceCountDir: 'prepare',
+        fileFilter: (name) => DEFAULT_ENTRY_STEPS.includes(name.replace(/\.md$/, '')),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'commands')
+            : join(projectPath, '.claude', 'commands'),
+        alwaysGlobal: false,
+        category: 'commands',
+        platform: 'claude',
+        defaultSelected: false,
+        build: (claudeDir, targetDir) => {
+            const { buildEntryCommands } = require('./entry-command-generator.js');
+            return buildEntryCommands(dirname(claudeDir), targetDir);
+        },
+    },
+    {
+        id: 'agents',
+        label: 'Agents',
+        description: 'Agent definitions',
+        sourcePath: join('.claude', 'agents'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'agents')
+            : join(projectPath, '.claude', 'agents'),
+        alwaysGlobal: false,
+        mandatory: true,
+        platform: 'claude',
+    },
+    {
+        id: 'skills',
+        label: 'Skills (Core)',
+        description: 'Core workflow and utility skills',
+        sourcePath: join('.claude', 'skills'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'skills')
+            : join(projectPath, '.claude', 'skills'),
+        alwaysGlobal: false,
+        mandatory: true,
+        category: 'skills',
+        platform: 'claude',
+        fileFilter: (name) => !NON_CORE_SKILL_NAMES.has(name),
+    },
+    {
+        id: 'skills-team',
+        label: 'Team Skills (Built-in)',
+        description: 'Built-in team skills (coordinate, review, testing, etc.)',
+        sourcePath: join('.claude', 'skills'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'skills')
+            : join(projectPath, '.claude', 'skills'),
+        alwaysGlobal: false,
+        mandatory: true,
+        category: 'skills',
+        platform: 'claude',
+        fileFilter: (name) => BUILTIN_TEAM_SKILLS.has(name),
+    },
+    {
+        id: 'claude-md',
+        label: 'CLAUDE.md',
+        description: 'Project instructions file',
+        sourcePath: join('workflows', 'claude-instructions.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'CLAUDE.md')
+            : join(projectPath, '.claude', 'CLAUDE.md'),
+        alwaysGlobal: false,
+        mandatory: true,
+        inject: true,
+        platform: 'claude',
+    },
+    {
+        id: 'codex-agents-md',
+        label: 'Codex AGENTS.md',
+        description: 'Codex project instructions file',
+        sourcePath: join('workflows', 'codex-instructions.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.codex', 'AGENTS.md')
+            : join(projectPath, '.codex', 'AGENTS.md'),
+        alwaysGlobal: false,
+        inject: true,
+        platform: 'codex',
+    },
+    {
+        id: 'claude-md-chinese',
+        label: 'Chinese Response (Claude)',
+        description: 'Chinese response guidelines → CLAUDE.md',
+        sourcePath: join('workflows', 'chinese-response.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'CLAUDE.md')
+            : join(projectPath, '.claude', 'CLAUDE.md'),
+        alwaysGlobal: false,
+        inject: true,
+        section: 'chinese',
+        platform: 'claude',
+    },
+    {
+        id: 'codex-md-chinese',
+        label: 'Chinese Response (Codex)',
+        description: 'Chinese response guidelines → AGENTS.md',
+        sourcePath: join('workflows', 'chinese-response.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.codex', 'AGENTS.md')
+            : join(projectPath, '.codex', 'AGENTS.md'),
+        alwaysGlobal: false,
+        inject: true,
+        section: 'chinese',
+        platform: 'codex',
+    },
+    {
+        id: 'codex-agents',
+        label: 'Codex Agents',
+        description: 'Codex agent definitions generated from canonical Claude agents',
+        sourcePath: join('.claude', 'agents'),
+        sourceCountDir: join('.claude', 'agents'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.codex', 'agents')
+            : join(projectPath, '.codex', 'agents'),
+        alwaysGlobal: false,
+        platform: 'codex',
+        build: buildCodexAgents,
+    },
+    {
+        id: 'codex-skills',
+        label: 'Codex Skills',
+        description: 'Codex skill definitions',
+        sourcePath: join('.codex', 'skills'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.codex', 'skills')
+            : join(projectPath, '.codex', 'skills'),
+        alwaysGlobal: false,
+        platform: 'codex',
+    },
+    // ---------------------------------------------------------------------------
+    // Antigravity (agy) CLI assets
+    // Source: `.claude/` — converted on-the-fly via skill-converter build callbacks.
+    // Install layout uses Antigravity's own conventions:
+    //   - Global skills/agents → ~/.gemini/antigravity-cli/{skills,agents}/
+    //   - Workspace skills/agents → <project>/.agents/{skills,agents}/
+    //   - Global context → ~/.gemini/GEMINI.md
+    //   - Workspace context → <project>/AGENTS.md
+    // ---------------------------------------------------------------------------
+    {
+        id: 'agy-context',
+        label: 'Agy Context (GEMINI.md / AGENTS.md)',
+        description: 'Antigravity workspace/global instructions',
+        sourcePath: join('workflows', 'codex-instructions.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.gemini', 'GEMINI.md')
+            : join(projectPath, 'AGENTS.md'),
+        alwaysGlobal: false,
+        inject: true,
+        platform: 'agy',
+    },
+    {
+        id: 'agy-md-chinese',
+        label: 'Chinese Response (Agy)',
+        description: 'Chinese response guidelines → GEMINI.md / AGENTS.md',
+        sourcePath: join('workflows', 'chinese-response.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.gemini', 'GEMINI.md')
+            : join(projectPath, 'AGENTS.md'),
+        alwaysGlobal: false,
+        inject: true,
+        section: 'chinese',
+        platform: 'agy',
+    },
+    {
+        id: 'agy-skills',
+        label: 'Agy Skills',
+        description: 'Antigravity skills (commands become slash commands)',
+        sourcePath: join('.claude', 'commands'),
+        sourceCountDir: join('.claude', 'commands'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.gemini', 'antigravity-cli', 'skills')
+            : join(projectPath, '.agents', 'skills'),
+        alwaysGlobal: false,
+        platform: 'agy',
+        build: (claudeDir, targetDir) => {
+            const { buildAgySkills } = require('./skill-converter.js');
+            return buildAgySkills(claudeDir, targetDir);
+        },
+    },
+    {
+        id: 'agy-agents',
+        label: 'Agy Sub-Agents',
+        description: 'Antigravity sub-agent definitions (for define_subagent)',
+        sourcePath: join('.claude', 'agents'),
+        sourceCountDir: join('.claude', 'agents'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.gemini', 'antigravity-cli', 'agents')
+            : join(projectPath, '.agents', 'agents'),
+        alwaysGlobal: false,
+        platform: 'agy',
+        build: (claudeDir, targetDir) => {
+            const { buildAgyAgents } = require('./skill-converter.js');
+            return buildAgyAgents(claudeDir, targetDir);
+        },
+    },
+    // ---------------------------------------------------------------------------
+    // Open-standard agent assets (.agents/)
+    //
+    // Source: `.claude/` — converted on-the-fly via skill-converter build
+    // callbacks with Claude-specific tool tokens neutralized. Auto-discovered
+    // by Codex, Kiro, Gemini CLI, GitHub CLI, Cursor, Qoder, Trae, Roo, and
+    // other .agents/-aware tools.
+    // ---------------------------------------------------------------------------
+    {
+        id: 'agents-standard-md-chinese',
+        label: 'Chinese Response (Agents Standard)',
+        description: 'Chinese response guidelines → .agents/AGENTS.md',
+        sourcePath: join('workflows', 'chinese-response.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.agents', 'AGENTS.md')
+            : join(projectPath, '.agents', 'AGENTS.md'),
+        alwaysGlobal: false,
+        inject: true,
+        section: 'chinese',
+        platform: 'agents-standard',
+    },
+    {
+        id: 'agents-standard-context',
+        label: 'Agent Context (AGENTS.md)',
+        description: 'Open-standard .agents/ project instructions',
+        sourcePath: join('workflows', 'codex-instructions.md'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.agents', 'AGENTS.md')
+            : join(projectPath, '.agents', 'AGENTS.md'),
+        alwaysGlobal: false,
+        inject: true,
+        platform: 'agents-standard',
+    },
+    {
+        id: 'agents-standard-skills',
+        label: 'Agent Skills — Open Standard',
+        description: 'Open-standard .agents/skills/ — portable across all .agents/-aware CLIs and IDEs',
+        sourcePath: join('.claude', 'commands'),
+        sourceCountDir: join('.claude', 'commands'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.agents', 'skills')
+            : join(projectPath, '.agents', 'skills'),
+        alwaysGlobal: false,
+        platform: 'agents-standard',
+        build: (claudeDir, targetDir) => {
+            const { buildAgentsStandardSkills } = require('./skill-converter.js');
+            return buildAgentsStandardSkills(claudeDir, targetDir);
+        },
+    },
+    {
+        id: 'agents-standard-agents',
+        label: 'Agent Sub-Agents — Open Standard',
+        description: 'Open-standard .agents/agents/ for sub-agent role definitions',
+        sourcePath: join('.claude', 'agents'),
+        sourceCountDir: join('.claude', 'agents'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.agents', 'agents')
+            : join(projectPath, '.agents', 'agents'),
+        alwaysGlobal: false,
+        platform: 'agents-standard',
+        build: (claudeDir, targetDir) => {
+            const { buildAgentsStandardAgents } = require('./skill-converter.js');
+            return buildAgentsStandardAgents(claudeDir, targetDir);
+        },
+    },
+    // -------------------------------------------------------------------------
+    // Optional skill packages — group bundles (use `install toggle` for individual control)
+    // -------------------------------------------------------------------------
+    {
+        id: 'skills-extra-team',
+        label: 'Extra Team Skills',
+        description: 'Legacy no-op bundle — former extra team skills were removed (2026-07); retained for manifest-replay migration',
+        sourcePath: join('.claude', 'skills'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'skills')
+            : join(projectPath, '.claude', 'skills'),
+        alwaysGlobal: false,
+        category: 'skills',
+        platform: 'claude',
+        defaultSelected: false,
+        fileFilter: (name) => EXTRA_TEAM_SKILL_NAMES.has(name),
+    },
+    {
+        id: 'skills-scholar',
+        label: 'Scholar Skills (选装)',
+        description: `${SCHOLAR_SKILLS.length} academic writing & research skills — optional, not installed by default`,
+        sourcePath: join('optional', 'skills'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'skills')
+            : join(projectPath, '.claude', 'skills'),
+        alwaysGlobal: false,
+        category: 'skills',
+        platform: 'claude',
+        defaultSelected: false,
+        fileFilter: (name) => SCHOLAR_SKILL_NAMES.has(name),
+    },
+    {
+        id: 'skills-meta',
+        label: 'Meta Skills',
+        description: 'Legacy no-op bundle — former meta-skill members moved to core `skills` (2026-07); retained for manifest-replay migration',
+        sourcePath: join('.claude', 'skills'),
+        target: (mode, projectPath) => mode === 'global'
+            ? join(homedir(), '.claude', 'skills')
+            : join(projectPath, '.claude', 'skills'),
+        alwaysGlobal: false,
+        category: 'skills',
+        platform: 'claude',
+        defaultSelected: false,
+        fileFilter: (name) => META_SKILL_NAMES.has(name),
+    },
+];
+export const EXTRA_PLATFORMS = [
+    { id: 'cursor', label: 'Cursor', description: 'Cursor AI IDE', configDir: '.cursor' },
+    { id: 'opencode', label: 'OpenCode', description: 'OpenCode CLI', configDir: '.opencode' },
+    { id: 'kiro', label: 'Kiro', description: 'AWS Kiro IDE', configDir: '.kiro' },
+    { id: 'kilo', label: 'Kilo Code', description: 'Kilo Code IDE', configDir: '.kilocode' },
+    { id: 'copilot', label: 'GitHub Copilot', description: 'GitHub Copilot agent', configDir: '.github', contextFile: 'copilot-instructions.md' },
+    { id: 'devin', label: 'Devin', description: 'Cognition Devin', configDir: '.devin' },
+    { id: 'qoder', label: 'Qoder / Qoder CN', description: 'Qoder CLI / Agent', configDir: '.qoder' },
+    { id: 'codebuddy', label: 'CodeBuddy', description: 'CodeBuddy IDE', configDir: '.codebuddy' },
+    { id: 'droid', label: 'Droid', description: 'Factory Droid', configDir: '.factory' },
+    { id: 'trae', label: 'Trae / Trae CN', description: 'Trae AI IDE', configDir: '.trae' },
+    { id: 'roo', label: 'Roo Code', description: 'Roo Code IDE', configDir: '.roo' },
+    { id: 'aider-desk', label: 'AiderDesk', description: 'AiderDesk Agent', configDir: '.aider-desk' },
+    { id: 'amp', label: 'Amp', description: 'Amp Agent', configDir: '.amp' },
+    { id: 'antigravity', label: 'Antigravity', description: 'Antigravity Agent', configDir: '.antigravity' },
+    { id: 'antigravity-cli', label: 'Antigravity CLI', description: 'Antigravity CLI Agent', configDir: '.antigravity-cli' },
+    { id: 'astrbot', label: 'AstrBot', description: 'AstrBot Agent', configDir: '.astrbot' },
+    { id: 'autohand-code', label: 'Autohand Code CLI', description: 'Autohand Code CLI Agent', configDir: '.autohand', globalConfigDir: '.autohand' },
+    { id: 'augment', label: 'Augment', description: 'Augment Agent', configDir: '.augment' },
+    { id: 'bob', label: 'IBM Bob', description: 'IBM Bob Agent', configDir: '.bob' },
+    { id: 'cline', label: 'Cline', description: 'Cline Agent', configDir: '.cline' },
+    { id: 'codearts-agent', label: 'CodeArts Agent', description: 'CodeArts Agent Agent', configDir: '.codeartsdoer' },
+    { id: 'codemaker', label: 'Codemaker', description: 'Codemaker Agent', configDir: '.codemaker' },
+    { id: 'codestudio', label: 'Code Studio', description: 'Code Studio Agent', configDir: '.codestudio' },
+    { id: 'command-code', label: 'Command Code', description: 'Command Code Agent', configDir: '.commandcode' },
+    { id: 'continue', label: 'Continue', description: 'Continue Agent', configDir: '.continue' },
+    { id: 'cortex', label: 'Cortex Code', description: 'Cortex Code Agent', configDir: '.cortex' },
+    { id: 'crush', label: 'Crush', description: 'Crush Agent', configDir: '.crush' },
+    { id: 'deepagents', label: 'Deep Agents', description: 'Deep Agents Agent', configDir: '.deepagents' },
+    { id: 'dexto', label: 'Dexto', description: 'Dexto Agent', configDir: '.dexto' },
+    { id: 'eve', label: 'Eve', description: 'Eve Agent', configDir: 'agent' },
+    { id: 'firebender', label: 'Firebender', description: 'Firebender Agent', configDir: '.firebender' },
+    { id: 'forgecode', label: 'ForgeCode', description: 'ForgeCode Agent', configDir: '.forge' },
+    { id: 'goose', label: 'Goose', description: 'Goose Agent', configDir: '.goose' },
+    { id: 'grok', label: 'Grok Build', description: 'xAI Grok Build CLI', configDir: '.grok', contextFile: 'rules/maestro.md', contextSource: 'grok-instructions.md' },
+    { id: 'hermes-agent', label: 'Hermes Agent', description: 'Hermes Agent Agent', configDir: '.hermes', globalConfigDir: '.hermes' },
+    { id: 'inference-sh', label: 'inference.sh', description: 'inference.sh Agent', configDir: '.inferencesh' },
+    { id: 'jazz', label: 'Jazz', description: 'Jazz Agent', configDir: '.jazz' },
+    { id: 'junie', label: 'Junie', description: 'Junie Agent', configDir: '.junie' },
+    { id: 'iflow-cli', label: 'iFlow CLI', description: 'iFlow CLI Agent', configDir: '.iflow' },
+    { id: 'kimi-code-cli', label: 'Kimi Code CLI', description: 'Kimi Code CLI Agent', configDir: '.kimi-code' },
+    { id: 'kode', label: 'Kode', description: 'Kode Agent', configDir: '.kode' },
+    { id: 'lingma', label: 'Lingma', description: 'Lingma Agent', configDir: '.lingma' },
+    { id: 'loaf', label: 'Loaf', description: 'Loaf Agent', configDir: '.loaf' },
+    { id: 'mcpjam', label: 'MCPJam', description: 'MCPJam Agent', configDir: '.mcpjam' },
+    { id: 'mistral-vibe', label: 'Mistral Vibe', description: 'Mistral Vibe Agent', configDir: '.vibe', globalConfigDir: '.vibe' },
+    { id: 'moxby', label: 'Moxby', description: 'Moxby Agent', configDir: '.moxby' },
+    { id: 'mux', label: 'Mux', description: 'Mux Agent', configDir: '.mux' },
+    { id: 'openhands', label: 'OpenHands', description: 'OpenHands Agent', configDir: '.openhands' },
+    { id: 'ona', label: 'Ona', description: 'Ona Agent', configDir: '.ona' },
+    { id: 'qwen-code', label: 'Qwen Code', description: 'Qwen Code Agent', configDir: '.qwen' },
+    { id: 'replit', label: 'Replit', description: 'Replit Agent', configDir: '.replit' },
+    { id: 'reasonix', label: 'Reasonix', description: 'Reasonix Agent', configDir: '.reasonix' },
+    { id: 'rovodev', label: 'Rovo Dev', description: 'Rovo Dev Agent', configDir: '.rovodev' },
+    { id: 'tabnine-cli', label: 'Tabnine CLI', description: 'Tabnine CLI Agent', configDir: '.tabnine' },
+    { id: 'terramind', label: 'Terramind', description: 'Terramind Agent', configDir: '.terramind' },
+    { id: 'tinycloud', label: 'Tinycloud', description: 'Tinycloud Agent', configDir: '.tinycloud' },
+    { id: 'warp', label: 'Warp', description: 'Warp Agent', configDir: '.warp' },
+    { id: 'windsurf', label: 'Windsurf', description: 'Windsurf Agent', configDir: '.windsurf' },
+    { id: 'zed', label: 'Zed', description: 'Zed Agent', configDir: '.zed' },
+    { id: 'zencoder', label: 'Zencoder / Zenflow', description: 'Zencoder / Zenflow Agent', configDir: '.zencoder' },
+    { id: 'neovate', label: 'Neovate', description: 'Neovate Agent', configDir: '.neovate' },
+    { id: 'pochi', label: 'Pochi', description: 'Pochi Agent', configDir: '.pochi' },
+    { id: 'promptscript', label: 'PromptScript', description: 'PromptScript Agent', configDir: '.promptscript' },
+    { id: 'adal', label: 'AdaL', description: 'AdaL Agent', configDir: '.adal' },
+];
+function makeExtraPlatformDefs(entry) {
+    const { id, configDir, contextFile = 'AGENTS.md' } = entry;
+    const rawGlobalDir = entry.globalConfigDir ?? configDir;
+    let globalDir;
+    const resolveGlobalDir = () => {
+        if (globalDir !== undefined)
+            return globalDir;
+        const fs = require('node:fs');
+        if (id === 'trae' && fs.existsSync(join(homedir(), '.trae-cn')))
+            globalDir = '.trae-cn';
+        else if (id === 'qoder' && fs.existsSync(join(homedir(), '.qoder-cn')))
+            globalDir = '.qoder-cn';
+        else
+            globalDir = rawGlobalDir;
+        return globalDir;
+    };
+    return [
+        {
+            id: `${id}-context`,
+            label: `${entry.label} Context`,
+            description: `${entry.label} project instructions (${contextFile})`,
+            sourcePath: join('workflows', entry.contextSource ?? 'codex-instructions.md'),
+            target: (mode, projectPath) => mode === 'global'
+                ? join(homedir(), resolveGlobalDir(), contextFile)
+                : join(projectPath, configDir, contextFile),
+            alwaysGlobal: false,
+            inject: true,
+            platform: id,
+        },
+        {
+            id: `${id}-md-chinese`,
+            label: `Chinese Response (${entry.label})`,
+            description: `Chinese response guidelines → ${contextFile}`,
+            sourcePath: join('workflows', 'chinese-response.md'),
+            target: (mode, projectPath) => mode === 'global'
+                ? join(homedir(), resolveGlobalDir(), contextFile)
+                : join(projectPath, configDir, contextFile),
+            alwaysGlobal: false,
+            inject: true,
+            section: 'chinese',
+            platform: id,
+        },
+        {
+            id: `${id}-skills`,
+            label: `${entry.label} Skills`,
+            description: `${entry.label} skill definitions`,
+            sourcePath: join('.claude', 'commands'),
+            sourceCountDir: join('.claude', 'commands'),
+            target: (mode, projectPath) => mode === 'global'
+                ? join(homedir(), resolveGlobalDir(), 'skills')
+                : join(projectPath, configDir, 'skills'),
+            alwaysGlobal: false,
+            platform: id,
+            build: (claudeDir, targetDir) => {
+                if (id === 'eve') {
+                    const { buildEveSkills } = require('./skill-converter.js');
+                    return buildEveSkills(claudeDir, targetDir);
+                }
+                if (id === 'grok') {
+                    const { buildGrokSkills } = require('./skill-converter.js');
+                    return buildGrokSkills(claudeDir, targetDir);
+                }
+                if (id === 'cursor') {
+                    const { buildCursorSkills } = require('./skill-converter.js');
+                    return buildCursorSkills(claudeDir, targetDir);
+                }
+                const { buildAgentsStandardSkills } = require('./skill-converter.js');
+                return buildAgentsStandardSkills(claudeDir, targetDir);
+            },
+        },
+        {
+            id: `${id}-agents`,
+            label: `${entry.label} Agents`,
+            description: `${entry.label} agent definitions`,
+            sourcePath: join('.claude', 'agents'),
+            sourceCountDir: join('.claude', 'agents'),
+            target: (mode, projectPath) => mode === 'global'
+                ? join(homedir(), resolveGlobalDir(), 'agents')
+                : join(projectPath, configDir, 'agents'),
+            alwaysGlobal: false,
+            platform: id,
+            build: (claudeDir, targetDir) => {
+                if (id === 'eve') {
+                    const { buildEveAgents } = require('./skill-converter.js');
+                    return buildEveAgents(claudeDir, targetDir);
+                }
+                if (id === 'grok') {
+                    const { buildGrokAgents } = require('./skill-converter.js');
+                    return buildGrokAgents(claudeDir, targetDir);
+                }
+                if (id === 'cursor') {
+                    const { buildCursorAgents } = require('./skill-converter.js');
+                    return buildCursorAgents(claudeDir, targetDir);
+                }
+                const { buildAgentsStandardAgents } = require('./skill-converter.js');
+                return buildAgentsStandardAgents(claudeDir, targetDir);
+            },
+        },
+    ];
+}
+for (const entry of EXTRA_PLATFORMS) {
+    COMPONENT_DEFS.push(...makeExtraPlatformDefs(entry));
+}
+// ---------------------------------------------------------------------------
+// Manifest migration — map old individual skill IDs to new group bundles
+// ---------------------------------------------------------------------------
+const VALID_IDS = new Set(COMPONENT_DEFS.map((d) => d.id));
+const LEGACY_SKILL_TO_GROUP = new Map();
+LEGACY_SKILL_TO_GROUP.set('commands-odyssey', 'commands');
+LEGACY_SKILL_TO_GROUP.set('commands-learn', 'commands');
+for (const s of LEGACY_EXTRA_TEAM_SKILL_NAMES)
+    LEGACY_SKILL_TO_GROUP.set(s, 'skills-extra-team');
+for (const s of SCHOLAR_SKILLS)
+    LEGACY_SKILL_TO_GROUP.set(s.name, 'skills-scholar');
+for (const s of LEGACY_META_SKILL_NAMES)
+    LEGACY_SKILL_TO_GROUP.set(s, 'skills-meta');
+export function migrateComponentIds(ids) {
+    const result = new Set();
+    for (const id of ids) {
+        if (VALID_IDS.has(id)) {
+            result.add(id);
+        }
+        else {
+            const groupId = LEGACY_SKILL_TO_GROUP.get(id);
+            if (groupId)
+                result.add(groupId);
+        }
+    }
+    return Array.from(result);
+}
+/**
+ * Partition a raw requested component-ID list (e.g. from `--components` or a
+ * replayed manifest/profile) into three buckets:
+ *  - `unknown`: IDs that name no defined component even after legacy migration
+ *    (caller should hard-error on these).
+ *  - `unavailable`: IDs that name a defined component but are absent from
+ *    `availableIds` — i.e. the component's source files are not present in this
+ *    package build (empty source dir, or not shipped). Reinstall/upgrade flows
+ *    replay the prior selection, so these must be soft-skipped, not fatal.
+ *  - `requested`: the migrated, de-duplicated ID list (defined IDs only).
+ */
+export function partitionRequestedComponentIds(rawIds, availableIds) {
+    const unknown = rawIds.filter((id) => migrateComponentIds([id]).length === 0);
+    const requested = Array.from(new Set(migrateComponentIds(rawIds)));
+    const unavailable = requested.filter((id) => !availableIds.has(id));
+    return { unknown, unavailable, requested };
+}
+/**
+ * Migrate old IDs + merge new default-selected components.
+ * Used during `maestro update` reinstall so new-version components
+ * with `defaultSelected !== false` are automatically included.
+ */
+export function mergeNewDefaults(existingIds, knownIds) {
+    const migrated = migrateComponentIds(existingIds);
+    // Older manifests did not record the catalog they were created from. In
+    // that case absence is ambiguous (new component vs explicit opt-out), so
+    // preserving the exact migrated selection is the only safe behavior.
+    if (!knownIds)
+        return migrated;
+    const migratedSet = new Set(migrated);
+    const knownSet = new Set(knownIds.flatMap((id) => migrateComponentIds([id])));
+    const selectedPlatforms = new Set(COMPONENT_DEFS
+        .filter((def) => migratedSet.has(def.id))
+        .map((def) => def.platform ?? 'shared')
+        .filter((platform) => platform !== 'shared'));
+    for (const def of COMPONENT_DEFS) {
+        const platform = def.platform ?? 'shared';
+        const platformSelected = platform === 'shared' || selectedPlatforms.has(platform);
+        if (!knownSet.has(def.id) && !migratedSet.has(def.id)
+            && def.defaultSelected !== false && platformSelected) {
+            migrated.push(def.id);
+            migratedSet.add(def.id);
+        }
+    }
+    return migrated;
+}

@@ -1,0 +1,7 @@
+{
+  "upstreamCommit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "source": "packages/pi-maestro-flow/src/mcp/server-manager.ts",
+  "licenseSource": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/mcp/LICENSE.pi-mcp-adapter",
+  "scope": "bounded discovery constants, types, errors and seven functions; Host drain constants excluded",
+  "transform": "export public page/error/collector; required checkAborted callback replaces two Host abort calls"
+}

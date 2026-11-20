@@ -1,0 +1,275 @@
+{
+  "repository": "https://github.com/catlog22/pi-maestro-flow",
+  "commit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "sourcePackages": [
+    "pi-maestro-fabric-core@0.1.0",
+    "pi-maestro-fabric@0.1.0"
+  ],
+  "note": "Original comments, public APIs and algorithms retained; runtime imports only rebased to the internal contracts. Host-specific stores, credentials, socket dialers and MCP clients remain injected by existing owners.",
+  "files": [
+    {
+      "source": "packages/pi-maestro-fabric-core/src/index.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/index.ts",
+      "beforeSha256": "443daf9dc563be3988bb475cbccc0fb2b7455933fe11739ee2cd26bfed177134",
+      "afterSha256": "443daf9dc563be3988bb475cbccc0fb2b7455933fe11739ee2cd26bfed177134",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/artifact.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/artifact.ts",
+      "beforeSha256": "8d093394f2c2b073812d577b77373e23458ccf8c527b7a3639e997579d61fc5e",
+      "afterSha256": "8d093394f2c2b073812d577b77373e23458ccf8c527b7a3639e997579d61fc5e",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/capability.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/capability.ts",
+      "beforeSha256": "ee5a693796b9552e4f6f429cc7f3977556046c2044ae6fc6a5b36b135567be79",
+      "afterSha256": "ee5a693796b9552e4f6f429cc7f3977556046c2044ae6fc6a5b36b135567be79",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/common.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/common.ts",
+      "beforeSha256": "88c4575735d51a7102fccd25fb179b9f14ae37119c006dc277e4f17fe6e29e8f",
+      "afterSha256": "88c4575735d51a7102fccd25fb179b9f14ae37119c006dc277e4f17fe6e29e8f",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/connection.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/connection.ts",
+      "beforeSha256": "cd98e9fd63ab5af3618e0ee7bdbc87ed4de3dae4795bcc372ea52cfc559b904b",
+      "afterSha256": "cd98e9fd63ab5af3618e0ee7bdbc87ed4de3dae4795bcc372ea52cfc559b904b",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/control.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/control.ts",
+      "beforeSha256": "76224ab6f53f28d0b4d32214f7fe6e8d9c32239f1b5b5c5bb11da989e131bb0d",
+      "afterSha256": "76224ab6f53f28d0b4d32214f7fe6e8d9c32239f1b5b5c5bb11da989e131bb0d",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/device.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/device.ts",
+      "beforeSha256": "7cf410417b1250225eb06e5f6777d7f9a033f8ddacb7fa9ab1e7b8950ecde116",
+      "afterSha256": "7cf410417b1250225eb06e5f6777d7f9a033f8ddacb7fa9ab1e7b8950ecde116",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/endpoint.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/endpoint.ts",
+      "beforeSha256": "d7b5383f93e5c3af9e859ce83b65ad81328cda23a8a0a1d93e9bf492d6b84398",
+      "afterSha256": "d7b5383f93e5c3af9e859ce83b65ad81328cda23a8a0a1d93e9bf492d6b84398",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/hub-relay.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/hub-relay.ts",
+      "beforeSha256": "a253fff2406e11edb8579136b7f1a723a35704b62a41738b223a0d543375b776",
+      "afterSha256": "a253fff2406e11edb8579136b7f1a723a35704b62a41738b223a0d543375b776",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/index.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/index.ts",
+      "beforeSha256": "432025147e56bbecfb6d5635520651c32e12cb4586c95464ad311b06b9a5e26f",
+      "afterSha256": "432025147e56bbecfb6d5635520651c32e12cb4586c95464ad311b06b9a5e26f",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/invocation.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/invocation.ts",
+      "beforeSha256": "7dc2508cfa84209f2cdb098962207106c3e9f96f91cb746c6dd86d36cf61d93e",
+      "afterSha256": "7dc2508cfa84209f2cdb098962207106c3e9f96f91cb746c6dd86d36cf61d93e",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/mount.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/mount.ts",
+      "beforeSha256": "9a782c994206927000911c1eaf90a1e79d1f1ce932cb4cc69c4e795d184551f2",
+      "afterSha256": "9a782c994206927000911c1eaf90a1e79d1f1ce932cb4cc69c4e795d184551f2",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/placement.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/placement.ts",
+      "beforeSha256": "6bedb46997a992e696abfdd86404902bba3809b5dd0cd74e73b3344974b01b37",
+      "afterSha256": "6bedb46997a992e696abfdd86404902bba3809b5dd0cd74e73b3344974b01b37",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/projection.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/projection.ts",
+      "beforeSha256": "2f3b8d1791fc465477cd436950b61ce74c22cfcdc128a2d3b2c1432a44e9e3c6",
+      "afterSha256": "2f3b8d1791fc465477cd436950b61ce74c22cfcdc128a2d3b2c1432a44e9e3c6",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/protocol.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/protocol.ts",
+      "beforeSha256": "610ebeccafdd7cafe7739e23c7736055fb7891adef46e544d67ff2d928b5f5a2",
+      "afterSha256": "610ebeccafdd7cafe7739e23c7736055fb7891adef46e544d67ff2d928b5f5a2",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/route.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/route.ts",
+      "beforeSha256": "09e25542ef94ed70af66bd5c519c4e9c1cfee28b90e0ae5a698e5cdbd758e274",
+      "afterSha256": "09e25542ef94ed70af66bd5c519c4e9c1cfee28b90e0ae5a698e5cdbd758e274",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/security.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/security.ts",
+      "beforeSha256": "b69b0fc01d5cef962f9d0ab2f0d4d5495fb7dab4180a20aecd30bf7eff90ebc2",
+      "afterSha256": "b69b0fc01d5cef962f9d0ab2f0d4d5495fb7dab4180a20aecd30bf7eff90ebc2",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/store.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/store.ts",
+      "beforeSha256": "5151cd79fba3dfc84b5127dfaf53a39e44331411bf1d4e0f0035523655376499",
+      "afterSha256": "5151cd79fba3dfc84b5127dfaf53a39e44331411bf1d4e0f0035523655376499",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/transport.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/transport.ts",
+      "beforeSha256": "e84f547681399af30837c15cec3f2b252e1d790f802f008b9ccfda6c906de84d",
+      "afterSha256": "e84f547681399af30837c15cec3f2b252e1d790f802f008b9ccfda6c906de84d",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/validation.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/validation.ts",
+      "beforeSha256": "db99d8e3c8607c040efee531f2461322a5bba5930b6965e9957a82fae970699c",
+      "afterSha256": "db99d8e3c8607c040efee531f2461322a5bba5930b6965e9957a82fae970699c",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric-core/src/public/v1/workspace.ts",
+      "destination": "packages/pi-graph-collaboration/src/contracts/public/v1/workspace.ts",
+      "beforeSha256": "2812822b325a82a65c2fb5fc6ef17b1aec84652ff89e80806e666b863e018d75",
+      "afterSha256": "2812822b325a82a65c2fb5fc6ef17b1aec84652ff89e80806e666b863e018d75",
+      "change": "byte-identical"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/admission-manager.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/admission-manager.ts",
+      "beforeSha256": "b53a55568e5ae90a967775d3cb90b2d7d9dac5c63a8b438b234093a091caf4f3",
+      "afterSha256": "d21ea45bddcbf6eefe9586b0ebb6333f905a2b3e7e2efb8c1c402cd544b8f68a",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/artifact-transfer.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/artifact-transfer.ts",
+      "beforeSha256": "4091a98cf2337e6e1b43774ca8e816a73503a58b2a4c3980030e41c0edd47d39",
+      "afterSha256": "0cf49036cdb76e85e8c40b5384c0b2f2e3258a11cc763c06840f0945c03381de",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/channel-router.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/channel-router.ts",
+      "beforeSha256": "ece6cb3807605d153b1f5dab69cda74a65cf2e5e0fce3776b800fbb96826c161",
+      "afterSha256": "743e853f35c14ee691b0f971de03014d52b89a1df092686c4039915e9f55f6e8",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/connection-manager.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/connection-manager.ts",
+      "beforeSha256": "57491b8f057c3e4771779f8626cae737fdb6909bbac88f936b54892efd4c05fd",
+      "afterSha256": "81a587be2e378db74e1b5c9999bc1f4d917bd677ff422d5c06a76245b2bd4203",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/directory-authority.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/directory-authority.ts",
+      "beforeSha256": "b1916aee9a35858754504552beb5747aa6fc1b1b5a6f949d665aeac33b720f3d",
+      "afterSha256": "e0c3c975683e176172973772bd6d52a96403cbb999b477b6adcca823b7352128",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/directory.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/directory.ts",
+      "beforeSha256": "8c9f3af553b263c5c018307c21578136d25134bca938cbb69ffc773009742185",
+      "afterSha256": "bcc0d238e0deea30310569a38c419f24799b5df4df3fc4bed2fb15348facb60b",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/edge-relay-transport.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/edge-relay-transport.ts",
+      "beforeSha256": "3f3464835fc37a7b074192810cacae453cdf3496abcf6d8652167520290b26da",
+      "afterSha256": "2c1e618591684dcdcb98d5afe108c16274c4e1d62950176ff9b66fbd4334d111",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/fixed-ssh-channel.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/fixed-ssh-channel.ts",
+      "beforeSha256": "b1e316e29909d81bfaa9280f7b1cd84bbbcd59d4bd91faf5bb4d0900430dbe73",
+      "afterSha256": "bc2621605015ccb853d4574f28d81d505027dae2c2be7c2a5905af398c675e10",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/index.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/index.ts",
+      "beforeSha256": "fa1ec7861f82ade191ce1229a64b3bea4d3f311009245c2ac2bec33fc1249d70",
+      "afterSha256": "fa1ec7861f82ade191ce1229a64b3bea4d3f311009245c2ac2bec33fc1249d70",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/invocation-manager.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/invocation-manager.ts",
+      "beforeSha256": "2061ad9b2dbf51037471a7da38ad9731da29e18cdba80ca3edc4bb4d47b5f831",
+      "afterSha256": "bd1f21569d91cfa3b3579b18017669646ae36aa5be8731f06606d0117945bbea",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/mcp-mount-provider.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/mcp-mount-provider.ts",
+      "beforeSha256": "08ea5b5426dd8f2ebdfe6a0122008fae4cfa83441f88969ad6b6ac06b94bc5b5",
+      "afterSha256": "8046432cc715b46401846410bf39dbe044e89bf38460f480bb2ae4f7082ef2cd",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/outbound-wss-transport.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/outbound-wss-transport.ts",
+      "beforeSha256": "3eee077fe21d8fe585efd8c5e93660cb4090d9ee6ec2d2d48e1a798abc79fd09",
+      "afterSha256": "04a4020f5d5ab5f6bda5f66251c430589295cb3f58a05b467a484b65386f3b00",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/presence-manager.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/presence-manager.ts",
+      "beforeSha256": "3ce8dbdb4e588355d2e6f7ab2f241f739be682c0b775f984d01f16826d75d771",
+      "afterSha256": "cb8556ecbc9331a874ec89c35c819dc4a8b1063132b6cd8754287d16ffa4c2fe",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/store-coordinator.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/store-coordinator.ts",
+      "beforeSha256": "85714408bb96091ca2eb1894287240439786d5433f59243a31bb05c10e3c1d50",
+      "afterSha256": "66918652e9ae08f1f3da5e1669799e321df5bf9819b9e533e1db7d4dba37481e",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/stream-channel.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/stream-channel.ts",
+      "beforeSha256": "08b13e4f7fd40011085318612c1bfd6cfc83d2d720e64ab63abf8739186ff488",
+      "afterSha256": "7f809b1e638741834e176dbe9a352b35269af26f99ea572ba0747dd6865491bb",
+      "change": "imports rebased to internal contracts only"
+    },
+    {
+      "source": "packages/pi-maestro-fabric/src/transport-registry.ts",
+      "destination": "packages/pi-graph-collaboration/src/runtime/transport-registry.ts",
+      "beforeSha256": "013323294dd20ad26a9838c49fc9cec642d1e3137e20a1b1244a28dfec321683",
+      "afterSha256": "1e2b21a0518a5262923bc812235e604f8531648ce78156d39261de0e06fe44a9",
+      "change": "imports rebased to internal contracts only"
+    }
+  ],
+  "upstreamRootLicense": "MIT; original copyright and permission notice copied verbatim as LICENSE.upstream",
+  "sourcePackageLicenseDeclarations": {
+    "pi-maestro-fabric-core@0.1.0": "ISC",
+    "pi-maestro-fabric@0.1.0": "ISC"
+  }
+}

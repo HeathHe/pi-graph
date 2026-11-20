@@ -1,0 +1,243 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { modelReference as parseModelReference, modelKey, TemporaryPlanSelection } from "pi-graph-model-role";
+import { randomUUID } from "node:crypto";
+import {
+  existsSync,
+  readFileSync,
+} from "node:fs";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { lockSettingsResource } from "../settings/resource-lock.ts";
+import { isPlanMode } from "./plan.ts";
+import { refreshModelRegistry } from "pi-maestro-teammate/v1/model-routing";
+
+interface PlanModelPatch {
+  present: boolean;
+  model?: string;
+}
+
+export interface PlanModelRuntimeOptions {
+  isPlanMode?: () => boolean;
+  loadModel?: (cwd: string, projectTrusted: boolean) => string | undefined;
+}
+
+export interface PlanModelTransition {
+  current: string;
+  act?: string;
+}
+
+export interface PlanModelController {
+  restoreActModel(ctx: Pick<ExtensionContext, "model" | "ui">): Promise<boolean>;
+  describeTransition(ctx: Pick<ExtensionContext, "model">): PlanModelTransition | undefined;
+}
+
+function readPlanModelPatch(filePath: string): PlanModelPatch {
+  if (!existsSync(filePath)) return { present: false };
+  try {
+    const root = JSON.parse(readFileSync(filePath, "utf8")) as { plan?: unknown };
+    if (!root.plan || typeof root.plan !== "object" || Array.isArray(root.plan)) return { present: false };
+    const plan = root.plan as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(plan, "model")) return { present: false };
+    if (plan.model === null) return { present: true };
+    if (typeof plan.model !== "string" || plan.model.trim().length === 0) return { present: false };
+    return { present: true, model: plan.model.trim() };
+  } catch {
+    return { present: false };
+  }
+}
+
+export function resolvePlanModelSettingsPaths(cwd: string): string[] {
+  const userDir = join(getAgentDir(), "pi-graph-next");
+  return [
+    join(userDir, "settings.json"),
+    join(cwd, ".pi", "pi-graph-next", "settings.json"),
+    join(cwd, ".pi", "pi-graph-next", "settings.local.json"),
+  ];
+}
+
+export function loadPlanModelSetting(cwd: string, projectTrusted = true): string | undefined {
+  let model: string | undefined;
+  const paths = resolvePlanModelSettingsPaths(cwd);
+  const candidates = projectTrusted ? paths : paths.slice(0, 1);
+  for (const filePath of candidates) {
+    const patch = readPlanModelPatch(filePath);
+    if (patch.present) model = patch.model;
+  }
+  return model;
+}
+
+export async function saveLocalPlanModelSetting(cwd: string, model: string | null): Promise<void> {
+  const filePath = resolvePlanModelSettingsPaths(cwd)[2]!;
+  const release = await lockSettingsResource(filePath);
+  let temporary: string | undefined;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    let root: Record<string, unknown> = {};
+    if (existsSync(filePath)) {
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("settings.local.json must contain a JSON object");
+      }
+      root = parsed as Record<string, unknown>;
+    }
+    const plan = root.plan && typeof root.plan === "object" && !Array.isArray(root.plan)
+      ? { ...(root.plan as Record<string, unknown>) }
+      : {};
+    plan.model = model;
+    root.plan = plan;
+    await mkdir(dirname(filePath), { recursive: true });
+    temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+    handle = await open(temporary, "wx", 0o600);
+    await handle.writeFile(`${JSON.stringify(root, null, 2)}\n`, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, filePath);
+    temporary = undefined;
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch { /* best effort */ }
+    }
+    if (temporary) {
+      try { await rm(temporary, { force: true }); } catch { /* best effort */ }
+    }
+    await release();
+  }
+}
+
+export function registerPlanModelSelection(
+  pi: ExtensionAPI,
+  options: PlanModelRuntimeOptions = {},
+): PlanModelController {
+  const planModeActive = options.isPlanMode ?? isPlanMode;
+  const configuredModel = options.loadModel ?? loadPlanModelSetting;
+  const selection = new TemporaryPlanSelection<NonNullable<ExtensionContext["model"]>>();
+  const warnedMessages = new Set<string>();
+
+  pi.registerCommand("plan-model", {
+    description: "Configure the dedicated model used in Plan mode",
+    async handler(args, ctx) {
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.notify("Trust this workspace before saving a project-local Plan model.", "warning");
+        return;
+      }
+      await refreshModelRegistry(ctx);
+      const available = ctx.modelRegistry.getAvailable();
+      const references = available.map((model) => modelKey(model)!).sort();
+      const requested = args.trim();
+      let selected: string | null | undefined;
+      if (requested) {
+        selected = ["off", "default", "session"].includes(requested.toLowerCase()) ? null : requested;
+      } else {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Usage: /plan-model provider/model or /plan-model off", "warning");
+          return;
+        }
+        const follow = "Follow session model";
+        const choice = await ctx.ui.select("Plan mode model", [follow, ...references]);
+        if (!choice) return;
+        selected = choice === follow ? null : choice;
+      }
+      if (selected !== null && !references.includes(selected)) {
+        ctx.ui.notify(`Plan model ${selected} is not available.`, "warning");
+        return;
+      }
+      try {
+        await saveLocalPlanModelSetting(ctx.cwd, selected);
+        warnedMessages.clear();
+        ctx.ui.notify(selected ? `Plan model: ${selected}` : "Plan model follows the session model.", "info");
+      } catch (error) {
+        ctx.ui.notify(`Could not save Plan model: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    },
+  });
+
+  const warnOnce = (ctx: Pick<ExtensionContext, "ui">, message: string): void => {
+    if (warnedMessages.has(message)) return;
+    warnedMessages.add(message);
+    ctx.ui.notify(message, "warning");
+  };
+
+  const restore = async (ctx: Pick<ExtensionContext, "model" | "ui">, force = false): Promise<boolean> => {
+    if (!selection.original) return true;
+    if (!force && modelKey(ctx.model) === modelKey(selection.original)) {
+      selection.restored();
+      return true;
+    }
+    try {
+      if (!await pi.setModel(selection.original)) {
+        warnOnce(ctx, `Could not restore the Act model ${modelKey(selection.original)}; it has no configured authentication.`);
+        return false;
+      }
+      selection.restored();
+      warnedMessages.clear();
+      return true;
+    } catch (error) {
+      warnOnce(ctx, `Could not restore the Act model ${modelKey(selection.original)}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (selection.original) await restore(ctx);
+    if (!selection.original) warnedMessages.clear();
+  });
+
+  pi.on("before_agent_start", async (_event, ctx) => {
+    // Outside Plan mode the configured value is never used, so checking the
+    // mode first keeps ordinary Act turns from probing the settings files.
+    if (!planModeActive()) {
+      await restore(ctx);
+      return;
+    }
+    const reference = configuredModel(ctx.cwd, ctx.isProjectTrusted());
+    if (!reference) {
+      await restore(ctx);
+      return;
+    }
+
+    const parsed = parseModelReference(reference);
+    const target = parsed ? ctx.modelRegistry.find(parsed.provider, parsed.id) : undefined;
+    if (!target) {
+      await restore(ctx);
+      warnOnce(ctx, `Plan model ${reference} is unavailable; continuing with the session model.`);
+      return;
+    }
+    if (modelKey(ctx.model) === modelKey(target)) return;
+
+    const previous = ctx.model;
+    // Capture before calling the host: a failed switch can partially change host state.
+    selection.rememberBeforeSwitch(previous);
+    try {
+      if (!await pi.setModel(target)) {
+        await restore(ctx, true);
+        warnOnce(ctx, `Plan model ${reference} has no configured authentication; continuing with the session model.`);
+        return;
+      }
+      warnedMessages.clear();
+    } catch (error) {
+      await restore(ctx, true);
+      warnOnce(ctx, `Could not select Plan model ${reference}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    if (!planModeActive()) await restore(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (await restore(ctx)) warnedMessages.clear();
+  });
+
+  return {
+    restoreActModel: restore,
+    describeTransition(ctx) {
+      const current = modelKey(ctx.model);
+      if (!current) return undefined;
+      const act = modelKey(selection.original);
+      return act && act !== current ? { current, act } : { current };
+    },
+  };
+}

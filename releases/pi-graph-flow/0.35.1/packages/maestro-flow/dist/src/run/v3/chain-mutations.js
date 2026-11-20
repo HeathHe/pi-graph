@@ -1,0 +1,167 @@
+import { createRevisionConflictError, V3StructuredError } from './errors.js';
+import { canonicalPayloadHash, createRequestReceipt, createTransitionReceipt, replayRequestReceipt, transitionReceiptRef, } from './receipts.js';
+import { assertSessionOperationAllowed } from './session-machine.js';
+function text(value, label) {
+    const normalized = value.trim();
+    if (!normalized)
+        throw new V3StructuredError('INVALID_ARGUMENT', `${label} is required`);
+    return normalized;
+}
+function decisionsWithOpenGate(session, stepId, decisionRef) {
+    const existing = session.decisions.find(decision => decision.decision_id === decisionRef);
+    if (existing && existing.status !== 'open') {
+        throw new V3StructuredError('INVALID_STATE_TRANSITION', `decision gate ${decisionRef} is already ${existing.status}; a resolved/escalated decision cannot be bound as a new gate`, { target_type: 'orchestration', target_id: session.session_id, next_actions: ['choose-a-new-decision-point'] });
+    }
+    return existing
+        ? session.decisions
+        : [...session.decisions, {
+                decision_id: decisionRef,
+                after_step_id: stepId,
+                status: 'open',
+                evidence_refs: [],
+            }];
+}
+function mutateSteps(session, mutation, evidence) {
+    const stepId = text(mutation.stepId, 'step ID');
+    const index = session.chain.findIndex(step => step.step_id === stepId);
+    if (mutation.kind === 'insert') {
+        if (index >= 0)
+            throw new V3StructuredError('INVALID_STATE_TRANSITION', `chain step ${stepId} already exists`);
+        const after = mutation.afterStepId?.trim() || null;
+        const insertionIndex = after === null ? session.chain.length : session.chain.findIndex(step => step.step_id === after) + 1;
+        if (after !== null && insertionIndex === 0)
+            throw new V3StructuredError('INVALID_ARGUMENT', `unknown after-step ${after}`);
+        const decisionRef = mutation.decisionRef?.trim() || null;
+        const step = {
+            step_id: stepId, command: text(mutation.command, 'command'), args: [...(mutation.args ?? [])],
+            status: 'pending', run_ids: [], goal_ref: mutation.goalRef?.trim() || null,
+            decision_ref: decisionRef,
+            decision_refs: [], stage: mutation.stage?.trim() || null,
+        };
+        // Declaring a decision gate records the open decision it refers to, so run
+        // next and session complete see the gate until `run decide` resolves it.
+        const decisions = decisionRef === null
+            ? session.decisions
+            : decisionsWithOpenGate(session, stepId, decisionRef);
+        return {
+            chain: [...session.chain.slice(0, insertionIndex), step, ...session.chain.slice(insertionIndex)],
+            decisions,
+        };
+    }
+    if (index < 0)
+        throw new V3StructuredError('INVALID_ARGUMENT', `unknown chain step ${stepId}`);
+    if (session.chain[index].status !== 'pending') {
+        throw new V3StructuredError('INVALID_STATE_TRANSITION', `${mutation.kind} requires pending chain step ${stepId}`);
+    }
+    if (mutation.kind === 'skip') {
+        if (evidence.length === 0)
+            throw new V3StructuredError('INVALID_ARGUMENT', 'skipping a chain step requires evidence');
+        return {
+            chain: session.chain.map((step, itemIndex) => itemIndex === index
+                ? { ...step, status: 'skipped', decision_refs: [...new Set([...step.decision_refs, ...evidence])].sort() }
+                : step),
+            decisions: session.decisions,
+        };
+    }
+    if (mutation.kind === 'update') {
+        const supplied = mutation.command !== undefined
+            || mutation.args !== undefined
+            || mutation.goalRef !== undefined
+            || mutation.stage !== undefined
+            || mutation.decisionRef !== undefined;
+        if (!supplied) {
+            throw new V3StructuredError('INVALID_ARGUMENT', 'chain update requires at least one field to update');
+        }
+        if (mutation.args !== undefined && mutation.args.length === 0) {
+            throw new V3StructuredError('INVALID_ARGUMENT', 'chain update does not support clearing args');
+        }
+        const current = session.chain[index];
+        const decisionRef = mutation.decisionRef === undefined
+            ? current.decision_ref
+            : text(mutation.decisionRef, 'decision reference');
+        if (mutation.decisionRef !== undefined
+            && current.decision_ref !== null
+            && decisionRef !== current.decision_ref) {
+            throw new V3StructuredError('INVALID_STATE_TRANSITION', `chain update cannot retarget decision gate ${current.decision_ref}; insert a new step instead`);
+        }
+        const decisions = mutation.decisionRef === undefined || decisionRef === current.decision_ref
+            ? session.decisions
+            : decisionsWithOpenGate(session, stepId, decisionRef);
+        return {
+            chain: session.chain.map((step, itemIndex) => itemIndex === index
+                ? {
+                    ...step,
+                    command: mutation.command === undefined ? step.command : text(mutation.command, 'command'),
+                    args: mutation.args === undefined ? step.args : [...mutation.args],
+                    goal_ref: mutation.goalRef === undefined ? step.goal_ref : text(mutation.goalRef, 'goal reference'),
+                    stage: mutation.stage === undefined ? step.stage : text(mutation.stage, 'stage'),
+                    decision_ref: decisionRef,
+                }
+                : step),
+            decisions,
+        };
+    }
+    return {
+        chain: session.chain.map((step, itemIndex) => itemIndex === index
+            ? { ...step, command: text(mutation.command, 'command'), args: [...(mutation.args ?? [])] }
+            : step),
+        decisions: session.decisions,
+    };
+}
+export function mutateChainV3(store, input) {
+    const sessionId = text(input.sessionId, 'session ID');
+    const requestId = text(input.requestId, 'request ID');
+    const actorId = text(input.actorId, 'actor ID');
+    const reason = text(input.reason, 'reason');
+    const evidenceRefs = [...new Set((input.evidenceRefs ?? []).map(item => item.trim()).filter(Boolean))].sort();
+    const recordedAt = input.recordedAt ?? new Date().toISOString();
+    const payload = {
+        operation: `session-chain-${input.mutation.kind}`,
+        expected_orchestration_revision: input.expectedOrchestrationRevision,
+        mutation: input.mutation,
+        actor_id: actorId,
+        reason,
+        evidence_refs: evidenceRefs,
+    };
+    const payloadHash = canonicalPayloadHash(payload);
+    return store.withV30Transaction(sessionId, tx => {
+        const replayed = replayRequestReceipt({ tx, sessionId, requestId, participantId: actorId, payloadHash });
+        if (replayed)
+            return { status: 'replayed', transition: replayed };
+        const session = tx.readSession();
+        if (session.orchestration_revision !== input.expectedOrchestrationRevision) {
+            throw createRevisionConflictError({
+                code: 'ORCHESTRATION_REVISION_CONFLICT', targetType: 'orchestration', targetId: sessionId,
+                expectedRevision: input.expectedOrchestrationRevision, currentRevision: session.orchestration_revision,
+                changedBy: 'unknown',
+            });
+        }
+        assertSessionOperationAllowed(session.status, 'advance_chain');
+        const { chain, decisions } = mutateSteps(session, input.mutation, evidenceRefs);
+        const nextSession = {
+            ...session,
+            chain,
+            decisions,
+            orchestration_revision: session.orchestration_revision + 1,
+            activity_revision: session.activity_revision + 1,
+            updated_at: recordedAt,
+        };
+        const transition = createTransitionReceipt({
+            transitionId: `chain-${requestId}`,
+            requestId, sessionId, activityRevision: nextSession.activity_revision,
+            targetType: 'orchestration', targetId: sessionId,
+            revisionBefore: session.orchestration_revision, revisionAfter: nextSession.orchestration_revision,
+            actorId, participantId: actorId, reason, evidenceRefs, recordedAt,
+            result: { kind: input.mutation.kind, chain },
+        });
+        const request = createRequestReceipt({
+            requestId, participantId: actorId, payloadHash,
+            transitionReceiptRef: transitionReceiptRef(transition.activity_revision, transition.transition_id),
+        });
+        tx.writeSession(nextSession);
+        tx.writeTransitionReceipt(transition);
+        tx.writeRequestReceipt(request);
+        return { status: 'applied', transition };
+    });
+}
+//# sourceMappingURL=chain-mutations.js.map

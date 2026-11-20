@@ -1,0 +1,20 @@
+{
+  "name": "pi-graph-context-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./threshold": "./src/threshold.ts",
+    "./arbiter": "./src/arbiter.ts",
+    "./contracts": "./src/contracts.ts"
+  },
+  "dependencies": {},
+  "peerDependencies": {},
+  "files": [
+    "src",
+    "LICENSE.upstream",
+    "PROVENANCE.json"
+  ]
+}

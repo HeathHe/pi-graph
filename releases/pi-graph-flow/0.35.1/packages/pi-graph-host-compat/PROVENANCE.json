@@ -1,0 +1,21 @@
+{
+  "upstreamCommit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "sources": [
+    {
+      "path": "packages/pi-maestro-settings-core/src/pi-host.ts",
+      "packageDeclaredLicense": "ISC"
+    },
+    {
+      "path": "packages/pi-maestro-flow/src/tools/native-tool-policy.ts"
+    },
+    {
+      "path": "packages/pi-maestro-teammate/src/runs/session-handoff.ts",
+      "sha256": "bbd1733be384df89aa917239128ef563871dd373589eb41d67ff53cfc7612129",
+      "transform": "171 original lines preserved byte-for-byte; old entrypoint reexports the narrow session-handoff module"
+    }
+  ],
+  "licenseFileSource": "upstream/LICENSE",
+  "licenseFileSHA256": "4604892b826ecf82c56cccf1bb33a976236065c9411f6da70fc1b8898b1315e8",
+  "licenseNote": "Root MIT notice preserved verbatim; settings package metadata declares ISC and no package-local license text was observed. No interpretation or replacement of that discrepancy.",
+  "transform": "pi-host bytes unchanged; native-tool-policy only classifier import changed to same-package relative import; old entrypoints reexport"
+}

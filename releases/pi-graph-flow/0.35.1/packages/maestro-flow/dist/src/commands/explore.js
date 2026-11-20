@@ -1,0 +1,238 @@
+// ---------------------------------------------------------------------------
+// `maestro explore` — lightweight parallel code exploration via API endpoints
+// ---------------------------------------------------------------------------
+import { resolve } from 'node:path';
+import { readFileSync, existsSync } from 'node:fs';
+import { loadExploreConfig, resolveEndpoints, getAllEndpoints, resolveExploreProxyUrl, injectProxy, resolveMoaPreset, DEFAULT_EXPLORE_MAX_TURNS, } from '../agents/api-explore/config.js';
+import { checkProxyReachable } from '../config/cli-tools-config.js';
+import { buildJobs, buildJobsFromEntries, runExploreJobs } from '../agents/api-explore/runner.js';
+import { generateSessionId, saveSession, listSessions, loadSession, } from '../agents/api-explore/session.js';
+import { normalizeRepositoryMapDepth } from '../agents/api-explore/repository-map.js';
+function truncatePrompt(prompt, maxLen = 60) {
+    const oneLine = prompt.replace(/\n/g, ' ').trim();
+    return oneLine.length > maxLen ? oneLine.slice(0, maxLen - 1) + '…' : oneLine;
+}
+function formatResultSection(r, index, total) {
+    if (total === 1) {
+        if (r.error)
+            return `Error (${r.endpointName}/${r.model}): ${r.error}`;
+        return r.content ?? '(no output)';
+    }
+    const promptTag = truncatePrompt(r.prompt);
+    const header = `── [${index + 1}] ${promptTag} ── ${r.endpointName} (${r.model}) ${(r.durationMs / 1000).toFixed(1)}s`;
+    return r.error ? `${header}\nError: ${r.error}` : `${header}\n${r.content ?? '(no output)'}`;
+}
+function formatResults(results) {
+    return results.map((r, i) => formatResultSection(r, i, results.length)).join('\n\n');
+}
+function loadPromptsFromFile(filePath) {
+    const abs = resolve(filePath);
+    if (!existsSync(abs)) {
+        throw new Error(`Prompt file not found: ${abs}`);
+    }
+    const raw = readFileSync(abs, 'utf-8');
+    if (filePath.endsWith('.json')) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+            return parsed.map((item) => {
+                if (typeof item === 'string')
+                    return { prompt: item };
+                if (item && typeof item === 'object' && 'prompt' in item) {
+                    const obj = item;
+                    return {
+                        prompt: String(obj.prompt),
+                        endpoint: obj.endpoint ? String(obj.endpoint) : undefined,
+                    };
+                }
+                throw new Error('JSON array items must be strings or objects with a "prompt" field');
+            });
+        }
+        throw new Error('JSON file must contain an array of prompts');
+    }
+    return raw.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean).map(p => ({ prompt: p }));
+}
+export function registerExploreCommand(program) {
+    const explore = program
+        .command('explore [prompts...]')
+        .description('Lightweight parallel code exploration via API endpoints')
+        .option('-f, --file <path>', 'Load prompts from a JSON or text file')
+        .option('-e, --endpoint <names>', 'Endpoint name(s), comma-separated (default: first available)')
+        .option('--all', 'Fan out to all configured endpoints')
+        .option('--parallel <n>', 'Max concurrent endpoint queues (default: from config or 4)', parseInt)
+        .option('--ep-concurrency <n>', 'Max concurrent jobs per endpoint (default: unlimited, or endpoint config "concurrency")', parseInt)
+        .option('--max-turns <n>', 'Max Batch rounds per job (default: from config or 5)', parseInt)
+        .option('--tree-depth <n>', 'Repository tree depth injected into the first prompt (default: 3, range: 1-6)', parseInt)
+        .option('--cd <dir>', 'Working directory for exploration')
+        .option('-o, --output-dir <dir>', 'Save session to custom directory instead of .workflow/explore/')
+        .option('--no-save', 'Do not save session')
+        .option('--json', 'Output results as JSON')
+        .option('--moa [preset]', 'Route through MOA (optional preset name)')
+        .action(async (promptArgs, opts) => {
+        const entries = promptArgs.map(p => ({ prompt: p }));
+        if (opts.file) {
+            try {
+                entries.push(...loadPromptsFromFile(opts.file));
+            }
+            catch (err) {
+                console.error(`Error loading prompt file: ${err instanceof Error ? err.message : String(err)}`);
+                process.exit(1);
+            }
+        }
+        if (entries.length === 0) {
+            console.error('Usage: maestro explore "prompt" [more prompts...]\n' +
+                '       maestro explore -f prompts.json\n\n' +
+                'Subcommands:\n' +
+                '  maestro explore show               List recent sessions\n' +
+                '  maestro explore output <id>         Show session results\n');
+            process.exit(1);
+        }
+        const config = loadExploreConfig();
+        let proxyUrl = resolveExploreProxyUrl(config);
+        if (proxyUrl) {
+            const reachable = await checkProxyReachable(proxyUrl);
+            if (!reachable) {
+                process.stderr.write(`Warning: proxy ${proxyUrl} is unreachable, proceeding without proxy.\n`);
+                proxyUrl = undefined;
+            }
+        }
+        const cwd = resolve(opts.cd ?? process.cwd());
+        const maxTurns = opts.maxTurns ?? config.maxTurns ?? DEFAULT_EXPLORE_MAX_TURNS;
+        const treeDepth = normalizeRepositoryMapDepth(opts.treeDepth ?? config.treeDepth);
+        const concurrency = opts.parallel ?? config.concurrency ?? 4;
+        let resolvedPreset;
+        if (opts.moa) {
+            resolvedPreset = resolveMoaPreset(config, typeof opts.moa === 'string' ? opts.moa : undefined) ?? undefined;
+            if (!resolvedPreset) {
+                console.error('No MOA preset configured. Add presets to ~/.maestro/moa.json');
+                process.exit(1);
+            }
+            if (resolvedPreset && proxyUrl) {
+                injectProxy(resolvedPreset.referenceEndpoints, proxyUrl);
+                resolvedPreset.aggregatorEndpoint = {
+                    ...resolvedPreset.aggregatorEndpoint,
+                    llmConfig: { ...resolvedPreset.aggregatorEndpoint.llmConfig, proxyUrl },
+                };
+            }
+        }
+        const globalEndpoints = resolveEndpoints(config, opts.endpoint, opts.all);
+        injectProxy(globalEndpoints, proxyUrl);
+        if (globalEndpoints.length === 0) {
+            console.error('No endpoints configured.\n' +
+                'Configure ~/.maestro/api.json with "endpoints" or legacy fields.\n' +
+                'Run `maestro explore --help` for details.');
+            process.exit(1);
+        }
+        const allEps = getAllEndpoints(config);
+        injectProxy(allEps, proxyUrl);
+        const jobs = opts.all
+            ? buildJobs(entries.map(e => e.prompt), globalEndpoints)
+            : buildJobsFromEntries(entries, globalEndpoints, allEps);
+        const totalJobs = jobs.length;
+        const sessionId = generateSessionId();
+        const usedEndpoints = [...new Set(jobs.map(j => j.endpointName))];
+        process.stderr.write(`[${sessionId}] ${entries.length} prompt(s), ${totalJobs} job(s), concurrency=${concurrency}\n`);
+        for (const name of usedEndpoints) {
+            const model = jobs.find(j => j.endpointName === name)?.llmConfig.model ?? '?';
+            process.stderr.write(`  ${name}: ${model}\n`);
+        }
+        process.stderr.write('\n');
+        const epConcurrency = opts.epConcurrency;
+        const jobIndex = new Map(jobs.map((j, i) => [j.id, i]));
+        const startTime = Date.now();
+        const results = await runExploreJobs({
+            jobs,
+            cwd,
+            maxTurns,
+            concurrency,
+            endpointConcurrency: epConcurrency,
+            treeDepth,
+            moaPreset: resolvedPreset,
+            circuitBreaker: config.circuitBreaker,
+            allEndpoints: allEps,
+            onProgress: (msg) => process.stderr.write(`${msg}\n`),
+            // Stream each agent result to stdout as soon as its job completes (text mode)
+            onJobDone: opts.json ? undefined : (result) => {
+                const idx = jobIndex.get(result.id) ?? 0;
+                const sep = totalJobs === 1 ? '\n' : '\n\n';
+                process.stdout.write(formatResultSection(result, idx, totalJobs) + sep);
+            },
+        });
+        const totalDuration = Date.now() - startTime;
+        // Save session
+        if (opts.save !== false) {
+            const savedPath = saveSession({
+                id: sessionId,
+                startedAt: new Date(startTime).toISOString(),
+                cwd,
+                prompts: entries.map(e => e.prompt),
+                endpoints: usedEndpoints,
+                totalJobs,
+                concurrency,
+                maxTurns,
+                durationMs: totalDuration,
+                results,
+                moa: resolvedPreset ? {
+                    preset: typeof opts.moa === 'string' ? opts.moa : 'default',
+                    referenceEndpoints: resolvedPreset.referenceEndpoints.map(ep => ep.name),
+                    results: [],
+                } : undefined,
+            }, opts.outputDir);
+            process.stderr.write(`\nSession saved: ${savedPath}\n`);
+        }
+        if (opts.json) {
+            // Detailed call traces live in the session JSON; keep stdout JSON result-only
+            const stdoutResults = results.map(({ trace, ...rest }) => rest);
+            process.stdout.write(JSON.stringify(stdoutResults, null, 2) + '\n');
+        }
+        // Text mode: sections were already streamed via onJobDone
+        const failed = results.filter(r => r.error);
+        if (failed.length > 0) {
+            process.stderr.write(`${failed.length}/${totalJobs} job(s) failed.\n`);
+            process.exit(1);
+        }
+    });
+    // ---- show subcommand -------------------------------------------------------
+    explore
+        .command('show')
+        .description('List recent explore sessions')
+        .option('--cd <dir>', 'Working directory')
+        .option('-o, --output-dir <dir>', 'Custom session directory')
+        .action((opts) => {
+        const cwd = resolve(opts.cd ?? process.cwd());
+        const sessions = listSessions(cwd, opts.outputDir);
+        if (sessions.length === 0) {
+            console.log('No explore sessions found.');
+            return;
+        }
+        console.log('ID                          Prompts  Duration');
+        console.log('─'.repeat(55));
+        for (const s of sessions) {
+            const dur = `${(s.durationMs / 1000).toFixed(1)}s`;
+            console.log(`${s.id.padEnd(28)} ${String(s.prompts).padEnd(9)} ${dur}`);
+        }
+    });
+    // ---- output subcommand -----------------------------------------------------
+    explore
+        .command('output <id>')
+        .description('Show results from a saved explore session')
+        .option('--cd <dir>', 'Working directory')
+        .option('-o, --output-dir <dir>', 'Custom session directory')
+        .option('--json', 'Output as JSON')
+        .action((id, opts) => {
+        const cwd = resolve(opts.cd ?? process.cwd());
+        const session = loadSession(cwd, id, opts.outputDir);
+        if (!session) {
+            console.error(`Session not found: ${id}`);
+            process.exit(1);
+        }
+        process.stderr.write(`[${session.id}] ${session.prompts.length} prompt(s), ${(session.durationMs / 1000).toFixed(1)}s total\n` +
+            `Endpoints: ${session.endpoints.join(', ')}\n\n`);
+        if (opts.json) {
+            process.stdout.write(JSON.stringify(session.results, null, 2) + '\n');
+        }
+        else {
+            process.stdout.write(formatResults(session.results) + '\n');
+        }
+    });
+}
+//# sourceMappingURL=explore.js.map

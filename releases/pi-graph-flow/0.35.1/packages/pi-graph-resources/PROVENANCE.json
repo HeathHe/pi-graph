@@ -1,0 +1,38 @@
+{
+  "upstreamCommit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "license": "MIT, see LICENSE.upstream",
+  "sources": [
+    {
+      "path": "rebuild/packages/pi-maestro-teammate/src/agents/agents.ts",
+      "sha256": "91532052c07a3f6f65d8f5f7dddea1f51d79946640df17411d870859b855bc08",
+      "beforeSource": "artifacts/pi-graph-full-parity-architecture-20261103/resource-catalog-evidence/packages__pi-maestro-teammate__src__agents__agents.ts"
+    },
+    {
+      "path": "rebuild/packages/pi-maestro-teammate/src/agents/frontmatter.ts",
+      "sha256": "769fbd8e6f9422d4d4020d88188ab5250a7643ec32d27cf833aa744596380b2b",
+      "beforeSource": "artifacts/pi-graph-full-parity-architecture-20261103/resource-catalog-evidence/packages__pi-maestro-teammate__src__agents__frontmatter.ts"
+    },
+    {
+      "path": "rebuild/packages/pi-maestro-flow/src/skills/skill-loader.ts",
+      "sha256": "ccaa54c2385286ccd7fb3b7926e073a21a8cb93b9fd597dd074f609a42c10aff",
+      "beforeSource": "artifacts/pi-graph-full-parity-architecture-20261103/resource-catalog-evidence/packages__pi-maestro-flow__src__skills__skill-loader.ts"
+    },
+    {
+      "path": "rebuild/packages/pi-maestro-flow/src/skills/skill-cache.ts",
+      "sha256": "5565aa3945808727632f32a138aba384263afbb642f72eadb175d09c8c73b042",
+      "beforeSource": "artifacts/pi-graph-full-parity-architecture-20261103/resource-catalog-evidence/packages__pi-maestro-flow__src__skills__skill-cache.ts"
+    },
+    {
+      "path": "rebuild/packages/pi-maestro-flow/src/resources/maestro-package.ts",
+      "sha256": "2b8c5b75ee66d8a9f985365827540a5f66488805d38388cc2421e860722c0fbe",
+      "beforeSource": "artifacts/pi-graph-full-parity-architecture-20261103/resource-catalog-evidence/packages__pi-maestro-flow__src__resources__maestro-package.ts"
+    },
+    {
+      "path": "rebuild/packages/pi-maestro-flow/src/tools/resource.ts",
+      "sha256": "9e52d363139b019ee20b62d8fdfd9c5807d5180b95240526210418c389dbe7fc",
+      "beforeSource": "artifacts/pi-graph-full-parity-architecture-20261103/resource-catalog-evidence/packages__pi-maestro-flow__src__tools__resource.ts"
+    }
+  ],
+  "canonicalAssets": "Remain at their original roots; optional/third-party assets retain their own licenses.",
+  "engine": "Uses installed maestro-flow0.5.91 API; no copied engine algorithms or resources."
+}

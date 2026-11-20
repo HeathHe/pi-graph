@@ -1,0 +1,80 @@
+{
+  "kind": "SOURCE_ONLY_SEVEN_LEAVES_23_EDITS",
+  "leaves": {
+    "dist/main.js": {
+      "sha256": "29d5564f1a397eeb8a9c771b8e42c4fb88420e676bddbd096854a3ad84f4d49e"
+    },
+    "dist/core/agent-session-services.js": {
+      "sha256": "20b7aa4b0657b53fb522ea051df26f72901802e03cc06c89e0a8926388bca601"
+    },
+    "dist/core/sdk.js": {
+      "sha256": "c43e4e1d49ac3ec4b9f48465bf2081bc5980b55f23d44040d02e9046dea45725"
+    },
+    "dist/core/agent-session.js": {
+      "sha256": "ee756f6f74afe9f8930ebf216c95334605d913a275a0eec2c9702f101baef3c3"
+    },
+    "dist/core/agent-session-runtime.js": {
+      "sha256": "44beede45451cef172d7137077e7e84867b9aaa9f20575143fb9a93fcc00261a"
+    },
+    "dist/core/resource-loader.js": {
+      "sha256": "57ece4ebd0ef6429bf45e1a22a7c581813251a988afa67bf2d3158eb752cdecc"
+    },
+    "dist/cli.js": {
+      "sha256": "8189b66abc4f9f431dbb70941dcba690d76d040de1fbfff212886be35a53639d"
+    }
+  },
+  "expectedEditCounts": {
+    "dist/main.js": 7,
+    "dist/core/agent-session-services.js": 2,
+    "dist/core/sdk.js": 1,
+    "dist/core/agent-session.js": 9,
+    "dist/core/agent-session-runtime.js": 2,
+    "dist/core/resource-loader.js": 1,
+    "dist/cli.js": 1
+  },
+  "requiredBuildDefines": {
+    "PI_BUNDLED_NODE": "true"
+  },
+  "parser": "acorn.parse ecmaVersion latest, sourceType module; not executed",
+  "mode": "bundled-node original embedded VIRTUAL_MODULES branch; no loader patch",
+  "embeddedBranchSources": {
+    "dist/core/extensions/loader.js": "55e794b969dd4692a553b21767fe876537fe06083586816f62848e76c553ef7c",
+    "dist/core/extensions/virtual-modules.js": "941f8647becc71fd241eac0fb19d3206f38f055f85721e5215a8473832d42f5a",
+    "dist/core/extensions/jiti-static-loader.js": "cef599ba10a21d50f93b2d284e0b41d464bc852a0d6c9b5e45e4048291e24dd0",
+    "dist/config.js": "8d84a58d53f1bd4360188f787b56b16444c20e00452d075cdc77056054387926"
+  },
+  "internalEntries": {
+    "m18:owned-prompts": {
+      "module": "dist/core/prompt-templates.js",
+      "sha256": "b99a3882ebdefd5b61b7d91a1a77b1a110baf60a8ed204e008e267e604a18b2d"
+    },
+    "m18:owned-theme": {
+      "module": "dist/modes/interactive/theme/theme.js",
+      "sha256": "10eba1a9a296acd8ee5258e5bff121cd21f9e9ab65f0f80c2f1761c3b565e7a5"
+    },
+    "m18:owned-source-info": {
+      "module": "dist/core/source-info.js",
+      "sha256": "8785b8ea42e12023ed2b81c5af81eb9e96e964aac8cf76db1f250b07c9c83537"
+    },
+    "m18:native-mcp-transport": {
+      "module": "dist/extensions/mcp/runtime.js",
+      "sha256": "1ed03790749c1c494f6ff3891652a4ad895cb25bf2ad4ed61202837c5e3055fb"
+    },
+    "m18:owned-extension-policy": {
+      "module": "dist/core/resource-loader.js",
+      "sha256": "57ece4ebd0ef6429bf45e1a22a7c581813251a988afa67bf2d3158eb752cdecc"
+    }
+  },
+  "sdkMetadata": {
+    "name": "@earendil-works/pi-coding-agent",
+    "version": "1.5.2",
+    "sha256": "18b422b7d80f2caa2551d253c0a8409e1caa54b954bfb7d18252e507bb8a0318"
+  },
+  "ownedExtensionPolicyAppend": "\n// Version-bound owned entry: explicit resources only, no DefaultResourceLoader construction.\nexport async function loadOwnedExtensionSet(options) {\n    if (options.clearCache) clearExtensionCache();\n    const methods = DefaultResourceLoader.prototype;\n    const receiver = {\n        cwd: options.cwd,\n        eventBus: options.eventBus,\n        builtinExtensions: new Map(options.extensionFactories.filter(isBuiltinExtension).map(input => [input.name, input])),\n        extensionFactories: options.extensionFactories.filter(input => !isBuiltinExtension(input)),\n        resolveExtensionLoadPath: methods.resolveExtensionLoadPath,\n        getExtensionPathKey: methods.getExtensionPathKey,\n        loadExtensionPaths: methods.loadExtensionPaths,\n        loadExtensionFactories: methods.loadExtensionFactories,\n        addExtensionConflictDiagnostics: methods.addExtensionConflictDiagnostics,\n        detectExtensionConflicts: methods.detectExtensionConflicts,\n    };\n    const paths = [...options.extensionPaths, ...options.builtinNames.map(name => `${BUILTIN_PATH_PREFIX}${name}`)];\n    return methods.loadFinalExtensionSet.call(receiver, paths);\n}\n",
+  "ownedEntries": {
+    "m18:owned-default-launcher": {
+      "source": "./owned-default-launcher.ts",
+      "sha256": "eac0f9f39bc7b12069f4839e126a865228e382c6c93a79b9dc9a5a5e1fc58c3c"
+    }
+  }
+}

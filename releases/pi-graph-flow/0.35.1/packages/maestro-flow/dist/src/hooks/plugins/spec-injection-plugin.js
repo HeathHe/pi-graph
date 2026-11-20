@@ -1,0 +1,140 @@
+// ---------------------------------------------------------------------------
+// SpecInjectionPlugin — Injects project specs into coordinator prompts
+// ---------------------------------------------------------------------------
+import { loadSpecs, loadExtraDocs } from '../../tools/spec-loader.js';
+import { loadSpecInjectionConfig } from '../../config/index.js';
+import { resolveSelf } from '../../tools/team-members.js';
+import { evaluateKeywordInjection } from '../keyword-spec-injector.js';
+import { logInjectionEvent } from '../spec-analytics.js';
+import { resolveRepositoryContext } from '../../repository/context.js';
+/**
+ * In-process plugin for `maestro coordinate` — injects relevant specs
+ * into the prompt via the `transformPrompt` waterfall hook.
+ *
+ * This is the coordinator counterpart to the Claude Code `spec-injector`
+ * subprocess hook. Both reuse the same spec-loader infrastructure.
+ */
+export class SpecInjectionPlugin {
+    projectPath;
+    sessionId;
+    name = 'specInjection';
+    constructor(projectPath = process.cwd(), sessionId = '') {
+        this.projectPath = projectPath;
+        this.sessionId = sessionId;
+    }
+    apply(registry) {
+        registry.transformPrompt.tap(this.name, async (prompt) => {
+            const parts = [prompt];
+            const config = loadSpecInjectionConfig(this.projectPath);
+            // Category-based injection with keyword filters
+            const category = inferCategory(prompt);
+            const uid = resolveUidSafe();
+            let currentRepoId = null;
+            try {
+                currentRepoId = resolveRepositoryContext('current', { projectRoot: this.projectPath }).repoId;
+            }
+            catch { /* legacy/unmanaged repositories expose only unscoped knowledge */ }
+            const loaderOpts = { applicableRepoId: currentRepoId };
+            if (config.keywordFilters?.include?.length)
+                loaderOpts.includeKeywords = config.keywordFilters.include;
+            if (config.keywordFilters?.exclude?.length)
+                loaderOpts.excludeKeywords = config.keywordFilters.exclude;
+            const catDocConfig = config.categoryDocs?.[category];
+            if (catDocConfig?.specFiles?.length)
+                loaderOpts.extraSpecFiles = catDocConfig.specFiles;
+            const catResult = loadSpecs(this.projectPath, category, uid, undefined, undefined, loaderOpts);
+            if (catResult.content) {
+                parts.push(catResult.content);
+            }
+            // Load category-level extra documents
+            if (catDocConfig?.docs?.length) {
+                const docsResult = loadExtraDocs(this.projectPath, catDocConfig.docs, { applicableRepoId: currentRepoId });
+                if (docsResult.content)
+                    parts.push(docsResult.content);
+            }
+            // Always-inject (session start): docs, keyword-matched entries, categories
+            if (config.always) {
+                if (config.always.docs?.length) {
+                    const alwaysResult = loadExtraDocs(this.projectPath, config.always.docs, { applicableRepoId: currentRepoId });
+                    if (alwaysResult.content)
+                        parts.push(alwaysResult.content);
+                }
+                if (config.always.keywords?.length) {
+                    const kwOpts = {
+                        includeKeywords: config.always.keywords,
+                        applicableRepoId: currentRepoId,
+                    };
+                    const kwResult = loadSpecs(this.projectPath, undefined, uid, undefined, undefined, kwOpts);
+                    if (kwResult.content)
+                        parts.push(kwResult.content);
+                }
+                if (config.always.categories?.length) {
+                    for (const cat of config.always.categories) {
+                        if (cat === category)
+                            continue;
+                        const catRes = loadSpecs(this.projectPath, cat, uid, undefined, undefined, { applicableRepoId: currentRepoId });
+                        if (catRes.content)
+                            parts.push(catRes.content);
+                    }
+                }
+            }
+            // Keyword-based injection (with session dedup)
+            if (this.sessionId) {
+                const kwResult = await evaluateKeywordInjection(prompt, this.projectPath, this.sessionId);
+                if (kwResult.inject && kwResult.content) {
+                    parts.push(kwResult.content);
+                }
+            }
+            const injected = parts.length > 1;
+            const injectedContent = injected ? parts.slice(1).join('\n\n---\n\n') : '';
+            const inferredCat = category;
+            logInjectionEvent(this.projectPath, {
+                source: 'spec-injection-plugin',
+                promptSnippet: prompt.slice(0, 300),
+                inferredCategory: inferredCat,
+                categories: injected ? [inferredCat] : [],
+                specCount: catResult.totalLoaded,
+                contentLength: injectedContent.length,
+                inject: injected,
+                reason: injected ? undefined : 'no-content',
+            }, config.analytics);
+            return injected ? parts.join('\n\n---\n\n') : prompt;
+        });
+    }
+}
+/**
+ * Best-effort uid resolution — returns undefined on any failure so spec
+ * injection never throws due to team-mode issues.
+ */
+function resolveUidSafe() {
+    try {
+        const self = resolveSelf();
+        return self?.uid ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Infer category from prompt keywords.
+ * The coordinator doesn't have agent-type metadata, so we use
+ * heuristic keyword matching on the assembled prompt.
+ *
+ * Principle: category = "who consumes" (agent type), not "what it's about".
+ * Multi-word phrases don't need \b; single words use \b to avoid sub-matches.
+ */
+function inferCategory(prompt) {
+    const lower = prompt.toLowerCase();
+    if (/\b(review|audit|compliance|lint)\b|code review|security audit|quality gate/.test(lower))
+        return 'review';
+    if (/\b(test(?:ing)?|coverage|assert|verify|validate|e2e|regression)\b/.test(lower))
+        return 'test';
+    if (/\b(debug|diagnose|bug|trace|crash|hang|leak)\b|root cause/.test(lower))
+        return 'debug';
+    if (/\b(plan|design|architect|decompose|blueprint)\b|migration strategy/.test(lower))
+        return 'arch';
+    if (/\b(ui|ux|frontend|component|style|css|scss|tailwind|design system|layout|animation|responsive|landing|dashboard|impeccable)\b/.test(lower))
+        return 'ui';
+    return 'coding'; // Default for implementation work
+}
+//# sourceMappingURL=spec-injection-plugin.js.map

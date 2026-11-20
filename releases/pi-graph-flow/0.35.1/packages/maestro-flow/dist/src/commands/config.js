@@ -1,0 +1,421 @@
+// ---------------------------------------------------------------------------
+// `maestro config` — unified configuration hub (TUI + CLI)
+//
+// Structure:
+//   maestro config                → unified TUI hub (tab: Skills / Delegate)
+//   maestro config skills         → skills TUI dashboard
+//   maestro config skills show    → print skill configs (non-interactive)
+//   maestro config skills set     → set a param default
+//   maestro config skills unset   → remove a param default
+//   maestro config skills reset   → clear all defaults for a skill
+//   maestro config skills list    → list all configurable skills
+//   maestro config skills edit    → TUI editor for a specific skill
+//   maestro config delegate       → delegate tools TUI dashboard
+//   maestro config delegate show  → print tools & roles summary
+//   maestro config delegate list  → tools overview (TUI)
+//   maestro config delegate roles → role mappings (TUI)
+//   maestro config delegate register → register settings file (TUI)
+//   maestro config delegate ref   → command reference (TUI)
+//   maestro config delegate config → config sources (TUI)
+//   maestro config session-schema set  → set the project Session schema writer
+//   maestro config session-schema show → print the current Session schema writer
+// ---------------------------------------------------------------------------
+import { InvalidArgumentError } from 'commander';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { sessionSchemaSelectionSchema, sessionSchemaWriterSchema } from '../run/schemas.js';
+import { SessionStore } from '../run/store.js';
+/**
+ * Check if the skill-context hook is installed in Claude Code settings.
+ * Direct file read — no dependency on hooks module to stay ESM-clean.
+ */
+export function checkSkillContextHook() {
+    try {
+        const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+        const settingsPath = join(claudeDir, 'settings.json');
+        if (!existsSync(settingsPath))
+            return 'not-installed';
+        const raw = readFileSync(settingsPath, 'utf8');
+        return raw.includes('skill-context') ? 'installed' : 'not-installed';
+    }
+    catch {
+        return 'not-installed';
+    }
+}
+function printHookWarning() {
+    console.log('\n⚠  skill-context hook is not installed. Parameter injection will not work.');
+    console.log('   Run: maestro hooks install --level standard');
+    console.log('   Or:  maestro install hooks\n');
+}
+async function printShow(skillName, json) {
+    const { loadSkillConfig } = await import('../config/skill-config.js');
+    const config = loadSkillConfig(process.cwd());
+    const skills = skillName
+        ? (config.skills[skillName] ? { [skillName]: config.skills[skillName] } : {})
+        : config.skills;
+    if (json) {
+        console.log(JSON.stringify(skills, null, 2));
+        return;
+    }
+    const entries = Object.entries(skills);
+    if (entries.length === 0) {
+        console.log(skillName ? `No config for "${skillName}"` : 'No skill configs set.');
+        return;
+    }
+    for (const [name, defaults] of entries) {
+        console.log(`\n${name}:`);
+        for (const [param, value] of Object.entries(defaults.params)) {
+            console.log(`  ${param.padEnd(20)} ${value}`);
+        }
+        if (defaults.updated) {
+            console.log(`  ${'updated'.padEnd(20)} ${defaults.updated}`);
+        }
+    }
+    // Check hook status when configs exist
+    if (entries.length > 0 && checkSkillContextHook() === 'not-installed') {
+        printHookWarning();
+    }
+}
+async function printList() {
+    const { loadAllCommandDefs, getConfigurableParams } = await import('../config/argument-hint-parser.js');
+    const { loadSkillConfig } = await import('../config/skill-config.js');
+    const defs = loadAllCommandDefs(process.cwd());
+    const config = loadSkillConfig(process.cwd());
+    const sorted = [...defs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    console.log(`\n${'Skill'.padEnd(30)} ${'Params'.padEnd(8)} ${'Configured'.padEnd(12)} Hint`);
+    console.log('─'.repeat(90));
+    for (const [name, def] of sorted) {
+        const configurable = getConfigurableParams(def.params);
+        const configured = config.skills[name];
+        const cfgCount = configured ? Object.keys(configured.params).length : 0;
+        const hint = def.argumentHint.length > 40
+            ? def.argumentHint.slice(0, 37) + '...'
+            : def.argumentHint;
+        const cfgLabel = cfgCount > 0 ? `${cfgCount} set` : '—';
+        console.log(`${name.padEnd(30)} ${String(configurable.length).padEnd(8)} ${cfgLabel.padEnd(12)} ${hint}`);
+    }
+    console.log(`\nTotal: ${sorted.length} skills`);
+}
+function parseValue(raw) {
+    if (raw === 'true')
+        return true;
+    if (raw === 'false')
+        return false;
+    const num = Number(raw);
+    if (!isNaN(num) && raw.trim() !== '')
+        return num;
+    return raw;
+}
+async function printDelegateShow(json) {
+    const { loadCliToolsConfig, selectToolByRole, getDefaultRoleMappings, DELEGATE_ROLES } = await import('../config/cli-tools-config.js');
+    const config = await loadCliToolsConfig(process.cwd());
+    const tools = Object.entries(config.tools);
+    const roles = getDefaultRoleMappings();
+    const userRoles = config.roles ?? {};
+    if (json) {
+        const out = {
+            tools: Object.fromEntries(tools.map(([name, e]) => [name, {
+                    enabled: e.enabled, model: e.primaryModel, tags: e.tags,
+                    ...(e.reasoningEffort ? { reasoningEffort: e.reasoningEffort } : {}),
+                    ...(e.settingsFile ? { settings: e.settingsFile } : {}),
+                    ...(e.baseTool ? { baseTool: e.baseTool } : {}),
+                }])),
+            roles: Object.fromEntries(DELEGATE_ROLES.map(r => {
+                const resolved = selectToolByRole(r, config);
+                const src = userRoles[r] ? 'user' : 'default';
+                return [r, { tool: resolved?.name ?? '(none)', source: src }];
+            })),
+        };
+        console.log(JSON.stringify(out, null, 2));
+        return;
+    }
+    // Text output
+    console.log('Tools:');
+    if (tools.length === 0) {
+        console.log('  (none configured)');
+    }
+    else {
+        for (const [name, entry] of tools) {
+            const icon = entry.enabled ? '✓' : '✗';
+            const effort = entry.reasoningEffort ? `effort=${entry.reasoningEffort}` : '';
+            const tags = entry.tags?.length ? `[${entry.tags.join(', ')}]` : '';
+            const settings = entry.settingsFile ? ` settings=${entry.settingsFile}` : '';
+            const base = entry.baseTool ? ` (→${entry.baseTool})` : '';
+            console.log(`  ${icon} ${name.padEnd(14)} ${(entry.primaryModel || '—').padEnd(26)} ${effort.padEnd(14)}${tags}${settings}${base}`);
+        }
+    }
+    console.log('\nRoles:');
+    for (const role of DELEGATE_ROLES) {
+        const resolved = selectToolByRole(role, config);
+        const src = userRoles[role] ? '*' : ' ';
+        console.log(`  ${src}${role.padEnd(14)} → ${resolved?.name ?? '(none)'}`);
+    }
+}
+const SESSION_SCHEMA_WRITERS = sessionSchemaWriterSchema.options;
+/** Commander argument validator: rejects writers outside the sessionSchemaWriterSchema enum. */
+function parseSessionSchemaWriter(value) {
+    if (!SESSION_SCHEMA_WRITERS.includes(value)) {
+        throw new InvalidArgumentError(`expected one of: ${SESSION_SCHEMA_WRITERS.join(', ')}`);
+    }
+    return value;
+}
+function workflowConfigPath(workflowRoot) {
+    return join(workflowRoot, '.workflow', 'config.json');
+}
+/** Read config.json with passthrough semantics; a missing file yields an empty object. */
+function readWorkflowConfig(workflowRoot) {
+    const path = workflowConfigPath(workflowRoot);
+    if (!existsSync(path))
+        return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(readFileSync(path, 'utf8'));
+    }
+    catch (error) {
+        throw new Error(`Invalid project config at ${path}: ${error.message}`);
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error(`Invalid project config at ${path}: expected a JSON object`);
+    }
+    return parsed;
+}
+/**
+ * Validate the full selection (writer enum + session_statusless linkage) before
+ * writing, then merge into config.json preserving unrelated top-level fields.
+ */
+function writeSessionSchemaSelection(workflowRoot, writer) {
+    const selection = sessionSchemaSelectionSchema.parse({
+        schema_version: 'session-schema-selection/1.0',
+        writer,
+        features: { session_statusless: writer === 'session/2.0' },
+    });
+    const path = workflowConfigPath(workflowRoot);
+    mkdirSync(join(workflowRoot, '.workflow'), { recursive: true });
+    const next = { ...readWorkflowConfig(workflowRoot), session_schema: selection };
+    writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+}
+export function registerConfigCommand(program) {
+    const cmd = program
+        .command('config')
+        .alias('cfg')
+        .description('Unified configuration hub (Skills, Delegate, Hooks, Overlay, Specs, Install)')
+        .action(async () => {
+        const { runConfigHub } = await import('../tui/config-ui/index.js');
+        await runConfigHub();
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config skills — skill parameter defaults
+    // ---------------------------------------------------------------------------
+    const skills = cmd
+        .command('skills')
+        .alias('sk')
+        .description('Skill parameter defaults (TUI)')
+        .action(async () => {
+        const { runConfigTui } = await import('../tui/config-ui/index.js');
+        await runConfigTui('dashboard');
+    });
+    skills.command('show')
+        .description('Print skill config(s)')
+        .argument('[skill]', 'Specific skill name')
+        .option('--json', 'Output as JSON')
+        .action(async (skill, opts) => {
+        await printShow(skill, opts.json);
+    });
+    skills.command('set')
+        .description('Set a parameter default (e.g. maestro config skills set execute auto-commit true)')
+        .argument('<skill>', 'Skill name (e.g. execute)')
+        .argument('<param>', 'Parameter name without -- prefix (e.g. auto-commit, y, method)')
+        .argument('<value>', 'Default value')
+        .option('-g, --global', 'Save to global config', false)
+        .action(async (skill, param, value, opts) => {
+        const { setSkillParam } = await import('../config/skill-config.js');
+        const scope = opts.global ? 'global' : 'workspace';
+        const workDir = opts.global ? undefined : process.cwd();
+        const paramName = param.startsWith('-') ? param : (param.length === 1 ? `-${param}` : `--${param}`);
+        setSkillParam(skill, paramName, parseValue(value), scope, workDir);
+        console.log(`✓ ${skill}: ${paramName} = ${value} (${scope})`);
+        if (checkSkillContextHook() === 'not-installed') {
+            printHookWarning();
+        }
+    });
+    skills.command('unset')
+        .description('Remove a parameter default')
+        .argument('<skill>', 'Skill name')
+        .argument('<param>', 'Parameter name without -- prefix')
+        .option('-g, --global', 'Remove from global config', false)
+        .action(async (skill, param, opts) => {
+        const { unsetSkillParam } = await import('../config/skill-config.js');
+        const scope = opts.global ? 'global' : 'workspace';
+        const workDir = opts.global ? undefined : process.cwd();
+        const paramName = param.startsWith('-') ? param : (param.length === 1 ? `-${param}` : `--${param}`);
+        unsetSkillParam(skill, paramName, scope, workDir);
+        console.log(`✓ Removed ${skill}: ${paramName} (${scope})`);
+    });
+    skills.command('reset')
+        .description('Clear all defaults for a skill (or all skills)')
+        .argument('[skill]', 'Skill name (omit for all)')
+        .option('-g, --global', 'Reset global config', false)
+        .action(async (skill, opts) => {
+        const { resetSkillConfig } = await import('../config/skill-config.js');
+        const scope = opts.global ? 'global' : 'workspace';
+        const workDir = opts.global ? undefined : process.cwd();
+        resetSkillConfig(skill, scope, workDir);
+        console.log(`✓ Reset ${skill ?? 'all skills'} (${scope})`);
+    });
+    skills.command('list')
+        .description('List all configurable skills and their parameters')
+        .action(async () => { await printList(); });
+    skills.command('edit')
+        .description('Open TUI editor for a specific skill')
+        .argument('<skill>', 'Skill name')
+        .action(async (skill) => {
+        const { runConfigTui } = await import('../tui/config-ui/index.js');
+        await runConfigTui('editor', skill);
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config delegate — delegate tool & role configuration
+    // ---------------------------------------------------------------------------
+    const delegate = cmd
+        .command('delegate')
+        .alias('dl')
+        .description('Delegate tool configuration (TUI)')
+        .action(async () => {
+        const { runDelegateConfigTui } = await import('../tui/config-ui/index.js');
+        await runDelegateConfigTui('dashboard');
+    });
+    delegate.command('show')
+        .description('Print tools & roles summary (non-interactive)')
+        .option('--json', 'Output as JSON')
+        .action(async (opts) => printDelegateShow(!!opts.json));
+    delegate.command('list')
+        .description('Tools overview (TUI)')
+        .action(async () => {
+        const { runDelegateConfigTui } = await import('../tui/config-ui/index.js');
+        await runDelegateConfigTui('tools');
+    });
+    delegate.command('roles')
+        .description('Role mappings (TUI)')
+        .action(async () => {
+        const { runDelegateConfigTui } = await import('../tui/config-ui/index.js');
+        await runDelegateConfigTui('roles');
+    });
+    delegate.command('register')
+        .description('Register settings file (TUI)')
+        .action(async () => {
+        const { runDelegateConfigTui } = await import('../tui/config-ui/index.js');
+        await runDelegateConfigTui('register');
+    });
+    delegate.command('ref')
+        .description('Command reference (TUI)')
+        .action(async () => {
+        const { runDelegateConfigTui } = await import('../tui/config-ui/index.js');
+        await runDelegateConfigTui('reference');
+    });
+    delegate.command('effort')
+        .description('Set reasoning effort for a tool (low, medium, high, max, or "unset")')
+        .argument('<tool>', 'Tool name (e.g. claude, codex)')
+        .argument('<level>', 'Effort level: low, medium, high, max, or "unset" to clear')
+        .action(async (tool, level) => {
+        const { loadCliToolsConfig, saveCliToolsConfig, REASONING_EFFORTS } = await import('../config/cli-tools-config.js');
+        const config = await loadCliToolsConfig(process.cwd());
+        const entry = config.tools[tool];
+        if (!entry) {
+            console.error(`Unknown tool: ${tool}. Available: ${Object.keys(config.tools).join(', ')}`);
+            process.exit(1);
+        }
+        if (level === 'unset') {
+            const updated = { ...entry };
+            delete updated.reasoningEffort;
+            await saveCliToolsConfig({ tools: { [tool]: updated } }, 'global', process.cwd());
+            console.log(`✓ ${tool}: reasoning effort cleared (tool default)`);
+            return;
+        }
+        if (!REASONING_EFFORTS.includes(level)) {
+            console.error(`Invalid effort: ${level}. Use: ${REASONING_EFFORTS.join(', ')}, or "unset".`);
+            process.exit(1);
+        }
+        await saveCliToolsConfig({ tools: { [tool]: { ...entry, reasoningEffort: level } } }, 'global', process.cwd());
+        console.log(`✓ ${tool}: reasoning effort = ${level}`);
+    });
+    delegate.command('reset')
+        .description('Reset cli-tools.json to defaults with auto-detected tools')
+        .action(async () => {
+        const { resetCliToolsConfig } = await import('../config/cli-tools-config.js');
+        const config = await resetCliToolsConfig();
+        const enabled = Object.entries(config.tools)
+            .filter(([, e]) => e.enabled)
+            .map(([n]) => n);
+        const disabled = Object.entries(config.tools)
+            .filter(([, e]) => !e.enabled)
+            .map(([n]) => n);
+        console.log('✓ cli-tools.json reset to defaults.');
+        if (enabled.length)
+            console.log(`  Enabled:  ${enabled.join(', ')}`);
+        if (disabled.length)
+            console.log(`  Disabled: ${disabled.join(', ')} (not found in PATH)`);
+    });
+    delegate.command('config')
+        .description('Config sources (global/workspace) (TUI)')
+        .action(async () => {
+        const { runDelegateConfigTui } = await import('../tui/config-ui/index.js');
+        await runDelegateConfigTui('sources');
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config hooks — hook status panel
+    // ---------------------------------------------------------------------------
+    cmd.command('hooks')
+        .description('Hook installation status (TUI)')
+        .action(async () => {
+        const { runHooksTui } = await import('../tui/config-ui/index.js');
+        await runHooksTui();
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config overlay — overlay management panel
+    // ---------------------------------------------------------------------------
+    cmd.command('overlay')
+        .description('Overlay management (TUI)')
+        .action(async () => {
+        const { runOverlayTui } = await import('../tui/config-ui/index.js');
+        await runOverlayTui();
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config specs — spec system panel
+    // ---------------------------------------------------------------------------
+    cmd.command('specs')
+        .description('Spec system status (TUI)')
+        .action(async () => {
+        const { runSpecsTui } = await import('../tui/config-ui/index.js');
+        await runSpecsTui();
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config install — install/uninstall panel
+    // ---------------------------------------------------------------------------
+    cmd.command('install')
+        .description('Install / uninstall panel (TUI)')
+        .action(async () => {
+        const { runInstallTui } = await import('../tui/config-ui/index.js');
+        await runInstallTui();
+    });
+    // ---------------------------------------------------------------------------
+    // maestro config session-schema — project Session schema writer selection
+    // ---------------------------------------------------------------------------
+    const sessionSchema = cmd
+        .command('session-schema')
+        .description('Project Session schema writer selection (.workflow/config.json)')
+        .option('--workflow-root <path>', 'project root containing .workflow', process.cwd());
+    sessionSchema.command('set')
+        .description('Set the Session schema writer (session/1.3, session/2.0, or session/3.0)')
+        .argument('<writer>', 'Session schema writer', parseSessionSchemaWriter)
+        .action((writer) => {
+        writeSessionSchemaSelection(resolve(sessionSchema.opts().workflowRoot), writer);
+        console.log(`✓ session schema writer set to ${writer}`);
+    });
+    sessionSchema.command('show')
+        .description('Show the current Session schema writer (defaults to session/3.0)')
+        .action(() => {
+        const writer = new SessionStore(resolve(sessionSchema.opts().workflowRoot)).sessionSchemaSelection().writer;
+        console.log(writer);
+    });
+}
+//# sourceMappingURL=config.js.map

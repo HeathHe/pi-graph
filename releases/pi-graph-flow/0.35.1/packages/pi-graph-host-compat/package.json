@@ -1,0 +1,31 @@
+{
+  "name": "pi-graph-host-compat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    "./pi-host": "./src/pi-host.ts",
+    "./native-tool-policy": "./src/native-tool-policy.ts",
+    "./session-handoff": "./src/session-handoff.ts",
+    "./model-runtime": "./src/model-runtime.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.99.0"
+  },
+  "files": [
+    "src",
+    "LICENSE.upstream",
+    "PROVENANCE.json"
+  ]
+}

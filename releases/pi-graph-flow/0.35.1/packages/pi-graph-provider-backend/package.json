@@ -1,0 +1,24 @@
+{
+  "name": "pi-graph-provider-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./protocol/*": "./src/protocol/*.ts",
+    "./*": "./src/*.ts"
+  },
+  "dependencies": {
+    "zod": "3.25.76"
+  },
+  "peerDependencies": {},
+  "files": [
+    "src",
+    "LICENSE.upstream",
+    "PROVENANCE.json"
+  ],
+  "bundledDependencies": [
+    "zod"
+  ]
+}

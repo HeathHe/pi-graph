@@ -1,0 +1,41 @@
+{
+  "name": "pi-graph-resources",
+  "version": "0.1.0",
+  "private": true,
+  "description": "M11 resource discovery, parsing, source revisions and approved engine-template reading.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE.upstream",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./agents": "./src/agents/agents.ts",
+    "./agents/frontmatter": "./src/agents/frontmatter.ts",
+    "./skills/loader": "./src/skills/skill-loader.ts",
+    "./skills/cache": "./src/skills/skill-cache.ts",
+    "./instructions": "./src/instructions/package-resources.ts",
+    "./scheme-resolvers": "./src/scheme-resolvers/skill-rule.ts",
+    "./engine-templates": "./src/engine-templates/adapter.ts",
+    "./catalog": "./src/catalog/catalog.ts"
+  },
+  "dependencies": {
+    "pi-graph-model-role": "0.1.0",
+    "maestro-flow": "0.5.91"
+  },
+  "scripts": {
+    "test": "node --test --experimental-transform-types test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepack": "node ../../scripts/bundle-settings-core.mjs",
+    "postpack": "node ../../scripts/bundle-settings-core.mjs --clean"
+  },
+  "bundledDependencies": [
+    "pi-graph-model-role"
+  ],
+  "files": [
+    "src",
+    "PROVENANCE.json",
+    "LICENSE.upstream"
+  ]
+}

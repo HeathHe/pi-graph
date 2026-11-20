@@ -1,0 +1,240 @@
+// src/graph/kg/extraction/knowledge/spec-extractor.ts
+// 从 .workflow/specs/*.md 提取 spec_entry nodes + constrains edges + derived_from edges
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { basename, resolve, extname } from 'node:path';
+import { makeNodeId } from '../../db/connection.js';
+import { parseSpecEntries as parseCanonicalSpecEntries } from '../../../../tools/spec-entry-parser.js';
+export function extractSpec(specsDir, workflowRoot) {
+    const nodes = [];
+    const edges = [];
+    const now = Date.now();
+    if (!existsSync(specsDir)) {
+        return { nodes, edges, fileRecord: createEmptyFileRecord(specsDir), references: [], structuralReferences: [] };
+    }
+    const specFiles = readdirSync(specsDir)
+        .filter(f => extname(f) === '.md')
+        .map(f => resolve(specsDir, f));
+    for (const specFilePath of specFiles) {
+        const content = readFileSync(specFilePath, 'utf-8');
+        const entries = parseSpecFile(content, specFilePath);
+        const fileStem = slugify(basename(specFilePath, extname(specFilePath)));
+        for (let index = 0; index < entries.length; index++) {
+            const entry = entries[index];
+            const wikiId = `spec:project:${fileStem}-${String(index + 1).padStart(3, '0')}`;
+            const nodeId = makeNodeId('spec', 'project', `${fileStem}-${String(index + 1).padStart(3, '0')}`);
+            nodes.push({
+                id: nodeId,
+                kind: 'spec_entry',
+                name: entry.title,
+                qualifiedName: `spec:${entry.title}`,
+                filePath: specFilePath,
+                language: 'markdown',
+                startLine: entry.lineStart,
+                endLine: entry.lineEnd,
+                startColumn: 0,
+                endColumn: 0,
+                docstring: '',
+                signature: '',
+                visibility: '',
+                isExported: false,
+                isAsync: false,
+                isStatic: false,
+                isAbstract: false,
+                decorators: [],
+                typeParameters: [],
+                sourceType: 'spec',
+                definition: entry.content,
+                aliases: [],
+                keywords: entry.keywords,
+                category: entry.category,
+                roles: entry.roles,
+                priority: entry.priority ?? '',
+                status: entry.status ?? 'active',
+                body: entry.content,
+                metadata: {
+                    wikiId,
+                    ...(entry.sid ? { sid: entry.sid } : {}),
+                    ...(entry.confidence ? { confidence: entry.confidence } : {}),
+                },
+                updatedAt: now,
+            });
+            // 如果有 domain 属性，创建 derived_from edge (spec→domain)
+            if (entry.domain) {
+                edges.push({
+                    source: nodeId,
+                    target: makeNodeId('domain', entry.domain),
+                    kind: 'derived_from',
+                    provenance: 'spec',
+                });
+            }
+        }
+    }
+    return {
+        nodes,
+        edges,
+        references: [],
+        structuralReferences: [],
+        fileRecord: {
+            path: specsDir,
+            contentHash: '',
+            language: 'markdown',
+            size: 0,
+            modifiedAt: now,
+            indexedAt: now,
+            nodeCount: nodes.length,
+            errors: [],
+            sourceType: 'spec',
+        },
+    };
+}
+// ---------------------------------------------------------------------------
+// Spec 文件解析 — frontmatter + 规则提取
+// ---------------------------------------------------------------------------
+function parseSpecFile(content, filePath) {
+    const canonical = parseCanonicalSpecEntries(content);
+    if (canonical.entries.length > 0 || canonical.legacy.length > 0) {
+        return [
+            ...canonical.entries.map(entry => ({
+                title: entry.title,
+                content: entry.content,
+                lineStart: entry.lineStart,
+                lineEnd: entry.lineEnd,
+                keywords: entry.keywords,
+                category: entry.category,
+                roles: [],
+                domain: entry.domain,
+                priority: '',
+                status: entry.status,
+                sid: entry.sid,
+                confidence: entry.confidence,
+            })),
+            ...canonical.legacy.map(entry => ({
+                title: entry.title,
+                content: entry.content,
+                lineStart: entry.lineStart,
+                lineEnd: entry.lineStart,
+                keywords: [],
+                category: '',
+                roles: [],
+            })),
+        ];
+    }
+    const entries = [];
+    const lines = content.split('\n');
+    // 解析 frontmatter
+    let lineOffset = 0;
+    let frontmatter = {};
+    if (lines[0]?.trim() === '---') {
+        const endIdx = lines.findIndex((l, i) => i > 0 && l.trim() === '---');
+        if (endIdx > 0) {
+            const fmLines = lines.slice(1, endIdx);
+            frontmatter = parseFrontmatter(fmLines.join('\n'));
+            lineOffset = endIdx + 1;
+        }
+    }
+    // 提取 spec 条目 — 每个二级标题 (# 或 ##) 为一个条目
+    let currentEntry = null;
+    for (let i = lineOffset; i < lines.length; i++) {
+        const line = lines[i];
+        const headingMatch = line.match(/^#{1,2}\s+(.+)/);
+        if (headingMatch) {
+            if (currentEntry) {
+                currentEntry.lineEnd = i - 1;
+                entries.push(currentEntry);
+            }
+            const title = headingMatch[1].trim();
+            currentEntry = {
+                title,
+                content: '',
+                lineStart: i + 1,
+                lineEnd: lines.length,
+                keywords: (frontmatter.keywords ?? []),
+                category: (frontmatter.category ?? ''),
+                roles: (frontmatter.roles ?? []),
+                domain: frontmatter.domain,
+                priority: frontmatter.priority,
+                status: frontmatter.status,
+            };
+        }
+        else if (currentEntry) {
+            currentEntry.content += line + '\n';
+        }
+    }
+    if (currentEntry) {
+        currentEntry.lineEnd = lines.length;
+        entries.push(currentEntry);
+    }
+    // 如果没有任何标题但有 frontmatter，创建整体条目
+    if (entries.length === 0 && Object.keys(frontmatter).length > 0) {
+        entries.push({
+            title: (frontmatter.title ?? filePath.replace(/\.md$/, '')),
+            content: content,
+            lineStart: 1,
+            lineEnd: lines.length,
+            keywords: (frontmatter.keywords ?? []),
+            category: (frontmatter.category ?? ''),
+            roles: (frontmatter.roles ?? []),
+            domain: frontmatter.domain,
+            priority: frontmatter.priority,
+            status: frontmatter.status,
+        });
+    }
+    return entries;
+}
+function slugify(value) {
+    return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+function parseFrontmatter(fmContent) {
+    const data = {};
+    let currentKey = '';
+    let arrayItems = null;
+    for (const line of fmContent.split('\n')) {
+        const trimLine = line.trim();
+        if (trimLine.startsWith('- ') && arrayItems !== null) {
+            arrayItems.push(trimLine.substring(2).trim());
+            continue;
+        }
+        if (arrayItems !== null && currentKey) {
+            data[currentKey] = arrayItems;
+            arrayItems = null;
+        }
+        const colonIdx = trimLine.indexOf(':');
+        if (colonIdx === -1)
+            continue;
+        const key = trimLine.substring(0, colonIdx).trim();
+        const value = trimLine.substring(colonIdx + 1).trim();
+        currentKey = key;
+        if (value === '' || value === '[]') {
+            arrayItems = [];
+        }
+        else if (value.startsWith('[') && value.endsWith(']')) {
+            data[key] = value
+                .slice(1, -1)
+                .split(',')
+                .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+                .filter((s) => s.length > 0);
+        }
+        else {
+            let parsedValue = value.replace(/^["']|["']$/g, '');
+            if (parsedValue.startsWith('[') || parsedValue.startsWith('{')) {
+                try {
+                    parsedValue = JSON.parse(parsedValue);
+                }
+                catch { /* ignore */ }
+            }
+            data[key] = parsedValue;
+        }
+    }
+    if (arrayItems !== null && currentKey) {
+        data[currentKey] = arrayItems;
+    }
+    return data;
+}
+function createEmptyFileRecord(path) {
+    return {
+        path, contentHash: '', language: 'markdown',
+        size: 0, modifiedAt: 0, indexedAt: 0, nodeCount: 0,
+        errors: [], sourceType: 'spec',
+    };
+}
+//# sourceMappingURL=spec-extractor.js.map

@@ -1,0 +1,2418 @@
+/**
+ * GatewayOverlay — configure and monitor the Pi Maestro Gateway:
+ * daemon/HTTP status, registered workspaces, Gateway tasks, discoverable Pi
+ * windows, and cross-window message history.
+ *
+ * Keys: 1 home · 2/c config · u tunnel · ↑↓/jk select · Enter details/edit · r refresh · R restart · e register/unregister cwd · s start · x stop · w workspaces · p password · Esc back/close
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { accessSync, constants, opendirSync, readdirSync, readFileSync, existsSync, statSync, type Dirent } from "node:fs";
+import { homedir } from "node:os";
+import { basename, delimiter, dirname, join } from "node:path";
+import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { resolveWorkspacePeerWorkspacesRoot } from "pi-maestro-teammate/v1/workspace-projections";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
+import { locateGateway, readGatewayBearerToken, readTunnelState, readOpenAiTunnelState, restartQuickTunnel, startQuickTunnel, stopQuickTunnel, startOpenAiTunnel, stopOpenAiTunnel, updateGatewayConfigServerURL, restoreGatewayConfig, stopGateway, startGateway, restartGateway, readGatewayControlStatus, listGatewayWorkspaces, startWorkspaceLease, registerGatewayWorkspacePermanent, readGatewayOpsPassword, detectGateway, removeGatewayWorkspaceByPath, readGatewayTasks, readGatewayCollaborativeSessions, readGatewayConfigView, writeGatewayConfigChanges, type TunnelState, type GatewayJournalTask, type GatewayConfigView } from "../gateway/workspace-client.ts";
+import { gatewayConfigPath } from "../gateway/state-paths.ts";
+import type { CollaborativeSessionStateV1, GatewayTodoTaskV1 } from "../gateway/session-contracts.ts";
+import type { GatewayFabricMonitorSnapshotV1 } from "../gateway/fabric/monitor-projection.ts";
+import type { GatewayConfigChanges } from "./gateway-wizard.ts";
+import { GatewayTunnelPanel } from "./gateway-tunnel-panel.ts";
+import { GatewayControlClient } from "../gateway/control-client.ts";
+import {
+  GatewayClientError,
+  GatewayStreamableHttpClient,
+  type GatewayMonitor,
+  type GatewayMonitorObservation,
+  type GatewayRemoteSession,
+  type GatewayRuntimeWindow,
+  type GatewayWindowEvent,
+  type GatewayWindowObservation,
+} from "./gateway-client.ts";
+
+const GATEWAY_DEFAULT_ENDPOINT = "http://127.0.0.1:9090/mcp";
+const PEER_STALE_MS = 20_000;
+const MAX_PEER_RUNTIME_ROOTS = 8;
+const MAX_PEER_OWNERS_PER_ROOT = 16;
+const MAX_PEER_FILES_PER_OWNER = 64;
+const MAX_PEER_FILE_METADATA = 128;
+
+export interface GatewayWorkspaceInfo {
+  name: string;
+  path: string;
+  /** Lease expiry (ms epoch) for TTL-registered windows; undefined = permanent. */
+  expiresAt?: number;
+}
+
+export interface GatewayWindowInfo {
+  displayName: string;
+  ownerId: string;
+  pid: number;
+  publishedAt: number;
+  agentCount: number;
+  contextPressure?: number;
+  /** normalizedCwd of the owning workspace (multi-workspace discovery). */
+  workspace?: string;
+}
+
+export interface GatewayThreadEntry {
+  commandId: string;
+  kind: "command" | "response";
+  createdAt: number;
+  fromOwnerId: string;
+  toOwnerId: string;
+  action?: string;
+  message?: string;
+  status?: string;
+  /** normalizedCwd of the workspace this entry belongs to. */
+  workspace?: string;
+}
+
+export interface GatewayMcpServerInfo {
+  name: string;
+  type: string;
+  command: string;
+  source: "global" | "project" | "agents" | "pi";
+  executable: boolean;
+  description?: string;
+}
+
+export interface GatewayConnectionInfo extends GatewayRemoteSession {}
+
+export interface GatewaySnapshot {
+  refreshing: boolean;
+  binary?: string;
+  version?: string;
+  endpoint: "unknown" | "online" | "offline";
+  endpointVersion?: string;
+  configPath?: string;
+  workspaces: GatewayWorkspaceInfo[];
+  cwdRegistered: boolean;
+  /** cwd is in config.yaml but its lease already expired and is waiting for gateway's sweep. */
+  cwdLeaseStale?: boolean;
+  windows: GatewayWindowInfo[];
+  thread: GatewayThreadEntry[];
+  mcpServers: GatewayMcpServerInfo[];
+  connections?: GatewayConnectionInfo[];
+  /** Unified pi_window entries. Undefined means the Runtime is unavailable, auth-blocked, or too old. */
+  runtimeWindows?: GatewayRuntimeWindow[];
+  runtimeWindowFallback?: "auth" | "unsupported" | "unavailable";
+  tunnel?: TunnelState;
+  openAiTunnel?: TunnelState;
+  /** Gateway journal tasks followed by optional legacy read-only history. */
+  tasks?: GatewayJournalTask[];
+  /** Workspace-local collaboration authority. It is independent from Pi Todo. */
+  collaborativeSessions?: CollaborativeSessionStateV1[];
+  collaborationMonitors?: Record<string, GatewayMonitor[]>;
+  collaborationMemberIds?: Record<string, string>;
+  collaborationError?: string;
+  /** Read-only Fabric health; never participates in Agent/Task routing. */
+  fabric?: GatewayFabricMonitorSnapshotV1;
+  /** Compatibility field names for verified built-in Gateway availability. */
+  forkInstalled?: boolean;
+  forkVersion?: string;
+  /** PERF-RV-006: ops password read once during refresh, cached for renders. */
+  opsPassword?: string;
+  error?: string;
+}
+
+export interface GatewayWindowComposeResult {
+  purpose: string;
+  message: string;
+  name?: string;
+  model?: string;
+  mode?: "steer" | "follow_up";
+}
+
+export interface GatewayOverlayParams {
+  cwd: string;
+  requestRender: () => void;
+  close: () => void;
+  onRegisterWorkspace?: (path: string) => Promise<string>;
+  /** E key: register cwd without a TTL lease (survives window close). */
+  onRegisterWorkspacePermanent?: (path: string) => Promise<string>;
+  onUnregisterWorkspace?: (path: string) => Promise<string>;
+  /** Compatibility callback retained for embedders; c/C now open the config page in-place. */
+  onOpenWizard?: () => void;
+  /** Open directly on the requested top-level page. */
+  initialPage?: "home" | "config" | "tunnel";
+  /** Host-native text prompts used by m/n window actions. */
+  onComposeWindowMessage?: (
+    target: GatewayRuntimeWindow | undefined,
+    session: GatewayConnectionInfo,
+    targetMode: "existing" | "new",
+  ) => Promise<GatewayWindowComposeResult | undefined>;
+  /** Publishes only refresh-generation-fenced Fabric snapshots to sibling UI consumers. */
+  onFabricProjection?: (snapshot: GatewayFabricMonitorSnapshotV1 | undefined) => void;
+  /** Test hook and transport injection point. */
+  createClient?: (endpoint: string) => GatewayStreamableHttpClient;
+  /** Skip constructor refresh in deterministic overlay tests. */
+  initialRefresh?: boolean;
+  /** Runtime height for bounded window/event views. */
+  getTerminalRows?: () => number;
+  /** Theme for role colors; when absent the overlay renders unstyled. */
+  theme?: OverlayTheme;
+  /** Endpoint readiness wait for startGateway (ms); tests shorten this. */
+  endpointWaitMs?: number;
+  /** Host-native prompt used by the tunnel structured editor. */
+  input?: (title: string, placeholder?: string) => Promise<string | undefined>;
+}
+
+type OverlayMode = "list" | "detail" | "workspace" | "window-list" | "window-detail" | "config" | "tunnel" | "collaboration" | "collaboration-detail" | "monitor-detail";
+
+function normalizeWorkspacePath(value: string): string {
+  let normalized = value.replace(/\\/g, "/");
+  if (normalized.length > 1 && !/^[A-Za-z]:\/$/.test(normalized)) normalized = normalized.replace(/\/+$/, "");
+  if (process.platform === "win32") normalized = normalized.toLowerCase();
+  return normalized;
+}
+
+/** Root of all peer workspaces (test seam: PI_PEER_WORKSPACES_ROOT). */
+function peerWorkspacesRoot(): string {
+  return process.env.PI_PEER_WORKSPACES_ROOT ?? resolveWorkspacePeerWorkspacesRoot();
+}
+
+function workspaceIdForCwd(cwd: string): string {
+  return createHash("sha256").update(normalizeWorkspacePath(cwd), "utf8").digest("hex");
+}
+
+/** Read at most `limit` entries without materializing an unbounded directory. */
+function boundedDirectoryEntries(path: string, limit: number): Dirent[] {
+  let directory: ReturnType<typeof opendirSync> | undefined;
+  try {
+    directory = opendirSync(path);
+    const entries: Dirent[] = [];
+    while (entries.length < limit) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      entries.push(entry);
+    }
+    return entries;
+  } catch {
+    return [];
+  } finally {
+    try { directory?.closeSync(); } catch { /* directory may already be closed */ }
+  }
+}
+
+/** Runtime dirs of a bounded workspace sample, prioritizing the current cwd. */
+function peerRuntimeRoots(preferredCwd?: string): string[] {
+  const root = peerWorkspacesRoot();
+  const preferredName = preferredCwd ? workspaceIdForCwd(preferredCwd) : undefined;
+  const names: string[] = preferredName ? [preferredName] : [];
+  for (const entry of boundedDirectoryEntries(root, MAX_PEER_RUNTIME_ROOTS)) {
+    if (!entry.isDirectory() || entry.name === preferredName) continue;
+    names.push(entry.name);
+    if (names.length >= MAX_PEER_RUNTIME_ROOTS) break;
+  }
+  return names.map((name) => join(root, name, "runtime"));
+}
+
+/** Best-effort workspace label (normalizedCwd) from a bounded owner sample. */
+function peerWorkspaceLabel(runtime: string): string | undefined {
+  const owners = join(runtime, "owners");
+  for (const entry of boundedDirectoryEntries(owners, MAX_PEER_OWNERS_PER_ROOT)) {
+    if (!entry.name.endsWith(".json")) continue;
+    const snapshot = readJson<OwnerSnapshotFile>(join(owners, entry.name));
+    if (snapshot?.normalizedCwd) return snapshot.normalizedCwd;
+  }
+  return undefined;
+}
+
+function readJson<T>(path: string): T | undefined {
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+interface OwnerSnapshotFile {
+  version?: number;
+  kind?: string;
+  workspaceId?: string;
+  normalizedCwd?: string;
+  ownerId?: string;
+  ownerNonce?: string;
+  pid?: number;
+  publishedAt?: number;
+  sessionName?: string;
+  contextPressure?: number;
+  agents?: unknown[];
+}
+
+function displayNameOf(sessionName: string | undefined, ownerId: string): string {
+  const label = sessionName || `window:${ownerId.slice(0, 8)}`;
+  return label.length > 64 ? `${label.slice(0, 61)}...` : label;
+}
+
+function collectWindows(now: number, preferredCwd?: string): GatewayWindowInfo[] {
+  const windows: GatewayWindowInfo[] = [];
+  for (const runtime of peerRuntimeRoots(preferredCwd)) {
+    const owners = join(runtime, "owners");
+    for (const entry of boundedDirectoryEntries(owners, MAX_PEER_OWNERS_PER_ROOT)) {
+      if (!entry.name.endsWith(".json")) continue;
+      const fullPath = join(owners, entry.name);
+      // PERF-RV-013: stat the file and skip stale ones BEFORE reading/parsing.
+      // Owner snapshots are written periodically; a file whose mtime is older
+      // than PEER_STALE_MS (20s) belongs to a window that already went offline
+      // and cannot be fresh, so skip the readFileSync+JSON.parse entirely.
+      try {
+        const stat = statSync(fullPath);
+        if (now - stat.mtimeMs > PEER_STALE_MS) continue;
+      } catch {
+        continue; // file vanished between readdir and stat — skip
+      }
+      const snapshot = readJson<OwnerSnapshotFile>(fullPath);
+      if (!snapshot || snapshot.kind !== "owner" || !snapshot.ownerId) continue;
+      if (now - (snapshot.publishedAt ?? 0) > PEER_STALE_MS) continue;
+      windows.push({
+        displayName: displayNameOf(snapshot.sessionName, snapshot.ownerId),
+        ownerId: snapshot.ownerId,
+        pid: snapshot.pid ?? 0,
+        publishedAt: snapshot.publishedAt ?? 0,
+        agentCount: snapshot.agents?.length ?? 0,
+        contextPressure: snapshot.contextPressure,
+        workspace: snapshot.normalizedCwd,
+      });
+    }
+  }
+  windows.sort((a, b) => b.publishedAt - a.publishedAt);
+  return windows;
+}
+
+function collectThread(preferredCwd?: string): GatewayThreadEntry[] {
+  const entries: GatewayThreadEntry[] = [];
+  // PERF-RV-005: Instead of reading and parsing every JSON file (which grows
+  // linearly with history), we stat each file's mtime, sort by mtime desc, and
+  // only read+parse the most recent ~60 files. We then slice to 30 as before.
+  // This bounds the cost as the commands/responses directories grow large.
+  const MAX_READ = 60;
+
+  /** Collect file paths and mtimes from a two-level directory tree. */
+  function collectFileMeta(dir: string, limit: number): Array<{ path: string; mtime: number }> {
+    const files: Array<{ path: string; mtime: number }> = [];
+    for (const owner of boundedDirectoryEntries(dir, MAX_PEER_OWNERS_PER_ROOT)) {
+      if (!owner.isDirectory()) continue;
+      const ownerDir = join(dir, owner.name);
+      for (const file of boundedDirectoryEntries(ownerDir, Math.min(MAX_PEER_FILES_PER_OWNER, limit - files.length))) {
+        if (!file.name.endsWith(".json") || file.name.includes(".processing")) continue;
+        const fullPath = join(ownerDir, file.name);
+        try {
+          files.push({ path: fullPath, mtime: statSync(fullPath).mtimeMs });
+        } catch {
+          // file vanished — skip
+        }
+        if (files.length >= limit) return files;
+      }
+    }
+    return files;
+  }
+
+  const allFiles: Array<{ path: string; mtime: number; workspace?: string }> = [];
+  for (const runtime of peerRuntimeRoots(preferredCwd)) {
+    const workspace = peerWorkspaceLabel(runtime);
+    for (const kind of ["commands", "responses"] as const) {
+      const remaining = MAX_PEER_FILE_METADATA - allFiles.length;
+      if (remaining <= 0) break;
+      for (const file of collectFileMeta(join(runtime, kind), remaining)) allFiles.push({ ...file, workspace });
+    }
+    if (allFiles.length >= MAX_PEER_FILE_METADATA) break;
+  }
+  allFiles.sort((a, b) => b.mtime - a.mtime);
+  const toRead = allFiles.slice(0, MAX_READ);
+
+  for (const { path, workspace } of toRead) {
+    // Distinguish commands from responses by the directory path: commands live
+    // under root/commands/, responses under root/responses/.
+    const normalizedPath = path.replace(/\\/g, "/");
+    if (normalizedPath.includes("/commands/")) {
+      const command = readJson<{
+        kind?: string; commandId?: string; createdAt?: number;
+        fromOwnerId?: string; toOwnerId?: string; action?: string; message?: string;
+      }>(path);
+      if (!command || command.kind !== "command" || !command.commandId) continue;
+      entries.push({
+        commandId: command.commandId,
+        kind: "command",
+        createdAt: command.createdAt ?? 0,
+        fromOwnerId: command.fromOwnerId ?? "",
+        toOwnerId: command.toOwnerId ?? "",
+        action: command.action,
+        message: command.message,
+        workspace,
+      });
+    } else if (normalizedPath.includes("/responses/")) {
+      const response = readJson<{
+        kind?: string; commandId?: string; respondedAt?: number;
+        fromOwnerId?: string; toOwnerId?: string; status?: string;
+      }>(path);
+      if (!response || response.kind !== "response" || !response.commandId) continue;
+      entries.push({
+        commandId: response.commandId,
+        kind: "response",
+        createdAt: response.respondedAt ?? 0,
+        fromOwnerId: response.fromOwnerId ?? "",
+        toOwnerId: response.toOwnerId ?? "",
+        status: response.status,
+        workspace,
+      });
+    }
+  }
+  entries.sort((a, b) => b.createdAt - a.createdAt);
+  return entries.slice(0, 30);
+}
+
+function collectWorkspaces(configPath: string): GatewayWorkspaceInfo[] {
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf8");
+  } catch {
+    return [];
+  }
+  const workspaces: GatewayWorkspaceInfo[] = [];
+  let current: GatewayWorkspaceInfo | undefined;
+  for (const line of raw.split(/\r?\n/)) {
+    const nameMatch = line.match(/^\s{2,}-\s+name:\s*(.+)$/);
+    if (nameMatch) {
+      current = { name: nameMatch[1].trim(), path: "" };
+      workspaces.push(current);
+      continue;
+    }
+    const pathMatch = line.match(/^\s{4,}path:\s*(.+)$/);
+    if (pathMatch && current) {
+      current.path = pathMatch[1].trim().replace(/^"|"$/g, "");
+      continue;
+    }
+    const expMatch = line.match(/^\s{4,}expires_at:\s*(.+)$/);
+    if (expMatch && current) {
+      const parsed = Date.parse(expMatch[1].trim().replace(/^"|"$/g, ""));
+      if (Number.isFinite(parsed)) current.expiresAt = parsed;
+    }
+  }
+  return workspaces;
+}
+
+interface McpJsonServer {
+  type?: string;
+  command?: string;
+  description?: string;
+}
+
+// PERF-RV-004: cache isExecutableOnPath results within a single refresh cycle.
+// The map is cleared at the start of each refresh() so a manual re-probe (r key)
+// re-checks, but repeated renders within the same refresh reuse results.
+const executablePathCache = new Map<string, boolean>();
+
+// collectMcpServers mirrors the gateway merge order for .mcp.json:
+// global → project → .agents/mcp.json → .pi/mcp.json (later wins).
+export function collectMcpServers(cwd: string): GatewayMcpServerInfo[] {
+  const files: Array<{ path: string; source: GatewayMcpServerInfo["source"] }> = [
+    { path: join(homedir(), ".mcp.json"), source: "global" },
+    { path: join(cwd, ".mcp.json"), source: "project" },
+    { path: join(cwd, ".agents", "mcp.json"), source: "agents" },
+    { path: join(cwd, ".pi", "mcp.json"), source: "pi" },
+  ];
+  const merged = new Map<string, GatewayMcpServerInfo>();
+  for (const { path, source } of files) {
+    let parsed: { mcpServers?: Record<string, McpJsonServer> };
+    try {
+      parsed = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      continue;
+    }
+    for (const [name, server] of Object.entries(parsed.mcpServers ?? {})) {
+      const command = server.command ?? "";
+      merged.set(name, {
+        name,
+        type: server.type ?? "stdio",
+        command,
+        source,
+        executable: command ? isExecutableOnPath(command) : false,
+        description: server.description,
+      });
+    }
+  }
+  return [...merged.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function isExecutableOnPath(command: string): boolean {
+  if (executablePathCache.has(command)) return executablePathCache.get(command)!;
+  const canExecute = (path: string): boolean => {
+    try { accessSync(path, constants.X_OK); return true; }
+    catch { return false; }
+  };
+  let result: boolean;
+  if (command.includes("/") || command.includes("\\")) {
+    result = canExecute(command);
+  } else {
+    const names = process.platform === "win32" && !/\.[^./\\]+$/u.test(command)
+      ? [command, ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((extension) => `${command}${extension.toLowerCase()}`)]
+      : [command];
+    result = (process.env.PATH ?? "").split(delimiter).some((directory) =>
+      names.some((name) => canExecute(join(directory || process.cwd(), name))),
+    );
+  }
+  executablePathCache.set(command, result);
+  return result;
+}
+
+// collectConnections uses a fully initialized Streamable-HTTP session. It stays
+// exported for focused transport tests and callers that only need Remote Sessions.
+export async function collectConnections(
+  endpoint: string,
+  client = new GatewayStreamableHttpClient(endpoint, 3_000),
+): Promise<GatewayConnectionInfo[] | undefined> {
+  try {
+    return await client.listRemoteSessions();
+  } catch {
+    return undefined;
+  }
+}
+
+async function probeEndpoint(configPath: string): Promise<{ endpoint: string; reachable: boolean; endpointVersion?: string }> {
+  let endpoint = GATEWAY_DEFAULT_ENDPOINT;
+  try {
+    const raw = readFileSync(configPath, "utf8");
+    const portMatch = raw.match(/^\s{2,}port:\s*(\d+)/m);
+    const port = portMatch ? Number(portMatch[1]) : 0;
+    if (port >= 1 && port <= 65_535) endpoint = `http://127.0.0.1:${port}/mcp`;
+  } catch {
+    // default endpoint
+  }
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "gateway-tui", version: "1.0.0" } } }),
+      signal: AbortSignal.timeout(2_000),
+    });
+    // Any HTTP response (even 401/403) proves gateway is up and listening — only a
+    // network failure (thrown) means offline. auth-mode servers reject an
+    // unauthenticated initialize with 401, which must NOT read as "未运行".
+    const reachable = true;
+    const contentType = response.headers.get("content-type") ?? "";
+    const raw = await response.text();
+    let payload: { result?: { serverInfo?: { name?: string; version?: string } } } | undefined;
+    if (contentType.includes("text/event-stream")) {
+      for (const line of raw.split(/\r?\n/)) {
+        if (line.startsWith("data:")) {
+          try {
+            payload = JSON.parse(line.slice(5).trim());
+          } catch {
+            // skip malformed frames
+          }
+        }
+      }
+    } else {
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        // non-JSON response
+      }
+    }
+    const info = payload?.result?.serverInfo;
+    // 200 → real serverInfo; 401/403 → still reachable, surface an auth hint so
+    // the board shows "gateway (需鉴权)" instead of bare "online" with no version.
+    let endpointVersion: string | undefined;
+    if (info) endpointVersion = `${info.name} ${info.version}`;
+    else if (response.status === 401) endpointVersion = "Pi Maestro Gateway 需鉴权（401）";
+    else if (response.status === 403) endpointVersion = "Pi Maestro Gateway 拒绝（403 Host）";
+    else endpointVersion = `Pi Maestro Gateway · HTTP ${response.status}`;
+    return { endpoint, reachable, endpointVersion };
+  } catch {
+    return { endpoint, reachable: false };
+  }
+}
+
+export class GatewayOverlay implements Component, Focusable {
+  focused = false;
+  private mode: OverlayMode = "list";
+  private selected = 0;
+  /** Selection index inside the workspace-management sub-mode. */
+  private wsSelected = 0;
+  /** SEC-RV-001: ops password reveal state — masked by default, toggled by P. */
+  private revealOpsPassword = false;
+  /** Inline config editor state (C key). `configView` is loaded lazily on
+   *  first entry into config mode; edits accumulate in `configChanges` and are
+   *  written atomically on save, so a user can change several fields then commit. */
+  private configView?: GatewayConfigView;
+  private configChanges: GatewayConfigChanges = {};
+  private configSelected = 0;
+  private configEditing = false;
+  private configDraft = "";
+  /** Sub-mode within config mode: top menu, or inside a list editor. */
+  private configListKey: "commandsAllow" | "commandsConfirm" | "commandsDeny" | "filesAllow" | "filesConfirm" | "filesDeny" | undefined;
+  private configListSelected = 0;
+  private readonly tunnelPanel: GatewayTunnelPanel;
+  private readonly initialPage: "home" | "config" | "tunnel";
+  private tunnelProvider: "cloudflare" | "openai" = "cloudflare";
+  private snapshot: GatewaySnapshot = {
+    refreshing: true, endpoint: "unknown", workspaces: [], cwdRegistered: false, windows: [], thread: [], mcpServers: [],
+  };
+  private status = "";
+  private workspaceToggleBusy = false;
+  private workspaceToggleQueued = false;
+  private workspaceToggleQueuedPermanent = false;
+  private starting = false;
+  private refreshGeneration = 0;
+  private refreshPromise?: Promise<void>;
+  private closed = false; // set on close() so async refresh/render skip work after close
+  private windowSelected = 0;
+  private windowSessionSelected = 0;
+  private windowObservation?: GatewayWindowObservation;
+  private observeTimer?: ReturnType<typeof setInterval>;
+  private observeGeneration = 0;
+  private observing = false;
+  private windowActionBusy = false;
+  private collaborationSelected = 0;
+  private collaborationItemSelected = 0;
+  private collaborationBusy = false;
+  private monitorObservation?: GatewayMonitorObservation;
+  private client?: GatewayStreamableHttpClient;
+  private clientEndpoint?: string;
+  private clientBearerToken?: string;
+
+  private clientForEndpoint(endpoint: string): GatewayStreamableHttpClient {
+    const bearerToken = readGatewayBearerToken();
+    if (!this.client || this.clientEndpoint !== endpoint || this.clientBearerToken !== bearerToken) {
+      this.client = this.params.createClient?.(endpoint) ?? new GatewayStreamableHttpClient(endpoint, 4_000, fetch, bearerToken);
+      this.clientEndpoint = endpoint;
+      this.clientBearerToken = bearerToken;
+    }
+    return this.client;
+  }
+
+  private safeRequestRender(): void {
+    if (this.closed) return;
+    this.params.requestRender();
+  }
+
+  constructor(private readonly params: GatewayOverlayParams) {
+    this.initialPage = params.initialPage ?? "home";
+    const tunnelConfigView = readGatewayConfigView();
+    if (params.initialPage === "config") {
+      this.mode = "config";
+      this.configView = tunnelConfigView ?? undefined;
+    } else if (params.initialPage === "tunnel") {
+      this.mode = "tunnel";
+    }
+    this.tunnelPanel = new GatewayTunnelPanel({
+      requestRender: () => this.safeRequestRender(),
+      // ui-conventions-003: top-level Esc closes. When the tunnel page is the
+      // overlay's initial view, Esc must close the overlay — bouncing to the
+      // home page made Esc appear to *open* the gateway TUI.
+      close: () => {
+        if (this.closed) return;
+        if (this.initialPage === "tunnel") {
+          this.markClosed();
+          this.params.close();
+          return;
+        }
+        this.mode = "list";
+        this.safeRequestRender();
+      },
+      escLabel: this.initialPage === "tunnel" ? "Esc 关闭" : "Esc 返回",
+      theme: params.theme,
+      createControlClient: (configPath) => new GatewayControlClient({ cwd: params.cwd, configPath }),
+      initialProfiles: tunnelConfigView?.tunnels.profiles,
+      httpPath: tunnelConfigView?.transport.httpPath,
+      input: params.input,
+    });
+    if (params.initialRefresh !== false && this.mode !== "tunnel") void this.refresh();
+  }
+
+  invalidate(): void {}
+  dispose(): void {
+    this.closed = true;
+    this.tunnelPanel.dispose();
+    this.stopWindowObserve();
+  }
+
+  private configPath(): string {
+    return gatewayConfigPath();
+  }
+
+  private listenPort(): number {
+    try {
+      const raw = readFileSync(this.configPath(), "utf8");
+      const match = raw.match(/^\s{2,}port:\s*(\d+)/m);
+      const port = Number(match?.[1]);
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535) return port;
+    } catch {
+      // default listener
+    }
+    return 9090;
+  }
+
+  /** Start only the verified packaged Gateway through its authenticated control client. */
+  private async startGateway(): Promise<void> {
+    if (this.starting) return;
+    this.starting = true;
+    this.status = "正在启动 Pi Maestro Gateway…";
+    this.safeRequestRender();
+    try {
+      const status = await startGateway(this.params.cwd);
+      this.status = status.online ? "Pi Maestro Gateway 已启动" : "Pi Maestro Gateway 尚未就绪";
+    } catch (error) {
+      this.status = `启动失败: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.starting = false;
+    }
+    await this.refresh();
+  }
+
+  /** Stop through authenticated Gateway IPC; fallback requires exact owner identity. */
+  private async stopGateway(): Promise<void> {
+    this.status = "正在停止 Pi Maestro Gateway…";
+    this.safeRequestRender();
+    try {
+      const status = await readGatewayControlStatus(this.params.cwd);
+      if (!status.owner) this.status = "Pi Maestro Gateway 未运行";
+      else {
+        await stopGateway(this.params.cwd);
+        this.status = "Pi Maestro Gateway 已停止";
+      }
+    } catch (error) {
+      this.status = `停止失败: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    await this.refresh();
+  }
+
+  /** Restart the built-in daemon so config changes take effect. */
+  private async restartGateway(): Promise<void> {
+    if (this.starting) return;
+    this.starting = true;
+    this.status = "正在重启 Pi Maestro Gateway…";
+    this.safeRequestRender();
+    try {
+      const status = await restartGateway(this.params.cwd);
+      this.status = status.online ? "Pi Maestro Gateway 已重启" : "Pi Maestro Gateway 尚未就绪";
+    } catch (error) {
+      this.status = `重启失败: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.starting = false;
+    }
+    await this.refresh();
+  }
+
+  /** T restarts the Cloudflare quick tunnel, syncs its new URL into config.yaml's
+   *  server_url, and restarts gateway so the OAuth issuer matches the new URL.
+   *  One-click refresh for the quick-tunnel-URL-changed scenario. */
+  private async refreshTunnelAndGateway(): Promise<void> {
+    if (this.starting) return;
+    this.starting = true;
+    this.status = "正在重启隧道并同步 Pi Maestro Gateway…";
+    this.safeRequestRender();
+    let newUrl: string | undefined;
+    let configUpdated = false;
+    let previousConfig: string | undefined;
+    try {
+      // Snapshot the complete config before replacing server_url. If the local
+      // restart fails, restoring the snapshot avoids leaving an old process
+      // paired with the new issuer.
+      previousConfig = readFileSync(this.configPath(), "utf8");
+      // 1. Restart the quick tunnel — stops the old one, parses the new URL.
+      newUrl = await restartQuickTunnel(this.listenPort());
+      const tunnelState = await readTunnelState();
+      if (tunnelState.phase !== "ready" || tunnelState.url !== newUrl) throw new Error("Cloudflare tunnel generation changed before config synchronization");
+      // 2. Write only if the same native generation still owns this endpoint.
+      await updateGatewayConfigServerURL(newUrl, { generation: tunnelState.generation, endpoint: newUrl });
+      configUpdated = true;
+      // 3. Restart the authenticated built-in daemon to load the new issuer.
+      await restartGateway(this.params.cwd);
+      const deadline = Date.now() + (this.params.endpointWaitMs ?? 15_000);
+      let online = false;
+      while (Date.now() < deadline) {
+        const { reachable } = await probeEndpoint(this.configPath());
+        if (reachable) { online = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (!online) throw new Error("Pi Maestro Gateway HTTP /mcp 端点未就绪");
+      const publicReady = tunnelState.health === "ok" || tunnelState.health === "auth";
+      this.status = publicReady
+        ? `隧道已更新: ${newUrl}/mcp · Pi Maestro Gateway 已重启 · 公网端点已就绪`
+        : `隧道已更新: ${newUrl}/mcp · Pi Maestro Gateway 已重启，但公网端点仍未就绪（按 r 重试或 T 重启隧道）`;
+    } catch (error) {
+      let rolledBack = false;
+      if (configUpdated) {
+        // Stop both sides before restoring the old snapshot. The old tunnel URL
+        // cannot be resumed after a Quick Tunnel rotation, so the consistent
+        // fallback is the old local config with no tunnel process.
+        try { await stopGateway(this.params.cwd); } catch { /* best-effort */ }
+      }
+      if (newUrl) {
+        try { await stopQuickTunnel(); } catch { /* best-effort */ }
+      }
+      if (configUpdated && previousConfig) {
+        try {
+          restoreGatewayConfig(previousConfig);
+          rolledBack = true;
+        } catch {
+          // Keep the failure visible; do not claim a rollback that did not land.
+        }
+      }
+      this.status = rolledBack
+        ? `隧道刷新失败，已回滚到旧配置: ${error instanceof Error ? error.message : String(error)}`
+        : `隧道刷新失败: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.starting = false;
+    }
+    await this.refresh();
+  }
+
+  /** Start one of the two alternative public tunnel providers. */
+  private async startTunnelProvider(provider: "cloudflare" | "openai"): Promise<void> {
+    if (this.starting) return;
+    this.starting = true;
+    this.status = `正在切换到 ${provider === "cloudflare" ? "Cloudflare Quick Tunnel" : "OpenAI Secure MCP Tunnel"}…`;
+    this.safeRequestRender();
+    try {
+      if (provider === "cloudflare") {
+        if (this.snapshot.openAiTunnel?.alive) await stopOpenAiTunnel(this.snapshot.openAiTunnel.generation);
+        const state = await startQuickTunnel(this.listenPort());
+        const endpoint = state.observed.endpoint;
+        if (state.observed.phase !== "ready" || !endpoint) throw new Error(state.observed.detail ?? "Cloudflare Quick Tunnel 未就绪");
+        await writeGatewayConfigChanges({ tunnelUrl: endpoint }, { generation: state.generation, endpoint });
+        this.status = `已切换到 Cloudflare · ${endpoint}/mcp · URL 已保存，按 R 重启 Gateway 应用 OAuth issuer`;
+      } else {
+        const openai = this.configView?.tunnels.openai;
+        if (!openai?.enabled) throw new Error("请先启用 OpenAI Tunnel，保存配置并按 R 重启 Gateway");
+        const pending = [
+          this.configChanges.openAiTunnelEnabled,
+          this.configChanges.openAiAutoInstall,
+          this.configChanges.openAiTunnelBinaryPath,
+          this.configChanges.openAiTunnelIdEnv,
+          this.configChanges.openAiRuntimeKeyEnv,
+          this.configChanges.openAiMinimumVersion,
+          this.configChanges.openAiCredentialTtlMs,
+        ].some((value) => value !== undefined);
+        if (pending) throw new Error("OpenAI Tunnel 配置尚未保存；请先保存并按 R 重启 Gateway");
+        if (this.snapshot.tunnel?.alive) await stopQuickTunnel(this.snapshot.tunnel.generation);
+        const state = await startOpenAiTunnel({
+          localPort: this.listenPort(),
+          ...(openai.binaryPath ? { binaryPath: openai.binaryPath } : {}),
+          autoInstall: openai.autoInstall,
+          tunnelIdEnv: openai.tunnelIdEnv,
+          runtimeKeyEnv: openai.runtimeKeyEnv,
+        });
+        if (state.observed.phase !== "ready") throw new Error(state.observed.detail ?? "OpenAI Tunnel 未就绪");
+        this.status = `已切换到 OpenAI Tunnel${state.observed.opaqueId ? ` · ${state.observed.opaqueId}` : ""}`;
+      }
+    } catch (error) {
+      this.status = `隧道切换失败: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.starting = false;
+      this.configView = readGatewayConfigView() ?? this.configView;
+    }
+    await this.refresh();
+  }
+
+  private async stopTunnelProvider(provider: "cloudflare" | "openai"): Promise<void> {
+    if (this.starting) return;
+    this.starting = true;
+    this.status = `正在停止 ${provider === "cloudflare" ? "Cloudflare" : "OpenAI"} Tunnel…`;
+    this.safeRequestRender();
+    try {
+      const state = provider === "cloudflare" ? this.snapshot.tunnel : this.snapshot.openAiTunnel;
+      if (provider === "cloudflare") await stopQuickTunnel(state?.generation);
+      else await stopOpenAiTunnel(state?.generation);
+      this.status = `${provider === "cloudflare" ? "Cloudflare" : "OpenAI"} Tunnel 已停止`;
+    } catch (error) {
+      this.status = `停止隧道失败: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.starting = false;
+    }
+    await this.refresh();
+  }
+
+  async refresh(): Promise<void> {
+    if (this.closed) return;
+    if (this.refreshPromise) return this.refreshPromise;
+    const operation = this.refreshOnce();
+    this.refreshPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.refreshPromise === operation) this.refreshPromise = undefined;
+    }
+  }
+
+  private async refreshOnce(): Promise<void> {
+    this.refreshGeneration++;
+    const generation = this.refreshGeneration;
+    executablePathCache.clear();
+    this.snapshot = { ...this.snapshot, refreshing: true, error: undefined };
+    this.safeRequestRender();
+    try {
+      const cwd = this.params.cwd;
+      const now = Date.now();
+      const binary = locateGateway();
+      const fork = detectGateway();
+      const version = fork.version ? `pi-maestro-gateway ${fork.version}` : undefined;
+      const controlStatus = await readGatewayControlStatus(cwd);
+      const configPath = gatewayConfigPath();
+      const workspaces = (await listGatewayWorkspaces()).map((workspace) => ({
+        name: basename(workspace.path),
+        path: workspace.path,
+        ...(workspace.expiresAt === undefined ? {} : { expiresAt: workspace.expiresAt }),
+      }));
+      let collaborativeSessions: CollaborativeSessionStateV1[] = [];
+      let collaborationError: string | undefined;
+      try {
+        collaborativeSessions = await readGatewayCollaborativeSessions(cwd);
+      } catch (error) {
+        collaborationError = error instanceof Error ? error.message : String(error);
+      }
+      const [tunnel, openAiTunnel] = await Promise.all([readTunnelState(), readOpenAiTunnelState()]);
+      const { endpoint, reachable, endpointVersion } = await probeEndpoint(configPath);
+      const online = reachable;
+      const opsPassword = readGatewayOpsPassword();
+
+      let connections: GatewayConnectionInfo[] | undefined;
+      let runtimeWindows: GatewayRuntimeWindow[] | undefined;
+      let runtimeWindowFallback: GatewaySnapshot["runtimeWindowFallback"];
+      const collaborationMonitors: Record<string, GatewayMonitor[]> = {};
+      const collaborationMemberIds: Record<string, string> = {};
+      let fabric: GatewayFabricMonitorSnapshotV1 | undefined;
+      if (online) {
+        const client = this.clientForEndpoint(endpoint);
+        const memberIds = collaborativeSessions.flatMap((state) => state.members.map((member) => member.id));
+        try {
+          connections = await client.listRemoteSessions(memberIds);
+          const windowGroups = await Promise.all(connections.map((session) => client.listWindows(session)));
+          runtimeWindows = windowGroups.flat();
+        } catch (error) {
+          runtimeWindowFallback = error instanceof GatewayClientError && error.kind === "auth"
+            ? "auth"
+            : error instanceof GatewayClientError && error.kind === "unsupported"
+              ? "unsupported"
+              : "unavailable";
+        }
+        for (let index = 0; index < collaborativeSessions.length; index++) {
+          const localState = collaborativeSessions[index]!;
+          const candidates = localState.members
+            .filter((member) => member.status === "active" && member.leaseExpiresAt > now)
+            .sort((left, right) => left.role === "owner" ? -1 : right.role === "owner" ? 1 : 0);
+          for (const member of candidates) {
+            try {
+              const state = await client.getGatewaySession(localState.session.id, member.id);
+              collaborativeSessions[index] = state;
+              const monitorList = await client.readGatewayMonitorList(state.session.id, member.id);
+              collaborationMonitors[state.session.id] = monitorList.monitors;
+              fabric ??= monitorList.fabric;
+              collaborationMemberIds[state.session.id] = member.id;
+              break;
+            } catch {
+              // A local state file may belong to another authenticated principal.
+            }
+          }
+        }
+      }
+
+      if (generation === this.refreshGeneration && !this.closed) {
+        this.snapshot = {
+          refreshing: false,
+          binary: binary ?? undefined,
+          version,
+          endpoint: online ? "online" : "offline",
+          endpointVersion: endpointVersion ?? (controlStatus.online ? "Pi Maestro Gateway IPC online" : undefined),
+          configPath: existsSync(configPath) ? configPath : undefined,
+          workspaces,
+          ...this.cwdRegistrationState(workspaces, cwd),
+          windows: collectWindows(now, cwd),
+          thread: collectThread(cwd),
+          mcpServers: collectMcpServers(cwd),
+          connections,
+          runtimeWindows,
+          runtimeWindowFallback,
+          tunnel,
+          openAiTunnel,
+          tasks: await readGatewayTasks(cwd),
+          collaborativeSessions,
+          collaborationMonitors,
+          collaborationMemberIds,
+          fabric,
+          ...(collaborationError === undefined ? {} : { collaborationError }),
+          forkInstalled: fork.installed,
+          forkVersion: fork.version,
+          opsPassword,
+        };
+        this.windowSessionSelected = Math.min(
+          this.windowSessionSelected,
+          Math.max(0, (connections?.length ?? 1) - 1),
+        );
+        this.windowSelected = Math.min(this.windowSelected, Math.max(0, this.windowEntries().length - 1));
+        this.collaborationSelected = Math.min(this.collaborationSelected, Math.max(0, collaborativeSessions.length - 1));
+        this.collaborationItemSelected = Math.min(this.collaborationItemSelected, Math.max(0, this.collaborationItems().length - 1));
+        this.params.onFabricProjection?.(fabric);
+      }
+      if (!tunnel.url && !tunnel.alive) tunnel.health = "dead";
+      if (!openAiTunnel.opaqueId && !openAiTunnel.alive) openAiTunnel.health = "dead";
+    } catch (error) {
+      if (generation === this.refreshGeneration && !this.closed) {
+        this.snapshot = { ...this.snapshot, refreshing: false, fabric: undefined, error: error instanceof Error ? error.message : String(error) };
+        this.params.onFabricProjection?.(undefined);
+      }
+    }
+    if (this.workspaceToggleQueued && !this.workspaceToggleBusy && generation === this.refreshGeneration && !this.closed) {
+      this.workspaceToggleQueued = false;
+      void this.toggleWorkspaceRegistration(this.workspaceToggleQueuedPermanent);
+    }
+    this.safeRequestRender();
+  }
+
+  private currentWindowSession(): GatewayConnectionInfo | undefined {
+    return this.snapshot.connections?.[this.windowSessionSelected];
+  }
+
+  private windowEntries(): GatewayRuntimeWindow[] {
+    const session = this.currentWindowSession();
+    if (!session) return [];
+    return (this.snapshot.runtimeWindows ?? []).filter((window) => window.remoteSessionId === session.sessionId);
+  }
+
+  private selectedRuntimeWindow(): GatewayRuntimeWindow | undefined {
+    return this.windowEntries()[this.windowSelected];
+  }
+
+  private stopWindowObserve(): void {
+    this.observeGeneration++;
+    if (this.observeTimer) clearInterval(this.observeTimer);
+    this.observeTimer = undefined;
+  }
+
+  private startWindowObserve(): void {
+    this.stopWindowObserve();
+    this.windowObservation = undefined;
+    const generation = this.observeGeneration;
+    void this.observeSelectedWindow(generation);
+    this.observeTimer = setInterval(() => void this.observeSelectedWindow(generation), 1_500);
+    this.observeTimer.unref?.();
+  }
+
+  private async observeSelectedWindow(generation: number): Promise<void> {
+    const window = this.selectedRuntimeWindow();
+    const session = this.currentWindowSession();
+    const client = this.client;
+    if (!window || !session || !client || this.mode !== "window-detail" || this.observing) return;
+    this.observing = true;
+    const cursor = window.kind === "registered" ? 0 : (this.windowObservation?.nextCursor ?? 0);
+    try {
+      const next = await client.observeWindow(session, window, cursor, 20);
+      if (generation !== this.observeGeneration || this.mode !== "window-detail" || this.selectedRuntimeWindow()?.id !== window.id) return;
+      const merged = new Map<string, GatewayWindowEvent>();
+      for (const event of [...(this.windowObservation?.events ?? []), ...next.events]) {
+        merged.set(windowEventKey(event), event);
+      }
+      this.windowObservation = { ...next, events: [...merged.values()].slice(-20) };
+      this.safeRequestRender();
+    } catch (error) {
+      if (generation !== this.observeGeneration) return;
+      this.status = `observe: ${error instanceof Error ? error.message : String(error)}`;
+      if (error instanceof GatewayClientError && (error.kind === "auth" || error.kind === "unsupported")) {
+        this.stopWindowObserve();
+      }
+      this.safeRequestRender();
+    } finally {
+      this.observing = false;
+    }
+  }
+
+  private rowBudget(reserved: number, fallback: number): number {
+    const terminalRows = this.params.getTerminalRows?.();
+    if (!Number.isFinite(terminalRows) || !terminalRows || terminalRows <= 0) return fallback;
+    return Math.max(3, Math.floor(terminalRows * 0.9) - reserved);
+  }
+
+  private async sendWindow(targetMode: "existing" | "new"): Promise<void> {
+    if (this.windowActionBusy) return;
+    const session = this.currentWindowSession();
+    const target = targetMode === "existing" ? this.selectedRuntimeWindow() : undefined;
+    const client = this.client;
+    if (!session || !client || !this.params.onComposeWindowMessage || (targetMode === "existing" && !target)) {
+      this.status = "Runtime window send unavailable";
+      this.safeRequestRender();
+      return;
+    }
+    this.windowActionBusy = true;
+    try {
+      const composed = await this.params.onComposeWindowMessage(target, session, targetMode);
+      if (!composed?.message.trim()) return;
+      this.status = targetMode === "new" ? "creating managed window…" : `sending to ${target!.displayName}…`;
+      this.safeRequestRender();
+      const result = await client.sendWindow({
+        remoteSessionId: session.sessionId,
+        purpose: composed.purpose.trim() || composed.message.trim(),
+        message: composed.message.trim(),
+        targetMode,
+        window: target?.id,
+        mode: composed.mode,
+        name: composed.name,
+        model: composed.model,
+        idempotencyKey: targetMode === "new" ? randomUUID() : undefined,
+        confirmed: true,
+      });
+      this.status = targetMode === "new"
+        ? `created ${result.windowId?.slice(0, 12) ?? "managed window"}`
+        : `sent · ${result.action ?? "accepted"}`;
+      await this.refresh();
+    } catch (error) {
+      this.status = `send: ${error instanceof Error ? error.message : String(error)}`;
+      this.safeRequestRender();
+    } finally {
+      this.windowActionBusy = false;
+    }
+  }
+
+  private currentCollaborativeSession(): CollaborativeSessionStateV1 | undefined {
+    return this.snapshot.collaborativeSessions?.[this.collaborationSelected];
+  }
+
+  private collaborationItems(): Array<{ kind: "todo"; todo: GatewayTodoTaskV1 } | { kind: "monitor"; monitor: GatewayMonitor }> {
+    const state = this.currentCollaborativeSession();
+    if (!state) return [];
+    return [
+      ...state.todos.map((todo) => ({ kind: "todo" as const, todo })),
+      ...(this.snapshot.collaborationMonitors?.[state.session.id] ?? []).map((monitor) => ({ kind: "monitor" as const, monitor })),
+    ];
+  }
+
+  private async renewCurrentGatewayMember(): Promise<void> {
+    if (this.collaborationBusy) return;
+    const state = this.currentCollaborativeSession();
+    const memberId = state && this.snapshot.collaborationMemberIds?.[state.session.id];
+    const member = state?.members.find((candidate) => candidate.id === memberId);
+    if (!state || !memberId || !member || !this.client) {
+      this.status = "Gateway member renewal unavailable for this authenticated identity";
+      this.safeRequestRender();
+      return;
+    }
+    this.collaborationBusy = true;
+    try {
+      await this.client.renewGatewayMember(state.session.id, memberId, state.session.revision, member.generation);
+      this.status = `Renewed member ${memberId} lease`;
+      await this.refresh();
+    } catch (error) {
+      this.status = `Member renewal failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.collaborationBusy = false;
+      this.safeRequestRender();
+    }
+  }
+
+  private async mutateSelectedGatewayTodo(action: "claim" | "release" | "advance", status?: "pending" | "blocked" | "completed" | "cancelled"): Promise<void> {
+    if (this.collaborationBusy) return;
+    const state = this.currentCollaborativeSession();
+    const item = this.collaborationItems()[this.collaborationItemSelected];
+    const memberId = state && this.snapshot.collaborationMemberIds?.[state.session.id];
+    if (!state || item?.kind !== "todo" || !memberId || !this.client) {
+      this.status = "Gateway Todo action unavailable for this authenticated member";
+      this.safeRequestRender();
+      return;
+    }
+    this.collaborationBusy = true;
+    this.status = `${action} Gateway Todo…`;
+    this.safeRequestRender();
+    try {
+      await this.client.mutateGatewayTodo({ action, sessionId: state.session.id, memberId, expectedSessionRevision: state.session.revision, todoId: item.todo.id, ...(status ? { status } : {}) });
+      this.status = `Gateway Todo ${action} completed`;
+      await this.refresh();
+    } catch (error) {
+      this.status = `Gateway Todo action failed: ${error instanceof Error ? error.message : String(error)}`;
+      this.safeRequestRender();
+    } finally {
+      this.collaborationBusy = false;
+    }
+  }
+
+  private async observeSelectedMonitor(reset = false): Promise<void> {
+    if (this.collaborationBusy) return;
+    const state = this.currentCollaborativeSession();
+    const item = this.collaborationItems()[this.collaborationItemSelected];
+    const memberId = state && this.snapshot.collaborationMemberIds?.[state.session.id];
+    if (!state || item?.kind !== "monitor" || !memberId || !this.client) return;
+    this.collaborationBusy = true;
+    try {
+      const cursor = reset ? 0 : (this.monitorObservation?.nextCursor ?? 0);
+      this.monitorObservation = await this.client.observeGatewayMonitor(state.session.id, memberId, item.monitor.handle, cursor);
+      this.status = this.monitorObservation.gap ? "Monitor cursor gap detected; showing retained events" : "";
+    } catch (error) {
+      this.status = `Monitor observe failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.collaborationBusy = false;
+      this.safeRequestRender();
+    }
+  }
+
+  private async cancelSelectedMonitor(): Promise<void> {
+    if (this.collaborationBusy) return;
+    const state = this.currentCollaborativeSession();
+    const item = this.collaborationItems()[this.collaborationItemSelected];
+    const memberId = state && this.snapshot.collaborationMemberIds?.[state.session.id];
+    if (!state || item?.kind !== "monitor" || !memberId || !this.client) return;
+    this.collaborationBusy = true;
+    try {
+      await this.client.cancelGatewayMonitor(state.session.id, memberId, item.monitor.handle);
+      this.status = "Monitor cancellation requested";
+      await this.refresh();
+    } catch (error) {
+      this.status = `Monitor cancel failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.collaborationBusy = false;
+      this.safeRequestRender();
+    }
+  }
+
+  /** Mark the overlay closed so async refresh/render callbacks skip work. */
+  markClosed(): void {
+    this.closed = true;
+    this.tunnelPanel.dispose();
+    this.stopWindowObserve();
+    this.params.onFabricProjection?.(undefined);
+  }
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, Math.min(width, 120));
+    if (safeWidth < 20) return [this.renderCompact(safeWidth)];
+    if (this.mode === "detail") return this.renderDetail(safeWidth);
+    if (this.mode === "workspace") return this.renderWorkspace(safeWidth);
+    if (this.mode === "window-list") return this.renderWindowList(safeWidth);
+    if (this.mode === "window-detail") return this.renderWindowDetail(safeWidth);
+    if (this.mode === "config") return this.renderConfig(safeWidth);
+    if (this.mode === "tunnel") return this.tunnelPanel.render(safeWidth);
+    if (this.mode === "collaboration") return this.renderCollaboration(safeWidth);
+    if (this.mode === "collaboration-detail") return this.renderCollaborationDetail(safeWidth);
+    if (this.mode === "monitor-detail") return this.renderMonitorDetail(safeWidth);
+    return this.renderList(safeWidth);
+  }
+
+  handleInput(data: string): void {
+    if (this.mode === "tunnel") {
+      this.tunnelPanel.handleInput(data);
+      return;
+    }
+    if (matchesKey(data, Key.escape)) {
+      if (this.mode === "window-detail") {
+        this.stopWindowObserve();
+        this.mode = "window-list";
+      } else if (this.mode === "config") {
+        if (this.configEditing) {
+          this.configEditing = false;
+          this.configDraft = "";
+        } else if (this.configListKey) {
+          this.configListKey = undefined;
+          this.configListSelected = 0;
+        } else if (this.initialPage === "config") {
+          // Top-level Esc closes: /gateway config opens directly on this page.
+          this.markClosed();
+          this.params.close();
+        } else {
+          this.mode = "list";
+        }
+      } else if (this.mode === "monitor-detail") {
+        this.mode = "collaboration-detail";
+        this.monitorObservation = undefined;
+      } else if (this.mode === "collaboration-detail") {
+        this.mode = "collaboration";
+        this.collaborationItemSelected = 0;
+      } else if (this.mode === "detail" || this.mode === "workspace" || this.mode === "window-list" || this.mode === "collaboration") {
+        this.mode = "list";
+      } else {
+        this.markClosed();
+        this.params.close();
+      }
+      this.params.requestRender();
+      return;
+    }
+    if (data === "1" && this.mode === "config" && !this.configEditing && !this.configListKey) {
+      this.mode = "list";
+      this.params.requestRender();
+      return;
+    }
+    if (data === "2" && this.mode === "list") {
+      this.enterConfigMode();
+      return;
+    }
+    if (this.mode === "monitor-detail") {
+      if (data === "r") void this.observeSelectedMonitor();
+      else if (data === "R") void this.observeSelectedMonitor(true);
+      else if (data === "x" || data === "X") void this.cancelSelectedMonitor();
+      return;
+    }
+    if (this.mode === "collaboration-detail") {
+      const items = this.collaborationItems();
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+        this.collaborationItemSelected = Math.max(0, this.collaborationItemSelected - 1);
+      } else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+        this.collaborationItemSelected = Math.min(Math.max(0, items.length - 1), this.collaborationItemSelected + 1);
+      } else if (isEnter(data) && items[this.collaborationItemSelected]?.kind === "monitor") {
+        this.monitorObservation = undefined;
+        this.mode = "monitor-detail";
+        void this.observeSelectedMonitor(true);
+      } else if (data === "u") {
+        void this.renewCurrentGatewayMember();
+      } else if (data === "a") {
+        const item = items[this.collaborationItemSelected];
+        if (item?.kind === "todo") void this.mutateSelectedGatewayTodo(item.todo.status === "in_progress" ? "release" : "claim");
+      } else if (data === "b") {
+        const item = items[this.collaborationItemSelected];
+        if (item?.kind === "todo") void this.mutateSelectedGatewayTodo("advance", item.todo.status === "blocked" ? "pending" : "blocked");
+      } else if (data === "d") {
+        void this.mutateSelectedGatewayTodo("advance", "completed");
+      } else if (data === "r") {
+        void this.refresh();
+      }
+      this.params.requestRender();
+      return;
+    }
+    if (this.mode === "collaboration") {
+      const sessions = this.snapshot.collaborativeSessions ?? [];
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+        this.collaborationSelected = Math.max(0, this.collaborationSelected - 1);
+      } else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+        this.collaborationSelected = Math.min(Math.max(0, sessions.length - 1), this.collaborationSelected + 1);
+      } else if (isEnter(data) && this.currentCollaborativeSession()) {
+        this.collaborationItemSelected = 0;
+        this.mode = "collaboration-detail";
+      } else if (data === "r") {
+        void this.refresh();
+      }
+      this.params.requestRender();
+      return;
+    }
+    if (this.mode === "window-detail") {
+      if (data === "m" || data === "M") void this.sendWindow("existing");
+      else if (data === "n" || data === "N") void this.sendWindow("new");
+      else if (data === "r") void this.observeSelectedWindow(this.observeGeneration);
+      return;
+    }
+    if (this.mode === "window-list") {
+      const sessions = this.snapshot.connections ?? [];
+      if (matchesKey(data, Key.left) || matchesKey(data, "h")) {
+        this.windowSessionSelected = Math.max(0, this.windowSessionSelected - 1);
+        this.windowSelected = 0;
+      } else if (matchesKey(data, Key.right) || matchesKey(data, "l")) {
+        this.windowSessionSelected = Math.min(Math.max(0, sessions.length - 1), this.windowSessionSelected + 1);
+        this.windowSelected = 0;
+      } else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+        this.windowSelected = Math.max(0, this.windowSelected - 1);
+      } else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+        this.windowSelected = Math.min(Math.max(0, this.windowEntries().length - 1), this.windowSelected + 1);
+      } else if (isEnter(data) && this.selectedRuntimeWindow()) {
+        this.mode = "window-detail";
+        this.startWindowObserve();
+      } else if (data === "m" || data === "M") {
+        void this.sendWindow("existing");
+      } else if (data === "n" || data === "N") {
+        void this.sendWindow("new");
+      } else if (data === "r") {
+        void this.refresh();
+      }
+      this.params.requestRender();
+      return;
+    }
+    if (this.mode === "detail") {
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+        this.selected = Math.max(0, this.selected - 1);
+        this.params.requestRender();
+      } else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+        this.selected = Math.min(this.snapshot.thread.length - 1, this.selected + 1);
+        this.params.requestRender();
+      }
+      return;
+    }
+    if (this.mode === "workspace") {
+      const ws = this.snapshot.workspaces;
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+        this.wsSelected = Math.max(0, this.wsSelected - 1);
+        this.params.requestRender();
+      } else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+        this.wsSelected = Math.min(Math.max(0, ws.length - 1), this.wsSelected + 1);
+        this.params.requestRender();
+      } else if (data === "d" || data === "D") {
+        void this.removeSelectedWorkspace();
+      } else if (data === "e") {
+        void this.toggleWorkspaceRegistration(false);
+      } else if (data === "E") {
+        void this.toggleWorkspaceRegistration(true);
+      }
+      return;
+    }
+    if (this.mode === "config") {
+      this.handleConfigInput(data);
+      return;
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+      this.selected = Math.max(0, this.selected - 1);
+      this.params.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+      this.selected = Math.min(this.snapshot.thread.length - 1, this.selected + 1);
+      this.params.requestRender();
+      return;
+    }
+    if (isEnter(data) && this.snapshot.thread.length > 0) {
+      this.mode = "detail";
+      this.params.requestRender();
+      return;
+    }
+    if (data === "g" || data === "G") {
+      this.collaborationSelected = Math.min(this.collaborationSelected, Math.max(0, (this.snapshot.collaborativeSessions?.length ?? 1) - 1));
+      this.mode = "collaboration";
+      this.params.requestRender();
+      return;
+    }
+    if (data === "v" || data === "V") {
+      this.windowSessionSelected = Math.min(this.windowSessionSelected, Math.max(0, (this.snapshot.connections?.length ?? 1) - 1));
+      this.windowSelected = 0;
+      this.mode = "window-list";
+      this.params.requestRender();
+      return;
+    }
+    if (data === "p" || data === "P") {
+      this.revealOpsPassword = !this.revealOpsPassword;
+      this.params.requestRender();
+      return;
+    }
+    if (data === "r") {
+      void this.refresh();
+      return;
+    }
+    if (data === "e") {
+      void this.toggleWorkspaceRegistration(false);
+      return;
+    }
+    if (data === "E") {
+      void this.toggleWorkspaceRegistration(true);
+      return;
+    }
+    if (data === "c" || data === "C") {
+      this.enterConfigMode();
+      return;
+    }
+    if (data === "s" || data === "S") {
+      void this.startGateway();
+      return;
+    }
+    if (data === "x" || data === "X") {
+      void this.stopGateway();
+      return;
+    }
+    if (data === "R") {
+      void this.restartGateway();
+      return;
+    }
+    if (data === "t" || data === "T") {
+      void this.refreshTunnelAndGateway();
+      return;
+    }
+    if (data === "u" || data === "U") {
+      this.mode = "tunnel";
+      this.params.requestRender();
+      return;
+    }
+    if (data === "w" || data === "W") {
+      this.wsSelected = 0;
+      this.mode = "workspace";
+      this.params.requestRender();
+    }
+  }
+
+  /** e/E toggles registration of the current window: lease (e) or permanent (E).
+   *  Unregistering is shared — it removes the entry regardless of lease mode. */
+  private async toggleWorkspaceRegistration(permanent = false): Promise<void> {
+    if (this.workspaceToggleBusy) return;
+    if (this.snapshot.refreshing) {
+      this.workspaceToggleQueued = true;
+      this.workspaceToggleQueuedPermanent = permanent;
+      this.status = "正在刷新 workspace，注册操作将在刷新后执行…";
+      this.safeRequestRender();
+      return;
+    }
+    this.workspaceToggleBusy = true;
+    const registered = this.snapshot.cwdRegistered;
+    this.status = registered ? "unregistering…" : "registering…";
+    this.safeRequestRender();
+    try {
+      if (registered && this.params.onUnregisterWorkspace) {
+        const message = await this.params.onUnregisterWorkspace(this.params.cwd);
+        this.status = message;
+      } else if (!registered && permanent && this.params.onRegisterWorkspacePermanent) {
+        const message = await this.params.onRegisterWorkspacePermanent(this.params.cwd);
+        this.status = message;
+      } else if (!registered && !permanent && this.params.onRegisterWorkspace) {
+        // Lease-based registration (TTL + heartbeat) — never fall back to a
+        // static `workspace register` while the extension provides a lease.
+        const message = await this.params.onRegisterWorkspace(this.params.cwd);
+        this.status = message;
+      } else if (registered) {
+        const { ok, message } = await removeGatewayWorkspaceByPath(this.params.cwd);
+        this.status = ok ? `unregistered: ${this.params.cwd}` : `remove failed: ${message}`;
+      } else {
+        const registeredNow = permanent
+          ? await registerGatewayWorkspacePermanent(this.params.cwd)
+          : await startWorkspaceLease(this.params.cwd);
+        this.status = registeredNow
+          ? `registered: ${this.params.cwd}`
+          : `register failed: ${this.params.cwd}`;
+      }
+    } catch (error) {
+      this.status = `${registered ? "remove" : "register"} failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.workspaceToggleBusy = false;
+    }
+    await this.refresh();
+  }
+
+  // --- Inline config editor (C key) ---
+  // A flat, ordered list of editable config entries. Each entry binds a key
+  // path (server.host, auth.mode, commands.allow, …) to a renderer + editor.
+  // Scalar edits accumulate in configChanges; list edits are applied directly
+  // to configChanges so add/delete is immediately visible.
+  private configEntries(): ConfigEntry[] {
+    const v = this.configView;
+    const listLen = (arr: string[] | undefined) => arr?.length ?? 0;
+    const left: ConfigEntry[] = [
+      { column: 0, group: "server", key: "server.host", label: "host", kind: "text", value: v?.server.host ?? "127.0.0.1" },
+      { column: 0, group: "server", key: "server.port", label: "port", kind: "number", value: String(v?.server.port ?? 9090) },
+      { column: 0, group: "server", key: "server.disable_localhost_protection", label: "disable_localhost_protection", kind: "bool", value: String(v?.server.disableLocalhostProtection ?? false) },
+      { column: 0, group: "server", key: "server.trust_proxy_headers", label: "trust_proxy_headers", kind: "bool", value: String(v?.server.trustProxyHeaders ?? false) },
+      { column: 0, group: "auth", key: "auth.mode", label: "mode", kind: "cycle", value: v?.auth.mode ?? "open", options: ["open", "bearer", "oauth"] },
+      { column: 0, group: "auth", key: "auth.token", label: "token", kind: "text", value: v?.auth.token ?? "" },
+      { column: 0, group: "auth", key: "auth.oauthPassword", label: "oauth password", kind: "text", value: v?.auth.oauthPassword ?? "" },
+      { column: 0, group: "auth", key: "auth.oauthServerURL", label: "oauth server_url", kind: "text", value: v?.auth.oauthServerURL ?? "" },
+      { column: 0, group: "commands", key: "commands.default", label: "default", kind: "cycle", value: v?.commands.default ?? "allow", options: ["allow", "confirm", "deny"] },
+      { column: 0, group: "commands", key: "commands.autoAllowReadonly", label: "auto_allow_readonly", kind: "cycle", value: String(v?.commands.autoAllowReadonly ?? "null"), options: ["null", "true", "false"] },
+      { column: 0, group: "commands", key: "commandsAllow", label: `allow (${listLen(this.configChanges.commandsAllow)}/${v?.commands.allow.length ?? 0})`, kind: "list", listKey: "commandsAllow" },
+      { column: 0, group: "commands", key: "commandsConfirm", label: `confirm (${listLen(this.configChanges.commandsConfirm)}/${v?.commands.confirm.length ?? 0})`, kind: "list", listKey: "commandsConfirm" },
+      { column: 0, group: "commands", key: "commandsDeny", label: `deny (${listLen(this.configChanges.commandsDeny)}/${v?.commands.deny.length ?? 0})`, kind: "list", listKey: "commandsDeny" },
+      { column: 0, group: "write", key: "save", label: "保存写入 config.yaml", kind: "action", action: "save" },
+      { column: 0, group: "write", key: "discard", label: "放弃修改", kind: "action", action: "discard" },
+    ];
+    const openai = v?.tunnels.openai;
+    const cloudflare = this.snapshot.tunnel;
+    const openAiState = this.snapshot.openAiTunnel;
+    const right: ConfigEntry[] = [
+      { column: 1, group: "tunnel", key: "tunnel.provider", label: "接入方式", kind: "cycle", value: this.tunnelProvider, options: ["cloudflare", "openai"] },
+      ...(this.tunnelProvider === "cloudflare" ? [
+        { column: 1 as const, group: "tunnel", key: "tunnel.cloudflare.status", label: "Cloudflare 状态", kind: "readonly" as const, value: cloudflare?.alive ? `${cloudflare.phase}${cloudflare.url ? ` · ${cloudflare.url}` : ""}` : "未运行" },
+        { column: 1 as const, group: "tunnel", key: "tunnel.cloudflare.start", label: "启动并切换到 Cloudflare", kind: "action" as const, action: "start-cloudflare" as const },
+        { column: 1 as const, group: "tunnel", key: "tunnel.cloudflare.stop", label: "停止 Cloudflare Tunnel", kind: "action" as const, action: "stop-cloudflare" as const },
+        { column: 1 as const, group: "tunnel", key: "tunnel.cloudflare.hint", label: "Quick Tunnel 自动生成 URL；无需账号", kind: "readonly" as const, value: "" },
+      ] : [
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.status", label: "OpenAI 状态", kind: "readonly" as const, value: openAiState?.alive ? `${openAiState.phase}${openAiState.opaqueId ? ` · ${openAiState.opaqueId}` : ""}` : "未运行" },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.enabled", label: "enabled (experimental)", kind: "bool" as const, value: String(openai?.enabled ?? false) },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.autoInstall", label: "auto_install (pinned download)", kind: "bool" as const, value: String(openai?.autoInstall ?? false) },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.binaryPath", label: "binary_path", kind: "text" as const, value: openai?.binaryPath ?? "PATH: tunnel-client" },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.tunnelIdEnv", label: "tunnel_id_env", kind: "text" as const, value: openai?.tunnelIdEnv ?? "CONTROL_PLANE_TUNNEL_ID" },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.runtimeKeyEnv", label: "runtime_key_env", kind: "text" as const, value: openai?.runtimeKeyEnv ?? "CONTROL_PLANE_API_KEY" },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.minimumVersion", label: "minimum_version", kind: "text" as const, value: openai?.minimumVersion ?? "0.0.14" },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.credentialTtlMs", label: "credential_ttl_ms", kind: "number" as const, value: String(openai?.credentialTtlMs ?? 300000) },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.start", label: "启动并切换到 OpenAI", kind: "action" as const, action: "start-openai" as const },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.stop", label: "停止 OpenAI Tunnel", kind: "action" as const, action: "stop-openai" as const },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.hint", label: "凭据只填 env 名；详情运行 /install openai-tunnel", kind: "readonly" as const, value: "" },
+      ]),
+      { column: 1, group: "files", key: "files.max_read_bytes", label: "max_read_bytes", kind: "number", value: String(v?.files.maxReadBytes ?? 1048576) },
+      { column: 1, group: "files", key: "files.max_patch_files", label: "max_patch_files", kind: "number", value: String(v?.files.maxPatchFiles ?? 20) },
+      { column: 1, group: "files", key: "filesAllow", label: `allow (${listLen(this.configChanges.filesAllow)}/${v?.files.allow.length ?? 0})`, kind: "list", listKey: "filesAllow" },
+      { column: 1, group: "files", key: "filesConfirm", label: `confirm (${listLen(this.configChanges.filesConfirm)}/${v?.files.confirm.length ?? 0})`, kind: "list", listKey: "filesConfirm" },
+      { column: 1, group: "files", key: "filesDeny", label: `deny (${listLen(this.configChanges.filesDeny)}/${v?.files.deny.length ?? 0})`, kind: "list", listKey: "filesDeny" },
+    ];
+    return [...left, ...right];
+  }
+
+  private enterConfigMode(): void {
+    this.configView = readGatewayConfigView() ?? undefined;
+    this.configChanges = {};
+    this.configSelected = 0;
+    this.configEditing = false;
+    this.configDraft = "";
+    this.configListKey = undefined;
+    this.configListSelected = 0;
+    this.tunnelProvider = this.snapshot.openAiTunnel?.alive ? "openai" : "cloudflare";
+    this.mode = "config";
+    this.params.requestRender();
+  }
+
+  /** Used by first-run registration to stay inside the two-page Gateway surface. */
+  showConfigPage(): void {
+    this.enterConfigMode();
+  }
+
+  private handleConfigInput(data: string): void {
+    // Inside a list editor: ↑↓ move, a add (inline), d delete selected, Esc back.
+    if (this.configListKey) {
+      const list = this.currentConfigList();
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+        this.configListSelected = Math.max(0, this.configListSelected - 1);
+        this.params.requestRender();
+      } else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+        this.configListSelected = Math.min(Math.max(0, list.length - 1), this.configListSelected + 1);
+        this.params.requestRender();
+      } else if ((data === "a" || data === "A") && !this.configEditing) {
+        this.configEditing = true;
+        this.configDraft = "";
+        this.params.requestRender();
+      } else if (data === "d" || data === "D") {
+        if (!this.configEditing && list.length > 0) {
+          list.splice(this.configListSelected, 1);
+          this.configListSelected = Math.min(this.configListSelected, Math.max(0, list.length - 1));
+          this.params.requestRender();
+        }
+      } else if (this.configEditing) {
+        if (isEnter(data)) {
+          const value = this.configDraft.trim();
+          if (value) list.push(value);
+          this.configEditing = false;
+          this.configDraft = "";
+          this.params.requestRender();
+        } else if (matchesKey(data, Key.backspace)) {
+          this.configDraft = this.configDraft.slice(0, -1);
+          this.params.requestRender();
+        } else if (data.length === 1 && data >= " " && data !== "\x7f") {
+          this.configDraft = (this.configDraft + data).slice(0, 200);
+          this.params.requestRender();
+        }
+      }
+      return;
+    }
+    const entries = this.configEntries();
+    if (this.configEditing) {
+      if (isEnter(data)) {
+        this.commitConfigDraft();
+        this.configEditing = false;
+        this.configDraft = "";
+        this.params.requestRender();
+      } else if (matchesKey(data, Key.backspace)) {
+        this.configDraft = this.configDraft.slice(0, -1);
+        this.params.requestRender();
+      } else if (data.length === 1 && data >= " " && data !== "\x7f") {
+        this.configDraft = (this.configDraft + data).slice(0, 200);
+        this.params.requestRender();
+      }
+      return;
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+      this.moveConfigSelection(-1);
+      return;
+    }
+    if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+      this.moveConfigSelection(1);
+      return;
+    }
+    if (matchesKey(data, Key.left) || matchesKey(data, "h")) {
+      this.switchConfigColumn(0);
+      return;
+    }
+    if (matchesKey(data, Key.right) || matchesKey(data, "l")) {
+      this.switchConfigColumn(1);
+      return;
+    }
+    if (isEnter(data)) {
+      this.activateConfigEntry(entries[this.configSelected]);
+      return;
+    }
+    // Space toggles bool/cycle entries without entering edit mode.
+    if (data === " ") {
+      const entry = entries[this.configSelected];
+      if (entry?.kind === "bool") this.setConfigScalar(entry.key, entry.value === "true" ? "false" : "true");
+      else if (entry?.kind === "cycle" && entry.options) {
+        const idx = entry.options.indexOf(entry.value ?? "");
+        this.setConfigScalar(entry.key, entry.options[(idx + 1) % entry.options.length]!);
+      }
+    }
+  }
+
+  private moveConfigSelection(delta: -1 | 1): void {
+    const entries = this.configEntries();
+    const current = entries[this.configSelected];
+    if (!current) return;
+    const column = entries.map((entry, index) => ({ entry, index })).filter(({ entry }) => entry.column === current.column);
+    const position = column.findIndex(({ entry }) => entry.key === current.key);
+    this.configSelected = column[Math.max(0, Math.min(column.length - 1, position + delta))]?.index ?? this.configSelected;
+    this.params.requestRender();
+  }
+
+  private switchConfigColumn(column: 0 | 1): void {
+    const entries = this.configEntries();
+    const current = entries[this.configSelected];
+    if (!current || current.column === column) return;
+    const source = entries.filter((entry) => entry.column === current.column);
+    const target = entries.map((entry, index) => ({ entry, index })).filter(({ entry }) => entry.column === column);
+    const position = Math.max(0, source.findIndex((entry) => entry.key === current.key));
+    this.configSelected = target[Math.min(position, target.length - 1)]?.index ?? this.configSelected;
+    this.params.requestRender();
+  }
+
+  private activateConfigEntry(entry: ConfigEntry | undefined): void {
+    if (!entry || entry.kind === "readonly") return;
+    if (entry.kind === "list") {
+      this.configListKey = entry.listKey;
+      this.configListSelected = 0;
+      this.params.requestRender();
+      return;
+    }
+    if (entry.kind === "action") {
+      if (entry.action === "save") void this.saveConfig();
+      else if (entry.action === "discard") {
+        this.configChanges = {};
+        this.configView = readGatewayConfigView() ?? this.configView;
+        this.status = "已放弃未保存修改";
+        this.params.requestRender();
+      } else if (entry.action === "start-cloudflare") void this.startTunnelProvider("cloudflare");
+      else if (entry.action === "stop-cloudflare") void this.stopTunnelProvider("cloudflare");
+      else if (entry.action === "start-openai") void this.startTunnelProvider("openai");
+      else if (entry.action === "stop-openai") void this.stopTunnelProvider("openai");
+      return;
+    }
+    if (entry.kind === "cycle" && entry.options) {
+      const idx = entry.options.indexOf(entry.value ?? "");
+      this.setConfigScalar(entry.key, entry.options[(idx + 1) % entry.options.length]!);
+      this.params.requestRender();
+      return;
+    }
+    if (entry.kind === "bool") {
+      this.setConfigScalar(entry.key, entry.value === "true" ? "false" : "true");
+      this.params.requestRender();
+      return;
+    }
+    // text / number: enter inline edit. Draft starts empty so the user types a
+    // fresh replacement value; the current value stays visible in the row label.
+    this.configEditing = true;
+    this.configDraft = "";
+    this.params.requestRender();
+  }
+
+  private commitConfigDraft(): void {
+    const entries = this.configEntries();
+    const entry = entries[this.configSelected];
+    if (!entry) return;
+    // An empty draft (Enter without typing) preserves the current value — a
+    // no-op edit, not a wipe. The user types a replacement value to change it.
+    if (this.configDraft.trim() === "") return;
+    this.setConfigScalar(entry.key, this.configDraft);
+  }
+
+  /** Apply a scalar change to the configChanges buffer and reflect it in configView
+   *  so the rendered value stays in sync before the save commits everything. */
+  private setConfigScalar(key: string, value: string): void {
+    const num = Number(value);
+    switch (key) {
+      case "server.host": this.configChanges.host = value; if (this.configView) this.configView.server.host = value; break;
+      case "server.port": if (Number.isInteger(num) && num > 0 && num < 65536) { this.configChanges.port = num; if (this.configView) this.configView.server.port = num; } break;
+      case "server.disable_localhost_protection": this.configChanges.disableLocalhostProtection = value === "true"; if (this.configView) this.configView.server.disableLocalhostProtection = value === "true"; break;
+      case "server.trust_proxy_headers": this.configChanges.trustProxyHeaders = value === "true"; if (this.configView) this.configView.server.trustProxyHeaders = value === "true"; break;
+      case "auth.mode": this.configChanges.authMode = value as GatewayConfigChanges["authMode"]; if (this.configView) this.configView.auth.mode = value; break;
+      case "auth.token": this.configChanges.authToken = value; if (this.configView) this.configView.auth.token = value; break;
+      case "auth.oauthPassword": this.configChanges.oauthPassword = value; if (this.configView) this.configView.auth.oauthPassword = value; break;
+      case "auth.oauthServerURL": this.configChanges.oauthServerURL = value; if (this.configView) this.configView.auth.oauthServerURL = value; break;
+      case "commands.default": this.configChanges.commandsDefault = value as GatewayConfigChanges["commandsDefault"]; if (this.configView) this.configView.commands.default = value; break;
+      case "commands.autoAllowReadonly": { const ar = value === "null" ? null : value === "true"; this.configChanges.commandsAutoReadonly = ar; if (this.configView) this.configView.commands.autoAllowReadonly = ar; break; }
+      case "files.max_read_bytes": if (Number.isInteger(num) && num > 0) { this.configChanges.filesMaxReadBytes = num; if (this.configView) this.configView.files.maxReadBytes = num; } break;
+      case "files.max_patch_files": if (Number.isInteger(num) && num > 0) { this.configChanges.filesMaxPatchFiles = num; if (this.configView) this.configView.files.maxPatchFiles = num; } break;
+      case "tunnel.provider": this.tunnelProvider = value === "openai" ? "openai" : "cloudflare"; break;
+      case "tunnel.openai.enabled": this.configChanges.openAiTunnelEnabled = value === "true"; if (this.configView) this.configView.tunnels.openai.enabled = value === "true"; break;
+      case "tunnel.openai.autoInstall": this.configChanges.openAiAutoInstall = value === "true"; if (this.configView) this.configView.tunnels.openai.autoInstall = value === "true"; break;
+      case "tunnel.openai.binaryPath": this.configChanges.openAiTunnelBinaryPath = value === "PATH: tunnel-client" ? "" : value; if (this.configView) this.configView.tunnels.openai.binaryPath = value === "PATH: tunnel-client" ? "" : value; break;
+      case "tunnel.openai.tunnelIdEnv": this.configChanges.openAiTunnelIdEnv = value; if (this.configView) this.configView.tunnels.openai.tunnelIdEnv = value; break;
+      case "tunnel.openai.runtimeKeyEnv": this.configChanges.openAiRuntimeKeyEnv = value; if (this.configView) this.configView.tunnels.openai.runtimeKeyEnv = value; break;
+      case "tunnel.openai.minimumVersion": this.configChanges.openAiMinimumVersion = value; if (this.configView) this.configView.tunnels.openai.minimumVersion = value; break;
+      case "tunnel.openai.credentialTtlMs": if (Number.isInteger(num) && num >= 1_000 && num <= 3_600_000) { this.configChanges.openAiCredentialTtlMs = num; if (this.configView) this.configView.tunnels.openai.credentialTtlMs = num; } break;
+    }
+  }
+
+  private currentConfigList(): string[] {
+    if (!this.configListKey) return [];
+    const existing = this.configView ? this.configListForView(this.configListKey) : [];
+    const buf = this.configChanges[this.configListKey];
+    // Once the user edits a list, the buffer is the source of truth; otherwise show the view's current list.
+    return buf ?? existing;
+  }
+
+  private configListForView(key: ConfigListKey): string[] {
+    const v = this.configView!;
+    switch (key) {
+      case "commandsAllow": return v.commands.allow;
+      case "commandsConfirm": return v.commands.confirm;
+      case "commandsDeny": return v.commands.deny;
+      case "filesAllow": return v.files.allow;
+      case "filesConfirm": return v.files.confirm;
+      case "filesDeny": return v.files.deny;
+    }
+  }
+
+  private async saveConfig(): Promise<void> {
+    if (!this.configView) return;
+    // Normalize the list buffers: if a list was opened but never edited, its
+    // buffer is undefined — carry the existing view list so the write is a no-op.
+    for (const key of ["commandsAllow", "commandsConfirm", "commandsDeny", "filesAllow", "filesConfirm", "filesDeny"] as const) {
+      if (this.configChanges[key] === undefined) this.configChanges[key] = this.configListForView(key);
+    }
+    this.status = "正在写入 config.yaml…";
+    this.params.requestRender();
+    try {
+      const { summary } = await writeGatewayConfigChanges(this.configChanges);
+      this.status = summary.length > 0
+        ? `已写入 ${summary.length} 项 — 重启 Pi Maestro Gateway 后生效（R 重启 · 或 /gateway 重入）`
+        : "无修改需写入";
+      // Reload the view so the rendered values match what is now on disk.
+      this.configView = readGatewayConfigView() ?? undefined;
+      this.configChanges = {};
+      this.configListKey = undefined;
+      this.params.requestRender();
+    } catch (error) {
+      this.status = `写入失败: ${error instanceof Error ? error.message : String(error)}`;
+      this.params.requestRender();
+    }
+  }
+
+  private renderConfig(width: number): string[] {
+    const inner = width - 2;
+    const rows = [fitLine(`Pi Maestro Gateway · 1 主页 · ${this.fg("36", "[2 配置]")}`, inner), rule(inner)];
+    if (!this.configView) {
+      const escHint = this.initialPage === "config" ? "Esc 关闭" : "Esc 返回";
+      rows.push(fitLine(this.fg("31", `配置读取失败；请检查 config.yaml 格式后按 ${escHint === "Esc 关闭" ? "Esc 关闭" : "Esc 返回主页"}`), inner));
+      rows.push(...fitSegments(inner, ["1 主页", escHint]));
+      return frame(rows, width, this.params.theme);
+    }
+    if (this.configListKey) {
+      rows.push(...this.renderConfigList(inner));
+      rows.push(...fitSegments(inner, ["a 添加", "d 删除", "Enter 确认输入", "Esc 返回"]));
+      if (this.status) rows.push(fitLine(this.status, inner));
+      return frame(rows, width, this.params.theme);
+    }
+    const escHint = this.initialPage === "config" ? "Esc 关闭" : "Esc 返回";
+    const entries = this.configEntries();
+    if (inner >= 76) {
+      const gap = 3;
+      const leftWidth = Math.floor((inner - gap) / 2);
+      const rightWidth = inner - gap - leftWidth;
+      const left = this.renderConfigColumn(entries, 0, leftWidth);
+      const right = this.renderConfigColumn(entries, 1, rightWidth);
+      rows.push(fitLine(this.fg("36", "Gateway 基础与命令安全"), leftWidth) + " │ " + fitLine(this.fg("36", "公网隧道与文件安全"), rightWidth));
+      for (let index = 0; index < Math.max(left.length, right.length); index++) {
+        rows.push((left[index] ?? " ".repeat(leftWidth)) + " │ " + (right[index] ?? " ".repeat(rightWidth)));
+      }
+    } else {
+      rows.push(...this.renderConfigColumn(entries, 0, inner));
+      rows.push(...this.renderConfigColumn(entries, 1, inner));
+    }
+    rows.push(rule(inner));
+    rows.push(fitLine(this.fg("2", "OpenAI 只保存 tunnel-client 路径与 env 名，不保存密钥；切换 provider 会先停止另一侧"), inner));
+    if (this.status) rows.push(fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["←→ 切栏", "↑↓ 选择", "Enter 编辑/执行", "space 切换", "1 主页", escHint]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderConfigColumn(entries: ConfigEntry[], column: 0 | 1, width: number): string[] {
+    const rows: string[] = [];
+    let currentGroup = "";
+    entries.forEach((entry, index) => {
+      if (entry.column !== column) return;
+      if (entry.group !== currentGroup) {
+        currentGroup = entry.group;
+        rows.push(fitLine(this.fg("36", `「${groupLabel(currentGroup)}」`), width));
+      }
+      const selected = index === this.configSelected && !this.configEditing;
+      const marker = selected ? "›" : " ";
+      let valueText: string;
+      if (entry.key === "tunnel.provider") {
+        const cloudflare = this.tunnelProvider === "cloudflare" ? this.fg("32", "[Cloudflare]") : " Cloudflare ";
+        const openai = this.tunnelProvider === "openai" ? this.fg("32", "[OpenAI experimental]") : " OpenAI experimental ";
+        valueText = `${cloudflare} ↔ ${openai}`;
+      } else if (entry.kind === "list" || entry.kind === "action" || entry.kind === "readonly" && !entry.value) {
+        valueText = entry.label;
+      } else if (this.configEditing && index === this.configSelected) {
+        valueText = `${entry.label} (${entry.value ?? ""}): ${this.configDraft}▌`;
+      } else if (entry.kind === "bool") {
+        valueText = `${entry.label}: ${entry.value === "true" ? this.fg("32", "true") : this.fg("31", "false")}`;
+      } else if (entry.kind === "cycle") {
+        valueText = `${entry.label}: ${this.fg("33", entry.value ?? "")}`;
+      } else {
+        valueText = `${entry.label}: ${entry.value ?? ""}`;
+      }
+      rows.push(fitLine(`${marker} ${valueText}`, width));
+    });
+    return rows;
+  }
+
+  private renderConfigList(inner: number): string[] {
+    const list = this.currentConfigList();
+    const label = this.configListKey ? this.configEntries().find((e) => e.listKey === this.configListKey)?.label ?? this.configListKey : "";
+    const rows = [fitLine(`列表编辑 · ${label} · ↑↓ 选择 a 添加 d 删除`, inner), rule(inner)];
+    if (list.length === 0 && !this.configEditing) {
+      rows.push(fitLine("  ○ 空列表（按 a 添加正则/规则）", inner));
+    } else {
+      for (let i = 0; i < list.length; i++) {
+        const marker = i === this.configListSelected ? this.fg("36", "▶") : " ";
+        rows.push(fitLine(`${marker} ${list[i]}`, inner));
+      }
+    }
+    if (this.configEditing) {
+      rows.push(fitLine(this.fg("33", `  + 新增: ${this.configDraft}▌`), inner));
+    }
+    return rows;
+  }
+
+  private renderCompact(width: number): string {
+    const endpoint = this.snapshot.endpoint === "online" ? "Gateway HTTP online" : this.snapshot.endpoint === "offline" ? "Gateway HTTP offline" : "Gateway …";
+    const windowCount = this.snapshot.runtimeWindows?.length ?? this.snapshot.windows.length;
+    const content = `${endpoint} · ${windowCount} windows · Esc close`;
+    return truncateToWidth(content, width, "…");
+  }
+
+  private renderList(width: number): string[] {
+    const inner = width - 2;
+    const rows = [fitLine(`Pi Maestro Gateway · ${this.fg("36", "[1 主页]")} · 2 配置`, inner), rule(inner)];
+    rows.push(fitLine(this.fg("36", "服务概览"), inner));
+    rows.push(...this.renderForkRows(inner));
+    rows.push(this.renderConnectionRow(inner));
+    const brokenMcp = this.snapshot.mcpServers.filter((server) => !server.executable).length;
+    rows.push(fitLine(`上游 MCP ${this.snapshot.mcpServers.length} · 客户端 ${this.snapshot.connections?.length ?? "—"} · 工作区 ${this.snapshot.workspaces.length}${brokenMcp ? ` · ${this.fg("31", `${brokenMcp} 个命令不可用`)}` : ""}`, inner));
+    rows.push(...this.renderFabricRows(inner));
+    rows.push(rule(inner));
+    rows.push(...this.renderTunnelRows(inner));
+    rows.push(...this.renderOpsPasswordRows(inner));
+    rows.push(rule(inner));
+    const sessionCount = this.snapshot.collaborativeSessions?.length ?? 0;
+    const todos = (this.snapshot.collaborativeSessions ?? []).reduce((count, state) => count + state.todos.length, 0);
+    const monitors = Object.values(this.snapshot.collaborationMonitors ?? {}).reduce((count, values) => count + values.length, 0);
+    const windowCount = this.snapshot.runtimeWindows?.length ?? this.snapshot.windows.length;
+    rows.push(fitLine(`协作概览 · ${sessionCount} Session · Gateway Todo ${todos} · Monitor ${monitors} · G 管理`, inner));
+    rows.push(fitLine(`Pi 窗口 ${windowCount} · V 查看 · Gateway Todo 与 Pi Todo 独立`, inner));
+    rows.push(rule(inner));
+    rows.push(fitLine(`最近消息（${this.snapshot.thread.length}）`, inner));
+    if (this.snapshot.thread.length === 0) {
+      rows.push(fitLine("  ○ 暂无跨窗口消息", inner));
+    } else {
+      const start = Math.max(0, Math.min(this.selected - 2, this.snapshot.thread.length - 5));
+      for (let index = start; index < Math.min(this.snapshot.thread.length, start + 5); index++) {
+        rows.push(this.renderThreadRow(this.snapshot.thread[index], index === this.selected, inner));
+      }
+    }
+    if (this.status) rows.push(fitLine(this.status, inner));
+    if (this.snapshot.error) rows.push(fitLine(this.fg("31", `! ${this.snapshot.error}`), inner));
+    rows.push(...fitSegments(inner, ["1 主页", "2/c 配置", "U 隧道", "Enter 消息", "G 协作", "V 窗口", "W 工作区", "r 刷新", this.snapshot.endpoint === "online" ? "x 停止" : "s 启动", "R 重启", "T 重建 Cloudflare", "e 注册(租约)", "E 注册(永久)", "P 口令", "Esc 关闭"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderFabricRows(width: number): string[] {
+    const fabric = this.snapshot.fabric;
+    if (!fabric) return [fitLine("Fabric · unavailable or disabled", width)];
+    const count = <T extends { health: string }>(items: readonly T[], health: string): number => items.filter((item) => item.health === health).length;
+    const suffix = fabric.truncated ? " · truncated" : "";
+    return [
+      fitLine(`Fabric · revision ${fabric.revision} · ${fabric.itemCount} items${suffix}`, width),
+      fitLine(`  Connectors ${fabric.connectors.length} · online ${count(fabric.connectors, "online")} · degraded ${count(fabric.connectors, "degraded")} · offline ${count(fabric.connectors, "offline")}`, width),
+      fitLine(`  Devices ${fabric.devices.length} · online ${count(fabric.devices, "online")} · disabled ${count(fabric.devices, "disabled")} · offline ${count(fabric.devices, "offline")}`, width),
+      fitLine(`  Endpoints ${fabric.endpoints.length} · agent ${fabric.endpoints.filter((item) => item.endpointKind === "agent").length} · MCP ${fabric.endpoints.filter((item) => item.endpointKind === "mcp").length} · online ${count(fabric.endpoints, "online")}`, width),
+    ];
+  }
+
+  /** Classify the cwd's registration: present in config.yaml, and if so whether
+   *  its lease is still live or already expired (waiting for gateway's sweep). */
+  private cwdRegistrationState(workspaces: GatewayWorkspaceInfo[], cwd: string): { cwdRegistered: boolean; cwdLeaseStale?: boolean } {
+    const normalized = cwd.replace(/\\/g, "/").toLowerCase();
+    const match = workspaces.find((workspace) => workspace.path.replace(/\\/g, "/").toLowerCase() === normalized);
+    if (!match) return { cwdRegistered: false };
+    // A permanent entry (no expires_at) is always live; a TTL entry whose
+    // expires_at has passed is stale until gateway's lease sweeper reclaims it.
+    const stale = match.expiresAt !== undefined && match.expiresAt <= Date.now();
+    return { cwdRegistered: true, cwdLeaseStale: stale };
+  }
+
+  private renderForkRows(width: number): string[] {
+    if (this.snapshot.forkInstalled) {
+      return [fitLine(this.fg("32", `Pi Maestro Gateway 已安装${this.snapshot.forkVersion ? ` · v${this.snapshot.forkVersion}` : ""}`), width)];
+    }
+    return [fitLine(this.fg("31", "未找到 Pi Maestro Gateway — 设置 PI_MAESTRO_GATEWAY_BIN 或重新安装 pi-maestro-flow"), width)];
+  }
+
+  private renderConnectionRow(width: number): string {
+    const binary = this.snapshot.binary ?? "未找到 Pi Maestro Gateway";
+    const version = this.snapshot.version ? ` · ${this.snapshot.version}` : "";
+    const endpoint = this.snapshot.endpoint === "online"
+      ? this.fg("32", `● ${this.snapshot.endpointVersion ?? "online"}`)
+      : this.snapshot.endpoint === "offline"
+        ? this.fg("31", "● offline")
+        : this.fg("33", "● …");
+    // "已注册" is green only when the lease is live; a stale-but-unswept entry
+    // is yellow so the user knows gateway will reclaim it (config.yaml still lists
+    // it until the next ~5min sweep).
+    const registered = this.snapshot.cwdRegistered
+      ? (this.snapshot.cwdLeaseStale ? this.fg("33", "租约过期·待清理") : this.fg("32", "已注册"))
+      : this.fg("33", "未注册");
+    // gateway's registry is rebuilt only at startup and every ~5min (lease sweep);
+    // a freshly-registered window is recognized by the runtime after that delay.
+    const sweepHint = this.snapshot.cwdRegistered && !this.snapshot.cwdLeaseStale ? " · Gateway workspace 已生效" : "";
+    return fitLine(`binary: ${binary}${version} · endpoint: ${endpoint} · 工作区 ${this.snapshot.workspaces.length} · 当前目录 ${registered}${sweepHint}`, width);
+  }
+
+  private renderTunnelRows(width: number): string[] {
+    const cloudflare = this.snapshot.tunnel;
+    const openai = this.snapshot.openAiTunnel;
+    const stateLabel = (state: TunnelState | undefined) => state?.alive
+      ? this.fg("32", `${state.phase}${state.pid ? ` · pid ${state.pid}` : ""}`)
+      : state?.health === "dead" ? this.fg("31", "异常") : this.fg("2", "未运行");
+    const rows = [fitLine(`${this.fg("36", "公网接入")} · 配置页切换 provider（2/c）· U 打开 Tunnel 操作页`, width)];
+    rows.push(fitLine(`  Cloudflare Quick Tunnel      ${stateLabel(cloudflare)}${cloudflare?.url ? ` · ${cloudflare.url}/mcp` : ""}`, width));
+    rows.push(fitLine(`  OpenAI Secure MCP Tunnel    ${stateLabel(openai)}${openai?.opaqueId ? ` · ${openai.opaqueId}` : ""} · experimental`, width));
+    const failureDetail = cloudflare?.health === "dead" && cloudflare.detail
+      ? cloudflare.detail
+      : openai?.health === "dead" ? openai.detail : undefined;
+    if (failureDetail) rows.push(fitLine(this.fg("31", `  ! ${failureDetail}`), width));
+    return rows;
+  }
+
+  /** 运维口令 (OAuth authorize 页面所需) — 展示在隧道区块下方。 */
+  private renderOpsPasswordRows(width: number): string[] {
+    // PERF-RV-006: read from the snapshot (populated once during refresh)
+    // instead of calling readGatewayOpsPassword() on every render.
+    // SEC-RV-001: mask the password by default (last 4 chars only); the full
+    // value is revealed only when the user presses P (revealOpsPassword).
+    // Full reveal is also available directly from the native Gateway config.
+    const pw = this.snapshot.opsPassword;
+    if (!pw) {
+      return [fitLine(this.fg("33", "运维口令：未在 config 持久化（OAuth 授权需要配置 oauth.password）"), width)];
+    }
+    const shown = this.revealOpsPassword
+      ? pw
+      : pw.length > 4
+        ? `●●●●${pw.slice(-4)}`
+        : "●●●●";
+    return [
+      fitLine(`运维口令（OAuth 授权页填写）: ${this.fg("36", shown)}`, width),
+      fitLine(this.fg("2", `  按 P 显明/隐藏口令（完整值见 the native Gateway config）`), width),
+    ];
+  }
+
+  /** Gateway metadata-only task journal. */
+  private renderTaskJournalRows(width: number): string[] {
+    const tasks = this.snapshot.tasks;
+    if (!tasks || tasks.length === 0) return [];
+    const rows = [fitLine(`委派任务（${tasks.length}）`, width)];
+    const statusColor: Record<string, string> = {
+      pending: "33",
+      delivered: "36",
+      executing: "34",
+      completed: "32",
+      failed: "31",
+    };
+    for (const task of tasks.slice(0, 6)) {
+      const color = statusColor[task.status] ?? "33";
+      const tid = task.id.slice(0, 8);
+      rows.push(fitLine(`  ${this.fg(color, task.status)} · ${tid} · Gateway · ${task.cwd || "?"}`, width));
+      if (task.status === "completed" && task.publicationId) {
+        rows.push(fitLine(this.fg("2", `      结果: agent://${task.publicationId}`), width));
+      } else if ((task.status === "failed" || task.status === "lost") && task.error) {
+        rows.push(fitLine(this.fg("31", `      错误: ${task.error.slice(0, 60)}`), width));
+      }
+    }
+    return rows;
+  }
+
+  private renderCollaborationSummary(width: number): string[] {
+    const sessions = this.snapshot.collaborativeSessions ?? [];
+    const todos = sessions.reduce((count, state) => count + state.todos.length, 0);
+    const monitors = Object.values(this.snapshot.collaborationMonitors ?? {}).reduce((count, values) => count + values.length, 0);
+    const rows = [fitLine(`Gateway 协作（${sessions.length} Session） · Gateway Todo ${todos} · Monitor ${monitors} · G 管理`, width)];
+    rows.push(fitLine(this.fg("33", "  Gateway Todo is independent and is not synchronized with Pi Todo."), width));
+    if (this.snapshot.collaborationError) rows.push(fitLine(this.fg("31", `  collaboration: ${this.snapshot.collaborationError}`), width));
+    return rows;
+  }
+
+  private renderCollaboration(width: number): string[] {
+    const inner = width - 2;
+    const sessions = this.snapshot.collaborativeSessions ?? [];
+    const rows = [fitLine("Gateway Collaboration · CollaborativeSession ↑↓ · Enter details", inner), rule(inner)];
+    rows.push(fitLine(this.fg("33", "Gateway Todo is independent and is not synchronized with Pi Todo."), inner));
+    if (sessions.length === 0) {
+      rows.push(fitLine("  ○ No workspace-local CollaborativeSession state", inner));
+    } else {
+      const start = Math.max(0, Math.min(this.collaborationSelected - 3, sessions.length - 7));
+      for (let index = start; index < Math.min(sessions.length, start + 7); index++) {
+        const state = sessions[index]!;
+        const marker = index === this.collaborationSelected ? this.fg("36", "▶") : " ";
+        const monitorCount = this.snapshot.collaborationMonitors?.[state.session.id]?.length ?? 0;
+        rows.push(fitLine(`${marker} ${state.session.id} · ${state.session.status} · revision ${state.session.revision} · members ${state.members.length} · Gateway Todo ${state.todos.length} · Monitor ${monitorCount}`, inner));
+      }
+    }
+    if (this.status) rows.push(fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["Enter details", "r refresh", "Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderCollaborationDetail(width: number): string[] {
+    const inner = width - 2;
+    const state = this.currentCollaborativeSession();
+    const rows = [fitLine("CollaborativeSession · members, Gateway Todo, execution Monitor", inner), rule(inner)];
+    if (!state) {
+      rows.push(fitLine("  ○ Session is no longer available", inner));
+    } else {
+      rows.push(fitLine(`${state.session.id} · state ${state.session.status} · revision ${state.session.revision}`, inner));
+      rows.push(fitLine(`workspace: ${state.session.workspacePath}`, inner));
+      rows.push(rule(inner));
+      rows.push(fitLine(`Members (${state.members.length}) · lease generation / expiry`, inner));
+      for (const member of state.members.slice(0, 8)) {
+        const remaining = member.leaseExpiresAt - Date.now();
+        const lease = remaining <= 0 ? this.fg("31", "expired") : `${Math.ceil(remaining / 1000)}s`;
+        rows.push(fitLine(`  ${member.id} · ${member.role}/${member.status} · gen ${member.generation} · lease ${lease}`, inner));
+      }
+      rows.push(rule(inner));
+      rows.push(fitLine(`Gateway Todo (${state.todos.length}) · independent; not synchronized with Pi Todo`, inner));
+      const selectedTodo = this.collaborationItemSelected < state.todos.length ? this.collaborationItemSelected : 0;
+      const todoStart = Math.max(0, Math.min(selectedTodo - 3, state.todos.length - 8));
+      if (state.todos.length === 0) rows.push(fitLine("  ○ No Gateway Todo items", inner));
+      for (let index = todoStart; index < Math.min(state.todos.length, todoStart + 8); index++) {
+        const todo = state.todos[index]!;
+        const marker = index === this.collaborationItemSelected ? this.fg("36", "▶") : " ";
+        const assignee = todo.assigneeId ? ` · @${todo.assigneeId}` : "";
+        rows.push(fitLine(`${marker} ${todo.status} · ${todo.id}${assignee} · ${todo.subject}`, inner));
+      }
+      rows.push(rule(inner));
+      const monitors = this.snapshot.collaborationMonitors?.[state.session.id] ?? [];
+      rows.push(fitLine(`Execution Monitor (${monitors.length}) · stable cursor`, inner));
+      if (monitors.length === 0) rows.push(fitLine("  ○ No session-bound execution handles, or current identity is read-only", inner));
+      const selectedMonitor = Math.max(0, this.collaborationItemSelected - state.todos.length);
+      const monitorStart = Math.max(0, Math.min(selectedMonitor - 3, monitors.length - 8));
+      for (let index = monitorStart; index < Math.min(monitors.length, monitorStart + 8); index++) {
+        const monitor = monitors[index]!;
+        const marker = state.todos.length + index === this.collaborationItemSelected ? this.fg("36", "▶") : " ";
+        const status = monitor.task.status === "lost" ? this.fg("31", "lost") : monitor.task.status;
+        rows.push(fitLine(`${marker} ${status} · ${monitor.handle} · cursor ${monitor.task.eventCursor} · results ${monitor.task.resultCount}`, inner));
+      }
+    }
+    if (this.status) rows.push(fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["↑↓ select", "Enter observe Monitor", "u renew my lease", "a claim/release Todo", "b block/unblock Todo", "d complete Todo", "r refresh", "Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderMonitorDetail(width: number): string[] {
+    const inner = width - 2;
+    const observation = this.monitorObservation;
+    const rows = [fitLine("Execution Monitor · cursor-addressed observation", inner), rule(inner)];
+    if (!observation) {
+      rows.push(fitLine(this.collaborationBusy ? "  observing…" : "  ○ No observation available", inner));
+    } else {
+      const status = observation.task.status === "lost" ? this.fg("31", "lost") : observation.task.status;
+      rows.push(fitLine(`${observation.handle} · ${status} · next cursor ${observation.nextCursor} · oldest ${observation.oldestCursor}${observation.hasMore ? " · more" : ""}`, inner));
+      rows.push(fitLine(observation.gap ? this.fg("31", "! cursor gap: older Monitor events were lost") : this.fg("32", "cursor continuity retained"), inner));
+      rows.push(rule(inner));
+      if (observation.events.length === 0) rows.push(fitLine("  ○ No retained events after this cursor", inner));
+      for (const event of observation.events.slice(-this.rowBudget(8, 12))) {
+        rows.push(fitLine(`  cursor ${event.cursor} · ${event.type} · ${new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false })}`, inner));
+      }
+    }
+    if (this.status) rows.push(fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["r next", "R replay retained", "x cancel", "Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderThreadRow(entry: GatewayThreadEntry, selected: boolean, width: number): string {
+    const marker = selected ? "›" : " ";
+    const time = new Date(entry.createdAt).toLocaleTimeString("zh-CN", { hour12: false });
+    const ws = entry.workspace ? `${basename(entry.workspace)} · ` : "";
+    if (entry.kind === "command") {
+      const from = entry.fromOwnerId.slice(0, 8);
+      const to = entry.toOwnerId.slice(0, 8);
+      const body = entry.message ? entry.message.replace(/\s+/g, " ").slice(0, 40) : "";
+      return fitLine(`${marker} ${time} ${ws}cmd ${entry.action ?? "?"} ${from}→${to} · ${body}`, width);
+    }
+    const from = entry.fromOwnerId.slice(0, 8);
+    const to = entry.toOwnerId.slice(0, 8);
+    return fitLine(`${marker} ${time} ${ws}rsp ${entry.status ?? "?"} ${from}→${to} · ${entry.commandId.slice(0, 8)}`, width);
+  }
+
+  private renderDetail(width: number): string[] {
+    const inner = width - 2;
+    const entry = this.snapshot.thread[this.selected];
+    const rows = [fitLine("消息详情 · ↑↓ 切换 · Esc 返回", inner), rule(inner)];
+    if (!entry) {
+      rows.push(fitLine("○ 无消息", inner));
+    } else {
+      rows.push(fitLine(`command_id: ${entry.commandId}`, inner));
+      rows.push(fitLine(`kind: ${entry.kind} · from: ${entry.fromOwnerId} → to: ${entry.toOwnerId}`, inner));
+      rows.push(fitLine(`time: ${new Date(entry.createdAt).toLocaleString("zh-CN", { hour12: false })}`, inner));
+      if (entry.action) rows.push(fitLine(`action: ${entry.action}`, inner));
+      if (entry.status) rows.push(fitLine(`status: ${entry.status}`, inner));
+      if (entry.message) {
+        rows.push(rule(inner));
+        for (const line of entry.message.split(/\r?\n/).slice(0, 12)) {
+          rows.push(fitLine(line || " ", inner));
+        }
+      }
+    }
+    rows.push(...fitSegments(inner, ["Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderWindowList(width: number): string[] {
+    const inner = width - 2;
+    const sessions = this.snapshot.connections ?? [];
+    const session = this.currentWindowSession();
+    const windows = this.windowEntries();
+    const rows = [fitLine("Pi 窗口 · Remote Session ←→ · ↑↓ 选择", inner), rule(inner)];
+    if (this.snapshot.runtimeWindows === undefined) {
+      const reason = this.snapshot.runtimeWindowFallback === "auth" ? "鉴权阻止 Runtime 调用" : "Runtime 缺少统一 pi_window actions";
+      rows.push(fitLine(this.fg("33", `${reason} · 使用 local registry fallback`), inner));
+      const fallbackBudget = this.rowBudget(6, 10);
+      const visibleFallback = this.snapshot.windows.length > fallbackBudget
+        ? this.snapshot.windows.slice(0, Math.max(1, fallbackBudget - 1))
+        : this.snapshot.windows;
+      for (const window of visibleFallback) {
+        rows.push(fitLine(`  local · ${window.displayName} · ${window.ownerId.slice(0, 8)} · pid ${window.pid}`, inner));
+      }
+      if (this.snapshot.windows.length > visibleFallback.length) {
+        rows.push(fitLine(`  … ${this.snapshot.windows.length - visibleFallback.length} more`, inner));
+      }
+      if (this.snapshot.windows.length === 0) rows.push(fitLine("  ○ 无本地 fresh owner", inner));
+      rows.push(...fitSegments(inner, ["r refresh", "Esc back"]));
+      return frame(rows, width, this.params.theme);
+    }
+    if (!session || sessions.length === 0) {
+      rows.push(fitLine("○ 无可用 Remote Session", inner));
+    } else {
+      rows.push(fitLine(`Remote ${this.windowSessionSelected + 1}/${sessions.length} · ${session.workspace || "?"} · ${session.status} · ${session.label || session.sessionId.slice(0, 8)}`, inner));
+      rows.push(rule(inner));
+      if (windows.length === 0) {
+        rows.push(fitLine("  ○ 此 Session 无窗口 · n 新建 managed window", inner));
+      } else {
+        const budget = this.rowBudget(8, 12);
+        const entryBudget = windows.length > budget ? Math.max(1, budget - 1) : budget;
+        const start = Math.max(0, Math.min(
+          this.windowSelected - Math.floor(entryBudget / 2),
+          windows.length - entryBudget,
+        ));
+        const end = Math.min(windows.length, start + entryBudget);
+        for (let index = start; index < end; index++) {
+          const window = windows[index];
+          const marker = index === this.windowSelected ? this.fg("36", "▶") : " ";
+          const cursor = window.cursor ? ` · cursor ${window.cursor}` : "";
+          rows.push(fitLine(`${marker} ${window.kind} · ${window.displayName} · ${window.status}${cursor}`, inner));
+        }
+        if (windows.length > entryBudget) {
+          rows.push(fitLine(`  … ${start} above · ${windows.length - end} below`, inner));
+        }
+      }
+    }
+    if (this.status) rows.push(fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["Enter observe", "m send", "n new", "r refresh", "Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  private renderWindowDetail(width: number): string[] {
+    const inner = width - 2;
+    const target = this.selectedRuntimeWindow();
+    const session = this.currentWindowSession();
+    const observation = this.windowObservation;
+    const rows = [fitLine("Pi 窗口详情 · incremental observe", inner), rule(inner)];
+    if (!target || !session) {
+      rows.push(fitLine("○ 窗口已不可用", inner));
+    } else {
+      const status = observation?.status ?? target.status;
+      const cursor = observation?.cursor ?? target.cursor;
+      rows.push(fitLine(`${target.displayName} · source ${observation?.source ?? target.kind} · status ${status} · cursor ${cursor}`, inner));
+      rows.push(fitLine(`Remote ${session.workspace || "?"} · ${session.label || session.sessionId.slice(0, 8)} · pid ${target.pid || "—"}`, inner));
+      rows.push(rule(inner));
+      if (!observation) {
+        rows.push(fitLine("  observing…", inner));
+      } else if (observation.events.length === 0) {
+        rows.push(fitLine("  ○ 暂无新 assistant/tool/lifecycle event", inner));
+      } else {
+        const eventBudget = this.rowBudget(9, 14);
+        for (const event of observation.events.slice(-eventBudget)) {
+          rows.push(renderWindowEvent(event, inner));
+        }
+      }
+    }
+    if (this.status) rows.push(fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["m send", "n new", "r observe", "Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  /** W 子模式：列出并更新 built-in Gateway workspace registry。 */
+  private renderWorkspace(width: number): string[] {
+    const inner = width - 2;
+    const ws = this.snapshot.workspaces;
+    const rows = [fitLine("Workspace 管理 · ↑↓ 选中 · d 删除 · e 注册当前目录 · Esc 返回", inner), rule(inner)];
+    if (ws.length === 0) {
+      rows.push(fitLine("○ 无已注册 workspace（按 e 注册当前目录）", inner));
+    } else {
+      for (let i = 0; i < ws.length; i++) {
+        const w = ws[i];
+        const marker = i === this.wsSelected ? this.fg("36", "▶") : " ";
+        const lease = w.expiresAt
+          ? w.expiresAt <= Date.now() ? this.fg("31", "租约·已过期") : this.fg("33", "租约")
+          : this.fg("32", "永久");
+        rows.push(fitLine(`${marker} ${w.name} · ${w.path} · ${lease}`, inner));
+      }
+      rows.push(rule(inner));
+      rows.push(fitLine(this.fg("31", "  d 删除选中 workspace（立即从 Gateway registry 清理）"), inner));
+    }
+    rows.push(...fitSegments(inner, ["d delete", "e 注册(租约)", "E 注册(永久)", "Esc back"]));
+    return frame(rows, width, this.params.theme);
+  }
+
+  /** Legacy numeric code → semantic role → theme slot. */
+  private fg(code: string, text: string): string {
+    const theme = this.params.theme;
+    if (!theme || !code) return text;
+    const role = CODE_ROLE[code];
+    if (role === "bold") return theme.bold ? theme.bold(text) : theme.fg("text", text);
+    return theme.fg(role ?? "text", text);
+  }
+
+  private async removeSelectedWorkspace(): Promise<void> {
+    const ws = this.snapshot.workspaces[this.wsSelected];
+    if (!ws) return;
+    if (this.params.onUnregisterWorkspace && normalizeWorkspacePath(ws.path) === normalizeWorkspacePath(this.params.cwd)) {
+      const message = await this.params.onUnregisterWorkspace(ws.path);
+      this.status = message;
+      this.safeRequestRender();
+      await this.refresh();
+      return;
+    }
+    const { ok, message } = await removeGatewayWorkspaceByPath(ws.path);
+    this.status = ok ? `已移除 ${ws.name} — ${message}` : `移除失败: ${message}`;
+    this.safeRequestRender();
+    await this.refresh();
+  }
+}
+
+// --- private TUI helpers (same pattern as sibling overlays) ---
+
+function sanitizeTerminalText(value: string): string {
+  return value
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC 序列(标题等)
+    // 非颜色 CSI 序列清掉;SGR 颜色码(以 m 结尾)必须保留以维持 this.fg()/主题着色
+    .replace(/\x1b\[(?![0-9;]*m)[0-9;?]*[ -/]*[@-~]/g, "")
+    // C0/C1 控制:保留 ESC(0x1b,SGR 序列的一部分)与 \t\n;只剥除其余控制符
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f-\u009f]/g, "")
+    .replace(/[\r\n]+/g, " ");
+}
+
+function windowEventKey(event: GatewayWindowEvent): string {
+  if (event.kind === "assistant") return `assistant:${event.at}:${event.text}`;
+  if (event.kind === "tool") return `tool:${event.at}:${event.toolCallId ?? ""}:${event.toolName}:${event.status ?? ""}`;
+  if (event.kind === "lifecycle") return `lifecycle:${event.at}:${event.phase}`;
+  return `rpc:${event.cursor}:${event.type}:${event.summary ?? ""}`;
+}
+
+function renderWindowEvent(event: GatewayWindowEvent, width: number): string {
+  const time = Number.isFinite(event.at) && event.at > 0
+    ? new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false })
+    : "--:--:--";
+  if (event.kind === "assistant") {
+    return fitLine(`  ${time} assistant · ${event.text.replace(/\s+/g, " ")}`, width);
+  }
+  if (event.kind === "tool") {
+    return fitLine(`  ${time} tool · ${event.toolName || "?"}${event.status ? ` · ${event.status}` : ""}`, width);
+  }
+  if (event.kind === "lifecycle") {
+    return fitLine(`  ${time} lifecycle · ${event.phase}`, width);
+  }
+  const label = event.type.startsWith("tool_execution_")
+    ? "tool"
+    : event.type === "message_update"
+      ? "assistant"
+      : "lifecycle";
+  return fitLine(`  ${time} ${label} · ${event.type}${event.summary ? ` · ${event.summary.replace(/\s+/g, " ")}` : ""}`, width);
+}
+
+function fitLine(value: string, width: number): string {
+  // pad=true pads by *visible* width (CJK chars count 2), keeping the right
+  // border aligned — padEnd() padded by code units and jagged CJK rows.
+  return truncateToWidth(sanitizeTerminalText(value), width, "…", true);
+}
+
+function rule(width: number): string {
+  return "─".repeat(Math.max(0, width));
+}
+
+function frame(rows: readonly string[], width: number, theme?: OverlayTheme): string[] {
+  // width is the OUTER width; content rows are │+inner+│, so the horizontal
+  // rules must span inner = width-2 to keep all rows the same width.
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    corners: "square",
+    clip: false,
+    pad: false,
+    theme,
+    borderColor: "borderMuted",
+  });
+}
+
+const CODE_ROLE: Record<string, string> = {
+  "1": "bold",
+  "2": "dim",
+  "31": "error",
+  "32": "success",
+  "33": "warning",
+  "34": "muted",
+  "35": "accent",
+  "36": "accent",
+};
+
+function fitSegments(width: number, segments: readonly string[]): string[] {
+  // Greedy-wrap the hint segments so no shortcut is hidden by truncation on
+  // narrow terminals.
+  const lines: string[] = [];
+  let current = "";
+  for (const segment of segments) {
+    const candidate = current ? `${current} · ${segment}` : segment;
+    if (current && visibleWidth(candidate) > width) {
+      lines.push(fitLine(current, width));
+      current = segment;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(fitLine(current, width));
+  return lines;
+}
+
+function isEnter(data: string): boolean {
+  return data === "\r" || data === "\n";
+}
+
+type ConfigListKey = "commandsAllow" | "commandsConfirm" | "commandsDeny" | "filesAllow" | "filesConfirm" | "filesDeny";
+
+interface ConfigEntry {
+  column: 0 | 1;
+  group: string;
+  key: string;
+  label: string;
+  kind: "text" | "number" | "bool" | "cycle" | "list" | "action" | "readonly";
+  value?: string;
+  options?: string[];
+  listKey?: ConfigListKey;
+  action?: "save" | "discard" | "start-cloudflare" | "stop-cloudflare" | "start-openai" | "stop-openai";
+}
+
+function groupLabel(group: string): string {
+  switch (group) {
+    case "server": return "服务器监听";
+    case "auth": return "认证";
+    case "commands": return "命令权限 security.commands";
+    case "files": return "文件权限 security.files";
+    case "tunnel": return "公网隧道（Cloudflare ↔ OpenAI）";
+    case "write": return "写入";
+    default: return group;
+  }
+}
+
+export const _gatewayTuiInternals = {
+  normalizeWorkspacePath,
+  workspaceIdForCwd,
+  collectWorkspaces,
+  collectWindows,
+  collectThread,
+  displayNameOf,
+};

@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true
+  },
+  "include": [
+    "src/tools/tool-discovery.ts",
+    "src/tools/intelligence.ts",
+    "src/tools/intelligence-safety.ts",
+    "src/tools/fff.ts",
+    "src/tools/bash-bg.ts",
+    "src/tools/search-tool-bm25.ts",
+    "src/tools/smart-search.ts",
+    "src/tools/smart-search-config.ts",
+    "src/tools/web-access/promise-try.d.ts",
+    "src/tui/smart-search-config.ts",
+    "src/tools/lsp-tool.ts",
+    "src/tools/lsp/**/*.ts",
+    "src/tools/browser-tool.ts",
+    "src/tools/browser/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "test"]
+}

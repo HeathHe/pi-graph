@@ -1,0 +1,1167 @@
+import { createHash } from "node:crypto";
+import { readdir, readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import type {
+  TodoMirrorTaskSpec,
+  WorkflowArtifact,
+  WorkflowCanonicalClaim,
+  WorkflowChainStep,
+  WorkflowDecisionPoint,
+  WorkflowExecution,
+  WorkflowExecutionLease,
+  WorkflowGate,
+  WorkflowRun,
+  WorkflowRunStatus,
+  WorkflowSession,
+  WorkflowSessionStatus,
+  WorkflowSnapshot,
+} from "./types.ts";
+
+export interface WorkflowBridgeOptions {
+  workflowDir?: string;
+  now?: () => Date;
+  /** Internal explicit locator reload used after a sessionless core acquisition. */
+  canonicalSessionId?: string;
+}
+
+interface ReadJsonResult {
+  present: boolean;
+  value?: Record<string, unknown>;
+  raw?: string;
+  error?: string;
+}
+
+export async function loadCanonicalSnapshot(
+  projectRoot: string,
+  options: WorkflowBridgeOptions = {},
+): Promise<WorkflowSnapshot> {
+  const workflowDir = resolve(projectRoot, options.workflowDir ?? ".workflow");
+  const diagnostics: string[] = [];
+  const fingerprintParts: string[] = [];
+  const state = await readJson(join(workflowDir, "state.json"));
+  if (state.raw) fingerprintParts.push(state.raw);
+  if (state.error) diagnostics.push(state.error);
+  if (state.present && state.error) {
+    return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+      status: "invalid",
+      error: state.error,
+    });
+  }
+
+  const activeSessionValue = state.value?.active_session_id;
+  const hasCanonicalClaim = activeSessionValue !== undefined && activeSessionValue !== null;
+  const activeSessionId = stringValue(activeSessionValue);
+  if (hasCanonicalClaim && (!activeSessionId || !safeId(activeSessionId))) {
+    const error = activeSessionId
+      ? `Rejected unsafe active_session_id: ${activeSessionId}`
+      : "active_session_id must be a non-empty safe string";
+    diagnostics.push(error);
+    return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+      ...(activeSessionId ? { activeSessionId } : {}),
+      status: "invalid",
+      error,
+    });
+  }
+
+  const explicitSessionId = options.canonicalSessionId;
+  if (explicitSessionId && !safeId(explicitSessionId)) {
+    const error = `Rejected unsafe explicit canonical Session id: ${explicitSessionId}`;
+    diagnostics.push(error);
+    return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+      activeSessionId: explicitSessionId,
+      status: "invalid",
+      error,
+    });
+  }
+  const canonicalSessionId = explicitSessionId
+    ?? activeSessionId
+    ?? await resolveCanonicalFallbackSessionId(workflowDir, state.value, diagnostics, fingerprintParts);
+  if (canonicalSessionId) {
+    const sessionDir = join(workflowDir, "sessions", canonicalSessionId);
+    const sessionResult = await readJson(join(sessionDir, "session.json"));
+    if (sessionResult.raw) fingerprintParts.push(sessionResult.raw);
+    if (sessionResult.error) diagnostics.push(sessionResult.error);
+    if (!sessionResult.value) {
+      const error = sessionResult.error ?? `Canonical Workflow Session ${canonicalSessionId} is missing`;
+      return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+        activeSessionId: canonicalSessionId,
+        status: "invalid",
+        error,
+      });
+    }
+
+    const declaredSessionId = stringValue(sessionResult.value.session_id);
+    if (declaredSessionId !== canonicalSessionId) {
+      const error = declaredSessionId
+        ? `Canonical session identity mismatch: state declares ${canonicalSessionId}, session.json declares ${declaredSessionId}`
+        : `Canonical Workflow Session ${canonicalSessionId} is missing session_id`;
+      diagnostics.push(error);
+      return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+        activeSessionId: canonicalSessionId,
+        status: "invalid",
+        error,
+      });
+    }
+
+    // session/3.0 minimal-state layout: the Session owns chain/active runs/gates
+    // directly and there is no Execution entity (no executions/ directory, no
+    // executionId/generation locator). Detect by schema_version and project
+    // through the v3 path; the v2 layout below is left untouched.
+    if (stringValue(sessionResult.value.schema_version) === "session/3.0") {
+      const v3Session = await projectSessionV30(
+        canonicalSessionId,
+        sessionDir,
+        sessionResult.value,
+        diagnostics,
+        fingerprintParts,
+      );
+      if (!v3Session) {
+        const error = `Canonical Workflow Session ${canonicalSessionId} has an invalid session/3.0 record`;
+        diagnostics.push(error);
+        return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+          activeSessionId: canonicalSessionId,
+          status: "invalid",
+          error,
+        });
+      }
+      return snapshot("canonical", projectRoot, v3Session, fingerprintParts, diagnostics, options.now, {
+        activeSessionId: canonicalSessionId,
+        status: "valid",
+      });
+    }
+
+    const artifactResult = await readJson(join(sessionDir, "artifacts.json"), true);
+    if (artifactResult.raw) fingerprintParts.push(artifactResult.raw);
+    if (artifactResult.error) diagnostics.push(artifactResult.error);
+    const runResults = await readRuns(join(sessionDir, "runs"), diagnostics);
+    fingerprintParts.push(...runResults.raw);
+    const session = normalizeSession(
+      canonicalSessionId,
+      sessionResult.value,
+      runResults.runs,
+      artifactResult.value,
+      diagnostics,
+    );
+    if (!session) {
+      const error = `Canonical Workflow Session ${canonicalSessionId} has an invalid session/2.0 record`;
+      diagnostics.push(error);
+      return snapshot("canonical", projectRoot, undefined, fingerprintParts, diagnostics, options.now, {
+        activeSessionId: canonicalSessionId,
+        status: "invalid",
+        error,
+      });
+    }
+    const executionResult = await readCurrentExecution(
+      sessionDir,
+      canonicalSessionId,
+      sessionResult.value,
+      diagnostics,
+    );
+    fingerprintParts.push(...executionResult.raw);
+    const execution = executionResult.execution
+      ?? legacyExecutionProjection(session, sessionResult.value);
+    return snapshot("canonical", projectRoot, session, fingerprintParts, diagnostics, options.now, {
+      activeSessionId: canonicalSessionId,
+      status: "valid",
+    }, execution);
+  }
+
+  const legacy = await loadLegacySnapshot(projectRoot, workflowDir, diagnostics, fingerprintParts, options.now);
+  if (legacy) return legacy;
+  return snapshot("none", projectRoot, undefined, fingerprintParts, diagnostics, options.now);
+}
+
+/**
+ * Projects a session/3.0 minimal-state Session
+ * (docs/session-run-minimal-state-architecture-20260812.md).
+ *
+ * The v3 layout has no Execution entity: the Session record owns the chain,
+ * active Run ids, artifacts ref, and evidence ref directly, and every Run
+ * lives under runs/<run_id>/run.json. The projection therefore produces a
+ * WorkflowSession with no WorkflowExecution and a locator without
+ * executionId/generation. session.json and every run.json raw payload feed the
+ * snapshot fingerprint so the fingerprint tracks state changes.
+ */
+async function projectSessionV30(
+  sessionId: string,
+  sessionDir: string,
+  raw: Record<string, unknown>,
+  diagnostics: string[],
+  fingerprintParts: string[],
+): Promise<WorkflowSession | undefined> {
+  if (stringValue(raw.schema_version) !== "session/3.0") return undefined;
+  const orchestrationRevision = nonnegativeIntegerValue(raw.orchestration_revision);
+  const activityRevision = nonnegativeIntegerValue(raw.activity_revision);
+  if (orchestrationRevision === undefined || activityRevision === undefined) {
+    diagnostics.push("session/3.0 requires nonnegative orchestration/activity revisions");
+    return undefined;
+  }
+
+  const artifactsRef = stringValue(raw.artifacts_ref) ?? "artifacts.json";
+  const evidenceRef = stringValue(raw.evidence_ref) ?? "evidence.json";
+
+  const artifactResult = await readJson(join(sessionDir, artifactsRef), true);
+  if (artifactResult.raw) fingerprintParts.push(artifactResult.raw);
+  if (artifactResult.error) diagnostics.push(artifactResult.error);
+  const artifactsRecord = recordValue(artifactResult.value?.artifacts)
+    ?? recordValue(artifactResult.value?.records)
+    ?? {};
+  const aliasesRecord = recordValue(artifactResult.value?.aliases) ?? {};
+
+  const evidenceResult = await readJson(join(sessionDir, evidenceRef), true);
+  if (evidenceResult.raw) fingerprintParts.push(evidenceResult.raw);
+  if (evidenceResult.error) diagnostics.push(evidenceResult.error);
+
+  const runResults = await readRuns(join(sessionDir, "runs"), diagnostics, true);
+  fingerprintParts.push(...runResults.raw);
+
+  const activeRunIds = stringArray(raw.active_run_ids);
+  return {
+    schemaVersion: "session/3.0",
+    sessionId,
+    intent: stringValue(raw.objective) ?? "",
+    status: sessionStatusV30(stringValue(raw.status)),
+    lifecycleAuthority: "legacy-session",
+    revision: Math.max(orchestrationRevision, activityRevision),
+    orchestrationRevision,
+    activityRevision,
+    // v3 allows multiple concurrently active Runs; the projection exposes the
+    // first for consumers that expect a single active Run id.
+    activeRunId: activeRunIds[0] ?? null,
+    definitionOfDone: stringValue(raw.definition_of_done) ?? "",
+    chain: chainV30Array(raw.chain),
+    runs: runResults.runs,
+    artifacts: Object.entries(artifactsRecord).map(([artifactId, value]) => normalizeArtifact(artifactId, value)),
+    aliases: Object.fromEntries(
+      Object.entries(aliasesRecord).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    ),
+  };
+}
+
+export class WorkflowBridge {
+  private current?: WorkflowSnapshot;
+  private refreshGeneration = 0;
+  private latestRefresh?: Promise<WorkflowSnapshot>;
+  private fallbackCanonicalSessionId?: string;
+
+  constructor(
+    private readonly projectRoot: string,
+    private readonly options: WorkflowBridgeOptions = {},
+  ) {}
+
+  refresh(): Promise<WorkflowSnapshot> {
+    return this.refreshWith(async () => {
+      const next = await this.loadSnapshot();
+      if (next.source !== "none" || !this.fallbackCanonicalSessionId) return next;
+      return loadCanonicalSnapshot(this.projectRoot, {
+        ...this.options,
+        canonicalSessionId: this.fallbackCanonicalSessionId,
+      });
+    });
+  }
+
+  refreshSession(sessionId: string): Promise<WorkflowSnapshot> {
+    this.fallbackCanonicalSessionId = sessionId;
+    return this.refreshWith(() => loadCanonicalSnapshot(this.projectRoot, {
+      ...this.options,
+      canonicalSessionId: sessionId,
+    }));
+  }
+
+  private refreshWith(load: () => Promise<WorkflowSnapshot>): Promise<WorkflowSnapshot> {
+    const generation = ++this.refreshGeneration;
+    const refresh = Promise.resolve()
+      .then(load)
+      .then(
+        (next) => {
+          if (generation !== this.refreshGeneration) return this.getWinningRefresh();
+          if (this.current?.revision.fingerprint === next.revision.fingerprint) return this.current;
+          this.current = next;
+          return next;
+        },
+        (error: unknown) => {
+          if (generation !== this.refreshGeneration) return this.getWinningRefresh();
+          throw error;
+        },
+      );
+    this.latestRefresh = refresh;
+    return refresh;
+  }
+
+  private getWinningRefresh(): Promise<WorkflowSnapshot> {
+    if (!this.latestRefresh) {
+      return Promise.reject(new Error("WorkflowBridge lost the winning refresh generation"));
+    }
+    return this.latestRefresh;
+  }
+
+  protected loadSnapshot(): Promise<WorkflowSnapshot> {
+    return loadCanonicalSnapshot(this.projectRoot, this.options);
+  }
+
+  getSnapshot(): WorkflowSnapshot | undefined {
+    return this.current;
+  }
+}
+
+export function buildTodoMirrorSpecs(snapshot: WorkflowSnapshot): TodoMirrorTaskSpec[] {
+  const session = snapshot.session;
+  if (!session) return [];
+  const execution = snapshot.execution?.legacyProjection ? undefined : snapshot.execution;
+  const chain = [...(execution?.chain ?? session.chain)];
+  const activeRunId = execution?.activeRunId ?? session.activeRunId;
+  const activeRun = activeRunId
+    ? session.runs.find((run) => run.runId === activeRunId)
+    : undefined;
+  if (activeRun && !chain.some((step) => step.runId === activeRun.runId)) {
+    chain.push({
+      step: activeRun.runId,
+      command: activeRun.command,
+      status: activeRun.status,
+      runId: activeRun.runId,
+    });
+  }
+  return chain.map((step, index) => {
+    const run = step.runId ? session.runs.find((candidate) => candidate.runId === step.runId) : undefined;
+    const previous = index > 0 ? chain[index - 1] : undefined;
+    const status = todoStatus(
+      run,
+      step.status,
+      index,
+      previous,
+    );
+    const summary = stringValue(run?.handoff?.summary);
+    const skill = step.skill?.trim();
+    return {
+      origin: {
+        sessionId: session.sessionId,
+        step: stableOriginStep(step, run),
+        ...(run ? { runId: run.runId, runSeq: runSequence(run.runId) } : {}),
+      },
+      subject: `Step ${index + 1}: ${step.command}`,
+      description: run?.goal ?? `Workflow step ${step.step}`,
+      status,
+      blockedByOriginKeys: previous && previous.status !== "completed" && status !== "completed"
+        ? [originKeyForChainStep(session.sessionId, previous, session.runs)]
+        : [],
+      context: run
+        ? `Active canonical Run: ${run.runId}\nUse maestro run brief ${run.runId} before continuing.`
+        : `Create the canonical Run for command: ${step.command}`,
+      skills: skill ? [{ name: skill, role: "primary" }] : [],
+      ...(summary ? { summary } : {}),
+    };
+  });
+}
+
+function snapshot(
+  source: WorkflowSnapshot["source"],
+  projectRoot: string,
+  session: WorkflowSession | undefined,
+  fingerprintParts: string[],
+  diagnostics: string[],
+  now: WorkflowBridgeOptions["now"],
+  canonicalClaim?: WorkflowCanonicalClaim,
+  execution?: WorkflowExecution,
+): WorkflowSnapshot {
+  const sessionGeneration = canonicalClaim
+    ? `canonical:${canonicalClaim.status}:${canonicalClaim.activeSessionId ?? "unknown"}:${session?.revision ?? 0}`
+    : session
+      ? `${source}:${session.sessionId}:${session.revision ?? 0}`
+      : source;
+  return {
+    source,
+    projectRoot: resolve(projectRoot),
+    loadedAt: (now?.() ?? new Date()).toISOString(),
+    revision: {
+      sessionRevision: session?.revision ?? 0,
+      ...(execution ? { executionRevision: execution.revision } : {}),
+      fingerprint: createHash("sha256").update(fingerprintParts.join("\u0000")).digest("hex"),
+    },
+    sessionGeneration,
+    ...(canonicalClaim ? { canonicalClaim } : {}),
+    ...(session ? {
+      locator: {
+        sessionId: session.sessionId,
+        ...(execution ? {
+          executionId: execution.executionId,
+          generation: execution.generation,
+        } : {}),
+        ...((execution?.activeRunId ?? session.activeRunId)
+          ? { runId: execution?.activeRunId ?? session.activeRunId ?? undefined }
+          : {}),
+      },
+      session,
+    } : {}),
+    ...(execution ? { execution } : {}),
+    diagnostics,
+  };
+}
+
+/**
+ * Fallback canonical resolution when state.json carries no active_session_id.
+ *
+ * Mirrors the Maestro CLI `run next` resolveSession strategy: the unique
+ * running Session projection with a pending chain step becomes the canonical
+ * candidate. Absence or ambiguity (multiple running projections) falls
+ * through to the legacy/none projection so the CLI and the extension agree on
+ * the binding target instead of drifting apart.
+ */
+async function resolveCanonicalFallbackSessionId(
+  workflowDir: string,
+  stateValue: Record<string, unknown> | undefined,
+  diagnostics: string[],
+  fingerprintParts: string[],
+): Promise<string | undefined> {
+  const projections = Array.isArray(stateValue?.sessions)
+    ? stateValue.sessions
+        .map(recordValue)
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+        .filter((entry) => entry.status === "running")
+        .map((entry) => stringValue(entry.session_id))
+        .filter((entry): entry is string => Boolean(entry && safeId(entry)))
+    : [];
+  if (projections.length === 0) {
+    diagnostics.push(
+      "No active_session_id claim and no running Session projection; canonical resolution is unavailable",
+    );
+    return undefined;
+  }
+  if (projections.length > 1) {
+    diagnostics.push(
+      `No active_session_id claim; ${projections.length} running Session projections — canonical resolution is ambiguous`,
+    );
+    return undefined;
+  }
+  const sessionId = projections[0]!;
+  const result = await readJson(join(workflowDir, "sessions", sessionId, "session.json"));
+  if (result.raw) fingerprintParts.push(result.raw);
+  if (result.error) {
+    diagnostics.push(result.error);
+    return undefined;
+  }
+  const raw = recordValue(result.value);
+  if (!raw || raw.status !== "running") {
+    diagnostics.push(
+      `Running Session projection ${sessionId} is not running on disk; canonical resolution is unavailable`,
+    );
+    return undefined;
+  }
+  const orchestration = recordValue(raw.orchestration);
+  const rawChain = Array.isArray(orchestration?.chain) ? orchestration.chain : [];
+  const hasPendingStep = rawChain.some((entry) => {
+    const step = recordValue(entry);
+    return step?.status === "pending" && step.decision_ref === undefined;
+  });
+  if (!hasPendingStep) {
+    diagnostics.push(
+      `Running Session ${sessionId} has no pending chain step; canonical resolution is unavailable`,
+    );
+    return undefined;
+  }
+  diagnostics.push(
+    `No active_session_id claim; resolved canonical Session ${sessionId} with a pending chain step`,
+  );
+  return sessionId;
+}
+
+async function readJson(path: string, optional = false): Promise<ReadJsonResult> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (optional && code === "ENOENT") return { present: false };
+    return { present: code !== "ENOENT", error: `${path}: ${errorMessage(error)}` };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed)) return { present: true, raw, error: `${path} must contain a JSON object` };
+    return { present: true, raw, value: parsed };
+  } catch (error) {
+    return { present: true, raw, error: `${path}: ${errorMessage(error)}` };
+  }
+}
+
+async function readCurrentExecution(
+  sessionDir: string,
+  sessionId: string,
+  sessionRaw: Record<string, unknown>,
+  diagnostics: string[],
+): Promise<{ execution?: WorkflowExecution; raw: string[] }> {
+  const executionsRoot = join(sessionDir, "executions");
+  let directories: string[];
+  try {
+    directories = (await readdir(executionsRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { raw: [] };
+    diagnostics.push(`${executionsRoot}: ${errorMessage(error)}`);
+    return { raw: [] };
+  }
+
+  const raw: string[] = [];
+  const executionCandidates = new Map<string, { execution: WorkflowExecution; primaryLayout: boolean }>();
+  for (const directory of directories) {
+    const result = await readJson(join(executionsRoot, directory, "execution.json"));
+    if (result.raw) raw.push(result.raw);
+    if (result.error) {
+      diagnostics.push(result.error);
+      continue;
+    }
+    if (!result.value) continue;
+    const normalized = normalizeExecution(result.value, sessionId, diagnostics);
+    if (!normalized) continue;
+    const primaryLayout = directory === normalized.executionId;
+    const futureLayout = directory === `${normalized.generation}-${normalized.executionId}`;
+    if (!primaryLayout && !futureLayout) {
+      diagnostics.push(`Ignored Execution ${normalized.executionId} from unrecognized directory ${directory}`);
+      continue;
+    }
+    const existing = executionCandidates.get(normalized.executionId);
+    if (!existing || (primaryLayout && !existing.primaryLayout)) {
+      executionCandidates.set(normalized.executionId, { execution: normalized, primaryLayout });
+    }
+  }
+  const executions = [...executionCandidates.values()]
+    .map((candidate) => candidate.execution)
+    .sort((left, right) => left.generation - right.generation
+      || left.executionId.localeCompare(right.executionId));
+
+  const hasCurrentPointer = Object.prototype.hasOwnProperty.call(sessionRaw, "current_execution_id");
+  if (hasCurrentPointer) {
+    if (sessionRaw.current_execution_id === null) return { raw };
+    const currentExecutionId = stringValue(sessionRaw.current_execution_id);
+    if (!currentExecutionId || !safeId(currentExecutionId)) {
+      diagnostics.push("current_execution_id must be a non-empty safe string or null");
+      return { raw };
+    }
+    const execution = executions.find((candidate) => candidate.executionId === currentExecutionId);
+    if (!execution) diagnostics.push(`Current Execution ${currentExecutionId} is missing or invalid`);
+    return { ...(execution ? { execution } : {}), raw };
+  }
+
+  // session/1.x has no Execution pointer. During the additive migration the
+  // highest generation is the deterministic current compatibility projection.
+  // A direct <executionId> directory wins over a duplicate future-layout
+  // <generation>-<executionId> directory during the de-duplication above.
+  const schemaVersion = stringValue(sessionRaw.schema_version);
+  if (!schemaVersion?.startsWith("session/1.")) return { raw };
+  const execution = executions.at(-1);
+  return { ...(execution ? { execution } : {}), raw };
+}
+
+function normalizeExecution(
+  raw: Record<string, unknown>,
+  sessionId: string,
+  diagnostics: string[],
+): WorkflowExecution | undefined {
+  const schemaVersion = stringValue(raw.schema_version);
+  const executionId = stringValue(raw.execution_id);
+  const declaredSessionId = stringValue(raw.session_id);
+  const generation = positiveIntegerValue(raw.generation);
+  const status = strictExecutionStatus(raw.status);
+  const revision = nonnegativeIntegerValue(raw.revision);
+  if (
+    schemaVersion !== "execution/1.0"
+    || !executionId
+    || !safeId(executionId)
+    || declaredSessionId !== sessionId
+    || generation === undefined
+    || status === undefined
+    || revision === undefined
+  ) {
+    diagnostics.push(`Ignored invalid Execution projection for Session ${sessionId}`);
+    return undefined;
+  }
+  const lease = normalizeExecutionLease(raw.lease, sessionId, executionId, diagnostics);
+  return {
+    schemaVersion,
+    executionId,
+    sessionId,
+    generation,
+    status,
+    revision,
+    activeRunId: nullableString(raw.active_run_id),
+    chain: chainArray(raw.chain),
+    decisionPoints: decisionPointArray(raw.decision_points),
+    gatesRef: stringValue(raw.gates_ref) ?? "gates.json",
+    artifactsRef: stringValue(raw.artifacts_ref) ?? "artifacts.json",
+    evidenceRef: stringValue(raw.evidence_ref) ?? "evidence.json",
+    lease,
+    startedAt: stringValue(raw.started_at) ?? "",
+    sealedAt: nullableString(raw.sealed_at),
+    sealSummary: nullableString(raw.seal_summary),
+    finalOutcome: executionOutcome(raw.final_outcome),
+  };
+}
+
+/**
+ * @deprecated Projects long-lived Execution lease metadata, which is
+ * superseded by the Session/Run minimal-state architecture
+ * (docs/session-run-minimal-state-architecture-20260812.md): v3 removes
+ * leases/heartbeats/handoff in favor of participant identity and revision CAS.
+ * Kept only for the migration-period v2 compatibility read path.
+ */
+function normalizeExecutionLease(
+  value: unknown,
+  sessionId: string,
+  executionId: string,
+  diagnostics: string[],
+): WorkflowExecutionLease | null {
+  if (value === null || value === undefined) return null;
+  const raw = recordValue(value);
+  const ownerId = stringValue(raw?.owner_id);
+  const ownerKind = executionOwnerKind(raw?.owner_kind);
+  const epoch = positiveIntegerValue(raw?.epoch);
+  if (!raw || stringValue(raw.session_id) !== sessionId || stringValue(raw.execution_id) !== executionId
+    || !ownerId || !ownerKind || epoch === undefined) {
+    diagnostics.push(`Ignored invalid redacted lease metadata for Execution ${executionId}`);
+    return null;
+  }
+  return {
+    ...(stringValue(raw.schema_version) ? { schemaVersion: stringValue(raw.schema_version) } : {}),
+    sessionId,
+    executionId,
+    ownerId,
+    ownerKind,
+    epoch,
+    acquiredAt: stringValue(raw.acquired_at) ?? "",
+    heartbeatAt: stringValue(raw.heartbeat_at) ?? "",
+    handoffTo: nullableString(raw.handoff_to),
+  };
+}
+
+function legacyExecutionProjection(
+  session: WorkflowSession,
+  raw: Record<string, unknown>,
+): WorkflowExecution | undefined {
+  const schemaVersion = stringValue(raw.schema_version);
+  if (!schemaVersion?.startsWith("session/1.") || !session.status) return undefined;
+  const legacyExecutionId = stringValue(raw.execution_id) ?? `legacy:${session.sessionId}`;
+  const legacyGeneration = positiveIntegerValue(raw.generation) ?? 1;
+  return {
+    executionId: legacyExecutionId,
+    sessionId: session.sessionId,
+    generation: legacyGeneration,
+    status: legacyExecutionStatus(session.status),
+    revision: session.revision,
+    activeRunId: session.activeRunId,
+    chain: session.chain,
+    decisionPoints: decisionPointArray(recordValue(raw.orchestration)?.decision_points),
+    gatesRef: "gates.json",
+    artifactsRef: "artifacts.json",
+    evidenceRef: "evidence.json",
+    lease: null,
+    startedAt: "",
+    sealedAt: nullableString(recordValue(raw.lifecycle)?.sealed_at),
+    sealSummary: nullableString(recordValue(raw.lifecycle)?.seal_summary),
+    finalOutcome: session.status === "failed" ? "failed" : null,
+    legacyProjection: true,
+  };
+}
+
+async function readRuns(
+  runsDir: string,
+  diagnostics: string[],
+  includeRunRevision = false,
+): Promise<{ runs: WorkflowRun[]; raw: string[] }> {
+  let directories: string[];
+  try {
+    directories = (await readdir(runsDir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { runs: [], raw: [] };
+    diagnostics.push(`${runsDir}: ${errorMessage(error)}`);
+    return { runs: [], raw: [] };
+  }
+  const runs: WorkflowRun[] = [];
+  const raw: string[] = [];
+  for (const directory of directories) {
+    const result = await readJson(join(runsDir, directory, "run.json"));
+    if (result.raw) raw.push(result.raw);
+    if (result.error) diagnostics.push(result.error);
+    if (result.value) runs.push(normalizeRun(directory, result.value, includeRunRevision));
+  }
+  return { runs, raw };
+}
+
+function normalizeSession(
+  activeSessionId: string,
+  raw: Record<string, unknown>,
+  runs: WorkflowRun[],
+  artifactRegistry?: Record<string, unknown>,
+  diagnostics: string[] = [],
+): WorkflowSession | undefined {
+  const schemaVersion = stringValue(raw.schema_version);
+  const statusless = schemaVersion === "session/2.0";
+  const statuslessFields = statusless ? strictStatuslessSessionFields(raw, diagnostics) : undefined;
+  if (statusless && !statuslessFields) return undefined;
+  const orchestration = recordValue(raw.orchestration);
+  const boundary = recordValue(raw.boundary_contract);
+  const artifactsRecord = recordValue(artifactRegistry?.artifacts)
+    ?? recordValue(artifactRegistry?.records)
+    ?? {};
+  const aliasesRecord = recordValue(artifactRegistry?.aliases) ?? {};
+  const activityRevision = optionalNumber(raw.activity_revision);
+  const identityRevision = optionalNumber(raw.identity_revision) ?? optionalNumber(raw.revision);
+  const revision = Math.max(numberValue(raw.revision), activityRevision ?? 0);
+  return {
+    ...(schemaVersion ? { schemaVersion } : {}),
+    sessionId: stringValue(raw.session_id) ?? activeSessionId,
+    intent: stringValue(raw.intent) ?? "",
+    ...(!statusless ? {
+      status: sessionStatus(raw.status),
+      lifecycleAuthority: "legacy-session" as const,
+    } : {
+      lifecycleAuthority: "execution-derived" as const,
+      ...statuslessFields,
+    }),
+    revision,
+    ...(identityRevision !== undefined ? { identityRevision } : {}),
+    ...(activityRevision !== undefined ? { activityRevision } : {}),
+    activeRunId: statusless ? null : nullableString(raw.active_run_id),
+    definitionOfDone: stringValue(boundary?.definition_of_done) ?? "",
+    chain: statusless ? [] : chainArray(orchestration?.chain),
+    runs,
+    artifacts: Object.entries(artifactsRecord).map(([artifactId, value]) => normalizeArtifact(artifactId, value)),
+    aliases: Object.fromEntries(Object.entries(aliasesRecord).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
+  } as WorkflowSession;
+}
+
+function strictStatuslessSessionFields(
+  raw: Record<string, unknown>,
+  diagnostics: string[],
+): Pick<
+  WorkflowSession,
+  "currentExecutionId" | "latestExecutionId" | "latestCompletedRunId" | "archivedAt" | "archivedBy"
+> | undefined {
+  const identityRevision = nonnegativeIntegerValue(raw.identity_revision);
+  const activityRevision = nonnegativeIntegerValue(raw.activity_revision);
+  const currentExecutionId = strictNullableString(raw, "current_execution_id", false);
+  const latestExecutionId = strictNullableString(raw, "latest_execution_id", true);
+  const latestCompletedRunId = strictNullableString(raw, "latest_completed_run_id", true);
+  const archivedAt = strictNullableString(raw, "archived_at", false);
+  const archivedBy = strictNullableString(raw, "archived_by", false);
+  if (
+    identityRevision === undefined
+    || activityRevision === undefined
+    || !currentExecutionId.valid
+    || !latestExecutionId.valid
+    || !latestCompletedRunId.valid
+    || !archivedAt.valid
+    || !archivedBy.valid
+  ) {
+    diagnostics.push(
+      "session/2.0 requires nonnegative identity/activity revisions and explicit valid "
+      + "current/latest/latest-completed/archive fields",
+    );
+    return undefined;
+  }
+  return {
+    currentExecutionId: currentExecutionId.value,
+    latestExecutionId: latestExecutionId.value,
+    latestCompletedRunId: latestCompletedRunId.value,
+    archivedAt: archivedAt.value,
+    archivedBy: archivedBy.value,
+  };
+}
+
+function strictNullableString(
+  raw: Record<string, unknown>,
+  key: string,
+  requireSafeId: boolean,
+): { valid: boolean; value: string | null } {
+  if (!Object.prototype.hasOwnProperty.call(raw, key)) return { valid: false, value: null };
+  const value = raw[key];
+  if (value === null) return { valid: true, value: null };
+  if (typeof value !== "string" || value.length === 0 || (requireSafeId && !safeId(value))) {
+    return { valid: false, value: null };
+  }
+  return { valid: true, value };
+}
+
+function normalizeRun(
+  fallbackId: string,
+  raw: Record<string, unknown>,
+  includeRunRevision = false,
+): WorkflowRun {
+  const input = recordValue(raw.input);
+  const command = recordValue(raw.command);
+  const output = recordValue(raw.output);
+  const runId = stringValue(raw.run_id) ?? fallbackId;
+  const commandName = stringValue(raw.command) ?? stringValue(command?.name) ?? "unknown";
+  const args = stringArray(input?.args).length > 0
+    ? stringArray(input?.args)
+    : stringArray(command?.args).length > 0
+      ? stringArray(command?.args)
+      : stringArray(raw.args);
+  const planPublication = commandName === "plan-publish" ? planPublicationIdentity(args) : undefined;
+  const runRevision = nonnegativeIntegerValue(raw.revision);
+  const isRunV30 = stringValue(raw.schema_version) === "run/3.0";
+  const attempt = positiveIntegerValue(raw.attempt);
+  const normalized: WorkflowRun = {
+    ...(stringValue(raw.schema_version) ? { schemaVersion: stringValue(raw.schema_version) } : {}),
+    ...(includeRunRevision && runRevision !== undefined ? { revision: runRevision } : {}),
+    runId,
+    // parent_run_id is a v2 command-run lineage field; run/3.0 dropped it in
+    // favor of retry_of_run_id/attempt, so it is never projected for v3 runs.
+    ...(isRunV30 ? {} : { parentRunId: nullableString(raw.parent_run_id) }),
+    ...(isRunV30 ? { retryOfRunId: nullableString(raw.retry_of_run_id) } : {}),
+    ...(isRunV30 && attempt !== undefined ? { attempt } : {}),
+    command: commandName,
+    status: runStatus(raw.status),
+    goal: nullableString(raw.goal),
+    args: commandName === "plan-publish" ? [] : args,
+    gates: gateArray(raw.gates),
+    primaryArtifactId: nullableString(raw.primary)
+      ?? nullableString(output?.primary_artifact_id)
+      ?? nullableString(raw.primary_artifact_id),
+    handoff: publicRunHandoff(recordValue(raw.handoff) ?? null, commandName),
+    startedAt: stringValue(raw.started_at) ?? "",
+    endedAt: nullableString(raw.ended_at)
+      ?? nullableString(raw.sealed_at)
+      ?? nullableString(raw.completed_at),
+  };
+  if (planPublication) {
+    Object.defineProperty(normalized, "planPublication", {
+      value: planPublication,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return normalized;
+}
+
+function publicRunHandoff(
+  handoff: Record<string, unknown> | null,
+  commandName: string,
+): Record<string, unknown> | null {
+  if (!handoff || commandName !== "plan-publish") return handoff;
+  const projected = { ...handoff };
+  if (typeof projected.summary === "string") projected.summary = "Published approved Pi Plan";
+  return projected;
+}
+
+function planPublicationIdentity(
+  args: readonly string[],
+): WorkflowRun["planPublication"] | undefined {
+  if (args.length !== 1) return undefined;
+  let input: unknown;
+  try {
+    input = JSON.parse(args[0]!);
+  } catch {
+    return undefined;
+  }
+  const record = recordValue(input);
+  const requestId = stringValue(record?.request_id);
+  const handoffKey = stringValue(record?.handoff_key);
+  if (!requestId || !handoffKey) return undefined;
+  return {
+    requestId,
+    handoffKeyHash: `sha256:${createHash("sha256").update(handoffKey, "utf8").digest("hex")}`,
+  };
+}
+
+function normalizeArtifact(artifactId: string, value: unknown): WorkflowArtifact {
+  const raw = recordValue(value) ?? {};
+  return {
+    artifactId,
+    kind: stringValue(raw.kind) ?? "unknown",
+    role: stringValue(raw.role) ?? "attachment",
+    runId: stringValue(raw.run_id) ?? stringValue(raw.producer_run_id) ?? "",
+    path: stringValue(raw.path) ?? stringValue(raw.relative_path) ?? "",
+    hash: stringValue(raw.hash) ?? stringValue(raw.content_hash) ?? "",
+    status: stringValue(raw.status) ?? "draft",
+    replaces: nullableString(raw.replaces),
+  };
+}
+
+async function loadLegacySnapshot(
+  projectRoot: string,
+  workflowDir: string,
+  diagnostics: string[],
+  fingerprintParts: string[],
+  now: WorkflowBridgeOptions["now"],
+): Promise<WorkflowSnapshot | undefined> {
+  const legacyRoot = join(workflowDir, ".maestro");
+  let names: string[];
+  try {
+    names = (await readdir(legacyRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return undefined;
+  }
+  for (const name of names) {
+    const result = await readJson(join(legacyRoot, name, "status.json"), true);
+    if (!result.value) continue;
+    if (result.raw) fingerprintParts.push(result.raw);
+    const rawChain = Array.isArray(result.value.chain)
+      ? result.value.chain
+      : Array.isArray(result.value.steps)
+        ? result.value.steps
+        : [];
+    const session: WorkflowSession = {
+      sessionId: `legacy-${name}`,
+      intent: stringValue(result.value.intent) ?? stringValue(result.value.objective) ?? name,
+      status: sessionStatus(result.value.status),
+      lifecycleAuthority: "legacy-session",
+      revision: numberValue(result.value.revision),
+      activeRunId: null,
+      definitionOfDone: "",
+      chain: rawChain.map((entry, index) => normalizeLegacyStep(entry, index)),
+      runs: [],
+      artifacts: [],
+      aliases: {},
+    };
+    diagnostics.push(`Using legacy workflow projection from .workflow/.maestro/${name}/status.json`);
+    return snapshot("legacy", projectRoot, session, fingerprintParts, diagnostics, now);
+  }
+  return undefined;
+}
+
+function decisionPointArray(value: unknown): WorkflowDecisionPoint[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index) => {
+    const raw = recordValue(entry) ?? {};
+    return {
+      pointId: stringValue(raw.point_id) ?? `decision-${index + 1}`,
+      afterStepId: nullableString(raw.after_step_id),
+      status: decisionPointStatus(raw.status),
+      retryCount: numberValue(raw.retry_count),
+      maxRetries: numberValue(raw.max_retries),
+      evidenceRef: nullableString(raw.evidence_ref),
+    };
+  });
+}
+
+function chainArray(value: unknown): WorkflowChainStep[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index) => {
+    const raw = recordValue(entry) ?? {};
+    return {
+      step: stringValue(raw.step) ?? stringValue(raw.step_id) ?? String(index + 1),
+      command: stringValue(raw.command) ?? stringValue(raw.step) ?? "unknown",
+      status: stringValue(raw.status) ?? "pending",
+      runId: nullableString(raw.run_id),
+      ...(stringValue(raw.skill) ? { skill: stringValue(raw.skill) } : {}),
+    };
+  });
+}
+
+/**
+ * session/3.0 chain steps carry run_ids (a step may retry through multiple
+ * Runs); the projection exposes the latest Run id for consumers that expect a
+ * single chain runId, mirroring the v3 active_run_ids rule of first-wins.
+ */
+function chainV30Array(value: unknown): WorkflowChainStep[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index) => {
+    const raw = recordValue(entry) ?? {};
+    const runIds = stringArray(raw.run_ids);
+    return {
+      step: stringValue(raw.step_id) ?? String(index + 1),
+      command: stringValue(raw.command) ?? stringValue(raw.step_id) ?? "unknown",
+      status: stringValue(raw.status) ?? "pending",
+      runId: runIds.length > 0 ? runIds[runIds.length - 1]! : null,
+      decisionRef: nullableString(raw.decision_ref),
+    };
+  });
+}
+
+function normalizeLegacyStep(value: unknown, index: number): WorkflowChainStep {
+  const raw = recordValue(value) ?? {};
+  return {
+    step: stringValue(raw.step) ?? stringValue(raw.id) ?? String(index + 1),
+    command: stringValue(raw.command) ?? stringValue(raw.name) ?? `step-${index + 1}`,
+    status: stringValue(raw.status) ?? "pending",
+    runId: nullableString(raw.run_id),
+  };
+}
+
+function gateArray(value: unknown, defaultPhase?: WorkflowGate["phase"]): WorkflowGate[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index) => normalizeGate(`gate-${index + 1}`, entry, defaultPhase));
+}
+
+function normalizeGate(
+  fallbackId: string,
+  value: unknown,
+  defaultPhase?: WorkflowGate["phase"],
+): WorkflowGate {
+  const raw = recordValue(value) ?? {};
+  const runId = stringValue(raw.run_id);
+  const phase = phaseValue(raw.phase) ?? phaseValue(raw.scope) ?? defaultPhase;
+  return {
+    id: stringValue(raw.id) ?? fallbackId,
+    ...(runId ? { runId } : {}),
+    ...(phase ? { phase } : {}),
+    blocking: raw.blocking !== false,
+    status: gateStatus(raw.status),
+    ...(sourceValue(raw.source) ? { source: sourceValue(raw.source) } : {}),
+  };
+}
+
+function todoStatus(
+  run: WorkflowRun | undefined,
+  chainStatus: string,
+  index: number,
+  previous?: WorkflowChainStep,
+): TodoMirrorTaskSpec["status"] {
+  const runFailures = (run?.gates ?? []).filter((gate) =>
+    gate.blocking && ["failed", "blocked"].includes(gate.status)
+  );
+  const completed = run?.status === "completed" || run?.status === "sealed" || chainStatus === "completed";
+  const blockingFailures = runFailures;
+  if (blockingFailures.some((gate) => gate.phase !== "entry")) return "blocked";
+  if (blockingFailures.some((gate) => gate.phase === "entry")) return "pending";
+  const runStatusValue = run?.status;
+  if (completed) return "completed";
+  if (runStatusValue === "running") return "in_progress";
+  if (runStatusValue === "blocked" || runStatusValue === "failed" || ["blocked", "failed"].includes(chainStatus)) return "blocked";
+  if (index > 0 && previous && previous.status !== "completed") return "blocked";
+  return "pending";
+}
+
+function originKeyForChainStep(sessionId: string, step: WorkflowChainStep, runs: WorkflowRun[]): string {
+  const run = step.runId ? runs.find((candidate) => candidate.runId === step.runId) : undefined;
+  return [sessionId, stableOriginStep(step, run), run?.runId ?? "", run ? runSequence(run.runId) : ""].join("\u0000");
+}
+
+function stableOriginStep(step: WorkflowChainStep, run: WorkflowRun | undefined): string {
+  return run ? `run:${run.runId}` : step.step;
+}
+
+function runSequence(runId: string): string | undefined {
+  return /^\d{8}-(\d{3})-/.exec(runId)?.[1];
+}
+
+function strictExecutionStatus(value: unknown): WorkflowExecution["status"] | undefined {
+  return ["active", "paused", "sealed"].includes(String(value))
+    ? value as WorkflowExecution["status"]
+    : undefined;
+}
+
+function legacyExecutionStatus(value: WorkflowSessionStatus): WorkflowExecution["status"] {
+  if (value === "failed") return "paused";
+  if (value === "sealed" || value === "archived") return "sealed";
+  return "active";
+}
+
+function executionOutcome(value: unknown): WorkflowExecution["finalOutcome"] {
+  return ["done", "done_with_concerns", "failed"].includes(String(value))
+    ? value as WorkflowExecution["finalOutcome"]
+    : null;
+}
+
+function executionOwnerKind(value: unknown): WorkflowExecutionLease["ownerKind"] | undefined {
+  return ["pi", "claude", "codex", "agy", "manual"].includes(String(value))
+    ? value as WorkflowExecutionLease["ownerKind"]
+    : undefined;
+}
+
+function decisionPointStatus(value: unknown): WorkflowDecisionPoint["status"] {
+  return ["pending", "passed", "escalated"].includes(String(value))
+    ? value as WorkflowDecisionPoint["status"]
+    : "pending";
+}
+
+function sessionStatus(value: unknown): WorkflowSessionStatus {
+  return ["planned", "running", "sealed", "archived", "failed"].includes(String(value))
+    ? value as WorkflowSessionStatus
+    : "planned";
+}
+
+/**
+ * session/3.0 statuses have no direct v2 counterpart: open->running, completed->sealed.
+ * The retired `paused` status (removed in v3) is read strip-tolerantly as `open` by the
+ * core, so legacy pre-simplification files project as running, never as planned.
+ */
+function sessionStatusV30(value: unknown): WorkflowSessionStatus {
+  switch (value) {
+    case "open": return "running";
+    case "paused": return "running";
+    case "completed": return "sealed";
+    case "archived": return "archived";
+    case "failed": return "failed";
+    default: return "planned";
+  }
+}
+
+function runStatus(value: unknown): WorkflowRunStatus {
+  const status = String(value);
+  if (["created", "running", "blocked", "failed", "completed", "sealed"].includes(status)) {
+    return status as WorkflowRunStatus;
+  }
+  // run/3.0 statuses with no v2 counterpart: pending maps to created (allocated
+  // but not started), cancelled maps to sealed (terminal, never completed).
+  if (status === "pending") return "created";
+  if (status === "cancelled") return "sealed";
+  return "created";
+}
+
+function gateStatus(value: unknown): WorkflowGate["status"] {
+  return ["pending", "running", "passed", "failed", "blocked", "waived", "skipped"].includes(String(value))
+    ? value as WorkflowGate["status"]
+    : "pending";
+}
+
+function phaseValue(value: unknown): WorkflowGate["phase"] | undefined {
+  return ["entry", "phase", "exit", "transition", "knowledge", "session"].includes(String(value))
+    ? value as WorkflowGate["phase"]
+    : undefined;
+}
+
+function sourceValue(value: unknown): WorkflowGate["source"] | undefined {
+  return ["contract", "prepared", "handoff"].includes(String(value)) ? value as WorkflowGate["source"] : undefined;
+}
+
+function safeId(value: string): boolean {
+  return value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\") && !value.includes("\u0000");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function positiveIntegerValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function nonnegativeIntegerValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

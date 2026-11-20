@@ -1,0 +1,102 @@
+import type { HookLevel } from '../../commands/hooks.js';
+import type { ExtraMcpTargetId } from '../../commands/install-backend.js';
+import type { HooksSelection } from './HooksConfig.js';
+export interface InstallFlowConfig {
+    mode: 'global' | 'project';
+    projectPath: string;
+    installComponents: boolean;
+    installHooks: boolean;
+    installMcp: boolean;
+    installCodexHooks: boolean;
+    codexHookLevel: HookLevel;
+    installCodexMcp: boolean;
+    codexMcpTools: string[];
+    codexMcpProjectRoot: string;
+    installAgyHooks: boolean;
+    agyHookLevel: HookLevel;
+    installExtraMcp: boolean;
+    extraMcpTargetIds: ExtraMcpTargetId[];
+    genericHookLevels: Record<string, HookLevel>;
+    installStatusline: boolean;
+    /** False when Claude Code is not selected — confirm page omits Statusline. */
+    statuslineApplicable?: boolean;
+    statuslineTheme: string;
+    hookLevel: HookLevel;
+    componentCount: number;
+    fileCount: number;
+    mcpToolCount: number;
+    selectedComponentIds: string[];
+    mcpTools: string[];
+    mcpProjectRoot: string;
+    backupClaudeMd: boolean;
+    backupAll: boolean;
+    /**
+     * Reconcile file ownership during upgrade/import installs.
+     * Normal installs are additive; upgrade installs should remove prior-owned
+     * files that are no longer produced by the current package.
+     */
+    pruneObsoleteOwnedFiles?: boolean;
+    claudeHooksSelection?: HooksSelection;
+    codexHooksSelection?: HooksSelection;
+    agyHooksSelection?: HooksSelection;
+    codexDedupeAgents?: boolean;
+    installPluginClaude?: boolean;
+    installPluginCodex?: boolean;
+    configureCodexMultiAgentV2?: boolean;
+    /** Steps to generate entry slash-commands for (empty = skip generation). */
+    entryCommandSteps?: string[];
+    /** Subsystems explicitly disabled by a non-interactive/profile install. */
+    explicitlyDisabled?: {
+        claudeHooks?: boolean;
+        claudeMcp?: boolean;
+        codexHooks?: boolean;
+        codexMcp?: boolean;
+        agyHooks?: boolean;
+        genericHooks?: string[];
+        extraMcp?: boolean;
+        statusline?: boolean;
+        pluginClaude?: boolean;
+        pluginCodex?: boolean;
+    };
+}
+export type WizardStep = 'mode' | 'components' | 'config' | 'review' | 'executing' | 'complete';
+export declare const WIZARD_STEPS: readonly WizardStep[];
+export interface InstallConfig {
+    mode: 'global' | 'project';
+    projectPath: string;
+    selectedIds: string[];
+    mcpEnabled: boolean;
+    mcpTools: string[];
+    mcpProjectRoot: string;
+    hookLevel: 'none' | 'minimal' | 'standard' | 'full';
+    /** Granular hook selection (overrides hookLevel when present) */
+    hooksSelection?: {
+        basePreset: HookLevel;
+        selectedHooks: string[];
+        isCustom: boolean;
+    };
+    doBackup: boolean;
+    /** Install statusline separately (default: false) */
+    installStatusline: boolean;
+    /** Backup CLAUDE.md before overwrite (default: true) */
+    backupClaudeMd: boolean;
+    /** Backup all replaced files (default: false) */
+    backupAll: boolean;
+}
+export declare const DEFAULT_INSTALL_CONFIG: InstallConfig;
+export interface InstallResult {
+    totalStats: {
+        files: number;
+        dirs: number;
+        skipped: number;
+    };
+    manifestPath: string;
+    mcpRegistered: boolean;
+    hookResult: {
+        installedHooks: string[];
+        level: string;
+    } | null;
+    disabledRestored: number;
+    overlaysApplied: number;
+}
+//# sourceMappingURL=types.d.ts.map

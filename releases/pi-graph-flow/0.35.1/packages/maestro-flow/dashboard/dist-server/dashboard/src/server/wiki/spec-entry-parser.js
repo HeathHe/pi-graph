@@ -1,0 +1,220 @@
+/**
+ * Spec entry parser — shared between specs routes and WikiIndexer.
+ *
+ * Extracts SpecEntry objects from markdown body text. Supports both
+ * `<spec-entry>` closed-tag format and legacy heading-based format.
+ */
+import { basename, extname } from 'node:path';
+import { normalizeCanonicalKnowledgeContent, } from '../../../../shared/knowledge-content.js';
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const ENTRY_TYPES = [
+    'coding', 'arch', 'quality', 'debug', 'test', 'review', 'learning', 'tools',
+    'bug', 'pattern', 'decision', 'rule', 'validation',
+];
+const FILE_TYPE_MAP = {
+    learnings: 'learning',
+    'coding-conventions': 'coding',
+    'architecture-constraints': 'arch',
+    'quality-rules': 'review',
+    'debug-notes': 'debug',
+    tools: 'tools',
+    'test-conventions': 'test',
+    'review-standards': 'review',
+};
+export const FILE_CATEGORY_MAP = {
+    learnings: 'learning',
+    'coding-conventions': 'coding',
+    'architecture-constraints': 'arch',
+    'quality-rules': 'review',
+    'debug-notes': 'debug',
+    'test-conventions': 'test',
+    'review-standards': 'review',
+    tools: 'tools',
+};
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+/** Heading regex: matches ## or ### at start of line. */
+export const HEADING_RE = /^(#{2,3})\s+(.+)$/;
+const TAG_ATTR_RE = /([\w-]+)="([^"]*)"/g;
+/** Detect entry type from heading text or fall back to file-based default. */
+export function detectEntryType(heading, fileName) {
+    const lower = heading.toLowerCase();
+    for (const t of ENTRY_TYPES) {
+        if (lower.includes(`[${t}]`))
+            return t;
+    }
+    for (const t of ENTRY_TYPES) {
+        if (new RegExp(`\\b${t}\\s*:`).test(lower))
+            return t;
+    }
+    const stem = basename(fileName, extname(fileName));
+    return FILE_TYPE_MAP[stem] ?? 'general';
+}
+/** Strip [type], [date], and legacy "type:" prefix from heading to get clean title. */
+export function extractCleanTitle(heading) {
+    return heading
+        .replace(/\[(coding|arch|quality|debug|test|review|learning|bug|pattern|decision|rule|validation)\]\s*/gi, '')
+        .replace(/\[\d{4}-\d{2}-\d{2}\]\s*/g, '')
+        .replace(/\d{4}-\d{2}-\d{2}T[\d:.Z+-]*/g, '')
+        .replace(/^(coding|arch|quality|debug|test|review|learning|bug|pattern|decision|rule|validation)\s*:\s*/i, '')
+        .trim();
+}
+// ---------------------------------------------------------------------------
+// Parser
+// ---------------------------------------------------------------------------
+/**
+ * Generic entry block parser. Extracts closed-tag blocks matching `tagName`,
+ * then parses remaining text with legacy heading-based parser.
+ */
+function parseEntryBlocks(body, tagName, fileName, frontmatter) {
+    const stem = basename(fileName, extname(fileName));
+    const entries = [];
+    let entryIndex = 0;
+    // Pass 1: Extract <tagName> closed-tag blocks
+    const tagRe = new RegExp(`<${tagName}\\s+([^>]+)>([\\s\\S]*?)<\\/${tagName}>`, 'g');
+    const consumedRanges = [];
+    let tagMatch;
+    while ((tagMatch = tagRe.exec(body)) !== null) {
+        const attrStr = tagMatch[1];
+        const innerContent = tagMatch[2].trim();
+        consumedRanges.push({ start: tagMatch.index, end: tagMatch.index + tagMatch[0].length });
+        const attrs = {};
+        let attrMatch;
+        TAG_ATTR_RE.lastIndex = 0;
+        while ((attrMatch = TAG_ATTR_RE.exec(attrStr)) !== null) {
+            attrs[attrMatch[1]] = attrMatch[2];
+        }
+        const titleMatch = innerContent.match(/^###\s+(.+)$/m);
+        const title = attrs.title || (titleMatch ? titleMatch[1].trim() : innerContent.split('\n')[0].trim());
+        const type = attrs.type ?? detectEntryType(title, fileName);
+        const id = `${stem}-${String(++entryIndex).padStart(3, '0')}`;
+        const normalized = normalizeCanonicalKnowledgeContent({
+            ...frontmatter,
+            title,
+            content: innerContent,
+            category: attrs.category ?? frontmatter?.category,
+            specCategory: attrs.specCategory ?? frontmatter?.specCategory,
+            keywords: attrs.keywords ? attrs.keywords.split(',') : frontmatter?.keywords,
+            tags: attrs.tags ? attrs.tags.split(',') : frontmatter?.tags,
+            sourceRef: attrs.sourceRef ?? attrs['source-ref'] ?? frontmatter?.sourceRef,
+            source: attrs.source ?? frontmatter?.source,
+            relatedPaths: attrs.relatedPaths ? attrs.relatedPaths.split(',') : frontmatter?.relatedPaths,
+            codePaths: attrs.codePaths ? attrs.codePaths.split(',') : frontmatter?.codePaths,
+            appliesToRepoIds: attrs.appliesToRepoIds ? attrs.appliesToRepoIds.split(',') : frontmatter?.appliesToRepoIds,
+            language: attrs.language ?? frontmatter?.language,
+            lang: attrs.lang ?? frontmatter?.lang,
+            decisionState: attrs.decisionState ?? frontmatter?.decisionState,
+            lifecycleStatus: attrs.lifecycleStatus ?? attrs['lifecycle-status'] ?? frontmatter?.lifecycleStatus,
+            status: attrs.status ?? frontmatter?.status,
+        });
+        const ref = attrs.ref || undefined;
+        const description = attrs.description || undefined;
+        const entryCategory = normalized.category ?? FILE_CATEGORY_MAP[stem] ?? 'general';
+        const VALID_CONFIDENCE = ['high', 'medium', 'low', 'contested'];
+        const VALID_STATUS = ['active', 'deprecated'];
+        const rawConfidence = attrs.confidence || undefined;
+        const confidence = rawConfidence && VALID_CONFIDENCE.includes(rawConfidence) ? rawConfidence : undefined;
+        const conflictNote = attrs['conflict-note'] || undefined;
+        const sid = attrs.sid || undefined;
+        const supersedes = attrs.supersedes || undefined;
+        const supersededBy = attrs['superseded-by'] || undefined;
+        const rawStatus = attrs.lifecycleStatus || attrs['lifecycle-status'] || attrs.status || undefined;
+        const status = rawStatus && VALID_STATUS.includes(normalized.lifecycleStatus)
+            ? normalized.lifecycleStatus
+            : undefined;
+        entries.push({
+            id,
+            type,
+            title,
+            description,
+            content: innerContent,
+            file: fileName,
+            timestamp: attrs.date ?? '',
+            category: entryCategory,
+            keywords: normalized.keywords.map(keyword => keyword.toLowerCase()),
+            ...(normalized.sourceRef ? { sourceRef: normalized.sourceRef } : {}),
+            ...(normalized.relatedPaths.length ? { relatedPaths: normalized.relatedPaths } : {}),
+            ...(normalized.appliesToRepoIds.length ? { appliesToRepoIds: normalized.appliesToRepoIds } : {}),
+            ...(normalized.language ? { language: normalized.language } : {}),
+            ...(normalized.decisionState ? { decisionState: normalized.decisionState } : {}),
+            ...(status ? { lifecycleStatus: status } : {}),
+            ...(ref ? { ref } : {}),
+            ...(confidence ? { confidence } : {}),
+            ...(conflictNote ? { conflictNote } : {}),
+            ...(sid ? { sid } : {}),
+            ...(supersedes ? { supersedes } : {}),
+            ...(supersededBy ? { supersededBy } : {}),
+            ...(status ? { status } : {}),
+        });
+    }
+    // Pass 2: Parse remaining text with legacy heading-based parser
+    let remaining = body;
+    for (const range of consumedRanges.reverse()) {
+        remaining = remaining.substring(0, range.start) + remaining.substring(range.end);
+    }
+    const lines = remaining.split('\n');
+    const sections = [];
+    let current = null;
+    for (const line of lines) {
+        const m = line.match(HEADING_RE);
+        if (m) {
+            if (current)
+                sections.push(current);
+            current = { heading: m[2].trim(), level: m[1].length, bodyLines: [] };
+        }
+        else if (current) {
+            current.bodyLines.push(line);
+        }
+    }
+    if (current)
+        sections.push(current);
+    for (const sec of sections) {
+        const content = sec.bodyLines.join('\n').trim();
+        if (!content)
+            continue;
+        const type = detectEntryType(sec.heading, fileName);
+        const id = `${stem}-${String(++entryIndex).padStart(3, '0')}`;
+        const dateMatch = sec.heading.match(/\[(\d{4}-\d{2}-\d{2})\]/) ?? sec.heading.match(/(\d{4}-\d{2}-\d{2})/);
+        const timestamp = dateMatch ? dateMatch[1] : '';
+        const title = extractCleanTitle(sec.heading) || sec.heading;
+        const normalized = normalizeCanonicalKnowledgeContent({
+            ...frontmatter,
+            title,
+            content,
+        });
+        const category = normalized.category ?? FILE_CATEGORY_MAP[stem] ?? 'general';
+        entries.push({
+            id,
+            type,
+            title,
+            content,
+            file: fileName,
+            timestamp,
+            category,
+            keywords: normalized.keywords,
+            ...(normalized.sourceRef ? { sourceRef: normalized.sourceRef } : {}),
+            ...(normalized.relatedPaths.length ? { relatedPaths: normalized.relatedPaths } : {}),
+            ...(normalized.appliesToRepoIds.length ? { appliesToRepoIds: normalized.appliesToRepoIds } : {}),
+            ...(normalized.language ? { language: normalized.language } : {}),
+            ...(normalized.decisionState ? { decisionState: normalized.decisionState } : {}),
+            lifecycleStatus: normalized.lifecycleStatus,
+        });
+    }
+    return entries;
+}
+/**
+ * Parse markdown body into SpecEntry objects from <spec-entry> blocks.
+ */
+export function parseSpecEntries(body, fileName, frontmatter) {
+    return parseEntryBlocks(body, 'spec-entry', fileName, frontmatter);
+}
+/**
+ * Parse markdown body into SpecEntry objects from <knowhow-entry> blocks.
+ */
+export function parseKnowhowEntries(body, fileName, frontmatter) {
+    return parseEntryBlocks(body, 'knowhow-entry', fileName, frontmatter);
+}
+//# sourceMappingURL=spec-entry-parser.js.map

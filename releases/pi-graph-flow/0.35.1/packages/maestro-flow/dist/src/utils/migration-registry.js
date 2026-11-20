@@ -1,0 +1,159 @@
+/**
+ * migration-registry.ts — Versioned migration framework for .workflow/ artifacts.
+ *
+ * Migrations are registered by source→target version pairs.
+ * The runner detects the current version from state.json and applies
+ * all pending migrations in sequence.
+ *
+ * Usage:
+ *   import { registry, runPendingMigrations } from './migration-registry.js';
+ *   registry.register({ from: '1.0', to: '2.0', name: '...', migrate: fn });
+ *   const results = runPendingMigrations(workflowRoot);
+ */
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+// ---------------------------------------------------------------------------
+// Version comparison helpers
+// ---------------------------------------------------------------------------
+/**
+ * Parse a version string into [major, minor] numbers.
+ * Returns [NaN, NaN] for unparseable input.
+ */
+function parseVersion(v) {
+    const parts = v.split('.');
+    return [parseInt(parts[0], 10), parseInt(parts[1] ?? '0', 10)];
+}
+/**
+ * Check whether `current` version satisfies a migration's `from` requirement.
+ *
+ * A migration registered as from='3.0' applies when the current version is
+ * '3.0', '3.1', '3.2', etc. (same major, minor >= from's minor).
+ * This prevents minor-version differences from silently breaking the chain.
+ */
+function versionSatisfies(current, from) {
+    if (current === from)
+        return true;
+    const [cMaj, cMin] = parseVersion(current);
+    const [fMaj, fMin] = parseVersion(from);
+    if (Number.isNaN(cMaj) || Number.isNaN(fMaj))
+        return false;
+    return cMaj === fMaj && cMin >= fMin;
+}
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+class MigrationRegistry {
+    migrations = [];
+    register(def) {
+        // Prevent duplicate registration
+        if (this.migrations.some(m => m.from === def.from && m.to === def.to))
+            return;
+        this.migrations.push(def);
+    }
+    /** Get all registered migrations sorted by version chain */
+    getAll() {
+        return this.migrations;
+    }
+    /** Build the migration chain from current version to latest */
+    buildPlan(currentVersion) {
+        const chain = [];
+        let version = currentVersion;
+        for (let i = 0; i < 20; i++) { // safety limit
+            // Forward-compatible match: a migration with from='3.0' also applies
+            // when the current version is '3.1', '3.2', etc. (same major, higher minor).
+            const next = this.migrations.find(m => versionSatisfies(version, m.from));
+            if (!next)
+                break;
+            chain.push(next);
+            version = next.to;
+        }
+        if (chain.length === 0)
+            return null;
+        return {
+            currentVersion,
+            targetVersion: version,
+            steps: chain,
+        };
+    }
+    /** Get the latest version any migration targets */
+    getLatestVersion() {
+        if (this.migrations.length === 0)
+            return '1.0';
+        // Walk the chain to find the terminal version
+        const targets = new Set(this.migrations.map(m => m.to));
+        const sources = new Set(this.migrations.map(m => m.from));
+        for (const t of targets) {
+            if (!sources.has(t))
+                return t; // terminal node
+        }
+        return this.migrations[this.migrations.length - 1].to;
+    }
+}
+export const registry = new MigrationRegistry();
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
+/** Detect current workflow version from state.json */
+export function detectVersion(workflowRoot) {
+    const statePath = join(workflowRoot, '.workflow', 'state.json');
+    if (!existsSync(statePath))
+        return null;
+    try {
+        const raw = JSON.parse(readFileSync(statePath, 'utf8'));
+        return raw.version ?? '1.0';
+    }
+    catch {
+        return null;
+    }
+}
+/** Plan pending migrations without executing */
+export function planMigrations(workflowRoot) {
+    const current = detectVersion(workflowRoot);
+    if (!current)
+        return null;
+    return registry.buildPlan(current);
+}
+/** Execute all pending migrations in sequence */
+export function runPendingMigrations(workflowRoot) {
+    const plan = planMigrations(workflowRoot);
+    if (!plan)
+        return { plan: null, results: [] };
+    const results = [];
+    for (const step of plan.steps) {
+        const result = step.migrate(join(workflowRoot, '.workflow'));
+        results.push({ step, result });
+        if (!result.success)
+            break; // stop on failure
+    }
+    // Write target version to state.json after successful migration
+    const allSucceeded = results.every(r => r.result.success);
+    if (allSucceeded && results.length > 0) {
+        const statePath = join(workflowRoot, '.workflow', 'state.json');
+        try {
+            const existing = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {};
+            existing.version = plan.targetVersion;
+            writeFileSync(statePath, JSON.stringify(existing, null, 2) + '\n');
+        }
+        catch {
+            // Best-effort version write — migration already applied
+        }
+    }
+    return { plan, results };
+}
+// ---------------------------------------------------------------------------
+// Migration auto-loading
+// ---------------------------------------------------------------------------
+/**
+ * Load all migrations from src/migrations/index.ts.
+ * Call this once at CLI entrypoint to populate the registry.
+ * Migrations are decoupled — add new files to src/migrations/ and register in index.ts.
+ */
+export async function loadMigrations() {
+    try {
+        await import('../migrations/index.js');
+    }
+    catch {
+        // migrations module not available (e.g., running from compiled .js without migrations)
+    }
+}
+//# sourceMappingURL=migration-registry.js.map

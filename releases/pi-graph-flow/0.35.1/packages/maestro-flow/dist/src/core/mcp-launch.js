@@ -1,0 +1,69 @@
+// Windows MCP/hook hosts spawn the configured command with piped stdio and
+// typically without CREATE_NO_WINDOW. npm's *.cmd shims are console programs,
+// so `cmd /c maestro-mcp` allocates a visible conhost that flashes then exits.
+// Launch node + the package JS entry instead; Unix keeps PATH binaries.
+// Hook command strings must also survive PowerShell -Command (Grok): a leading
+// quoted argv0 is a string expression, not a program.
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+function isMaestroFlowRoot(dir) {
+    if (!existsSync(join(dir, 'bin', 'maestro-mcp.js')))
+        return false;
+    try {
+        const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8'));
+        return pkg.name === 'maestro-flow' || pkg.name === 'maestro';
+    }
+    catch {
+        return false;
+    }
+}
+export function resolveMaestroPackageRoot(fromFile = fileURLToPath(import.meta.url)) {
+    let dir = dirname(fromFile);
+    for (let i = 0; i < 10; i++) {
+        if (isMaestroFlowRoot(dir))
+            return dir;
+        const parent = dirname(dir);
+        if (parent === dir)
+            break;
+        dir = parent;
+    }
+    throw new Error('Cannot resolve maestro-flow package root (bin/maestro-mcp.js missing)');
+}
+export function resolveMaestroMcpLaunch(opts = {}) {
+    const platform = opts.platform ?? process.platform;
+    if (platform !== 'win32') {
+        return { command: 'maestro-mcp', args: [] };
+    }
+    const root = opts.packageRoot ?? resolveMaestroPackageRoot();
+    const execPath = opts.execPath ?? process.execPath;
+    return { command: execPath, args: [join(root, 'bin', 'maestro-mcp.js')] };
+}
+function quoteWin(value) {
+    return `"${value.replace(/"/g, '\\"')}"`;
+}
+function winNodeScriptCommand(scriptName, extraArgs, opts) {
+    const execPath = opts.execPath ?? process.execPath;
+    const root = opts.packageRoot ?? resolveMaestroPackageRoot();
+    const script = quoteWin(join(root, 'bin', scriptName));
+    // Grok (and other PowerShell -Command hosts) treat a leading quoted token as a
+    // string, not a program: `"C:\Program Files\nodejs\node.exe" "script" args`
+    // fails with ParserError at character 36. Keep argv0 unquoted. When the real
+    // node path contains spaces or shell metacharacters, use PATH `node` so the
+    // executable does not need quotes. cmd.exe shell:true still accepts this form.
+    const argv0 = /[\s&|<>()^%!`$;{}'",]/.test(execPath) ? 'node' : execPath;
+    return [argv0, script, ...extraArgs].join(' ');
+}
+export function maestroHookCommand(name, opts = {}) {
+    const platform = opts.platform ?? process.platform;
+    if (platform !== 'win32')
+        return `maestro hooks run ${name}`;
+    return winNodeScriptCommand('maestro.js', ['hooks', 'run', name], opts);
+}
+export function maestroStatuslineCommand(opts = {}) {
+    const platform = opts.platform ?? process.platform;
+    if (platform !== 'win32')
+        return 'maestro-statusline';
+    return winNodeScriptCommand('maestro-statusline.js', [], opts);
+}
+//# sourceMappingURL=mcp-launch.js.map

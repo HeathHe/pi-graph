@@ -1,0 +1,730 @@
+/**
+ * Maestro Statusline Hook — Two-line colored text
+ *
+ * Line 1: Model | Coordinator | Task | Team | Dir+Git | Context
+ * Line 2: Milestone ◆Phase | Session chain (ANL-001→PLN-001→EXC-001→VRF-001 ✓)
+ *
+ * Input (stdin JSON from Claude Code):
+ *   { model, workspace, session_id, context_window }
+ *
+ * Output (stdout): formatted ANSI string (1 or 2 lines)
+ */
+import { readFileSync, readdirSync, statSync, existsSync, writeFileSync } from 'node:fs';
+import { join, basename, resolve } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { AUTO_COMPACT_BUFFER_PCT, BRIDGE_PREFIX, ANSI_RESET, ICONS, GIT_ICONS, TEXT_COLORS, ansiFg, getCtxLevel, STATUSLINE_LAYOUT, } from './constants.js';
+import { readCoordBridge } from './coordinator-tracker.js';
+import { resolveSelf } from '../tools/team-members.js';
+import { readRecentActivity } from '../tools/team-activity.js';
+import { findWorkspaceRoot } from './workspace.js';
+import { buildHookErrorAlertSegment } from './hook-logger.js';
+// ---------------------------------------------------------------------------
+// Renderer
+// ---------------------------------------------------------------------------
+/** Colored text on transparent background, pipe separators */
+function renderColoredText(segments) {
+    if (segments.length === 0)
+        return '';
+    const sepColor = ansiFg(TEXT_COLORS.separator);
+    const sep = `${sepColor} | ${ANSI_RESET}`;
+    const parts = segments.map((seg) => {
+        const colorKey = seg.key;
+        const color = TEXT_COLORS[colorKey] ?? TEXT_COLORS.model;
+        return `${ansiFg(color)}${seg.text}${ANSI_RESET}`;
+    });
+    return parts.join(sep);
+}
+// ---------------------------------------------------------------------------
+// Context usage
+// ---------------------------------------------------------------------------
+function normalizeUsage(remaining) {
+    const usableRemaining = Math.max(0, ((remaining - AUTO_COMPACT_BUFFER_PCT) / (100 - AUTO_COMPACT_BUFFER_PCT)) * 100);
+    return Math.max(0, Math.min(100, Math.round(100 - usableRemaining)));
+}
+function buildContextText(usedPct) {
+    const filled = Math.floor(usedPct / 10);
+    const bar = '\u2588'.repeat(filled) + '\u2591'.repeat(10 - filled);
+    return `${ICONS.ctx} ${bar} ${usedPct}%`;
+}
+/** Format token count: 1234 → "1.2k", 123456 → "123k" */
+function formatTokens(n) {
+    if (n < 1000)
+        return String(n);
+    if (n < 10000)
+        return (n / 1000).toFixed(1) + 'k';
+    return Math.round(n / 1000) + 'k';
+}
+/** Build token usage text: "↑12k ↓3k Σ15k" */
+function buildTokenText(input, output) {
+    return `↑${formatTokens(input)} ↓${formatTokens(output)} Σ${formatTokens(input + output)}`;
+}
+// ---------------------------------------------------------------------------
+// Bridge
+// ---------------------------------------------------------------------------
+function writeBridge(session, remaining, usedPct) {
+    try {
+        const bridgePath = join(tmpdir(), `${BRIDGE_PREFIX}${session}.json`);
+        const data = {
+            session_id: session,
+            remaining_percentage: remaining,
+            used_pct: usedPct,
+            timestamp: Math.floor(Date.now() / 1000),
+        };
+        writeFileSync(bridgePath, JSON.stringify(data));
+    }
+    catch {
+        // Silent fail — bridge is best-effort
+    }
+}
+// ---------------------------------------------------------------------------
+// Data readers
+// ---------------------------------------------------------------------------
+function readCurrentTask(session) {
+    const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+    const todosDir = join(claudeDir, 'todos');
+    if (!existsSync(todosDir))
+        return '';
+    try {
+        const files = readdirSync(todosDir)
+            .filter((f) => f.startsWith(session) && f.includes('-agent-') && f.endsWith('.json'))
+            .map((f) => ({ name: f, mtime: statSync(join(todosDir, f)).mtime }))
+            .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+        if (files.length > 0) {
+            const todos = JSON.parse(readFileSync(join(todosDir, files[0].name), 'utf8'));
+            const inProgress = todos.find((t) => t.status === 'in_progress');
+            if (inProgress)
+                return inProgress.activeForm || '';
+        }
+    }
+    catch {
+        // Silently fail
+    }
+    return '';
+}
+function isCompletedArtifactStatus(status) {
+    return status === 'sealed' || status === 'completed';
+}
+/** Latest completed_at timestamp (ms epoch) across a chain, or 0 if none parseable */
+function chainCompletedAt(chain) {
+    let max = 0;
+    for (const a of chain.artifacts) {
+        if (!a.completed_at)
+            continue;
+        const t = Date.parse(a.completed_at);
+        if (!Number.isNaN(t) && t > max)
+            max = t;
+    }
+    return max;
+}
+/** Effective status of a chain: in_progress > failed > completed > pending */
+function chainStatus(chain) {
+    if (chain.artifacts.some(a => a.status === 'in_progress'))
+        return 'in_progress';
+    if (chain.artifacts.some(a => a.status === 'failed'))
+        return 'failed';
+    if (chain.allCompleted)
+        return 'completed';
+    return 'pending';
+}
+/** The "active" artifact in a chain — the one whose type names the current step */
+function activeArtifact(chain) {
+    return (chain.artifacts.find(a => a.status === 'in_progress') ??
+        chain.artifacts.find(a => a.status === 'failed') ??
+        chain.artifacts[chain.artifacts.length - 1]);
+}
+const emptyWf = {
+    milestone: '', currentPhase: 0, currentStep: 0, status: '',
+    total: 0, completed: 0, inProgress: 0, planned: 0, workspaceRoot: '',
+    chains: [], orphans: [], currentTaskId: '',
+};
+/**
+ * Build dependency chains from artifacts.
+ * Walk depends_on links: find roots (no depends_on), then follow forward.
+ */
+function buildChains(artifacts) {
+    if (artifacts.length === 0)
+        return { chains: [], orphans: [] };
+    const byId = new Map();
+    for (const a of artifacts)
+        byId.set(a.id, a);
+    // Build forward map: parent → children
+    const children = new Map();
+    const hasParent = new Set();
+    for (const a of artifacts) {
+        const deps = a.depends_on;
+        if (!deps)
+            continue;
+        const depIds = Array.isArray(deps) ? deps : [deps];
+        for (const depId of depIds) {
+            if (byId.has(depId)) {
+                hasParent.add(a.id);
+                const existing = children.get(depId) || [];
+                existing.push(a.id);
+                children.set(depId, existing);
+            }
+        }
+    }
+    // Roots: artifacts with no parent in this set
+    const roots = artifacts.filter(a => !hasParent.has(a.id));
+    const visited = new Set();
+    const chains = [];
+    for (const root of roots) {
+        if (visited.has(root.id))
+            continue;
+        const chain = [];
+        let current = root.id;
+        while (current && !visited.has(current)) {
+            visited.add(current);
+            const art = byId.get(current);
+            if (art)
+                chain.push(art);
+            // Follow first child (linear chain)
+            const kids = children.get(current);
+            current = kids?.[0];
+        }
+        if (chain.length > 0) {
+            const allCompleted = chain.every(a => isCompletedArtifactStatus(a.status));
+            chains.push({ artifacts: chain, allCompleted });
+        }
+    }
+    // Orphans: not visited by any chain walk
+    const orphans = artifacts.filter(a => !visited.has(a.id));
+    return { chains, orphans };
+}
+/** Read canonical Session/Run progress from `.workflow/sessions/`. */
+function readWorkflowState(dir) {
+    const root = findWorkspaceRoot(dir);
+    if (!root)
+        return emptyWf;
+    const statePath = join(root, '.workflow', 'state.json');
+    if (!existsSync(statePath))
+        return emptyWf;
+    try {
+        const state = JSON.parse(readFileSync(statePath, 'utf8'));
+        const result = { ...emptyWf, workspaceRoot: root };
+        const sessionId = typeof state.active_session_id === 'string'
+            ? state.active_session_id
+            : Array.isArray(state.sessions)
+                ? [...state.sessions].reverse().find((entry) => entry.status === 'running' || entry.status === 'paused')?.session_id
+                : null;
+        if (!sessionId)
+            return result;
+        const sessionDir = join(root, '.workflow', 'sessions', sessionId);
+        const session = JSON.parse(readFileSync(join(sessionDir, 'session.json'), 'utf8'));
+        const registry = JSON.parse(readFileSync(join(sessionDir, 'artifacts.json'), 'utf8'));
+        const runsDir = join(sessionDir, 'runs');
+        const runs = existsSync(runsDir)
+            ? readdirSync(runsDir).map(name => {
+                try {
+                    return JSON.parse(readFileSync(join(runsDir, name, 'run.json'), 'utf8'));
+                }
+                catch {
+                    return null;
+                }
+            }).filter((run) => run !== null)
+            : [];
+        const sequenceByRun = new Map(runs.map(run => [run.run_id, run.sequence]));
+        // Hide sessions whose work is done but were never sealed: every Run is in
+        // a terminal-success state, so the milestone line would otherwise linger
+        // forever. Zero-Run sessions are just getting started and stay visible;
+        // a failed Run keeps it visible too.
+        const sessionLive = session.status === 'running' || session.status === 'paused';
+        const allRunsDone = runs.length > 0 && runs.every(run => run.status === 'sealed' || run.status === 'completed');
+        if (sessionLive && allRunsDone)
+            return { ...emptyWf, workspaceRoot: root };
+        result.milestone = session.intent ?? sessionId;
+        result.status = session.status ?? '';
+        result.total = runs.length;
+        result.completed = runs.filter(run => run.status === 'sealed' || run.status === 'completed').length;
+        result.inProgress = runs.filter(run => run.status === 'running' || run.status === 'blocked').length;
+        result.currentPhase = session.active_run_id ? (sequenceByRun.get(session.active_run_id) ?? 0) : 0;
+        const artifacts = Object.entries(registry.artifacts ?? {}).map(([id, artifact]) => ({
+            id,
+            type: artifact.kind ?? 'artifact',
+            status: artifact.status ?? 'unknown',
+            phase: artifact.producer_run_id ? (sequenceByRun.get(artifact.producer_run_id) ?? null) : null,
+            path: artifact.relative_path ?? '',
+            depends_on: null,
+            completed_at: artifact.created_at ?? null,
+        }));
+        const { chains, orphans } = buildChains(artifacts);
+        result.chains = chains;
+        result.orphans = orphans;
+        return result;
+    }
+    catch {
+        return emptyWf;
+    }
+}
+/**
+ * Cross-process cache for the git segment.
+ *
+ * Every render is its own short-lived process, so the three `git` spawns below
+ * (measured 71 + 118 + 69 ms idle, worse under load) are paid in full each time
+ * with no in-process state to amortize them. The cache file lives in tmpdir,
+ * keyed by directory.
+ *
+ * Freshness: `.git/HEAD` and `.git/index` mtimes force an immediate refresh, so
+ * branch switches, commits and staging show up at once. A worktree edit touches
+ * neither, hence the TTL — the dirty marker can lag by up to that long, which is
+ * invisible at human glance and is the only thing traded for dropping three
+ * process spawns off a hot render path.
+ */
+const GIT_CACHE_TTL_MS = 2000;
+function gitCachePath(dir) {
+    let h = 0;
+    for (let i = 0; i < dir.length; i++)
+        h = (h * 31 + dir.charCodeAt(i)) | 0;
+    return join(tmpdir(), `maestro-statusline-git-${(h >>> 0).toString(36)}.json`);
+}
+/** Cheap fingerprint of the repo state git would report on. */
+function gitCacheKey(dir) {
+    const stamp = (rel) => {
+        try {
+            return String(statSync(join(dir, rel)).mtimeMs);
+        }
+        catch {
+            return '-';
+        }
+    };
+    return `${dir}|${stamp('.git/HEAD')}|${stamp('.git/index')}`;
+}
+function readGitInfo(dir) {
+    const cachePath = gitCachePath(dir);
+    const key = gitCacheKey(dir);
+    try {
+        const entry = JSON.parse(readFileSync(cachePath, 'utf8'));
+        if (entry.key === key && Date.now() - entry.at < GIT_CACHE_TTL_MS)
+            return entry.git;
+    }
+    catch { /* no or unreadable cache — fall through to the real read */ }
+    const git = readGitInfoUncached(dir);
+    try {
+        writeFileSync(cachePath, JSON.stringify({ key, at: Date.now(), git }));
+    }
+    catch { /* cache is best-effort */ }
+    return git;
+}
+function readGitInfoUncached(dir) {
+    try {
+        const opts = { cwd: dir, timeout: 2000, stdio: 'pipe' };
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', opts).toString().trim();
+        if (!branch)
+            return null;
+        const statusOut = execSync('git status --porcelain -uno', opts).toString();
+        const dirty = statusOut.length > 0;
+        const conflict = statusOut.split('\n').some((l) => l.startsWith('UU') || l.startsWith('AA'));
+        let ahead = 0;
+        let behind = 0;
+        try {
+            const ab = execSync('git rev-list --left-right --count HEAD...@{upstream}', opts).toString().trim();
+            const parts = ab.split(/\s+/);
+            if (parts.length === 2) {
+                ahead = parseInt(parts[0], 10) || 0;
+                behind = parseInt(parts[1], 10) || 0;
+            }
+        }
+        catch {
+            // No upstream or detached — ignore
+        }
+        return { branch, dirty, conflict, ahead, behind };
+    }
+    catch {
+        return null;
+    }
+}
+function formatGitSuffix(git) {
+    const parts = [];
+    if (git.conflict)
+        parts.push(GIT_ICONS.conflict);
+    else if (git.dirty)
+        parts.push(GIT_ICONS.dirty);
+    if (git.ahead > 0)
+        parts.push(`${GIT_ICONS.ahead}${git.ahead}`);
+    if (git.behind > 0)
+        parts.push(`${GIT_ICONS.behind}${git.behind}`);
+    const suffix = parts.length > 0 ? ` ${parts.join('')}` : '';
+    return `${ICONS.git} ${git.branch}${suffix}`;
+}
+// ---------------------------------------------------------------------------
+// Teammate activity segment
+// ---------------------------------------------------------------------------
+const TEAM_CACHE_TTL_MS = 10_000;
+const TEAM_WINDOW_MIN = 30;
+const TEAM_MAX_INLINE = 3;
+function teamCachePath(session) {
+    // Session IDs are only repository-local. Fence the process-shared temp cache
+    // by physical project root so identical IDs cannot leak stale teammate state
+    // across repositories or concurrent test/worktree invocations.
+    const projectRoot = resolve(process.env.MAESTRO_PROJECT_ROOT || process.cwd());
+    const rootFence = createHash('sha256').update(projectRoot).digest('hex').slice(0, 16);
+    return join(tmpdir(), `maestro-team-statusline-${rootFence}-${session}.json`);
+}
+function writeTeamCache(path, segment) {
+    try {
+        writeFileSync(path, JSON.stringify({ ts: Date.now(), segment }));
+    }
+    catch { /* best-effort */ }
+    return segment;
+}
+function shortTaskId(taskId) {
+    const idx = taskId.lastIndexOf('-');
+    return idx < 0 ? taskId : (taskId.slice(idx + 1) || taskId);
+}
+function formatTeammate(name, evt) {
+    if (typeof evt.phase_id === 'number' && typeof evt.task_id === 'string' && evt.task_id) {
+        return `${name} (P${evt.phase_id}/${shortTaskId(evt.task_id)})`;
+    }
+    if (typeof evt.phase_id === 'number')
+        return `${name} (P${evt.phase_id})`;
+    if (typeof evt.target === 'string' && evt.target)
+        return `${name} (${evt.target})`;
+    return name;
+}
+export function buildTeamSegment(session) {
+    try {
+        const cachePath = teamCachePath(session);
+        if (existsSync(cachePath)) {
+            try {
+                const cached = JSON.parse(readFileSync(cachePath, 'utf8'));
+                if (cached && typeof cached.ts === 'number' && typeof cached.segment === 'string' && Date.now() - cached.ts < TEAM_CACHE_TTL_MS) {
+                    return cached.segment;
+                }
+            }
+            catch { /* corrupt cache */ }
+        }
+        const self = resolveSelf();
+        if (!self)
+            return writeTeamCache(cachePath, '');
+        const events = readRecentActivity(TEAM_WINDOW_MIN);
+        if (events.length === 0)
+            return writeTeamCache(cachePath, '');
+        const latest = new Map();
+        for (const evt of events) {
+            if (!evt || typeof evt.user !== 'string' || typeof evt.host !== 'string')
+                continue;
+            if (evt.user === self.uid && evt.host === self.host)
+                continue;
+            const key = `${evt.user}@${evt.host}`;
+            const prev = latest.get(key);
+            if (!prev) {
+                latest.set(key, evt);
+                continue;
+            }
+            const prevT = Date.parse(prev.ts);
+            const curT = Date.parse(evt.ts);
+            if (!Number.isNaN(curT) && (Number.isNaN(prevT) || curT >= prevT))
+                latest.set(key, evt);
+        }
+        if (latest.size === 0)
+            return writeTeamCache(cachePath, '');
+        const ordered = Array.from(latest.values()).sort((a, b) => {
+            const ta = Date.parse(a.ts);
+            const tb = Date.parse(b.ts);
+            return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta);
+        });
+        const inline = ordered.slice(0, TEAM_MAX_INLINE).map(evt => formatTeammate(evt.user, evt));
+        let body = inline.join(' | ');
+        const extra = ordered.length - inline.length;
+        if (extra > 0)
+            body += ` +${extra}`;
+        return writeTeamCache(cachePath, `\u{1F465} ${body}`);
+    }
+    catch {
+        return '';
+    }
+}
+// ---------------------------------------------------------------------------
+// Coordinator segment
+// ---------------------------------------------------------------------------
+export function buildCoordinatorSegment(session) {
+    if (!session)
+        return '';
+    try {
+        const bridge = readCoordBridge(session);
+        if (!bridge)
+            return '';
+        const { status, current_step, chain_name } = bridge;
+        if (status === 'completed' || status === 'failed')
+            return '';
+        const isPaused = status === 'paused' || status === 'step_paused';
+        // Use real step counts (excluding decision nodes) when available
+        const total = bridge.steps_real ?? bridge.steps_total;
+        const done = bridge.steps_real_completed ?? bridge.steps_completed;
+        const progress = isPaused ? 'P' : `${done}/${total}`;
+        const isRalph = bridge.source === 'ralph';
+        const stepLabel = current_step?.skill ?? '';
+        const parts = [];
+        if (isRalph) {
+            // Ralph: show lifecycle position + decision marker + quality mode
+            parts.push('ralph');
+            if (bridge.lifecycle_position)
+                parts.push(bridge.lifecycle_position);
+            else if (stepLabel)
+                parts.push(stepLabel);
+            if (bridge.decision_pending)
+                parts.push('\u25C6'); // ◆ decision pending
+            if (bridge.quality_mode && bridge.quality_mode !== 'standard')
+                parts.push(bridge.quality_mode);
+            // Quality gates progress
+            if (bridge.passed_gates && bridge.passed_gates.length > 0) {
+                parts.push(`\u2713${bridge.passed_gates.length}`); // ✓N gates passed
+            }
+        }
+        else {
+            // Maestro: chain name + current step
+            if (chain_name)
+                parts.push(chain_name);
+            if (stepLabel)
+                parts.push(stepLabel);
+        }
+        return `${parts.join(' ')} [${progress}]`;
+    }
+    catch {
+        return '';
+    }
+}
+// ---------------------------------------------------------------------------
+// Chain renderer — session chain for line 2+
+// ---------------------------------------------------------------------------
+/** Extract readable slug from artifact path */
+function extractSlug(art) {
+    const b = basename(art.path || '');
+    // runs/20260713-001-analyze/outputs/findings.json → findings.json
+    return b
+        .replace(/^\d+-/, '') // leading number prefix
+        .replace(/^\d{8}-/, '') // YYYYMMDD- prefix
+        .replace(/^(analyze|plan|execute|verify|brainstorm|spec|review|debug|test)-/, '') // type prefix
+        .replace(/-\d{4}-\d{2}-\d{2}$/, '') // trailing date
+        .replace(/-P\d+/, '') // -P1, -P2
+        || art.type;
+}
+/** Render chain status-first: `slug ✓` or `slug ⚙ execute (3/4)` */
+function renderChain(chain) {
+    const slug = extractSlug(chain.artifacts[0]);
+    const slugLabel = ansiFg(TEXT_COLORS.task) + slug + ANSI_RESET;
+    const status = chainStatus(chain);
+    if (status === 'completed') {
+        return `${slugLabel} ${ansiFg(TEXT_COLORS.ctxOk)}✓${ANSI_RESET}`;
+    }
+    const active = activeArtifact(chain);
+    const done = chain.artifacts.filter(a => isCompletedArtifactStatus(a.status)).length;
+    const total = chain.artifacts.length;
+    const typeLabel = ansiFg(TEXT_COLORS.phase) + active.type + ANSI_RESET;
+    if (status === 'failed') {
+        return `${slugLabel} ${ansiFg(TEXT_COLORS.ctxCrit)}✗${ANSI_RESET} ${typeLabel}`;
+    }
+    if (status === 'in_progress') {
+        const progress = ansiFg(TEXT_COLORS.separator) + `(${done}/${total})` + ANSI_RESET;
+        return `${slugLabel} ${ansiFg(TEXT_COLORS.ctxWarn)}⚙${ANSI_RESET} ${typeLabel} ${progress}`;
+    }
+    // pending
+    return `${slugLabel} ${ansiFg(TEXT_COLORS.separator)}○${ANSI_RESET} ${typeLabel}`;
+}
+/** Render orphan: same status-first style as chains */
+function renderOrphan(art) {
+    const slug = extractSlug(art);
+    const slugLabel = ansiFg(TEXT_COLORS.task) + slug + ANSI_RESET;
+    if (isCompletedArtifactStatus(art.status)) {
+        return `${slugLabel} ${ansiFg(TEXT_COLORS.ctxOk)}✓${ANSI_RESET}`;
+    }
+    const typeLabel = ansiFg(TEXT_COLORS.phase) + art.type + ANSI_RESET;
+    if (art.status === 'failed') {
+        return `${slugLabel} ${ansiFg(TEXT_COLORS.ctxCrit)}✗${ANSI_RESET} ${typeLabel}`;
+    }
+    if (art.status === 'in_progress') {
+        return `${slugLabel} ${ansiFg(TEXT_COLORS.ctxWarn)}⚙${ANSI_RESET} ${typeLabel}`;
+    }
+    return `${slugLabel} ${ansiFg(TEXT_COLORS.separator)}○${ANSI_RESET} ${typeLabel}`;
+}
+// ---------------------------------------------------------------------------
+// Filter & cap — keep line 2 focused on active work
+// ---------------------------------------------------------------------------
+const CHAIN_DONE_TTL_MS = 48 * 60 * 60 * 1000; // 48h
+const CHAIN_MAX = 3;
+function statusRank(s) {
+    // in_progress > failed > completed > pending  (lower = higher priority)
+    if (s === 'in_progress')
+        return 0;
+    if (s === 'failed')
+        return 1;
+    if (s === 'completed')
+        return 2;
+    return 3;
+}
+/** Drop stale completed items (>48h) and cap total to CHAIN_MAX */
+function filterAndCapChains(chains, orphans) {
+    const now = Date.now();
+    const totalIn = chains.length + orphans.length;
+    // Drop expired completed chains
+    const liveChains = chains.filter(c => {
+        if (chainStatus(c) !== 'completed')
+            return true;
+        const ts = chainCompletedAt(c);
+        return ts > 0 && now - ts < CHAIN_DONE_TTL_MS;
+    });
+    // Drop expired completed orphans
+    const liveOrphans = orphans.filter(o => {
+        if (!isCompletedArtifactStatus(o.status))
+            return true;
+        if (!o.completed_at)
+            return false; // unknown age + completed → drop
+        const ts = Date.parse(o.completed_at);
+        return !Number.isNaN(ts) && now - ts < CHAIN_DONE_TTL_MS;
+    });
+    const items = [
+        ...liveChains.map(c => ({ kind: 'chain', data: c })),
+        ...liveOrphans.map(o => ({ kind: 'orphan', data: o })),
+    ];
+    items.sort((a, b) => {
+        const sa = a.kind === 'chain' ? chainStatus(a.data) : a.data.status;
+        const sb = b.kind === 'chain' ? chainStatus(b.data) : b.data.status;
+        const rankDiff = statusRank(sa) - statusRank(sb);
+        if (rankDiff !== 0)
+            return rankDiff;
+        // Same rank → recency desc
+        const ta = a.kind === 'chain' ? chainCompletedAt(a.data) : (a.data.completed_at ? Date.parse(a.data.completed_at) : 0);
+        const tb = b.kind === 'chain' ? chainCompletedAt(b.data) : (b.data.completed_at ? Date.parse(b.data.completed_at) : 0);
+        return tb - ta;
+    });
+    const kept = items.slice(0, CHAIN_MAX);
+    const droppedByCap = items.length - kept.length;
+    const droppedByTtl = totalIn - items.length;
+    return {
+        chains: kept.filter(i => i.kind === 'chain').map(i => i.data),
+        orphans: kept.filter(i => i.kind === 'orphan').map(i => i.data),
+        hidden: droppedByCap + droppedByTtl,
+    };
+}
+// ---------------------------------------------------------------------------
+// Main formatter
+// ---------------------------------------------------------------------------
+/**
+ * Main statusline handler.
+ *
+ * compact (default): Line 1 = all segments; Line 2 = workflow (if active)
+ * expanded:          Line 1 = Model/Thinking/Coord/Task/Team
+ *                    Line 2 = Dir+Git/Tokens/Context
+ *                    Line 3 = workflow (if active)
+ */
+export function formatStatusline(data) {
+    const model = data.model?.display_name || 'Claude';
+    const dir = data.workspace?.current_dir || process.cwd();
+    const session = data.session_id || '';
+    const remaining = data.context_window?.remaining_percentage;
+    // ---- Collect data ----
+    const wf = readWorkflowState(dir);
+    const coord = session ? buildCoordinatorSegment(session) : '';
+    const task = session ? readCurrentTask(session) : '';
+    const team = session ? buildTeamSegment(session) : '';
+    const alert = session ? buildHookErrorAlertSegment(session) : '';
+    const git = readGitInfo(dir);
+    let usedPct = 0;
+    if (remaining != null) {
+        usedPct = normalizeUsage(remaining);
+        if (session)
+            writeBridge(session, remaining, usedPct);
+    }
+    // ---- Segment group A: Alert | Model | Coord | Task | Team ----
+    const segA = [];
+    if (alert)
+        segA.push({ key: 'ctxAlert', text: alert });
+    segA.push({ key: 'model', text: `${ICONS.model} ${model}` });
+    if (coord)
+        segA.push({ key: 'coord', text: `${ICONS.coord} ${coord}` });
+    if (task)
+        segA.push({ key: 'task', text: `${ICONS.task} ${task}` });
+    if (team)
+        segA.push({ key: 'team', text: `${ICONS.team} ${team}` });
+    // ---- Segment group B: Dir+Git | Tokens+Lines | Context ----
+    const segB = [];
+    let dirText = `${ICONS.dir} ${basename(dir)}`;
+    if (git)
+        dirText += `  ${formatGitSuffix(git)}`;
+    segB.push({ key: 'dir', text: dirText });
+    const inputTokens = data.context_window?.total_input_tokens;
+    const outputTokens = data.context_window?.total_output_tokens;
+    const linesAdded = data.cost?.total_lines_added ?? 0;
+    const linesRemoved = data.cost?.total_lines_removed ?? 0;
+    const statParts = [];
+    if (inputTokens != null && outputTokens != null && (inputTokens > 0 || outputTokens > 0)) {
+        statParts.push(buildTokenText(inputTokens, outputTokens));
+    }
+    if (linesAdded > 0 || linesRemoved > 0) {
+        const added = ansiFg(TEXT_COLORS.ctxOk) + `+${linesAdded}` + ANSI_RESET;
+        const removed = ansiFg(TEXT_COLORS.ctxCrit) + `-${linesRemoved}` + ANSI_RESET;
+        statParts.push(`${added} ${removed}`);
+    }
+    if (statParts.length > 0) {
+        segB.push({ key: 'task', text: statParts.join(' ') });
+    }
+    if (remaining != null) {
+        const level = getCtxLevel(usedPct);
+        const ctxKey = `ctx${level.charAt(0).toUpperCase()}${level.slice(1)}`;
+        segB.push({ key: ctxKey, text: buildContextText(usedPct) });
+    }
+    // ---- Build rendered lines ----
+    let line1;
+    let line2 = null;
+    if (STATUSLINE_LAYOUT === 'expanded') {
+        // expanded: two info lines before optional workflow line
+        line1 = renderColoredText(segA);
+        line2 = renderColoredText(segB);
+    }
+    else {
+        // compact (default): merge both groups into one line
+        line1 = renderColoredText([...segA, ...segB]);
+    }
+    // ---- Workflow line: Milestone ◆Phase | chains ----
+    if (!wf.milestone) {
+        return line2 !== null ? line1 + '\n' + line2 : line1;
+    }
+    const sep = ansiFg(TEXT_COLORS.separator) + ' | ' + ANSI_RESET;
+    const dot = ansiFg(TEXT_COLORS.separator) + ' · ' + ANSI_RESET;
+    let header = ansiFg(TEXT_COLORS.milestone) + `${ICONS.milestone} ${wf.milestone}` + ANSI_RESET;
+    if (wf.total > 0)
+        header += ansiFg(TEXT_COLORS.milestone) + ` ${wf.completed}/${wf.total}` + ANSI_RESET;
+    if (wf.currentPhase)
+        header += ' ' + ansiFg(TEXT_COLORS.phase) + `${ICONS.phase} P${wf.currentPhase}` + ANSI_RESET;
+    const view = filterAndCapChains(wf.chains, wf.orphans);
+    const chainParts = [];
+    for (const chain of view.chains)
+        chainParts.push(renderChain(chain));
+    for (const orphan of view.orphans)
+        chainParts.push(renderOrphan(orphan));
+    if (view.hidden > 0)
+        chainParts.push(ansiFg(TEXT_COLORS.separator) + `+${view.hidden}` + ANSI_RESET);
+    const workflowLine = chainParts.length === 0
+        ? header
+        : header + sep + chainParts.join(dot);
+    if (line2 !== null) {
+        return line1 + '\n' + line2 + '\n' + workflowLine;
+    }
+    return line1 + '\n' + workflowLine;
+}
+/** Entry point — reads stdin JSON, writes formatted statusline to stdout */
+export function runStatusline() {
+    let input = '';
+    const timeout = setTimeout(() => process.exit(0), 3000);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => (input += chunk));
+    process.stdin.on('end', () => {
+        clearTimeout(timeout);
+        // Exit explicitly once the output is flushed. Clearing the timeout removes
+        // the only forced exit, so any handle still held further down the render
+        // path would keep this process resident forever — observed in the wild as
+        // 19 statusline processes alive for up to 9 hours.
+        try {
+            const data = JSON.parse(input);
+            process.stdout.write(formatStatusline(data), () => process.exit(0));
+            return;
+        }
+        catch {
+            // Silent fail
+        }
+        process.exit(0);
+    });
+}
+//# sourceMappingURL=statusline.js.map

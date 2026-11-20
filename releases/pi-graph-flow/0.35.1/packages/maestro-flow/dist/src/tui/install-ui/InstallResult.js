@@ -1,0 +1,21 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { Box, Text, useInput, useApp } from 'ink';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { t } from '../../i18n/index.js';
+import { C, BORDER } from '../shared/index.js';
+function Row({ label, value, valueColor }) {
+    return (_jsxs(Box, { children: [_jsx(Text, { color: C.primary, children: label.padEnd(16) }), _jsx(Text, { color: valueColor ?? C.success, children: value })] }));
+}
+export function InstallResult({ result }) {
+    const { exit } = useApp();
+    useInput((_input, key) => {
+        if (key.return)
+            exit();
+    });
+    return (_jsxs(Box, { flexDirection: "column", paddingX: 1, children: [_jsxs(Box, { flexDirection: "column", ...BORDER.success, paddingX: 1, children: [_jsx(Text, { bold: true, color: C.success, children: t.install.resultTitle }), result.filesInstalled > 0 && (_jsx(Row, { label: "Files:", value: `${result.filesInstalled} installed` })), result.dirsCreated > 0 && (_jsx(Row, { label: "Dirs:", value: `${result.dirsCreated} created` })), result.filesSkipped > 0 && (_jsx(Row, { label: "Preserved:", value: `${result.filesSkipped} settings files` })), result.hooksInstalled > 0 && (_jsx(Row, { label: "Hooks:", value: `${result.hooksInstalled} installed` })), _jsx(Row, { label: "Statusline:", value: result.statuslineInstalled ? t.install.resultStatuslineInstalled : t.install.confirmSkipped, valueColor: result.statuslineInstalled ? C.success : C.neutral }), _jsx(Row, { label: "MCP:", value: result.mcpRegistered ? 'maestro-tools registered' : t.install.confirmSkipped, valueColor: result.mcpRegistered ? C.success : C.neutral }), result.codexHooksInstalled > 0 && (_jsx(Row, { label: "Codex Hooks:", value: `${result.codexHooksInstalled} installed` })), _jsx(Row, { label: "Codex MCP:", value: result.codexMcpRegistered ? 'maestro-tools registered' : t.install.confirmSkipped, valueColor: result.codexMcpRegistered ? C.success : C.neutral }), result.agyHooksInstalled > 0 && (_jsx(Row, { label: "Agy Hooks:", value: `${result.agyHooksInstalled} installed` })), (result.extraMcpRegistered.length > 0 || result.extraMcpFailed.length > 0) && (_jsx(Row, { label: "Extra MCP:", value: result.extraMcpFailed.length === 0
+                            ? `${result.extraMcpRegistered.join(', ')}`
+                            : `${result.extraMcpRegistered.join(', ')}${result.extraMcpRegistered.length ? ' | ' : ''}failed: ${result.extraMcpFailed.join(', ')}`, valueColor: result.extraMcpFailed.length === 0 ? C.success : C.warning })), result.backupPath && (_jsxs(Box, { children: [_jsx(Text, { color: C.primary, children: 'Backup:'.padEnd(16) }), _jsx(Text, { dimColor: true, children: result.backupPath })] })), result.manifestPath && (_jsxs(Box, { children: [_jsx(Text, { color: C.primary, children: t.install.resultManifest.padEnd(16) }), _jsx(Text, { dimColor: true, children: result.manifestPath })] }))] }), result.migrationWarnings.length > 0 && (_jsxs(Box, { flexDirection: "column", ...BORDER.warning, paddingX: 1, marginTop: 1, children: [_jsx(Text, { bold: true, color: C.warning, children: "\u26A0 Migration Warnings" }), result.migrationWarnings.map((w, i) => (_jsx(Text, { color: C.warning, wrap: "wrap", children: w }, i)))] })), result.statuslineInstalled && (_jsxs(Box, { marginTop: 1, children: [_jsxs(Text, { dimColor: true, children: ["Nerd Font glyphs needed for statusline icons \u2014 run", ' '] }), _jsx(Text, { color: C.primary, children: "maestro install fonts" }), _jsx(Text, { dimColor: true, children: " for platform-specific setup." })] })), existsSync(join(homedir(), '.pi')) && (_jsxs(Box, { flexDirection: "column", ...BORDER.warning, paddingX: 1, marginTop: 1, children: [_jsx(Text, { bold: true, color: C.warning, children: "Pi Agent" }), _jsx(Text, { color: C.warning, wrap: "wrap", children: t.install.piPluginReminder })] })), _jsx(Box, { marginTop: 1, children: _jsx(Text, { dimColor: true, children: t.install.resultExit }) })] }));
+}
+//# sourceMappingURL=InstallResult.js.map

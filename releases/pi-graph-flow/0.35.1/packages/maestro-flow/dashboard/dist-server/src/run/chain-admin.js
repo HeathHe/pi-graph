@@ -1,0 +1,573 @@
+// ---------------------------------------------------------------------------
+// Chain administration — engine-agnostic Session creation from a predefined
+// chain definition, plus the three chain-edit verbs (insert / skip / replace).
+//
+// This is the canonical home for chain building and mutation that the CLI
+// (`maestro session create` / `maestro session chain …`) drives. The retired
+// ralph adapter once reused `createChainSession` (the dependency ran ralph → run
+// only; the src/ralph/ tree has since been removed), so `chainStepId` lives here
+// rather than in the former src/ralph/session-adapter.ts.
+//
+// Retryable edits go through SessionStore.replayOrApplyTransition so authority
+// and the idempotency receipt share one StoreTransaction.
+// ---------------------------------------------------------------------------
+import { z } from 'zod';
+import { SessionStore } from './store.js';
+import { decompositionSchema, positionSchema } from './schemas.js';
+import { validateSessionId } from './ids.js';
+import { createTopicIdentity } from './topic-identity.js';
+import { checkLease } from './lease.js';
+import { assertTransitionMutationRevisions, createTransitionOutcome, prepareTransitionMutation, transitionMutationReceipt, } from './transition-receipts.js';
+// ── Step id convention (canonical) ───────────────────────────────────────────
+// Mirrors the historic ralph convention `step-{NNN}-{command}` so migrated and
+// freshly built chains keep a single id shape.
+export function chainStepId(index, command) {
+    return `step-${String(index).padStart(3, '0')}-${command}`;
+}
+// ── Chain definition schema (file / stdin input) ─────────────────────────────
+// Kept local to chain-admin: this is the CLI input surface, not a persisted
+// session block. Fields align with orchestrationStepSchema / decisionPointSchema
+// on the input face; persisted step ids and status are derived here.
+const chainDefStepSchema = z.object({
+    command: z.string().min(1),
+    args: z.string().optional(),
+    stage: z.string().nullable().optional(),
+    goal_ref: z.string().nullable().optional(),
+    retry_max: z.number().int().nonnegative().optional(),
+    // A decision node: names the decision point this step gates on. When set the
+    // step is a decision node (dispatched by the orchestrator, not run as a Run).
+    decision_ref: z.string().nullable().optional(),
+}).strict();
+const chainDefDecisionPointSchema = z.object({
+    point_id: z.string().min(1),
+    after_step_id: z.string().nullable().optional(),
+    max_retries: z.number().int().nonnegative().optional(),
+}).strict();
+const chainDefPositionSchema = z.object({
+    lifecycle: z.string(),
+    phase: z.number().int().nullable().optional(),
+    phase_is_new: z.boolean().optional(),
+    milestone: z.string().optional(),
+    planning_mode: z.string().nullable().optional(),
+    passed_gates: z.array(z.string()).optional(),
+    scope_verdict: z.string().nullable().optional(),
+}).strict();
+const chainDefBoundaryContractSchema = z.object({
+    in_scope: z.array(z.string()),
+    out_of_scope: z.array(z.string()),
+    constraints: z.array(z.string()),
+    definition_of_done: z.string(),
+}).strict();
+const chainDefDecompositionSchema = z.object({
+    execution_criteria: z.array(z.string()).optional(),
+    goals: decompositionSchema.shape.goals.optional(),
+    changelog: decompositionSchema.shape.changelog.optional(),
+}).strict();
+const chainDefExecutorSchema = z.object({
+    platform: z.string(),
+    cli_tool: z.string(),
+}).strict();
+export const chainDefinitionSchema = z.object({
+    intent: z.string().min(1).optional(),
+    engine: z.enum(['ralph', 'coordinator', 'manual']).optional(),
+    quality_mode: z.enum(['quick', 'standard', 'full']).optional(),
+    auto_mode: z.boolean().optional(),
+    steps: z.array(chainDefStepSchema).min(1),
+    decision_points: z.array(chainDefDecisionPointSchema).optional(),
+    boundary_contract: chainDefBoundaryContractSchema.optional(),
+    position: chainDefPositionSchema.nullable().optional(),
+    decomposition: chainDefDecompositionSchema.nullable().optional(),
+    executor: chainDefExecutorSchema.nullable().optional(),
+}).strict().superRefine((definition, ctx) => {
+    const pointIds = new Set();
+    for (const point of definition.decision_points ?? []) {
+        if (pointIds.has(point.point_id)) {
+            ctx.addIssue({ code: 'custom', message: `duplicate decision point: ${point.point_id}`, path: ['decision_points'] });
+        }
+        pointIds.add(point.point_id);
+    }
+    definition.steps.forEach((step, index) => {
+        if (step.decision_ref && !pointIds.has(step.decision_ref)) {
+            ctx.addIssue({ code: 'custom', message: `decision_ref has no matching decision point: ${step.decision_ref}`, path: ['steps', index, 'decision_ref'] });
+        }
+    });
+});
+// Default retry ceiling mirrors the ralph decision node default (max_retries: 2).
+const DEFAULT_RETRY_MAX = 2;
+// Default decision retry ceiling mirrors A_BUILD_STEPS rule 4 (max_retries: 2).
+const DEFAULT_DECISION_MAX_RETRIES = 2;
+// ── Chain assembly from a definition ─────────────────────────────────────────
+function buildChain(steps) {
+    return steps.map((step, index) => {
+        const decisionRef = step.decision_ref ?? null;
+        const chainStep = {
+            step_id: chainStepId(index, step.command),
+            command: step.command,
+            status: 'pending',
+            run_id: null,
+            inserted_by: 'build',
+            decision_ref: decisionRef,
+        };
+        if (step.args !== undefined)
+            chainStep.args = step.args;
+        if (step.stage !== undefined)
+            chainStep.stage = step.stage;
+        if (step.goal_ref !== undefined)
+            chainStep.goal_ref = step.goal_ref;
+        // Execution steps carry a retry counter; decision nodes are gated by their
+        // decision point's own retry_count, so they do not.
+        if (!decisionRef) {
+            chainStep.retry = { count: 0, max: step.retry_max ?? DEFAULT_RETRY_MAX };
+        }
+        return chainStep;
+    });
+}
+function buildDecisionPoints(def) {
+    const points = def.decision_points ?? [];
+    return points.map(point => ({
+        point_id: point.point_id,
+        after_step_id: point.after_step_id ?? null,
+        status: 'pending',
+        retry_count: 0,
+        max_retries: point.max_retries ?? DEFAULT_DECISION_MAX_RETRIES,
+        evidence_ref: null,
+    }));
+}
+function buildPosition(def) {
+    if (!def.position)
+        return null;
+    const p = def.position;
+    return {
+        lifecycle: p.lifecycle,
+        phase: p.phase ?? null,
+        phase_is_new: p.phase_is_new ?? false,
+        milestone: p.milestone ?? '',
+        planning_mode: p.planning_mode ?? null,
+        passed_gates: p.passed_gates ?? [],
+        scope_verdict: p.scope_verdict ?? null,
+    };
+}
+function buildDecomposition(def) {
+    if (!def.decomposition)
+        return null;
+    const d = def.decomposition;
+    return decompositionSchema.parse({
+        execution_criteria: d.execution_criteria ?? [],
+        goals: d.goals ?? [],
+        changelog: d.changelog ?? [],
+    });
+}
+function timestampId() {
+    return new Date().toISOString().replace(/[:.\-TZ]/g, '').slice(0, 14);
+}
+/**
+ * Derive a session id from a slug, aligning with the ralph convention
+ * `ralph-{YYYYMMDD-HHmmss}`: the slug replaces the fixed prefix. A slug that
+ * already looks like a full session id (contains a 14-digit timestamp tail) is
+ * used verbatim so callers can pin an explicit id.
+ */
+export function deriveSessionId(slug) {
+    const trimmed = slug.trim();
+    validateSessionId(trimmed);
+    if (/\d{8}-\d{6}$/.test(trimmed) || /\d{14}$/.test(trimmed))
+        return trimmed;
+    const ts = timestampId();
+    const stamp = `${ts.slice(0, 8)}-${ts.slice(8, 14)}`;
+    return `${trimmed}-${stamp}`;
+}
+/**
+ * Create a Session from an optional predefined chain definition. Engine may be
+ * ralph / coordinator / manual. When no definition is supplied an empty-chain
+ * session is created (intent only). The session id is derived from `slug` unless
+ * an explicit id is passed.
+ */
+export function createChainSession(projectRoot, slug, opts = {}) {
+    // Public callers are not necessarily the CLI, so do not rely on Commander
+    // having parsed the chain-file already. Validate before allocating a Session
+    // to avoid leaving an empty shell for an invalid definition.
+    const def = opts.definition ? chainDefinitionSchema.parse(opts.definition) : undefined;
+    const intent = opts.intent ?? def?.intent;
+    if (!intent) {
+        throw new Error('intent is required (pass opts.intent or definition.intent)');
+    }
+    // Materialize every nested persisted block before Session allocation. Any
+    // schema failure must leave no authority shell or occupied Session ID.
+    const materialized = def ? {
+        chain: buildChain(def.steps),
+        decisionPoints: buildDecisionPoints(def),
+        position: buildPosition(def),
+        decomposition: buildDecomposition(def),
+    } : null;
+    const sessionId = deriveSessionId(slug);
+    const store = new SessionStore(projectRoot);
+    store.createSession(sessionId, intent, { ifExists: 'error' });
+    const engine = opts.engine ?? def?.engine ?? 'manual';
+    const qualityMode = opts.qualityMode ?? def?.quality_mode ?? 'standard';
+    const autoMode = opts.autoMode ?? def?.auto_mode ?? false;
+    store.update(sessionId, (draft) => {
+        const o = draft.session.orchestration;
+        o.engine = engine;
+        o.quality_mode = qualityMode;
+        o.auto_mode = autoMode;
+        const boundaryContract = opts.boundaryContract ?? def?.boundary_contract;
+        if (boundaryContract) {
+            draft.session.boundary_contract = boundaryContract;
+        }
+        if (opts.topic) {
+            draft.session.topic_identity = createTopicIdentity(projectRoot, opts.topic);
+        }
+        if (materialized) {
+            o.chain = materialized.chain;
+            o.decision_points = materialized.decisionPoints;
+            o.position = materialized.position;
+            o.decomposition = materialized.decomposition;
+        }
+        const executor = opts.executor ?? def?.executor;
+        if (executor)
+            o.executor = { platform: executor.platform, cli_tool: executor.cli_tool };
+        return null;
+    });
+    const session = store.readBundle(sessionId).session;
+    return { sessionId, sessionDir: store.sessionDir(sessionId), session };
+}
+// ── Chain edit verbs ─────────────────────────────────────────────────────────
+/**
+ * The lowest chain index a new step may occupy. Sparse skipped markers after
+ * the first pending step (for example a pre-skipped legacy seal node) do not
+ * lock the pending head. Running/completed/sealed/failed steps remain an
+ * authority boundary even if an inconsistent pending step appears before them.
+ */
+function activeBoundary(chain) {
+    let boundary = 0;
+    let pendingSeen = false;
+    for (let index = 0; index < chain.length; index++) {
+        const status = chain[index].status;
+        if (status === 'pending') {
+            pendingSeen = true;
+            continue;
+        }
+        if (pendingSeen && status === 'skipped')
+            continue;
+        boundary = index + 1;
+    }
+    return boundary;
+}
+function recordObject(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? value
+        : null;
+}
+function stepHasRecordedAttempt(session, stepId) {
+    return session.requests.some(request => {
+        if (request.type !== 'transition')
+            return false;
+        const payload = recordObject(request.payload);
+        const subject = recordObject(payload?.subject);
+        return payload?.operation === 'complete'
+            && subject?.chain_step_id === stepId
+            && typeof subject.run_id === 'string'
+            && subject.run_id.length > 0;
+    });
+}
+function replacementChangesSemantics(step, opts) {
+    return (opts.command !== undefined && opts.command !== step.command)
+        || (opts.args !== undefined && opts.args !== step.args)
+        || (opts.stage !== undefined && opts.stage !== (step.stage ?? null))
+        || (opts.goalRef !== undefined && opts.goalRef !== (step.goal_ref ?? null));
+}
+function assertKnownGoalRef(bundle, goalRef) {
+    if (goalRef === undefined || goalRef === null)
+        return;
+    const decomposition = bundle.session.orchestration.decomposition;
+    if (decomposition && !decomposition.goals.some(goal => goal.id === goalRef)) {
+        throw new Error(`goal_ref ${goalRef} does not exist in Session decomposition`);
+    }
+}
+function assertInsertGoalBinding(bundle, opts, decisionRef, anchor) {
+    if (bundle.session.orchestration.decomposition
+        && opts.stage !== undefined
+        && opts.stage !== null
+        && !decisionRef
+        && (opts.goalRef === undefined || opts.goalRef === null)
+        && (!anchor || (anchor.goal_ref ?? null) !== null)) {
+        throw new Error(`inserting staged step ${opts.command} requires an explicit goal_ref`);
+    }
+    assertKnownGoalRef(bundle, opts.goalRef);
+}
+function assertReplacementGoalBinding(bundle, step, opts) {
+    const decomposition = bundle.session.orchestration.decomposition;
+    if (!decomposition)
+        return;
+    const stageChanges = opts.stage !== undefined && opts.stage !== (step.stage ?? null);
+    if (stageChanges && (opts.goalRef === undefined || opts.goalRef === null)) {
+        throw new Error(`changing stage for ${step.step_id} requires an explicit goal_ref`);
+    }
+    assertKnownGoalRef(bundle, opts.goalRef);
+}
+/** Resolve an `after` selector (step_id, numeric index, or start sentinel) to a chain index. */
+function resolveAfterIndex(chain, after) {
+    const normalized = after.trim().toLowerCase();
+    if (['start', 'head', 'beginning', 'none'].includes(normalized))
+        return -1;
+    const asIndex = Number(after);
+    if (Number.isInteger(asIndex) && String(asIndex) === after.trim()) {
+        if (asIndex < 0 || asIndex >= chain.length) {
+            throw new Error(`after index ${asIndex} out of range (chain has ${chain.length} steps)`);
+        }
+        return asIndex;
+    }
+    const idx = chain.findIndex(step => step.step_id === after);
+    if (idx === -1)
+        throw new Error(`after step not found: ${after}`);
+    return idx;
+}
+function uniqueStepId(chain, index, command, exclude) {
+    const base = chainStepId(index, command);
+    if (!chain.some(step => step !== exclude && step.step_id === base))
+        return base;
+    let suffix = 2;
+    while (chain.some(step => step !== exclude && step.step_id === `${base}-${suffix}`))
+        suffix++;
+    return `${base}-${suffix}`;
+}
+function assertMutationGuards(bundle, options) {
+    if (bundle.session.status === 'sealed' || bundle.session.status === 'archived') {
+        throw new Error(`Session ${bundle.session.session_id} is ${bundle.session.status} and immutable`);
+    }
+    assertTransitionMutationRevisions(bundle.session, options);
+    const leaseConflict = checkLease(bundle.session.orchestration.lease, options.leaseClaim ?? {});
+    if (leaseConflict)
+        throw new Error(leaseConflict);
+}
+/** Apply exactly one chain edit to an in-memory authority draft. */
+export function applyChainMutation(bundle, mutation) {
+    const chain = bundle.session.orchestration.chain;
+    if (mutation.operation === 'insert') {
+        const opts = mutation.options;
+        const afterIdx = resolveAfterIndex(chain, opts.after);
+        const insertPos = afterIdx + 1;
+        const boundary = activeBoundary(chain);
+        if (insertPos < boundary) {
+            throw new Error(`cannot insert before the active position: insert slot ${insertPos} < active boundary ${boundary} `
+                + `(a completed/running/sealed/skipped step occupies index ${boundary - 1})`);
+        }
+        const decisionRef = opts.decisionRef ?? null;
+        assertInsertGoalBinding(bundle, opts, decisionRef, chain[afterIdx]);
+        const step = {
+            step_id: uniqueStepId(chain, insertPos, opts.command), command: opts.command, status: 'pending',
+            run_id: null, inserted_by: opts.insertedBy, decision_ref: decisionRef,
+        };
+        if (opts.args !== undefined)
+            step.args = opts.args;
+        if (opts.stage !== undefined)
+            step.stage = opts.stage;
+        if (opts.goalRef !== undefined)
+            step.goal_ref = opts.goalRef;
+        if (!decisionRef)
+            step.retry = { count: 0, max: DEFAULT_RETRY_MAX };
+        if (decisionRef && !bundle.session.orchestration.decision_points.some(point => point.point_id === decisionRef)) {
+            bundle.session.orchestration.decision_points.push({
+                point_id: decisionRef, after_step_id: chain[afterIdx]?.step_id ?? null, status: 'pending',
+                retry_count: 0, max_retries: DEFAULT_DECISION_MAX_RETRIES, evidence_ref: null,
+            });
+        }
+        chain.splice(insertPos, 0, step);
+        bundle.session.activity_revision++;
+        return step;
+    }
+    const index = chain.findIndex(step => step.step_id === mutation.stepId);
+    if (index === -1)
+        throw new Error(`chain step not found: ${mutation.stepId}`);
+    const step = chain[index];
+    if (step.status !== 'pending') {
+        throw new Error(`only pending steps can be ${mutation.operation === 'skip' ? 'skipped' : 'replaced'}; ${mutation.stepId} is ${step.status}`);
+    }
+    if (mutation.operation === 'skip') {
+        step.status = 'skipped';
+        step.run_id = null;
+    }
+    else {
+        const opts = mutation.options;
+        if (stepHasRecordedAttempt(bundle.session, step.step_id)
+            && replacementChangesSemantics(step, opts)) {
+            throw new Error(`cannot replace semantics of ${step.step_id} after a recorded Run attempt; insert a new step instead`);
+        }
+        assertReplacementGoalBinding(bundle, step, opts);
+        if (opts.command !== undefined) {
+            step.command = opts.command;
+            step.step_id = uniqueStepId(chain, index, opts.command, step);
+        }
+        if (opts.args !== undefined)
+            step.args = opts.args;
+        if (opts.stage !== undefined)
+            step.stage = opts.stage;
+        if (opts.goalRef !== undefined)
+            step.goal_ref = opts.goalRef;
+    }
+    bundle.session.activity_revision++;
+    return step;
+}
+function runChainMutation(projectRoot, sessionId, operation, payload, mutation, transition) {
+    const store = new SessionStore(projectRoot);
+    if (!store.sessionExists(sessionId))
+        throw new Error(`session not found: ${sessionId}`);
+    const prepared = prepareTransitionMutation({
+        session: store.readBundle(sessionId).session,
+        currentFence: store.readSessionFence(sessionId),
+        operation,
+        subject: { session_id: sessionId, run_id: null, chain_step_id: null },
+        payload,
+        options: transition,
+    });
+    const evaluated = store.replayOrApplyTransition(sessionId, prepared.request, draft => {
+        assertMutationGuards(draft, prepared.options);
+        const value = structuredClone(applyChainMutation(draft, mutation));
+        return createTransitionOutcome({
+            request_id: prepared.request.request_id,
+            request_hash: prepared.request.normalized_request_hash,
+            operation,
+            status: 'applied',
+            applied_at: new Date().toISOString(),
+            subject: prepared.request.subject,
+            postconditions: {
+                session_identity_revision: draft.session.identity_revision,
+                session_activity_revision: draft.session.activity_revision,
+                active_run_id: draft.session.active_run_id,
+                run_hash: null,
+                artifact_registry_revision: draft.artifacts.revision,
+            },
+            exit_code: 0,
+            error_code: null,
+            result: { value },
+        });
+    });
+    const value = structuredClone(evaluated.outcome.result.value);
+    return Object.assign(value, {
+        transition: transitionMutationReceipt(prepared.request, evaluated.outcome, evaluated.replayed),
+    });
+}
+/**
+ * Insert a new pending step after the `after` step (step_id or index). The
+ * insertion slot must be inside the still-pending tail: inserting before any
+ * completed / running / sealed / skipped step is rejected. Inserting after the
+ * active step (the fix-loop case) is allowed.
+ */
+export function insertChainStep(projectRoot, sessionId, opts) {
+    return runChainMutation(projectRoot, sessionId, 'chain-insert', {
+        after: opts.after, command: opts.command, args: opts.args ?? null, stage: opts.stage ?? null,
+        goal_ref: opts.goalRef ?? null, inserted_by: opts.insertedBy, decision_ref: opts.decisionRef ?? null,
+    }, { operation: 'insert', options: opts }, opts.transition);
+}
+/**
+ * Skip a pending chain step. Only `pending` steps may be skipped — completed /
+ * running / sealed / already-skipped steps are rejected. `skipped` is a free
+ * status string (the step status field is not a closed enum), and chain.ts's
+ * nextPendingIndex selects only `status === 'pending'`, so a skipped step is
+ * naturally excluded from step driving.
+ */
+export function skipChainStep(projectRoot, sessionId, stepId, transition) {
+    return runChainMutation(projectRoot, sessionId, 'chain-skip', { step_id: stepId }, {
+        operation: 'skip', stepId,
+    }, transition);
+}
+/**
+ * Replace fields of a pending chain step in place. Only `pending` steps may be
+ * replaced. When `command` changes the step_id is regenerated at the step's
+ * current index to keep the `step-{NNN}-{command}` convention consistent.
+ */
+export function replaceChainStep(projectRoot, sessionId, stepId, opts) {
+    return runChainMutation(projectRoot, sessionId, 'chain-replace', {
+        step_id: stepId,
+        command: opts.command ?? null,
+        has_command: opts.command !== undefined,
+        args: opts.args ?? null,
+        has_args: opts.args !== undefined,
+        stage: opts.stage ?? null,
+        has_stage: opts.stage !== undefined,
+        goal_ref: opts.goalRef ?? null,
+        has_goal_ref: opts.goalRef !== undefined,
+    }, { operation: 'replace', stepId, options: opts }, opts.transition);
+}
+/** Apply an integral meta replacement to an in-memory authority draft. */
+export function applyMetaMutation(bundle, opts) {
+    const orchestration = bundle.session.orchestration;
+    const updated = [];
+    if (opts.position !== undefined) {
+        orchestration.position = opts.position;
+        updated.push('position');
+    }
+    if (opts.decomposition !== undefined) {
+        orchestration.decomposition = opts.decomposition;
+        updated.push('decomposition');
+    }
+    bundle.session.activity_revision++;
+    return {
+        session_id: bundle.session.session_id,
+        updated,
+        position: orchestration.position ?? null,
+        decomposition: orchestration.decomposition ?? null,
+    };
+}
+/**
+ * Parse + validate a caller-supplied position block against positionSchema. The
+ * error is surfaced verbatim to the CLI so a malformed block reports the exact
+ * offending field rather than a whole-session parse failure.
+ */
+export function parsePositionInput(raw) {
+    return positionSchema.parse(raw);
+}
+/** Parse + validate a caller-supplied decomposition block against decompositionSchema. */
+export function parseDecompositionInput(raw) {
+    return decompositionSchema.parse(raw);
+}
+/**
+ * Integral-replace orchestration.position and/or orchestration.decomposition.
+ * The single write入口 for goal-audit / task_decomposition status flips /
+ * goal_changelog appends — the prompt layer rebuilds the whole block and submits
+ * it here rather than editing session.json directly. At least one block must be
+ * provided (enforced by the caller). Blocks are validated by the caller via
+ * parsePositionInput / parseDecompositionInput before this replaces them; the
+ * transition transaction re-parse is the final guard.
+ */
+export function updateSessionMeta(projectRoot, sessionId, opts) {
+    const store = new SessionStore(projectRoot);
+    if (!store.sessionExists(sessionId)) {
+        throw new Error(`session not found: ${sessionId}`);
+    }
+    const prepared = prepareTransitionMutation({
+        session: store.readBundle(sessionId).session,
+        currentFence: store.readSessionFence(sessionId),
+        operation: 'meta-update',
+        subject: { session_id: sessionId, run_id: null, chain_step_id: null },
+        payload: {
+            position: opts.position ?? null,
+            has_position: opts.position !== undefined,
+            decomposition: opts.decomposition ?? null,
+            has_decomposition: opts.decomposition !== undefined,
+        },
+        options: opts.transition,
+    });
+    const evaluated = store.replayOrApplyTransition(sessionId, prepared.request, draft => {
+        assertMutationGuards(draft, prepared.options);
+        const value = applyMetaMutation(draft, opts);
+        return createTransitionOutcome({
+            request_id: prepared.request.request_id,
+            request_hash: prepared.request.normalized_request_hash,
+            operation: 'meta-update', status: 'applied', applied_at: new Date().toISOString(),
+            subject: prepared.request.subject,
+            postconditions: {
+                session_identity_revision: draft.session.identity_revision,
+                session_activity_revision: draft.session.activity_revision,
+                active_run_id: draft.session.active_run_id,
+                run_hash: null,
+                artifact_registry_revision: draft.artifacts.revision,
+            },
+            exit_code: 0, error_code: null, result: { value },
+        });
+    });
+    return {
+        ...structuredClone(evaluated.outcome.result.value),
+        transition: transitionMutationReceipt(prepared.request, evaluated.outcome, evaluated.replayed),
+    };
+}
+//# sourceMappingURL=chain-admin.js.map

@@ -1,0 +1,64 @@
+import { loadExploreConfig, resolveEndpoints, resolveExploreProxyUrl, injectProxy, DEFAULT_EXPLORE_MAX_TURNS, } from '../../agents/api-explore/config.js';
+import { buildJobsFromEntries, runExploreJobs, } from '../../agents/api-explore/runner.js';
+const MARKER_RE = /<!-- EXPLORE_QUERIES:([\s\S]*?)-->/;
+function extractExploreMarker(prompt) {
+    const match = prompt.match(MARKER_RE);
+    if (!match)
+        return null;
+    try {
+        return JSON.parse(match[1]);
+    }
+    catch {
+        return null;
+    }
+}
+export class ExplorePlugin {
+    cwd;
+    name = 'explore';
+    pendingResults = [];
+    constructor(cwd = process.cwd()) {
+        this.cwd = cwd;
+    }
+    apply(registry) {
+        registry.transformPrompt.tap(this.name, async (prompt) => {
+            const marker = extractExploreMarker(prompt);
+            if (!marker || marker.queries.length === 0)
+                return prompt;
+            const results = await this.runQueries(marker);
+            if (results.length === 0) {
+                return prompt.replace(MARKER_RE, '');
+            }
+            const sections = results.map((r, i) => `### Explore [${i + 1}]: ${truncate(r.prompt, 60)}\n\n${r.content}`);
+            const block = `## Context (api-explore)\n\n${sections.join('\n\n---\n\n')}`;
+            const cleaned = prompt.replace(MARKER_RE, '');
+            return `${block}\n\n---\n\n${cleaned}`;
+        });
+    }
+    async runQueries(marker) {
+        try {
+            const config = loadExploreConfig();
+            const proxyUrl = resolveExploreProxyUrl(config);
+            const endpoints = resolveEndpoints(config, marker.endpoint);
+            injectProxy(endpoints, proxyUrl);
+            if (endpoints.length === 0)
+                return [];
+            const entries = marker.queries.map(q => ({ prompt: q, endpoint: marker.endpoint }));
+            const jobs = buildJobsFromEntries(entries, endpoints, endpoints);
+            const results = await runExploreJobs({
+                jobs,
+                cwd: this.cwd,
+                maxTurns: marker.maxTurns ?? DEFAULT_EXPLORE_MAX_TURNS,
+                concurrency: Math.min(jobs.length, 4),
+            });
+            return results.filter(r => r.content && !r.error);
+        }
+        catch {
+            return [];
+        }
+    }
+}
+function truncate(s, max) {
+    const line = s.replace(/\n/g, ' ').trim();
+    return line.length > max ? line.slice(0, max - 1) + '…' : line;
+}
+//# sourceMappingURL=explore-plugin.js.map

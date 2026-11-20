@@ -1,0 +1,512 @@
+import {UsageTotalsCache,usageTotals as coreUsageTotals} from 'pi-graph-observability/usage';
+import type {UsageRecordV1} from 'pi-graph-observability/usage';
+import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { ExtensionStatusSegment } from "./extension-status.ts";
+import type { IconGlyphs } from "./icons.ts";
+import { fitSegmentsByPriority, type PrioritizedSegment, type WidthUtils } from "./layout.ts";
+import type { MaestroWorkflowV1 } from "./public/v1/events.ts";
+
+// Re-exported so existing importers keep working; the implementations now live in
+// layout.ts because the widgets need the same priority-collapse behaviour.
+export { fitSegmentsByPriority, type WidthUtils };
+
+export type PaintTheme = Pick<Theme, "fg">;
+
+export interface UsageTotals {
+	unknownFields?: string[];
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	latestCacheHitRate: number | undefined;
+}
+
+export interface FooterParts {
+	model: string;
+	provider?: string;
+	thinking?: string;
+	cwd?: string;
+	ctxPct: number;
+	ctxTokens: number;
+	ctxWindow: number;
+	totals: UsageTotals;
+	/** Cost currency for the footer: "usd" shows $, "cny" converts by currencyRate and shows ¥. */
+	currency?: "usd" | "cny";
+	/** CNY per 1 USD; only used when currency is "cny". */
+	currencyRate?: number;
+	git?: string;
+	agentSummary?: string;
+	bashBgStatus?: string;
+	workflowStatus?: string;
+	/** Maestro workflow session/run snapshot from the UI projection channel. */
+	maestroWorkflow?: MaestroWorkflowV1 | null;
+	supervisionStatus?: string;
+	/** Provider usage bars (quota/balance/spend) on a dedicated footer line. */
+	usageStatus?: string;
+	extensionStatuses?: readonly ExtensionStatusSegment[];
+	width: number;
+	glyphs: IconGlyphs;
+	theme: PaintTheme;
+	utils: WidthUtils;
+}
+
+export function emptyTotals(): UsageTotals {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, latestCacheHitRate: undefined };
+}
+
+interface UsageCacheEntry {
+	key: string;
+	totals: UsageTotals;
+	computedAt: number;
+}
+
+const DEFAULT_USAGE_THROTTLE_MS = 500;
+
+let usageCache: UsageCacheEntry | undefined;
+const coreTotalsCache=new UsageTotalsCache();
+let usageRevision=0;
+// Static mode lowers the token refresh cadence. The getter reads live config so
+// a toggle applies on the next render without re-registering.
+let usageThrottleMs: (() => number) | undefined;
+
+/** Set the wall-clock throttle for token totals; 0 means uncapped. */
+export function setUsageThrottle(getMs: () => number): void {
+	usageThrottleMs = getMs;
+}
+
+function entryIdentity(entry: unknown): string {
+	const e = entry as {
+		id?: string;
+		timestamp?: number;
+		type?: string;
+		message?: {
+			role?: string;
+			usage?: {
+				input?: number;
+				output?: number;
+				cacheRead?: number;
+				cacheWrite?: number;
+				cost?: { total?: number };
+			};
+		};
+	} | undefined;
+	if (!e) return "";
+	const usage = e.message?.usage;
+	const usageKey = usage
+		? JSON.stringify(usage)
+		: "";
+	return `${e.id ?? ""}|${e.timestamp ?? ""}|${e.type ?? ""}|${e.message?.role ?? ""}|${usageKey}`;
+}
+
+function entriesKey(entries: readonly unknown[]): string {
+	return entries.map(entryIdentity).join("\0");
+}
+
+export function invalidateUsageCache(): void {
+	usageCache = undefined;
+	coreTotalsCache.clear();
+}
+
+// Sum assistant-message usage across session entries (shape: entry.message.usage).
+export function getUsageTotals(entries: readonly unknown[], now: number = Date.now()): UsageTotals {
+	const key = entriesKey(entries);
+	const throttleMs = Math.max(0, usageThrottleMs?.() ?? DEFAULT_USAGE_THROTTLE_MS);
+	if (
+		usageCache
+		&& usageCache.key === key
+		&& (throttleMs === 0 || now - usageCache.computedAt < throttleMs)
+	) {
+		return usageCache.totals;
+	}
+
+	const records:UsageRecordV1[]=[];
+	for(const value of entries){
+		const entry=value as {id?:string;type?:string;message?:{role?:string;usage?:{input?:number;output?:number;cacheRead?:number;cacheWrite?:number;cost?:{total?:number}}}}|undefined;
+		if(entry?.type!=='message'||entry.message?.role!=='assistant'||!entry.message.usage)continue;
+		const usage=entry.message.usage;
+		const clean=(value:unknown):number|undefined=>typeof value==='number'&&Number.isFinite(value)&&value>=0?value:undefined;
+		const tokens=Object.fromEntries(['input','output','cacheRead','cacheWrite'].flatMap(k=>{const v=clean(usage[k as keyof typeof usage]);return v===undefined?[]:[[k,v]];}));
+		const cost=clean(usage.cost?.total);
+		records.push({ts:records.length,model:'session',provider:'session',sessionId:'footer',cwd:'footer',usage:tokens,cost:cost===undefined?{}:{total:cost}});
+	}
+	if(usageCache?.key!==key)usageRevision++;
+	const totals=coreTotalsCache.get('footer',usageRevision,records),latest=records.at(-1),last=latest?coreUsageTotals([latest]):undefined;
+	const prompt=last&&last.input!==undefined&&last.cacheRead!==undefined&&last.cacheWrite!==undefined?last.input+last.cacheRead+last.cacheWrite:undefined;
+	const t:UsageTotals={input:totals.input??0,output:totals.output??0,cacheRead:totals.cacheRead??0,cacheWrite:totals.cacheWrite??0,cost:totals.totalCost??0,unknownFields:totals.unknownFields,latestCacheHitRate:prompt!==undefined&&prompt>0?last!.cacheRead!/prompt*100:undefined};
+	usageCache = { key, totals: t, computedAt: now };
+	return t;
+}
+
+export function fmtTokens(n: number): string {
+	if (n >= 1_000_000) return trim(n / 1_000_000) + "m";
+	if (n >= 1_000) return trim(n / 1_000) + "k";
+	return String(n);
+}
+
+// USD cost formatting (the "$" glyph is painted by the caller, like ↑/↓ for tokens):
+// cents below $1, two decimals above, compact k above $1k. Sub-cent values keep
+// enough significant digits to stay meaningful (e.g. 0.008).
+export function fmtCost(n: number): string {
+	if (n >= 1_000) return trim(n / 1_000) + "k";
+	if (n >= 100) return String(Math.round(n));
+	if (n >= 0.01) return (Math.round((n + Number.EPSILON) * 100) / 100).toFixed(2);
+	return n.toFixed(4).replace(/\.?0+$/, "");
+}
+
+function trim(x: number): string {
+	return x.toFixed(1).replace(/\.0$/, "");
+}
+
+export function renderBar(pct: number, barWidth: number, glyphs: IconGlyphs, theme: PaintTheme): string {
+	const w = Math.max(0, barWidth);
+	const clamped = Math.max(0, Math.min(100, pct));
+	const filled = Math.max(0, Math.min(w, Math.round((clamped / 100) * w)));
+	const empty = w - filled;
+	return theme.fg("dim", "[") + theme.fg(contextColor(pct), glyphs.barDone.repeat(filled)) + theme.fg("dim", glyphs.barPending.repeat(empty)) + theme.fg("dim", "]");
+}
+
+const CONTEXT_WARN_PCT = 70;
+const CONTEXT_CRITICAL_PCT = 90;
+
+function contextColor(pct: number): ThemeColor {
+	if (pct >= CONTEXT_CRITICAL_PCT) return "error";
+	if (pct >= CONTEXT_WARN_PCT) return "warning";
+	return "accent";
+}
+
+// Crossing a context threshold used to be signalled by hue alone. The glyph makes
+// the escalation readable without colour, per the non-colour-accessibility rule.
+function contextMark(pct: number, glyphs: IconGlyphs): string {
+	return pct >= CONTEXT_WARN_PCT ? `${glyphs.blocked} ` : "";
+}
+
+// yolo / bypassPermissions disable approval prompts entirely. Red text alone is
+// not enough for a safety-relevant state.
+const UNSAFE_APPROVAL_MODES = new Set(["yolo", "bypasspermissions"]);
+
+function approvalMode(status: ExtensionStatusSegment): string {
+	return status.text.replace(/^APPROVAL\s+/i, "").trim().toLowerCase();
+}
+
+function extensionStatusColor(status: ExtensionStatusSegment): ThemeColor {
+	if (status.key === "maestro-auto-compact-mode") {
+		return /\bON$/i.test(status.text.trim()) ? "success" : "muted";
+	}
+	if (status.key === "mode") {
+		const mode = status.text.trim().toUpperCase();
+		if (mode === "ACT") return "success";
+		if (mode === "PLAN") return "warning";
+		if (mode === "READY" || mode === "PLAN READY") return "accent";
+		return "muted";
+	}
+	if (status.key === "maestro-plan-auto") return "warning";
+	if (status.key === "self-evolve") return "success";
+	if (status.key === "decision-policy") {
+		if (status.text.startsWith("DEC !")) return "error";
+		if (status.text.startsWith("DEC ?")) return "accent";
+		if (status.text.startsWith("DEC ▶")) return "warning";
+		if (status.text.startsWith("DEC ✓")) return "success";
+	}
+	if (status.key !== "approval-mode") return "muted";
+	const mode = approvalMode(status);
+	if (UNSAFE_APPROVAL_MODES.has(mode)) return "error";
+	if (mode === "dontask") return "warning";
+	if (mode === "acceptedits") return "success";
+	if (mode === "plan") return "accent";
+	return "text";
+}
+
+const HIDDEN_EXTENSION_STATUS_KEYS = new Set([
+	"maestro-auto-compact-mode",
+	// The active thinking level already belongs to the model identity on line one.
+	"maestro-effort",
+	"mcp",
+	"swarm-best",
+	"team-swarm",
+]);
+
+function isVisibleExtensionStatus(status: ExtensionStatusSegment, thinking?: string): boolean {
+	if (status.text === "" || status.text === thinking) return false;
+	if (HIDDEN_EXTENSION_STATUS_KEYS.has(status.key)) return false;
+	if (status.key === "self-evolve" && /^EVOL off$/i.test(status.text.trim())) return false;
+	if (status.key === "maestro-plan-auto" && /^PLAN-AUTO off$/i.test(status.text.trim())) return false;
+	if (status.key === "decision-policy" && /^DEC ○ (?:未配置|A:off E:off)$/i.test(status.text.trim())) return false;
+	return !/^(?:TEAM SWARM\b|BEST\b|COMPLETED$|ACT$)/i.test(status.text.trim());
+}
+
+function paintExtensionStatus(
+	status: ExtensionStatusSegment,
+	theme: PaintTheme,
+): string {
+	const marker = status.key === "decision-policy"
+		? /^(DEC) ([○!?▶✓])(.*)$/.exec(status.text)
+		: status.key === "self-evolve" ? /^(EVOL) (●)(.*)$/.exec(status.text) : null;
+	if (marker) {
+		return theme.fg("muted", `${marker[1]} `)
+			+ theme.fg(extensionStatusColor(status), marker[2])
+			+ theme.fg("muted", marker[3]);
+	}
+	const text = status.key === "approval-mode" && UNSAFE_APPROVAL_MODES.has(approvalMode(status))
+		? "YOLO"
+		: status.key === "maestro-auto-compact-mode"
+			? status.text.replace(/^AUTO\s+/i, "AUTO COMPACT ")
+			: status.text;
+	return theme.fg(extensionStatusColor(status), text);
+}
+
+const MAESTRO_STATUS_GLYPHS: Record<string, string> = {
+	running: "▶",
+	paused: "⏸",
+	blocked: "!",
+	waiting_user: "?",
+	retrying: "↻",
+	sealed: "✓",
+	failed: "×",
+	cancelled: "⊘",
+	ready: "✓",
+	completed: "✓",
+	pending: "○",
+	unknown: "□",
+};
+
+function maestroStatusColor(status: string): ThemeColor {
+	switch (status) {
+		case "running":
+		case "retrying":
+			return "warning";
+		case "blocked":
+		case "failed":
+		case "cancelled":
+			return "error";
+		case "completed":
+		case "ready":
+		case "sealed":
+			return "success";
+		case "paused":
+		case "waiting_user":
+			return "accent";
+		default:
+			return "muted";
+	}
+}
+
+/**
+ * Maestro Session/Run footer line, sourced from the Flow UI projection snapshot.
+ * Mirrors the shape Flow renders when it owns the footer: session label first so
+ * concurrent sessions stay identifiable at narrow widths.
+ */
+function renderMaestroWorkflowLine(workflow: MaestroWorkflowV1, theme: PaintTheme, g: IconGlyphs): string {
+	const sep = ` ${theme.fg("dim", g.separator.trim())} `;
+	const run = workflow.run;
+	const status = run?.status ?? workflow.session.status;
+	const parts: string[] = [`${theme.fg("accent", "⚑")} ${theme.fg("accent", workflow.session.label)}`];
+	if (workflow.next) parts.push(theme.fg("warning", `» ${workflow.next}`));
+	parts.push(theme.fg(maestroStatusColor(status), `${MAESTRO_STATUS_GLYPHS[status] ?? "□"} ${status}`));
+	if (run) parts.push(theme.fg("muted", `${run.id}/${run.command}`));
+	parts.push(`${theme.fg("success", `✓${workflow.chain.completed}`)} ${theme.fg("warning", `▶${workflow.chain.running}`)} ${theme.fg("dim", `○${workflow.chain.pending}`)}`);
+	if (workflow.gates.total > 0) parts.push(theme.fg("muted", `gate ${workflow.gates.passed}/${workflow.gates.total}`));
+	return parts.join(sep);
+}
+
+function alignRight(left: string, right: string, width: number, measure: WidthUtils["measure"]): string {
+	if (right === "") return left;
+	const rw = measure(right);
+	if (left === "") return " ".repeat(Math.max(0, width - rw)) + right;
+	const lw = measure(left);
+	if (lw + rw + 1 > width) return left;
+	return left + " ".repeat(width - lw - rw) + right;
+}
+
+export function renderFooter(p: FooterParts): string[] {
+	const { width: viewportWidth, theme, glyphs: g, utils } = p;
+	if (viewportWidth <= 0) return [""];
+	// Footer values repaint on usage, Git, workflow and background-job updates.
+	// Reserve the last terminal column so those rewrites cannot trigger auto-wrap.
+	const width = Math.max(1, viewportWidth - 1);
+	const ell = theme.fg("dim", g.ellipsis);
+	const sep = theme.fg("dim", g.separator.trim());
+
+	const identitySeparator = ` ${sep} `;
+	const visibleStatuses = (p.extensionStatuses ?? []).filter(
+		(status) => isVisibleExtensionStatus(status, p.thinking),
+	);
+	const fastStatus = visibleStatuses.find((status) => status.key === "codex-fast");
+	const controlStatuses = visibleStatuses.filter(
+		(status) => status.key === "mode"
+			|| status.key === "approval-mode"
+			|| status.key === "maestro-auto-compact-mode",
+	);
+
+	// line 1: prioritized identity and control segments
+	// minWidth keeps a glyph-prefixed segment from decaying into "{icon}…", which
+	// costs columns and tells the user nothing about the path or branch.
+	const labelled = (glyph: string, value: string, priority: number, color: ThemeColor): PrioritizedSegment => ({
+		text: `${theme.fg(color, glyph)} ${theme.fg(color, value)}`,
+		priority,
+		minWidth: utils.measure(glyph) + 1 + utils.measure(g.ellipsis) + 3,
+	});
+	const leftParts: PrioritizedSegment[] = controlStatuses.map((status, index) => ({
+		text: paintExtensionStatus(status, theme),
+		priority: 8 - index,
+		clippable: false,
+	}));
+	leftParts.push({
+		text: `${theme.fg("accent", g.model)} ${theme.fg("accent", p.model)}`,
+		priority: 5,
+		minWidth: utils.measure(g.model) + 1 + utils.measure(g.ellipsis) + 3,
+	});
+	if (fastStatus) {
+		leftParts.push({ text: theme.fg("success", "FAST"), priority: 4, clippable: false });
+	}
+	if (p.thinking && p.thinking !== "off") {
+		leftParts.push({ text: theme.fg("muted", p.thinking), priority: 4, clippable: false });
+	}
+	if (p.supervisionStatus) {
+		leftParts.push({
+			text: `${theme.fg("muted", "SUP")} ${theme.fg("warning", p.supervisionStatus)}`,
+			priority: 2,
+			clippable: true,
+			minWidth: utils.measure("SUP") + 1 + utils.measure(g.ellipsis) + 3,
+		});
+	}
+	if (p.cwd) leftParts.push(labelled(g.workspace, p.cwd, 0, "syntaxFunction"));
+	if (p.git) leftParts.push(labelled(g.git, p.git, 3, "syntaxFunction"));
+
+	// line 1: a left identity group and one right-aligned resource group.
+	// The resource group progressively contracts before lower-priority identity
+	// segments are sacrificed: full bar → compact bar → percentage → token totals.
+	const resourceCandidates: string[] = [];
+	const statSeparator = ` ${sep} `;
+	const addResourceCandidate = (...parts: string[]): void => {
+		const candidate = parts.filter((part) => part !== "").join(statSeparator);
+		if (!resourceCandidates.includes(candidate)) resourceCandidates.push(candidate);
+	};
+
+	const t = p.totals;
+	const inputText = `${theme.fg("accent", g.tokensIn)}${t.unknownFields?.includes("input")?"?":fmtTokens(t.input)}`;
+	const outputText = `${theme.fg("success", g.tokensOut)}${t.unknownFields?.includes("output")?"?":fmtTokens(t.output)}`;
+	const tokenStats = [inputText, outputText];
+	const coreStats = [...tokenStats];
+	const hasCache = t.cacheRead > 0 || t.cacheWrite > 0;
+	if (hasCache && t.latestCacheHitRate !== undefined) {
+		coreStats.push(`${theme.fg("success", g.cacheHit)}${t.latestCacheHitRate.toFixed(0)}%`);
+	}
+	const fullStats = p.agentSummary
+		? [...coreStats, theme.fg("accent", p.agentSummary)]
+		: coreStats;
+
+	// Cost only appears once the channel registers pricing; a $0 estimate is
+	// noise on every session of an unconfigured custom provider.
+	const currency = p.currency ?? "usd";
+	const rate = p.currencyRate && p.currencyRate > 0 ? p.currencyRate : 1;
+	const costValue = currency === "cny" ? t.cost * rate : t.cost;
+	const costSymbol = currency === "cny" ? "¥" : g.cost;
+	const costText = t.unknownFields?.includes("totalCost") ? `${theme.fg("warning", costSymbol)}?` : costValue > 0 ? `${theme.fg("warning", costSymbol)}${fmtCost(costValue)}` : "";
+	const withCost = (stats: string[]): string[] => (costText && stats.length > 0 ? [...stats, costText] : stats);
+
+	if (p.ctxWindow > 0) {
+		// A contextWindow that under-reports the live token count (custom providers
+		// do this) previously printed e.g. "137%" beside a bar clamped at full.
+		const shownPct = Math.min(100, Math.round(p.ctxPct));
+		const pctText = theme.fg(
+			contextColor(p.ctxPct),
+			`${contextMark(p.ctxPct, g)}${shownPct}%`,
+		);
+		const tokText = `${theme.fg("text", fmtTokens(p.ctxTokens))}${theme.fg("dim", "/")}${theme.fg("text", fmtTokens(p.ctxWindow))}`;
+		const fullContext = `${renderBar(p.ctxPct, 10, g, theme)} ${pctText} ${sep} ${tokText}`;
+		const compactContext = `${renderBar(p.ctxPct, 5, g, theme)} ${pctText} ${sep} ${tokText}`;
+		const capacityContext = `${pctText} ${sep} ${tokText}`;
+		addResourceCandidate(fullContext, ...withCost(fullStats));
+		addResourceCandidate(fullContext, ...withCost(coreStats));
+		addResourceCandidate(compactContext, ...withCost(coreStats));
+		addResourceCandidate(compactContext, ...withCost(tokenStats));
+		addResourceCandidate(capacityContext, ...withCost(tokenStats));
+		addResourceCandidate(pctText, ...withCost(tokenStats));
+		addResourceCandidate(...withCost(tokenStats));
+		addResourceCandidate(pctText);
+	} else {
+		addResourceCandidate(...withCost(fullStats));
+		addResourceCandidate(...withCost(coreStats));
+		addResourceCandidate(...withCost(tokenStats));
+	}
+	resourceCandidates.push("");
+
+	const fitLeftBeside = (right: string): string[] => {
+		const rightWidth = utils.measure(right);
+		const available = Math.max(0, width - rightWidth - (right ? 1 : 0));
+		return fitSegmentsByPriority(
+			leftParts,
+			available,
+			utils.measure,
+			utils.clip,
+			g.ellipsis,
+			utils.measure(identitySeparator),
+		);
+	};
+
+	let right1 = "";
+	let fittedLeft: string[] = [];
+	let selected = false;
+	for (const candidate of resourceCandidates) {
+		const candidateLeft = fitLeftBeside(candidate);
+		if (candidateLeft.length !== leftParts.length) continue;
+		right1 = candidate;
+		fittedLeft = candidateLeft;
+		selected = true;
+		break;
+	}
+	if (!selected) {
+		// At extreme widths keep the highest-priority identity segment beside the
+		// smallest useful context summary. If even that cannot fit, identity wins.
+		for (let index = resourceCandidates.length - 2; index >= 0; index--) {
+			const candidate = resourceCandidates[index];
+			const candidateLeft = fitLeftBeside(candidate);
+			if (candidateLeft.length === 0) continue;
+			right1 = candidate;
+			fittedLeft = candidateLeft;
+			selected = true;
+			break;
+		}
+	}
+	if (!selected) fittedLeft = fitLeftBeside("");
+
+	const line1 = alignRight(fittedLeft.join(identitySeparator), right1, width, utils.measure);
+	const lines = [utils.clip(line1, width, ell)];
+	if (p.bashBgStatus) {
+		lines.push(utils.clip(p.bashBgStatus, width, ell));
+	}
+	if (p.usageStatus) {
+		lines.push(utils.clip(p.usageStatus, width, ell));
+	}
+	if (p.workflowStatus) {
+		lines.push(utils.clip(theme.fg("muted", p.workflowStatus), width, ell));
+	}
+	if (p.maestroWorkflow) {
+		lines.push(utils.clip(renderMaestroWorkflowLine(p.maestroWorkflow, theme, g), width, ell));
+	}
+	const statuses = visibleStatuses.filter((status) => status !== fastStatus && !controlStatuses.includes(status));
+	if (statuses.length > 0) {
+		const statusSeparator = ` ${sep} `;
+		const fittedStatuses = fitSegmentsByPriority(
+			statuses.map((status, index) => {
+				const unsafe = status.key === "approval-mode" && UNSAFE_APPROVAL_MODES.has(approvalMode(status));
+				return {
+					text: paintExtensionStatus(status, theme),
+					// An unsafe approval mode must never be the segment that gets dropped.
+					priority: unsafe ? statuses.length + 1 : statuses.length - index,
+					clippable: !unsafe,
+				};
+			}),
+			width,
+			utils.measure,
+			utils.clip,
+			g.ellipsis,
+			utils.measure(statusSeparator),
+		);
+		if (fittedStatuses.length > 0) {
+			lines.push(utils.clip(fittedStatuses.join(statusSeparator), width, ell));
+		}
+	}
+	return lines;
+}

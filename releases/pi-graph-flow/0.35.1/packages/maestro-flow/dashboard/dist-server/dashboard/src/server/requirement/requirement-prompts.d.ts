@@ -1,0 +1,7 @@
+import type { OutputFormat } from '@anthropic-ai/claude-agent-sdk';
+import type { ExpansionDepth, ExpandedRequirement } from '../../shared/requirement-types.js';
+export declare const REQUIREMENT_SYSTEM_PROMPT = "You are a requirements analyst for a software development workflow system.\n\n## Role\nYou decompose user requirements into structured, actionable checklist items. Each item should be independently estimable and assignable. You produce ONLY valid JSON \u2014 no markdown, no explanation.\n\n## Principles\n- Break requirements down along natural boundaries (feature, module, layer)\n- Each item must have a clear definition of done implied by its title + description\n- Dependencies should be explicit \u2014 if item B needs item A done first, list A in deps\n- Estimated effort should be realistic relative to the scope\n- Priority reflects business value and risk, not just implementation order\n- Types: \"feature\" for new capabilities, \"task\" for infrastructure/setup, \"bug\" for defects, \"improvement\" for enhancements\n";
+export declare function buildExpandPrompt(text: string, depth: ExpansionDepth): string;
+export declare function buildRefinePrompt(requirement: ExpandedRequirement, feedback: string): string;
+export declare function buildContinuePrompt(text: string, depth: ExpansionDepth, previousRequirement: ExpandedRequirement): string;
+export declare const REQUIREMENT_OUTPUT_SCHEMA: OutputFormat;

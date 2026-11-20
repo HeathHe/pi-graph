@@ -1,0 +1,149 @@
+// src/graph/kg/extraction/code/svelte-extractor.ts
+// Svelte 提取器: script 块 + 模板函数调用 + PascalCase 组件引用
+// Svelte 5 rune 过滤 ($state/$derived/$effect 不产生节点)
+// 参考: codegraph/src/extraction/svelte-extractor.ts
+import { makeFileNodeId, makeImportReference, } from './tree-sitter-types.js';
+import { getTreeSitterEngine } from './tree-sitter.js';
+import { rebaseStructuralReferenceOrigin, } from '../../resolution/structural-reference.js';
+// Svelte 5 runes — 这些是编译器指令, 不产生符号
+const SVELTE_RUNES = new Set([
+    '$state', '$derived', '$effect', '$props', '$bindable',
+    '$inspect', '$host', '$effect.pre', '$effect.root',
+]);
+function parseSvelte(source) {
+    const blocks = [];
+    // <script> 块
+    const scriptRegex = /<script([^>]*)>([\s\S]*?)<\/script>/;
+    const scriptMatch = source.match(scriptRegex);
+    if (scriptMatch) {
+        const fullMatchIndex = scriptMatch.index ?? 0;
+        const startLine = source.substring(0, fullMatchIndex).split('\n').length;
+        const tagEnd = source.indexOf('>', fullMatchIndex);
+        const contentStart = source.substring(0, tagEnd + 1).split('\n').length;
+        const langMatch = scriptMatch[1].match(/lang=["'](\w+)["']/);
+        blocks.push({
+            type: 'script',
+            content: scriptMatch[2],
+            startLine: contentStart,
+            lang: langMatch?.[1],
+        });
+    }
+    return blocks;
+}
+export async function extractSvelte(source, filePath, onEmbeddedParseError = 'warn') {
+    const blocks = parseSvelte(source);
+    const symbols = [];
+    const references = [];
+    const importReferences = [];
+    const structuralReferences = [];
+    const edges = [];
+    const engine = getTreeSitterEngine();
+    for (const block of blocks) {
+        if (block.type === 'script' && block.content.trim()) {
+            const lang = (block.lang === 'ts' || block.lang === 'typescript')
+                ? 'typescript'
+                : 'javascript';
+            if (!engine.isAvailable()) {
+                if (onEmbeddedParseError === 'fail') {
+                    throw new Error(`Svelte embedded script parser unavailable (${lang}): ${filePath}`);
+                }
+                continue;
+            }
+            try {
+                const tree = await engine.parse(block.content, lang);
+                if (!tree) {
+                    throw new Error(`tree-sitter returned no ${lang} tree`);
+                }
+                try {
+                    const { javascriptExtractor, typescriptExtractor } = await import('./languages/typescript.js');
+                    const extractor = lang === 'typescript' ? typescriptExtractor : javascriptExtractor;
+                    const result = extractor.extract(tree, block.content, filePath);
+                    for (const sym of result.symbols) {
+                        // 过滤 Svelte 5 runes
+                        if (SVELTE_RUNES.has(sym.name))
+                            continue;
+                        sym.startLine += block.startLine - 1;
+                        sym.endLine += block.startLine - 1;
+                        symbols.push(sym);
+                    }
+                    for (const ref of result.references) {
+                        ref.line += block.startLine - 1;
+                        references.push(ref);
+                    }
+                    for (const ref of result.importReferences ?? []) {
+                        importReferences.push({
+                            ...ref,
+                            line: ref.line + block.startLine - 1,
+                        });
+                    }
+                    for (const ref of result.structuralReferences ?? []) {
+                        structuralReferences.push(rebaseStructuralReferenceOrigin(ref, {
+                            ...ref.origin,
+                            line: ref.origin.line + block.startLine - 1,
+                        }));
+                    }
+                    for (const edge of result.edges) {
+                        edges.push({
+                            ...edge,
+                            ...(edge.line === undefined ? {} : { line: edge.line + block.startLine - 1 }),
+                        });
+                    }
+                }
+                finally {
+                    tree.delete();
+                }
+            }
+            catch (err) {
+                if (onEmbeddedParseError === 'fail') {
+                    throw new Error(`Svelte embedded script parse failed (${lang}): ${filePath}`, { cause: err });
+                }
+                if (process.env.MAESTRO_DEBUG === '1')
+                    console.warn('[MaestroGraph] Svelte script parse error:', err);
+            }
+        }
+    }
+    // 从模板提取 PascalCase 组件引用
+    const componentRegex = /<([A-Z][a-zA-Z0-9]*)/g;
+    let compMatch;
+    const seen = new Set();
+    while ((compMatch = componentRegex.exec(source)) !== null) {
+        const componentName = compMatch[1];
+        if (!seen.has(componentName) && !SVELTE_RUNES.has(componentName)) {
+            seen.add(componentName);
+            const line = source.substring(0, compMatch.index).split('\n').length;
+            references.push({
+                fromSymbolName: '<file>',
+                fromSymbolId: makeFileNodeId(filePath),
+                referenceName: componentName,
+                referenceKind: 'imports',
+                line,
+                col: compMatch.index + 1,
+                filePath,
+                language: 'svelte',
+            });
+            importReferences.push(makeImportReference(filePath, componentName, line, compMatch.index + 1, 'component'));
+        }
+    }
+    // 标记(markup)表达式函数调用 → calls: {fmt(n)} / {#if fn()} / on:click={() => inc()}
+    const markupCallRegex = /\{([^{}]*?)([A-Za-z_$][\w$]*)\s*\(/g;
+    const MARKUP_KEYWORDS = new Set(['if', 'each', 'await', 'key', 'then', 'catch', 'snippet', 'render', 'html', 'const', 'debug']);
+    let mcMatch;
+    while ((mcMatch = markupCallRegex.exec(source)) !== null) {
+        const fnName = mcMatch[2];
+        if (SVELTE_RUNES.has(fnName) || MARKUP_KEYWORDS.has(fnName))
+            continue;
+        const line = source.substring(0, mcMatch.index).split('\n').length;
+        references.push({
+            fromSymbolName: '<file>',
+            fromSymbolId: makeFileNodeId(filePath),
+            referenceName: fnName,
+            referenceKind: 'calls',
+            line,
+            col: mcMatch.index + (mcMatch[0].length - fnName.length) + 1,
+            filePath,
+            language: 'svelte',
+        });
+    }
+    return { symbols, references, importReferences, structuralReferences, edges };
+}
+//# sourceMappingURL=svelte-extractor.js.map

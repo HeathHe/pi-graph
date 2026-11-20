@@ -1,0 +1,390 @@
+{
+  "kind": "version-bound source recipe; resolve local inputs before invoking buildOwnedSdk",
+  "sdk": {
+    "name": "@earendil-works/pi-coding-agent",
+    "version": "1.5.2",
+    "packageSHA256": "18b422b7d80f2caa2551d253c0a8409e1caa54b954bfb7d18252e507bb8a0318",
+    "inventorySHA256": "5e2f3c289f058900201288db193613615a60c8388b4166cdba5a358c45c03320"
+  },
+  "sourcePins": [
+    {
+      "path": "flow/src/gateway/contracts.ts",
+      "sha256": "26933234220785d85cd17c290fff11c9db3d54df614a10316c64bd6895ac8b0e",
+      "bytes": 14300
+    },
+    {
+      "path": "flow/src/gateway/fabric/endpoint-dispatcher.ts",
+      "sha256": "2135b2d816aead24d54a8e041fa8910a1b8f925211354802d1b37b654ecd26d0",
+      "bytes": 13035
+    },
+    {
+      "path": "flow/src/gateway/fabric/https-transport.ts",
+      "sha256": "ba0da4eab8c11e42803691ab6a5d6b6efb2160763e7ba86db67cdbc027d1be46",
+      "bytes": 25478
+    },
+    {
+      "path": "flow/src/host/host-types.ts",
+      "sha256": "b7600ed6d755561de465245a52a01dc279d3ae734b91b453f84585b5eab66f89",
+      "bytes": 1928
+    },
+    {
+      "path": "flow/src/host/main.ts",
+      "sha256": "e3a040e001eae73a070cd5db425e8363315b989cc1f0320398ef58532acf7b88",
+      "bytes": 3079
+    },
+    {
+      "path": "flow/src/host/owned-default-launcher.ts",
+      "sha256": "eac0f9f39bc7b12069f4839e126a865228e382c6c93a79b9dc9a5a5e1fc58c3c",
+      "bytes": 4660
+    },
+    {
+      "path": "flow/src/host/sdk-types.ts",
+      "sha256": "1464a16d4514774e5b1b6ed43617dd43225da853b4912616296a6f2042b4c7ab",
+      "bytes": 700
+    },
+    {
+      "path": "flow/src/host/session-scope.ts",
+      "sha256": "d4ff635d16bfeecfcb4f89af80958ead31120df18359bf308a25752cb7eeb798",
+      "bytes": 5275
+    },
+    {
+      "path": "flow/src/mcp/abort.ts",
+      "sha256": "e73c182626cd187a3ae83254d146875ca6c71c911c6cdbe74890003b8811784a",
+      "bytes": 1073
+    },
+    {
+      "path": "flow/src/mcp/agent-dir.ts",
+      "sha256": "f68dc27c933e1cbbd6c411c2142db48048dd5e861de17cd596970736447b0724",
+      "bytes": 537
+    },
+    {
+      "path": "flow/src/mcp/consent-manager.ts",
+      "sha256": "fcc15906c716bafbda0c09769d06b6a7ec4e4d97661858f54490ae6af594a469",
+      "bytes": 1976
+    },
+    {
+      "path": "flow/src/mcp/elicitation-handler.ts",
+      "sha256": "e6fe9704f15c0d5bb1814cb039a84cadb44061988cdc29c04b72f701b08bb816",
+      "bytes": 14713
+    },
+    {
+      "path": "flow/src/mcp/errors.ts",
+      "sha256": "30f55692a20fc6275533523dd069d91d905f830f568fdfeeaaea7777fbcd3f7b",
+      "bytes": 5814
+    },
+    {
+      "path": "flow/src/mcp/fabric-mount-registry.ts",
+      "sha256": "88f28c5973421ec186b6f9e8c8c667c3dbecf580ce287c07677df464ab4e698c",
+      "bytes": 10750
+    },
+    {
+      "path": "flow/src/mcp/fabric-route-guard.ts",
+      "sha256": "383b61977233e45362fca2cfd853c6626725985f6cc8f9bb7dca1cd7584c6319",
+      "bytes": 3921
+    },
+    {
+      "path": "flow/src/mcp/fabric-transport.ts",
+      "sha256": "5aedf3efa5367c4d66e9c8c86fd458aea0c66e89bccbd698ef0ab69c98618605",
+      "bytes": 8677
+    },
+    {
+      "path": "flow/src/mcp/glimpse-ui.ts",
+      "sha256": "e9dcf75b440f9452c32d622578443f1db4883f00fd95d0986565e4d824271e48",
+      "bytes": 2391
+    },
+    {
+      "path": "flow/src/mcp/host-html-template.ts",
+      "sha256": "e859402654a1fb8fe9ee190d3a576daac168d27ce62681bbcc1561c7cacca025",
+      "bytes": 19885
+    },
+    {
+      "path": "flow/src/mcp/lifecycle.ts",
+      "sha256": "192aec7a5373870eab4c86cb1717385ff12acb4c3f070c8060daea688ed3cb73",
+      "bytes": 10181
+    },
+    {
+      "path": "flow/src/mcp/logger.ts",
+      "sha256": "809888d9b3920dd20b07fc973eced6ce8481b55245bb97d5827bae8b055fb464",
+      "bytes": 4243
+    },
+    {
+      "path": "flow/src/mcp/mcp-auth-flow.ts",
+      "sha256": "564497bdd46e32338f0a9c5dee244751fb3ba1f00b61b086d0bd295450d204ff",
+      "bytes": 2556
+    },
+    {
+      "path": "flow/src/mcp/mcp-auth.ts",
+      "sha256": "14035639afa602fc537870a54743d6c6c7795d149e5af62cc255c3a8ec0ffc05",
+      "bytes": 11020
+    },
+    {
+      "path": "flow/src/mcp/mcp-callback-server.ts",
+      "sha256": "d52d74cebfd64ee7d7ba9c9f8e089c1c5537fe76c49978472f7e2a63d5d25088",
+      "bytes": 15544
+    },
+    {
+      "path": "flow/src/mcp/mcp-oauth-provider.ts",
+      "sha256": "c911b92821a0e4cb727a3418eb10a2dedafc87206f8d19b24e93dd448b64a15e",
+      "bytes": 12888
+    },
+    {
+      "path": "flow/src/mcp/metadata-cache.ts",
+      "sha256": "2e4ad64b9dc291e860ce3cd56a63a69aa6b133300cd92c8efc305a1762a134d4",
+      "bytes": 6533
+    },
+    {
+      "path": "flow/src/mcp/native-app-bridge.ts",
+      "sha256": "39b09b426ff35ab7867badaa7a38c5982274ce2c1414cbd29d0213cb7a5c02de",
+      "bytes": 47156
+    },
+    {
+      "path": "flow/src/mcp/native-app-http-operation.ts",
+      "sha256": "5283d0d6fa662cbc5312a489aa1cbea4b53f104a76a3e862d234af3aa9ac4bfc",
+      "bytes": 1105
+    },
+    {
+      "path": "flow/src/mcp/native-app-port.ts",
+      "sha256": "1a2e374b7be605dfadd828228aef0f6dde48196e987505bbd4cff9fd1f52dd1d",
+      "bytes": 498
+    },
+    {
+      "path": "flow/src/mcp/npx-resolver.ts",
+      "sha256": "279a3ad94dbd7f0ea20d22f05ce7091284dcfe44ce0ae5b3ca65c01939e7f50a",
+      "bytes": 16612
+    },
+    {
+      "path": "flow/src/mcp/resource-tools.ts",
+      "sha256": "e5ac03db2ca7f98d3b8e5e34c4f3893f32b847f5728e98a0d870b3b2f6e3d5b2",
+      "bytes": 479
+    },
+    {
+      "path": "flow/src/mcp/sampling-handler.ts",
+      "sha256": "f19c4707fae57f1878e1f67b52ae7a0b0393fb1172c374ad539382d39fde4796",
+      "bytes": 9676
+    },
+    {
+      "path": "flow/src/mcp/server-manager.ts",
+      "sha256": "5c8b1f80bacd0da7a1347ad4664cc40ab6682307bcb20a1846c9e17d821aea49",
+      "bytes": 32288
+    },
+    {
+      "path": "flow/src/mcp/state.ts",
+      "sha256": "5b4fd467173ab5def904d9d02de93a9bcd9febc951038841a324aaba4fd122b3",
+      "bytes": 1455
+    },
+    {
+      "path": "flow/src/mcp/types.ts",
+      "sha256": "fe722396518941d163b98c53104a4cae78b63542c92212d13a1774d260461599",
+      "bytes": 13193
+    },
+    {
+      "path": "flow/src/mcp/ui-resource-handler.ts",
+      "sha256": "8ae9d015b690a921fd8444cba08873a64e19a8d008d02545afc2d40fad1470ce",
+      "bytes": 6276
+    },
+    {
+      "path": "flow/src/mcp/ui-server.ts",
+      "sha256": "49315aea4be7ee48d90a6ba7f9ff970e549966c9cd0bc58debc202c81d27d01e",
+      "bytes": 38121
+    },
+    {
+      "path": "flow/src/mcp/ui-session-policy.ts",
+      "sha256": "6378ae3e1f6d86aa5f022de9eb6947015b13ad80e65270d301188fb9a8d3c567",
+      "bytes": 9568
+    },
+    {
+      "path": "flow/src/mcp/ui-session.ts",
+      "sha256": "42202a5dd74dd87b0e67ba6ec4598c998bd874ef991d4006dfcba5b5d04f070c",
+      "bytes": 9358
+    },
+    {
+      "path": "flow/src/mcp/ui-stream-types.ts",
+      "sha256": "2892161d3ac3efc2f4b757f667e64cd22edafe844763ada1cd70de03fdf77500",
+      "bytes": 3878
+    },
+    {
+      "path": "flow/src/mcp/utils.ts",
+      "sha256": "284a64c22aa9c2df7c6fda5c57352c974151e8fbb33571407eda3e25306f9600",
+      "bytes": 4774
+    },
+    {
+      "path": "flow/src/host/build-host-adapter.mjs",
+      "sha256": "6bf5c7a6368d72a43a0f998cb3479b0eb53c9294a3823681685bb2e7f79448dc",
+      "bytes": 32815
+    },
+    {
+      "path": "flow/src/host/PATCH-SPEC.json",
+      "sha256": "799bda774d6851c6289b616676cb64d5aa864cff21c142f31991b741bc014598",
+      "bytes": 4344
+    },
+    {
+      "path": "flow/src/mcp/app-bridge.bundle.js",
+      "sha256": "7d069dbfba3733453e4a7a6e340e767b95fddc10b01fa907b8582c1a85144e8e",
+      "bytes": 295508
+    }
+  ],
+  "dependencyBindings": [
+    {
+      "name": "@earendil-works/pi-agent-core",
+      "metadataSHA256": "95152a1095f4677284afde73dcf7a8a1525f46be0831177611526c14cea2ccec"
+    },
+    {
+      "name": "@earendil-works/pi-ai",
+      "metadataSHA256": "db02f15488aa28c3cce6bbdeabab7d3a43eaea8b293a9688570bc0b43b15f1b0"
+    },
+    {
+      "name": "@earendil-works/pi-codemode",
+      "metadataSHA256": "5fef26332a79610bc737db5e84dd85dd0b8c77fa90a19b6c83707447ba18d9a1"
+    },
+    {
+      "name": "@earendil-works/pi-mcp",
+      "metadataSHA256": "25acfdf6beb2375a79e9edd3652e4849725cf553a3062c188238110db7221bb4"
+    },
+    {
+      "name": "@earendil-works/pi-tui",
+      "metadataSHA256": "a69278408dbc23c0c6efe4079c99b012c14cf2bea78167b72334cdbe319ad4ec"
+    },
+    {
+      "name": "@silvia-odwyer/photon-node",
+      "metadataSHA256": "a1362f6a9e9d942d6b77555f1e40b19a6b3e2cc04bfb8af95e452a6f769fe7db"
+    },
+    {
+      "name": "brace-expansion",
+      "metadataSHA256": "8af7dc0916002266f3b01459ef691d9f834d8ecdb0e021263280a50b913d85fa"
+    },
+    {
+      "name": "chalk",
+      "metadataSHA256": "5a853fc6dc0c529bc126f97645989e9d60d06a2e9b20f66a6b48b0e8ef9da3ef"
+    },
+    {
+      "name": "cross-spawn",
+      "metadataSHA256": "2e106cd9b4ae4e34ead35218371a0d4e172da72515a4f8f97d69a2e1fe3dee82"
+    },
+    {
+      "name": "diff",
+      "metadataSHA256": "372a1ad33bcaded0234d5d327d1164c18968ee3f2e9f362ddd22e4489e91e369"
+    },
+    {
+      "name": "highlight.js",
+      "metadataSHA256": "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf"
+    },
+    {
+      "name": "hosted-git-info",
+      "metadataSHA256": "7c3774e4843581832aec08133a19df318625a91c1ca6c90fef1a328d4e02705e"
+    },
+    {
+      "name": "ignore",
+      "metadataSHA256": "809e28f354aca6ac273e9d455ee2ebd8f2c0e8676d0b62417a5b11ddda4ba8cd"
+    },
+    {
+      "name": "jiti",
+      "metadataSHA256": "aab8aafc42d9aeec14a6e2fe0e15ea1514c0c205a624055a7e776f2ec456283c"
+    },
+    {
+      "name": "lovely-mermaid",
+      "metadataSHA256": "4d3afd8d6004c97e76b9270b8e77121db34b5fca672b316743ed0c7637a37307"
+    },
+    {
+      "name": "minimatch",
+      "metadataSHA256": "ef4a771ea995978f41d37b063f9f8c061101ac89d0c53647cf4087df970e7ba5"
+    },
+    {
+      "name": "proper-lockfile",
+      "metadataSHA256": "23888ecc7abd83a8e98e132da556eda2172792cc04c4e6d157b590667802bd2a"
+    },
+    {
+      "name": "quickjs-wasi",
+      "metadataSHA256": "efa1d0d3b440dd7a31f55690d414f9c7f59e6a15395075efee884454c86715c2"
+    },
+    {
+      "name": "semver",
+      "metadataSHA256": "7c94cb7f2a53c27b20d76386ec144c062894dbcc909cfabd0f728c37874b1776"
+    },
+    {
+      "name": "typebox",
+      "metadataSHA256": "c59ddfd977ce941f1e8ee8b0a0b14396c332fa27cc5fa6fa165227ffd5a3992f"
+    },
+    {
+      "name": "undici",
+      "metadataSHA256": "652933475722a1ac7b8531f29a728f856e018332f56ea39f79a2dcc3544d56d0"
+    },
+    {
+      "name": "yaml",
+      "metadataSHA256": "20b8b197cbd10dad245d45e463dfe58e4c8c25a47e24bc4256ad9ab58bf35683"
+    },
+    {
+      "name": "@modelcontextprotocol/sdk",
+      "metadataSHA256": "0216319ea53177f7ed419d660b2f52ccc7e3327e57f9ee2ef03225ff543aeae4"
+    },
+    {
+      "name": "@modelcontextprotocol/ext-apps",
+      "metadataSHA256": "5f238c430e0c3a62f8be2a918a05da0d09ccf369b695d85237afd92a81f194df"
+    },
+    {
+      "name": "zod",
+      "metadataSHA256": "70eedbe34fd52385a4ae2f3e5759b19682189f0118ea73a6e7c32c677f61668e"
+    }
+  ],
+  "externalEntryPins": [
+    {
+      "specifier": "typebox",
+      "sha256": "26af1f941dfdb2c65928f2a11862bb4a1210652bcc6764135f5a425d7e4aeb72",
+      "bytes": 607
+    },
+    {
+      "specifier": "@earendil-works/pi-agent-core",
+      "sha256": "40cb358d7f05594e9b67845a78ae50ad05e8375f0cfa8cee8a74801556c09afd",
+      "bytes": 203
+    },
+    {
+      "specifier": "@earendil-works/pi-mcp",
+      "sha256": "7119a8b2a32d8e5e0d5f01318c6fae7535e137a55719c6c4955121ae41dfa967",
+      "bytes": 958
+    },
+    {
+      "specifier": "@modelcontextprotocol/sdk/types.js",
+      "sha256": "962836b0f8dad85bcd398ad3ddb5ba81a7c7530c706955aa846dd8dfc02dd6a9",
+      "bytes": 73271
+    },
+    {
+      "specifier": "@modelcontextprotocol/ext-apps/app-bridge",
+      "sha256": "4ca8beabda9dee36a4f48dde8ad874d91f3587156edb8d0d99fb112d43e3aad2",
+      "bytes": 42746
+    },
+    {
+      "specifier": "zod",
+      "sha256": "6419c4ac0e637ff08463083e31886d10354f74cbcc4e584400b2b837e39ac881",
+      "bytes": 105
+    }
+  ],
+  "tools": {
+    "esbuildVersion": "0.28.2",
+    "esbuildEntry": {
+      "sha256": "61ec0ba144ff93f4bf0e96ad6fab6f430ede0aa13e27ace8063ed63ba416b3cd",
+      "bytes": 97463
+    },
+    "esbuildPackage": {
+      "sha256": "9d0bc453f4e791553c4cc2298ba023b409241fd9801e494741666eb0f6051490",
+      "bytes": 3980
+    },
+    "nativeCompiler": {
+      "sha256": "10b6243df618d374bb2d5c9cfbe7052e1405f6aa4e53a6164f11a91b9f2e1384",
+      "bytes": 10590882
+    },
+    "nativePackage": {
+      "sha256": "4e652c9e4410daf03da852a664940153601fac397233cdcf276b4b1a312454b9",
+      "bytes": 382
+    },
+    "acorn": {
+      "sha256": "76254fc76529713b4dfd2532972d17a991ffd9aafeebb1f977445b5506b9fb0b",
+      "bytes": 234658
+    },
+    "acornPackage": {
+      "sha256": "04d6fecaafb5e3d20a38fc3b64fed84bb3830a7759a8c00400ebcb87331fec00",
+      "bytes": 1067
+    }
+  },
+  "platformOfVerifiedCompiler": "darwin-arm64",
+  "api": "buildOwnedSdk(input) exported by builder/build-owned-sdk.mjs",
+  "runtimeLayout": "patched SDK must retain its dependency closure and original worker/theme/schema assets; shim source alone is not a runnable distribution"
+}

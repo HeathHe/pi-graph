@@ -1,0 +1,25 @@
+{
+  "name": "pi-graph-model-role",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "dependencies": {
+    "pi-maestro-backend-core": "0.1.5"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test test/*.test.ts",
+    "check": "tsc -p tsconfig.json",
+    "prepack": "node ../../scripts/bundle-settings-core.mjs",
+    "postpack": "node ../../scripts/bundle-settings-core.mjs --clean"
+  },
+  "bundledDependencies": [
+    "pi-maestro-backend-core"
+  ],
+  "files": [
+    "src"
+  ]
+}

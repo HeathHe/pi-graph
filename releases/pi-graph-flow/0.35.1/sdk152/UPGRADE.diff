@@ -1,0 +1,111 @@
+--- sdk140/flow/src/host/PATCH-SPEC.json
++++ sdk152/flow/src/host/PATCH-SPEC.json
+@@ -2,22 +2,22 @@
+   "kind": "SOURCE_ONLY_SEVEN_LEAVES_23_EDITS",
+   "leaves": {
+     "dist/main.js": {
+-      "sha256": "08b91f9eb3adf9a5027c18732d1e4de70999bd15c445b65cb0ddd0cd68f2746b"
++      "sha256": "29d5564f1a397eeb8a9c771b8e42c4fb88420e676bddbd096854a3ad84f4d49e"
+     },
+     "dist/core/agent-session-services.js": {
+       "sha256": "20b7aa4b0657b53fb522ea051df26f72901802e03cc06c89e0a8926388bca601"
+     },
+     "dist/core/sdk.js": {
+-      "sha256": "1edf7b026e86fbf41de5a95857e5f4c0e4c68cabf03ec2dd6ad6515f5d21fdbe"
++      "sha256": "c43e4e1d49ac3ec4b9f48465bf2081bc5980b55f23d44040d02e9046dea45725"
+     },
+     "dist/core/agent-session.js": {
+-      "sha256": "7f38cc43b78cc6a8ea7311417607dec7da1feaf10a63f1e51de08046054a7b79"
++      "sha256": "ee756f6f74afe9f8930ebf216c95334605d913a275a0eec2c9702f101baef3c3"
+     },
+     "dist/core/agent-session-runtime.js": {
+-      "sha256": "928b6528bb17d26273af8f7023a4f98e5f440d5896a4280d060b9b3e1f9a6882"
++      "sha256": "44beede45451cef172d7137077e7e84867b9aaa9f20575143fb9a93fcc00261a"
+     },
+     "dist/core/resource-loader.js": {
+-      "sha256": "ad50235884ea6d5ee14cdae1efcfe6afef58b22b18ce574e81886d57ca9f4642"
++      "sha256": "57ece4ebd0ef6429bf45e1a22a7c581813251a988afa67bf2d3158eb752cdecc"
+     },
+     "dist/cli.js": {
+       "sha256": "8189b66abc4f9f431dbb70941dcba690d76d040de1fbfff212886be35a53639d"
+@@ -38,39 +38,39 @@
+   "parser": "acorn.parse ecmaVersion latest, sourceType module; not executed",
+   "mode": "bundled-node original embedded VIRTUAL_MODULES branch; no loader patch",
+   "embeddedBranchSources": {
+-    "dist/core/extensions/loader.js": "c63226a56ab2f4f9e4e6c8ea97e4bcb9c71d723b38eba1ee3569559bba21a666",
+-    "dist/core/extensions/virtual-modules.js": "9742c3576adb6799a42015e328f4ddaf74d85fa3502f271bf247fb836769a17b",
++    "dist/core/extensions/loader.js": "55e794b969dd4692a553b21767fe876537fe06083586816f62848e76c553ef7c",
++    "dist/core/extensions/virtual-modules.js": "941f8647becc71fd241eac0fb19d3206f38f055f85721e5215a8473832d42f5a",
+     "dist/core/extensions/jiti-static-loader.js": "cef599ba10a21d50f93b2d284e0b41d464bc852a0d6c9b5e45e4048291e24dd0",
+-    "dist/config.js": "b53418ca3bc54b70e18ccb192eb471696f5211c5aa2e80d68fe6fe3851ff23ae"
++    "dist/config.js": "8d84a58d53f1bd4360188f787b56b16444c20e00452d075cdc77056054387926"
+   },
+   "internalEntries": {
+     "m18:owned-prompts": {
+       "module": "dist/core/prompt-templates.js",
+-      "sha256": "7661704470a957c98d63132b178cb4b8238a268ff9ad25c1ad2a3e705ec4e41c"
++      "sha256": "b99a3882ebdefd5b61b7d91a1a77b1a110baf60a8ed204e008e267e604a18b2d"
+     },
+     "m18:owned-theme": {
+       "module": "dist/modes/interactive/theme/theme.js",
+-      "sha256": "8099c3916f52b2bd43757e2a397e292a7b922d81dbdc07bc3bed27000be26378"
++      "sha256": "10eba1a9a296acd8ee5258e5bff121cd21f9e9ab65f0f80c2f1761c3b565e7a5"
+     },
+     "m18:owned-source-info": {
+       "module": "dist/core/source-info.js",
+-      "sha256": "67562eea112e99f4a7880913143730bd90e3655381c0f353e3dd18c5e9f1ef07"
++      "sha256": "8785b8ea42e12023ed2b81c5af81eb9e96e964aac8cf76db1f250b07c9c83537"
+     },
+     "m18:native-mcp-transport": {
+       "module": "dist/extensions/mcp/runtime.js",
+-      "sha256": "be9e8eea88363f2fefaea2c25c854845393f112394ee5989d22facd2f1acea6e"
++      "sha256": "1ed03790749c1c494f6ff3891652a4ad895cb25bf2ad4ed61202837c5e3055fb"
+     },
+     "m18:owned-extension-policy": {
+       "module": "dist/core/resource-loader.js",
+-      "sha256": "ad50235884ea6d5ee14cdae1efcfe6afef58b22b18ce574e81886d57ca9f4642"
++      "sha256": "57ece4ebd0ef6429bf45e1a22a7c581813251a988afa67bf2d3158eb752cdecc"
+     }
+   },
+   "sdkMetadata": {
+     "name": "@earendil-works/pi-coding-agent",
+-    "version": "1.4.0",
+-    "sha256": "df6883685382d6a914e5797232744c26579fe7db5576ea0e9c859d018ca2d54e"
++    "version": "1.5.2",
++    "sha256": "18b422b7d80f2caa2551d253c0a8409e1caa54b954bfb7d18252e507bb8a0318"
+   },
+-  "ownedExtensionPolicyAppend": "\n// Version-bound owned entry: explicit resources only, no DefaultResourceLoader construction.\nexport async function loadOwnedExtensionSet(options) {\n    if (options.clearCache) clearExtensionCache();\n    const methods = DefaultResourceLoader.prototype;\n    const receiver = {\n        cwd: options.cwd,\n        eventBus: options.eventBus,\n        builtinExtensions: new Map(options.extensionFactories.filter(isBuiltinExtension).map(input => [input.name, input])),\n        extensionFactories: options.extensionFactories.filter(input => !isBuiltinExtension(input)),\n        resolveExtensionLoadPath: methods.resolveExtensionLoadPath,\n        loadExtensionPaths: methods.loadExtensionPaths,\n        loadExtensionFactories: methods.loadExtensionFactories,\n        addExtensionConflictDiagnostics: methods.addExtensionConflictDiagnostics,\n        detectExtensionConflicts: methods.detectExtensionConflicts,\n    };\n    const paths = [...options.extensionPaths, ...options.builtinNames.map(name => `${BUILTIN_PATH_PREFIX}${name}`)];\n    return methods.loadFinalExtensionSet.call(receiver, paths);\n}\n",
++  "ownedExtensionPolicyAppend": "\n// Version-bound owned entry: explicit resources only, no DefaultResourceLoader construction.\nexport async function loadOwnedExtensionSet(options) {\n    if (options.clearCache) clearExtensionCache();\n    const methods = DefaultResourceLoader.prototype;\n    const receiver = {\n        cwd: options.cwd,\n        eventBus: options.eventBus,\n        builtinExtensions: new Map(options.extensionFactories.filter(isBuiltinExtension).map(input => [input.name, input])),\n        extensionFactories: options.extensionFactories.filter(input => !isBuiltinExtension(input)),\n        resolveExtensionLoadPath: methods.resolveExtensionLoadPath,\n        getExtensionPathKey: methods.getExtensionPathKey,\n        loadExtensionPaths: methods.loadExtensionPaths,\n        loadExtensionFactories: methods.loadExtensionFactories,\n        addExtensionConflictDiagnostics: methods.addExtensionConflictDiagnostics,\n        detectExtensionConflicts: methods.detectExtensionConflicts,\n    };\n    const paths = [...options.extensionPaths, ...options.builtinNames.map(name => `${BUILTIN_PATH_PREFIX}${name}`)];\n    return methods.loadFinalExtensionSet.call(receiver, paths);\n}\n",
+   "ownedEntries": {
+     "m18:owned-default-launcher": {
+       "source": "./owned-default-launcher.ts",
+--- sdk140/flow/src/host/build-host-adapter.mjs
++++ sdk152/flow/src/host/build-host-adapter.mjs
+@@ -92,7 +92,10 @@
+     insert(bindEmit.start, "this.#m18Lifecycle?.publish(this, this._extensionRunner);\n        ", "bind-publish-before-original-emit");
+     insert(bind.body.end - 1, '\n        } catch (error) { this.retireHostSession("startup-failed"); throw error; }\n    ', "bind-preserve-error");
+     const reload = method(ast, "AgentSession", "reload");
+-    insert(reload.body.start + 1, '\n        this.retireHostSession("reload");\n        try {', "reload-fence-before-old-shutdown");
++    const oldRunner = varStatement(reload, "oldRunner");
++    const guards = reload.body.body.filter(node => node.end <= oldRunner.start);
++    if (guards.length !== 2 || !guards.every((node, i) => node.type === "IfStatement" && member(node.test, "this", i === 0 ? "isStreaming" : "isCompacting") && node.consequent.type === "BlockStatement" && node.consequent.body.length === 1 && node.consequent.body[0].type === "ThrowStatement")) fail("reload refusal guards changed");
++    insert(oldRunner.start, 'this.retireHostSession("reload");\n        try {\n        ', "reload-fence-after-refusal-before-shutdown");
+     const reloadEmit = unique(reload, (node) => node.type === "ExpressionStatement" && node.expression.type === "AwaitExpression" &&
+       node.expression.argument.type === "CallExpression" && node.expression.argument.callee.type === "MemberExpression" &&
+       member(node.expression.argument.callee.object, "this", "_extensionRunner") && identifier(node.expression.argument.callee.property, "emit"), "reload session_start emit");
+@@ -101,10 +104,12 @@
+   } else if (path === "dist/core/agent-session-runtime.js") {
+     insert(method(ast, "AgentSessionRuntime", "teardownCurrent").body.start + 1,
+       '\n        this.session.retireHostSession("replace");', "teardown-after-original-cancellation-points");
+-    insert(method(ast, "AgentSessionRuntime", "dispose").body.start + 1,
+-      '\n        this.session.retireHostSession("dispose");', "runtime-dispose-before-shutdown");
++    const dispose = method(ast, "AgentSessionRuntime", "dispose");
++    const abort = dispose.body.body[0];
++    if (abort?.type !== "ExpressionStatement" || abort.expression.type !== "AwaitExpression" || abort.expression.argument.type !== "CallExpression" || abort.expression.argument.callee.type !== "MemberExpression" || !member(abort.expression.argument.callee.object, "this", "session") || !identifier(abort.expression.argument.callee.property, "abort")) fail("runtime dispose abort order changed");
++    insert(abort.end, '\n        this.session.retireHostSession("dispose");', "runtime-dispose-after-abort-before-shutdown");
+   } else if (path === "dist/core/resource-loader.js") {
+-    for (const name of ["resolveExtensionLoadPath", "loadExtensionPaths", "loadExtensionFactories", "loadFinalExtensionSet", "addExtensionConflictDiagnostics", "detectExtensionConflicts"]) {
++    for (const name of ["resolveExtensionLoadPath", "getExtensionPathKey", "loadExtensionPaths", "loadExtensionFactories", "loadFinalExtensionSet", "addExtensionConflictDiagnostics", "detectExtensionConflicts"]) {
+       method(ast, "DefaultResourceLoader", name);
+     }
+     insert(source.length, spec.ownedExtensionPolicyAppend, "owned-extension-policy-entry");

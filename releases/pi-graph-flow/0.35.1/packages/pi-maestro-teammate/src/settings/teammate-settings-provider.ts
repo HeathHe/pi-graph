@@ -1,0 +1,941 @@
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import {
+  SETTINGS_ANNOUNCE_EVENT,
+  SETTINGS_DISCOVER_EVENT,
+  SETTINGS_PROTOCOL_VERSION,
+  type ConfiguredSettingValue,
+  type JsonValue,
+  type SettingDefinition,
+  type SettingsActivationPlan,
+  type SettingsAnnounceEventV1,
+  type SettingsChange,
+  type SettingsContextV1,
+  type SettingsDiscoverEventV1,
+  type SettingsProviderV1,
+  type SettingsResourceConflict,
+  type SettingsResourceRevision,
+  type SettingsScope,
+  type SettingsSnapshot,
+  type SettingsValidationIssue,
+} from "pi-maestro-settings-core/v1";
+import { discoverAgents } from "../agents/agents.ts";
+import {
+  TEAMMATE_TASK_TYPE_META,
+  discoverRoutingTaskTypes,
+  getGlobalModelRoutingPath,
+  getProjectModelRoutingPath,
+  loadModelRoutingStores,
+  replaceModelRoutingStores,
+  type GlobalModelRoutingStore,
+  type ModelRoutingStoreContentPair,
+  type ModelRoutingStorePair,
+  type ProjectModelRoutingStore,
+} from "../models/model-routing.ts";
+import { parseTeammateTaskType, type TeammateTaskType } from "../shared/task-types.ts";
+import { TEAMMATE_THINKING_LEVELS, parseTeammateThinkingLevel } from "../shared/thinking.ts";
+import {
+  BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+} from "../shared/limits.ts";
+
+const PROVIDER_ID = "pi-maestro-teammate";
+const PROVIDER_VERSION = "1.0.0";
+const BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY = "monitoring.backgroundStatusHeartbeatMs";
+
+interface SettingsEventBus {
+  on(event: string, handler: (payload: unknown) => void): void | (() => void);
+  emit(event: string, payload: unknown): void;
+}
+
+export interface TeammateSettingsProvider extends SettingsProviderV1 {
+  readonly providerId: typeof PROVIDER_ID;
+  readonly instanceId: string;
+}
+
+export interface TeammateSettingsProviderOptions {
+  getGlobalPath?: () => string;
+  getProjectPath?: (cwd: string) => string;
+  discoverTaskTypes?: (cwd: string) => readonly TeammateTaskType[];
+  discoverRoles?: (cwd: string) => readonly string[];
+  discoverRoleSummaries?: (cwd: string) => { name: string; description: string }[];
+  applyBackgroundStatusHeartbeatMs?: (intervalMs: number) => Promise<void> | void;
+  /** False on hosts with native cache warming (pi >= 0.86): the heartbeat setting is hidden. */
+  includeBackgroundStatusHeartbeat?: boolean;
+  openLegacySettings?: () => Promise<void> | void;
+}
+
+interface RoutingDocument {
+  content: string;
+  raw: GlobalModelRoutingStore | ProjectModelRoutingStore;
+  error?: string;
+}
+
+interface RoutingResourceState {
+  scope: "global" | "project";
+  path: string;
+  document: RoutingDocument;
+  revision: SettingsResourceRevision;
+}
+
+interface PreparedRoutingChange {
+  token: string;
+  transactionId: string;
+  changedKeys: readonly string[];
+  globalPath: string;
+  projectPath: string;
+  before: ModelRoutingStorePair;
+  next: ModelRoutingStorePair;
+  beforeContent: ModelRoutingStoreContentPair;
+  expectedRevisions: readonly SettingsResourceRevision[];
+  committedContent?: ModelRoutingStoreContentPair;
+  committedRevisions?: readonly SettingsResourceRevision[];
+}
+
+const BASE_CATALOGS = {
+  en: {
+    "teammate.provider": "Teammate",
+    "teammate.provider.description": "Agent routing and background monitoring",
+    "teammate.group.monitoring": "Background monitoring",
+    "teammate.monitoring.backgroundStatusHeartbeatMs": "Status heartbeat interval (ms)",
+    "teammate.monitoring.backgroundStatusHeartbeatMs.description": "Monitoring-only status turn interval while the root session is idle and teammate or bash_bg work remains active. Range: 1 minute to 30 minutes; default: 10 minutes.",
+    "teammate.monitoring.applyFailed": "The background status heartbeat interval could not be applied to the current session.",
+    "teammate.routing.model": "Primary model",
+    "teammate.routing.fallbacks": "Fallback models",
+    "teammate.routing.thinking": "Thinking level",
+    "teammate.routing.fast": "Codex Fast",
+    "teammate.routing.fast.description": "Pi openai-codex only; priority tier may consume more quota. Unset inherits routing/project defaults.",
+    "teammate.roles": "Discovered roles",
+    "teammate.roles.description": "Read-only catalog of the discovered teammate roles.",
+    "teammate.roles.row": "Role",
+    "routing.manage": "Management",
+    "teammate.option.off": "Off",
+    "teammate.option.minimal": "Minimal",
+    "teammate.option.low": "Low",
+    "teammate.option.medium": "Medium",
+    "teammate.option.high": "High",
+    "teammate.option.xhigh": "Extra high",
+    "teammate.option.max": "Max",
+  },
+  "zh-CN": {
+    "teammate.provider": "Teammate",
+    "teammate.provider.description": "Agent 路由与后台监测",
+    "teammate.group.monitoring": "后台监测",
+    "teammate.monitoring.backgroundStatusHeartbeatMs": "状态心跳间隔（毫秒）",
+    "teammate.monitoring.backgroundStatusHeartbeatMs.description": "主 Session 空闲且仍有 teammate 或 bash_bg 在后台运行时，发送仅表示监测状态的心跳轮次。范围 1 分钟到 30 分钟，默认 10 分钟。",
+    "teammate.monitoring.applyFailed": "无法将后台状态心跳间隔应用到当前 Session。",
+    "teammate.routing.model": "主 Model",
+    "teammate.routing.fallbacks": "Fallbacks",
+    "teammate.routing.thinking": "Thinking",
+    "teammate.routing.fast": "Codex Fast",
+    "teammate.routing.fast.description": "仅限 Pi openai-codex；优先级可能消耗更多额度。不设置时继承路由 / 项目默认值。",
+    "teammate.roles": "发现 Roles",
+    "teammate.roles.description": "发现的 teammate Roles 只读目录。",
+    "teammate.roles.row": "Role",
+    "routing.manage": "管理",
+    "teammate.option.off": "Off",
+    "teammate.option.minimal": "Minimal",
+    "teammate.option.low": "Low",
+    "teammate.option.medium": "Medium",
+    "teammate.option.high": "High",
+    "teammate.option.xhigh": "Extra high",
+    "teammate.option.max": "Max",
+  },
+} as const;
+
+const BUILTIN_TASK_LABELS: Record<string, { en: string; zh: string }> = {
+  explore: { en: "Explore", zh: "Explore" },
+  analysis: { en: "Analysis", zh: "Analysis" },
+  debug: { en: "Debug", zh: "Debug" },
+  planning: { en: "Planning", zh: "Planning" },
+  development: { en: "Development", zh: "Development" },
+  review: { en: "Review", zh: "Review" },
+  testing: { en: "Testing", zh: "Testing" },
+};
+
+export function createTeammateSettingsProvider(options: TeammateSettingsProviderOptions = {}): TeammateSettingsProvider {
+  const instanceId = randomUUID();
+  const includeHeartbeat = options.includeBackgroundStatusHeartbeat !== false;
+  const getGlobalPath = options.getGlobalPath ?? getGlobalModelRoutingPath;
+  const getProjectPath = options.getProjectPath ?? getProjectModelRoutingPath;
+  const taskTypes = options.discoverTaskTypes ?? ((cwd: string) => discoverRoutingTaskTypes(cwd));
+  const roles = options.discoverRoles ?? ((cwd: string) => discoverAgents(cwd).map((agent) => agent.name));
+  const roleSummaries = options.discoverRoleSummaries ?? ((cwd: string) => discoverAgents(cwd).map((agent) => ({ name: agent.name, description: agent.description })));
+  const prepared = new Map<string, PreparedRoutingChange>();
+
+  return {
+    providerId: PROVIDER_ID,
+    instanceId,
+    describe: (request) => {
+      const types = taskTypes(request.context.cwd);
+      return {
+        id: PROVIDER_ID,
+        version: PROVIDER_VERSION,
+        instanceId,
+        labelKey: "teammate.provider",
+        descriptionKey: "teammate.provider.description",
+        order: 20,
+        capabilities: { read: true, write: true, prepareCommit: true, rollback: "compensating", hotUpdate: true },
+        settings: definitions(types, roles(request.context.cwd), roleSummaries(request.context.cwd), includeHeartbeat),
+        catalogs: catalogs(types, roles(request.context.cwd)),
+      };
+    },
+    read: (request) => {
+      const resources = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      return snapshot(resources, instanceId, taskTypes(request.context.cwd), roles(request.context.cwd), roleSummaries(request.context.cwd), includeHeartbeat);
+    },
+    validate: (request) => {
+      const resources = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      return validateRequest(request.changes, request.expectedRevisions, resources);
+    },
+    prepare: async (request) => {
+      const resources = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      const validation = validateRequest(request.changes, request.expectedRevisions, resources);
+      if (!validation.valid) {
+        return { prepared: false, validation, conflicts: validation.conflicts };
+      }
+      const before = storePair(resources);
+      const next = applyChanges(before, request.changes);
+      const token = randomUUID();
+      const state: PreparedRoutingChange = {
+        token,
+        transactionId: request.transactionId,
+        changedKeys: request.changes.map((change) => change.key),
+        globalPath: getGlobalPath(),
+        projectPath: getProjectPath(request.context.cwd),
+        before,
+        next,
+        beforeContent: contentPair(resources),
+        expectedRevisions: resources.map((entry) => entry.revision),
+      };
+      prepared.set(token, state);
+      return {
+        prepared: true,
+        prepareToken: token,
+        validation: { valid: true, issues: [] },
+        activation: activationForKeys(state.changedKeys),
+      };
+    },
+    commit: async (request) => {
+      const state = requirePrepared(prepared, request.prepareToken, request.transactionId);
+      const current = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      const validation = validateRequest([], state.expectedRevisions, current);
+      if (!validation.valid) throw new Error("Teammate model routing changed after Settings preparation");
+      const published = replaceModelRoutingStores(
+        state.globalPath,
+        state.projectPath,
+        state.before,
+        state.next,
+        state.beforeContent,
+      );
+      // Record rollback metadata at the publish boundary so a post-publish read failure
+      // cannot leave a published-but-unrollable commit.
+      state.committedContent = {
+        global: `${JSON.stringify(published.global, null, 2)}\n`,
+        project: `${JSON.stringify(published.project, null, 2)}\n`,
+      };
+      let resources: RoutingResourceState[];
+      try {
+        resources = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      } catch {
+        resources = [
+          resourceStateFromContent("global", state.globalPath, published.global, state.committedContent.global),
+          resourceStateFromContent("project", state.projectPath, published.project, state.committedContent.project),
+        ];
+      }
+      state.committedRevisions = resources.map((entry) => entry.revision);
+      return {
+        snapshot: snapshot(resources, instanceId, taskTypes(request.context.cwd), roles(request.context.cwd), roleSummaries(request.context.cwd), includeHeartbeat),
+        revisions: resources.map((entry) => entry.revision),
+        changedKeys: state.changedKeys,
+        activation: activationForKeys(state.changedKeys),
+      };
+    },
+    abort: async (request) => {
+      prepared.delete(request.prepareToken);
+    },
+    rollback: async (request) => {
+      const state = prepared.get(request.prepareToken);
+      if (!state || state.transactionId !== request.transactionId || !state.committedRevisions || !state.committedContent) {
+        return { rolledBack: false };
+      }
+      const resources = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      const validation = validateRequest([], state.committedRevisions, resources);
+      if (!validation.valid) {
+        return { rolledBack: false, conflicts: validation.conflicts };
+      }
+      replaceModelRoutingStores(
+        state.globalPath,
+        state.projectPath,
+        state.next,
+        state.before,
+        state.committedContent,
+        state.beforeContent,
+      );
+      prepared.delete(request.prepareToken);
+      const restored = readResources(request.context.cwd, getGlobalPath, getProjectPath);
+      return { rolledBack: true, snapshot: snapshot(restored, instanceId, taskTypes(request.context.cwd), roles(request.context.cwd), roleSummaries(request.context.cwd), includeHeartbeat) };
+    },
+    applyRuntime: async (request) => {
+      const state = [...prepared.values()].find((entry) => entry.transactionId === request.transactionId);
+      if (state) prepared.delete(state.token);
+      const liveKeys = request.changes
+        .map((change) => change.key)
+        .filter((key) => key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+      const deferredKeys = request.changes
+        .map((change) => change.key)
+        .filter((key) => key !== BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+      const appliedKeys: string[] = [];
+      const failed: Array<{ key: string; messageKey: string }> = [];
+      if (liveKeys.length > 0) {
+        const value = request.snapshot.effective.values.find(
+          (entry) => entry.key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+        )?.value;
+        if (typeof value === "number" && options.applyBackgroundStatusHeartbeatMs) {
+          try {
+            await options.applyBackgroundStatusHeartbeatMs(value);
+            appliedKeys.push(BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+          } catch {
+            failed.push({
+              key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+              messageKey: "teammate.monitoring.applyFailed",
+            });
+          }
+        } else {
+          deferredKeys.push(BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+        }
+      }
+      return {
+        appliedKeys,
+        deferred: deferredKeys.length > 0 ? [{ boundary: "next-invocation", keys: deferredKeys }] : [],
+        failed,
+      };
+    },
+    invokeAction: async () => ({ handled: false }),
+  };
+}
+
+export function registerTeammateSettingsProvider(events: SettingsEventBus, provider: TeammateSettingsProvider): () => void {
+  const announce = (requestId?: string): void => {
+    events.emit(SETTINGS_ANNOUNCE_EVENT, {
+      version: SETTINGS_PROTOCOL_VERSION,
+      requestId,
+      providerId: provider.providerId,
+      instanceId: provider.instanceId,
+      provider,
+    } satisfies SettingsAnnounceEventV1);
+  };
+  const result = events.on(SETTINGS_DISCOVER_EVENT, (payload) => {
+    if (isDiscover(payload)) announce(payload.requestId);
+  });
+  announce();
+  return () => { if (typeof result === "function") result(); };
+}
+
+function definitions(taskTypes: readonly TeammateTaskType[], roles: readonly string[], summaries: readonly { name: string; description: string }[], includeHeartbeat = true): SettingDefinition[] {
+  const settings = taskTypes.flatMap((taskType, index): SettingDefinition[] => [
+    {
+      key: settingKey(taskType, "model"),
+      group: `routing.${taskType}`,
+      order: index * 4,
+      labelKey: "teammate.routing.model",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: { kind: "model", optionsSource: "teammate.available-models" },
+    },
+    {
+      key: settingKey(taskType, "fallbacks"),
+      group: `routing.${taskType}`,
+      order: index * 4 + 1,
+      labelKey: "teammate.routing.fallbacks",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: { kind: "string-list" },
+    },
+    {
+      key: settingKey(taskType, "thinking"),
+      group: `routing.${taskType}`,
+      order: index * 4 + 2,
+      labelKey: "teammate.routing.thinking",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: {
+        kind: "enum",
+        options: TEAMMATE_THINKING_LEVELS.map((value) => ({ value, labelKey: `teammate.option.${value}` })),
+      },
+    },
+    {
+      key: settingKey(taskType, "fast"),
+      group: `routing.${taskType}`,
+      order: index * 4 + 3,
+      labelKey: "teammate.routing.fast",
+      descriptionKey: "teammate.routing.fast.description",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: { kind: "boolean" },
+    },
+  ]);
+  if (includeHeartbeat) settings.unshift({
+    key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+    group: "teammate.group.monitoring",
+    order: 0,
+    labelKey: "teammate.monitoring.backgroundStatusHeartbeatMs",
+    descriptionKey: "teammate.monitoring.backgroundStatusHeartbeatMs.description",
+    defaultValue: BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+    scopes: ["global"],
+    merge: "override",
+    activation: "live",
+    sensitivity: "public",
+    reversibility: "full",
+    editor: {
+      kind: "integer",
+      min: BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+      max: BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+      step: 60_000,
+    },
+  });
+  settings.push(...roles.flatMap((role, index): SettingDefinition[] => [
+    {
+      key: roleSettingKey(role, "model"),
+      group: `role.${role}`,
+      order: 10_000 + index * 4,
+      labelKey: "teammate.routing.model",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: { kind: "model", optionsSource: "teammate.available-models" },
+    },
+    {
+      key: roleSettingKey(role, "fallbacks"),
+      group: `role.${role}`,
+      order: 10_000 + index * 4 + 1,
+      labelKey: "teammate.routing.fallbacks",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: { kind: "string-list" },
+    },
+    {
+      key: roleSettingKey(role, "thinking"),
+      group: `role.${role}`,
+      order: 10_000 + index * 4 + 2,
+      labelKey: "teammate.routing.thinking",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: {
+        kind: "enum",
+        options: TEAMMATE_THINKING_LEVELS.map((value) => ({ value, labelKey: `teammate.option.${value}` })),
+      },
+    },
+    {
+      key: roleSettingKey(role, "fast"),
+      group: `role.${role}`,
+      order: 10_000 + index * 4 + 3,
+      labelKey: "teammate.routing.fast",
+      descriptionKey: "teammate.routing.fast.description",
+      scopes: ["global", "project"],
+      merge: "override",
+      activation: "next-invocation",
+      sensitivity: "public",
+      reversibility: "full",
+      editor: { kind: "boolean" },
+    },
+  ]));
+  settings.push({
+    key: "teammate.roles",
+    group: "routing.manage",
+    order: Number.MAX_SAFE_INTEGER,
+    labelKey: "teammate.roles",
+    descriptionKey: "teammate.roles.description",
+    scopes: ["project"],
+    merge: "provider-defined",
+    activation: "live",
+    sensitivity: "private",
+    reversibility: "none",
+    editor: { kind: "overview" },
+  });
+  return settings;
+}
+
+function catalogs(taskTypes: readonly TeammateTaskType[], roles: readonly string[]) {
+  const en = { ...BASE_CATALOGS.en } as Record<string, string>;
+  const zh = { ...BASE_CATALOGS["zh-CN"] } as Record<string, string>;
+  for (const taskType of taskTypes) {
+    const labels = BUILTIN_TASK_LABELS[taskType];
+    const fallback = TEAMMATE_TASK_TYPE_META[taskType]?.label ?? taskType;
+    en[`routing.${taskType}`] = labels?.en ?? fallback;
+    zh[`routing.${taskType}`] = labels?.zh ?? fallback;
+  }
+  for (const role of roles) {
+    en[`role.${role}`] = `Role @${role}`;
+    zh[`role.${role}`] = `角色 @${role}`;
+  }
+  return { en, "zh-CN": zh };
+}
+
+function snapshot(
+  resources: readonly RoutingResourceState[],
+  instanceId: string,
+  taskTypes: readonly TeammateTaskType[],
+  roles: readonly string[],
+  summaries: readonly { name: string; description: string }[],
+  includeHeartbeat = true,
+): SettingsSnapshot {
+  const configured: ConfiguredSettingValue[] = [];
+  const effective: SettingsSnapshot["effective"]["values"][number][] = [];
+  const stores = storePair(resources);
+  const requestedProfile = stores.project.activeProfile ?? stores.global.defaultProfile;
+  const profileId = Object.hasOwn(stores.global.profiles, requestedProfile)
+    ? requestedProfile
+    : stores.global.defaultProfile;
+  const profile = stores.global.profiles[profileId];
+  const globalResource = resources.find((entry) => entry.scope === "global")!;
+  const projectResource = resources.find((entry) => entry.scope === "project")!;
+  const configuredHeartbeatMs = stores.global.backgroundStatusHeartbeatMs;
+  if (includeHeartbeat) {
+    configured.push({
+      key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+      scope: "global",
+      state: globalResource.document.error ? "invalid" : configuredHeartbeatMs === undefined ? "absent" : "set",
+      ...(configuredHeartbeatMs === undefined ? {} : { value: configuredHeartbeatMs }),
+      resource: globalResource.revision.resource,
+      ...(globalResource.document.error ? { messageKey: globalResource.document.error } : {}),
+    });
+    effective.push({
+      key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+      value: configuredHeartbeatMs ?? BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+      source: configuredHeartbeatMs === undefined ? "default" : "configured",
+      ...(configuredHeartbeatMs === undefined ? {} : { scope: "global", resource: globalResource.revision.resource }),
+    });
+  }
+  for (const taskType of taskTypes) {
+    for (const field of ["model", "fallbacks", "thinking", "fast"] as const) {
+      const key = settingKey(taskType, field);
+      const globalValue = rawValue(profile, taskType, field);
+      const projectValue = rawValue(stores.project.overrides, taskType, field);
+      configured.push({
+        key,
+        scope: "global",
+        state: globalResource.document.error ? "invalid" : globalValue.present ? "set" : "absent",
+        ...(globalValue.present ? { value: globalValue.value } : {}),
+        resource: globalResource.revision.resource,
+        ...(globalResource.document.error ? { messageKey: globalResource.document.error } : {}),
+      });
+      configured.push({
+        key,
+        scope: "project",
+        state: projectResource.document.error ? "invalid" : projectValue.present ? "set" : "absent",
+        ...(projectValue.present ? { value: projectValue.value } : {}),
+        resource: projectResource.revision.resource,
+        ...(projectResource.document.error ? { messageKey: projectResource.document.error } : {}),
+      });
+      const selected = stores.project.applyOverrides && projectValue.present
+        ? { value: projectValue.value, scope: "project" as const, resource: projectResource.revision.resource }
+        : globalValue.present
+          ? { value: globalValue.value, scope: "global" as const, resource: globalResource.revision.resource }
+          : undefined;
+      effective.push({
+        key,
+        value: selected?.value ?? null,
+        source: selected ? "configured" : "default",
+        ...(selected ? { scope: selected.scope, resource: selected.resource } : {}),
+      });
+    }
+  }
+  for (const role of roles) {
+    for (const field of ["model", "fallbacks", "thinking", "fast"] as const) {
+      const key = roleSettingKey(role, field);
+      const globalValue = rawRoleValue(profile, role, field);
+      const projectValue = rawRoleValue(stores.project.overrides, role, field);
+      configured.push({
+        key,
+        scope: "global",
+        state: globalResource.document.error ? "invalid" : globalValue.present ? "set" : "absent",
+        ...(globalValue.present ? { value: globalValue.value } : {}),
+        resource: globalResource.revision.resource,
+        ...(globalResource.document.error ? { messageKey: globalResource.document.error } : {}),
+      });
+      configured.push({
+        key,
+        scope: "project",
+        state: projectResource.document.error ? "invalid" : projectValue.present ? "set" : "absent",
+        ...(projectValue.present ? { value: projectValue.value } : {}),
+        resource: projectResource.revision.resource,
+        ...(projectResource.document.error ? { messageKey: projectResource.document.error } : {}),
+      });
+      const selected = stores.project.applyOverrides && projectValue.present
+        ? { value: projectValue.value, scope: "project" as const, resource: projectResource.revision.resource }
+        : globalValue.present
+          ? { value: globalValue.value, scope: "global" as const, resource: globalResource.revision.resource }
+          : undefined;
+      effective.push({
+        key,
+        value: selected?.value ?? null,
+        source: selected ? "configured" : "default",
+        ...(selected ? { scope: selected.scope, resource: selected.resource } : {}),
+      });
+    }
+  }
+
+  const roleRows = summaries.map((summary) => ({
+    labelKey: "teammate.roles.row",
+    value: summary.description || summary.name,
+    status: "dim" as const,
+  }));
+  effective.push({ key: "teammate.roles", value: roleRows, source: "runtime" });
+  return {
+    providerId: PROVIDER_ID,
+    providerInstanceId: instanceId,
+    configured: { values: configured, resources: resources.map((entry) => entry.revision) },
+    effective: { values: effective },
+  };
+}
+
+function readResources(
+  cwd: string,
+  getGlobalPath: () => string,
+  getProjectPath: (cwd: string) => string,
+): RoutingResourceState[] {
+  const globalPath = getGlobalPath();
+  const projectPath = getProjectPath(cwd);
+  try {
+    const stores = loadModelRoutingStores(globalPath, projectPath);
+    return [
+      resourceState("global", globalPath, stores.global),
+      resourceState("project", projectPath, stores.project),
+    ];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      invalidResourceState("global", globalPath, defaultGlobalStore(), message),
+      invalidResourceState("project", projectPath, defaultProjectStore(), message),
+    ];
+  }
+}
+
+function resourceState(
+  scope: "global" | "project",
+  filePath: string,
+  raw: GlobalModelRoutingStore | ProjectModelRoutingStore,
+): RoutingResourceState {
+  const content = readContent(filePath);
+  return { scope, path: filePath, document: { content, raw }, revision: revision(scope, filePath, content) };
+}
+
+function resourceStateFromContent(
+  scope: "global" | "project",
+  filePath: string,
+  raw: GlobalModelRoutingStore | ProjectModelRoutingStore,
+  content: string,
+): RoutingResourceState {
+  return { scope, path: filePath, document: { content, raw }, revision: revision(scope, filePath, content) };
+}
+
+function invalidResourceState(
+  scope: "global" | "project",
+  filePath: string,
+  raw: GlobalModelRoutingStore | ProjectModelRoutingStore,
+  error: string,
+): RoutingResourceState {
+  const content = readContent(filePath);
+  return { scope, path: filePath, document: { content, raw, error }, revision: revision(scope, filePath, content) };
+}
+
+function readContent(filePath: string): string {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw error;
+  }
+}
+
+function revision(scope: "global" | "project", filePath: string, content: string): SettingsResourceRevision {
+  return {
+    resource: { providerId: PROVIDER_ID, scope, id: `${scope}:teammate-models.json` },
+    etag: createHash("sha256").update(content || "<missing>").digest("hex"),
+    size: Buffer.byteLength(content),
+  };
+}
+
+function validateRequest(
+  changes: readonly SettingsChange[],
+  expectedRevisions: readonly SettingsResourceRevision[] | undefined,
+  resources: readonly RoutingResourceState[],
+) {
+  const issues: SettingsValidationIssue[] = [];
+  const conflicts: SettingsResourceConflict[] = [];
+  for (const resource of resources) {
+    const expected = expectedRevisions?.find((entry) => entry.resource.id === resource.revision.resource.id);
+    if (expected && expected.etag !== resource.revision.etag) conflicts.push(resourceConflict(resource.revision, expected.etag));
+    if (resource.document.error) {
+      issues.push({
+        severity: "error",
+        messageKey: "teammate.settings.invalidDocument",
+        key: changes[0]?.key ?? "routing.manage",
+        scope: resource.scope,
+      });
+    }
+  }
+  for (const change of changes) {
+    const parsed = parseSettingKey(change.key);
+    if (!parsed) {
+      issues.push(issue(change, "teammate.settings.unknownKey"));
+      continue;
+    }
+    if ((parsed.kind === "runtime" && change.scope !== "global")
+      || (parsed.kind !== "runtime" && change.scope !== "global" && change.scope !== "project")) {
+      issues.push(issue(change, "teammate.settings.invalidScope"));
+      continue;
+    }
+    if (change.operation === "set" && !validValue(parsed, change.value)) {
+      issues.push(issue(change, "teammate.settings.invalidValue"));
+    }
+  }
+  return { valid: issues.length === 0 && conflicts.length === 0, issues, conflicts };
+}
+
+function applyChanges(before: ModelRoutingStorePair, changes: readonly SettingsChange[]): ModelRoutingStorePair {
+  const next = structuredClone(before);
+  const requestedProfile = next.project.activeProfile ?? next.global.defaultProfile;
+  const profileId = Object.hasOwn(next.global.profiles, requestedProfile)
+    ? requestedProfile
+    : next.global.defaultProfile;
+  for (const change of changes) {
+    const parsed = parseSettingKey(change.key);
+    if (!parsed) continue;
+    if (parsed.kind === "runtime") {
+      if (change.operation === "unset") delete next.global.backgroundStatusHeartbeatMs;
+      else next.global.backgroundStatusHeartbeatMs = change.value as number;
+      continue;
+    }
+    const rules = change.scope === "global"
+      ? next.global.profiles[profileId]
+      : next.project.overrides;
+    if (parsed.kind === "role") {
+      rules.roleMappings ??= {};
+      const roleRules = rules.roleMappings[parsed.role] ?? {};
+      const roleField = parsed.field === "fallbacks" ? "fallbackModels" : parsed.field;
+      if (change.operation === "unset") {
+        delete roleRules[roleField];
+        if (Object.keys(roleRules).length === 0) delete rules.roleMappings[parsed.role];
+      } else if (parsed.field === "fallbacks" && Array.isArray(change.value)) {
+        roleRules.fallbackModels = [...new Set(change.value
+          .filter((value): value is string => typeof value === "string")
+          .map((value) => value.trim())
+          .filter(Boolean))];
+        rules.roleMappings[parsed.role] = roleRules;
+      } else {
+        roleRules[roleField] = change.value as never;
+        rules.roleMappings[parsed.role] = roleRules;
+      }
+    } else {
+      const section = sectionFor(parsed.field);
+      const values = rules[section] ?? {};
+      if (change.operation === "unset") {
+        delete values[parsed.taskType];
+      } else if (parsed.field === "fallbacks" && Array.isArray(change.value)) {
+        values[parsed.taskType] = [...new Set(change.value
+          .filter((value): value is string => typeof value === "string")
+          .map((value) => value.trim())
+          .filter(Boolean))];
+      } else if (parsed.field === "model" && typeof change.value === "string") {
+        values[parsed.taskType] = change.value.trim();
+      } else {
+        values[parsed.taskType] = change.value as never;
+      }
+      if (section === "fastModes") rules.fastModes = values as NonNullable<typeof rules.fastModes>;
+      if (section === "fallbackMappings") {
+        rules.fallbackMappings = values as NonNullable<typeof rules.fallbackMappings>;
+      }
+    }
+    if (change.scope === "project" && change.operation === "set") next.project.applyOverrides = true;
+  }
+  if (!hasRoutingRules(next.project.overrides)) next.project.applyOverrides = false;
+  return next;
+}
+
+function rawRoleValue(
+  raw: { roleMappings?: Record<string, { model?: string | null; fallbackModels?: string[] | null; thinking?: string | null; fast?: boolean | null } | null> },
+  role: string,
+  field: "model" | "fallbacks" | "thinking" | "fast",
+): { present: boolean; value?: JsonValue } {
+  const rules = raw.roleMappings?.[role];
+  if (!rules || !Object.hasOwn(rules, field === "model" ? "model" : field === "fallbacks" ? "fallbackModels" : field)) {
+    return { present: false };
+  }
+  const value = field === "model" ? rules.model : field === "fallbacks" ? rules.fallbackModels : field === "fast" ? rules.fast : rules.thinking;
+  if (field === "model") return { present: true, value: typeof value === "string" ? value : null };
+  if (field === "fallbacks") return { present: true, value: Array.isArray(value) ? [...value] : null };
+  if (field === "fast") return { present: true, value: typeof value === "boolean" ? value : null };
+  return { present: true, value: parseTeammateThinkingLevel(value) ?? null };
+}
+
+function rawValue(
+  raw: { mappings: Record<string, unknown> | object; fallbackMappings?: Record<string, unknown> | object; thinkingLevels: Record<string, unknown> | object; fastModes?: Record<string, unknown> | object },
+  taskType: TeammateTaskType,
+  field: "model" | "fallbacks" | "thinking" | "fast",
+): { present: boolean; value?: JsonValue } {
+  const section = isRecord(raw[sectionFor(field)]) ? raw[sectionFor(field)] as Record<string, unknown> : {};
+  if (!Object.hasOwn(section, taskType)) return { present: false };
+  const value = section[taskType];
+  if (field === "model") return { present: true, value: typeof value === "string" ? value.trim() : null };
+  if (field === "fallbacks") {
+    return {
+      present: true,
+      value: Array.isArray(value)
+        ? value.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean)
+        : null,
+    };
+  }
+  if (field === "fast") return { present: true, value: typeof value === "boolean" ? value : null };
+  return { present: true, value: parseTeammateThinkingLevel(value) ?? null };
+}
+
+function settingKey(taskType: TeammateTaskType, field: "model" | "fallbacks" | "thinking" | "fast"): string {
+  return `routing.${taskType}.${field}`;
+}
+
+type RoutingField = "model" | "fallbacks" | "thinking" | "fast";
+
+type ParsedSetting =
+  | { kind: "runtime"; field: "backgroundStatusHeartbeatMs" }
+  | { kind: "task"; taskType: TeammateTaskType; field: RoutingField }
+  | { kind: "role"; role: string; field: RoutingField };
+
+function roleSettingKey(role: string, field: "model" | "fallbacks" | "thinking" | "fast"): string {
+  return `role.${role}.${field}`;
+}
+
+function parseSettingKey(key: string): ParsedSetting | undefined {
+  if (key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY) {
+    return { kind: "runtime", field: "backgroundStatusHeartbeatMs" };
+  }
+  const taskMatch = /^routing\.([a-z][a-z0-9._-]*)\.(model|fallbacks|thinking|fast)$/.exec(key);
+  if (taskMatch) {
+    const taskType = parseTeammateTaskType(taskMatch[1]);
+    if (!taskType) return undefined;
+    return { kind: "task", taskType, field: taskMatch[2] as RoutingField };
+  }
+  const roleMatch = /^role\.([a-z][a-z0-9._-]*)\.(model|fallbacks|thinking|fast)$/.exec(key);
+  if (!roleMatch) return undefined;
+  return { kind: "role", role: roleMatch[1], field: roleMatch[2] as RoutingField };
+}
+
+function sectionFor(field: "model" | "fallbacks" | "thinking" | "fast"): "mappings" | "fallbackMappings" | "thinkingLevels" | "fastModes" {
+  if (field === "model") return "mappings";
+  if (field === "fallbacks") return "fallbackMappings";
+  if (field === "fast") return "fastModes";
+  return "thinkingLevels";
+}
+
+function validValue(setting: ParsedSetting, value: JsonValue): boolean {
+  if (setting.kind === "runtime") {
+    return typeof value === "number"
+      && Number.isSafeInteger(value)
+      && value >= BACKGROUND_STATUS_HEARTBEAT_MIN_MS
+      && value <= BACKGROUND_STATUS_HEARTBEAT_MAX_MS;
+  }
+  if (setting.field === "fast") return value === null || typeof value === "boolean";
+  if (setting.field === "model") return value === null || (typeof value === "string" && value.trim().length > 0);
+  if (setting.field === "fallbacks") return value === null || (Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim().length > 0));
+  return value === null || parseTeammateThinkingLevel(value) !== undefined;
+}
+
+function activationForKeys(keys: readonly string[]): SettingsActivationPlan[] {
+  const live = keys.filter((key) => key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+  const deferred = keys.filter((key) => key !== BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+  return [
+    ...(live.length > 0 ? [{ boundary: "live" as const, keys: live }] : []),
+    ...(deferred.length > 0 ? [{ boundary: "next-invocation" as const, keys: deferred }] : []),
+  ];
+}
+
+function storePair(resources: readonly RoutingResourceState[]): ModelRoutingStorePair {
+  return {
+    global: structuredClone(resources.find((entry) => entry.scope === "global")!.document.raw as GlobalModelRoutingStore),
+    project: structuredClone(resources.find((entry) => entry.scope === "project")!.document.raw as ProjectModelRoutingStore),
+  };
+}
+
+function contentPair(resources: readonly RoutingResourceState[]): ModelRoutingStoreContentPair {
+  return {
+    global: resources.find((entry) => entry.scope === "global")!.document.content,
+    project: resources.find((entry) => entry.scope === "project")!.document.content,
+  };
+}
+
+function defaultGlobalStore(): GlobalModelRoutingStore {
+  return {
+    version: 4,
+    defaultProfile: "default",
+    profiles: {
+      default: { name: "Default", mappings: {}, thinkingLevels: {} },
+    },
+  };
+}
+
+function defaultProjectStore(): ProjectModelRoutingStore {
+  return {
+    version: 4,
+    applyOverrides: false,
+    overrides: { mappings: {}, thinkingLevels: {} },
+  };
+}
+
+function hasRoutingRules(rules: ProjectModelRoutingStore["overrides"]): boolean {
+  return Object.keys(rules.mappings).length > 0
+    || Object.keys(rules.thinkingLevels).length > 0
+    || Object.keys(rules.fastModes ?? {}).length > 0
+    || Object.keys(rules.fallbackMappings ?? {}).length > 0
+    || Object.keys(rules.roleMappings ?? {}).length > 0
+    || Object.keys(rules.typeMeta ?? {}).length > 0;
+}
+
+function resourceConflict(actual: SettingsResourceRevision, expectedEtag: string): SettingsResourceConflict {
+  return { resource: actual.resource, expectedEtag, actualEtag: actual.etag, messageKey: "settings.conflict" };
+}
+
+function issue(change: SettingsChange, messageKey: string): SettingsValidationIssue {
+  return { severity: "error", messageKey, key: change.key, scope: change.scope };
+}
+
+function requirePrepared(
+  prepared: Map<string, PreparedRoutingChange>,
+  token: string,
+  transactionId: string,
+): PreparedRoutingChange {
+  const state = prepared.get(token);
+  if (!state || state.transactionId !== transactionId) throw new Error("prepared Teammate settings transaction is unavailable");
+  return state;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isDiscover(payload: unknown): payload is SettingsDiscoverEventV1 {
+  return Boolean(payload && typeof payload === "object"
+    && (payload as Partial<SettingsDiscoverEventV1>).version === SETTINGS_PROTOCOL_VERSION
+    && typeof (payload as Partial<SettingsDiscoverEventV1>).requestId === "string");
+}

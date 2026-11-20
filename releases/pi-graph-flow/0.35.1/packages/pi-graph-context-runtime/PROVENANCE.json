@@ -1,0 +1,25 @@
+{
+  "upstreamCommit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "licenseSource": "artifacts/pi-maestro-comparison-20261103/upstream/LICENSE",
+  "licenseSha256": "4604892b826ecf82c56cccf1bb33a976236065c9411f6da70fc1b8898b1315e8",
+  "scope": "M09.C02 Phase A only; no Host integration or acceptance",
+  "knownPreservedBoundaries": [
+    "already-aborted signal not synchronously rejected",
+    "complete() has no event identity; Host filtering required",
+    "second lease expiration does not prove physical settlement"
+  ],
+  "sources": [
+    {
+      "target": "src/threshold.ts",
+      "source": "rebuild/packages/pi-maestro-flow/src/compaction/compaction-threshold.ts",
+      "sourceSha256": "408a19de3047f5c467a74a85962be16e01f4507bdbc5b617d1e23e8148d888c4",
+      "modification": "byte-identical algorithm"
+    },
+    {
+      "target": "src/arbiter.ts",
+      "source": "rebuild/packages/pi-maestro-flow/src/compaction/compaction-arbiter.ts",
+      "sourceSha256": "634f5b707e89e9bf141c0208253ce629fb5bc61fbe6e4299b622ee31799b1fde",
+      "modification": "type import location; injected clock/schedule/cancel; clarified second lease comment; existing transitions preserved"
+    }
+  ]
+}

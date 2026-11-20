@@ -1,0 +1,989 @@
+import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { VERSION } from "@earendil-works/pi-coding-agent";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+import {
+	SETTINGS_ANNOUNCE_EVENT,
+	SETTINGS_DISCOVER_EVENT,
+	SETTINGS_PROTOCOL_VERSION,
+	getPiHostMode,
+	type ConfiguredSettingValue,
+	type JsonValue,
+	type SettingDefinition,
+	type SettingsActivationPlan,
+	type SettingsAnnounceEventV1,
+	type SettingsChange,
+	type SettingsContextV1,
+	type SettingsDiscoverEventV1,
+	type SettingsProviderV1,
+	type SettingsResource,
+	type SettingsResourceConflict,
+	type SettingsResourceRevision,
+	type SettingsSnapshot,
+	type SettingsValidationIssue,
+} from "pi-maestro-settings-core/v1";
+import {
+	getConfigPath,
+	mergeConfig,
+	mergeConfigDocument,
+} from "../config.ts";
+import { DEFAULT_CONFIG, type CockpitConfig } from "../types.ts";
+import type { SettingsEventBus } from "./registry.ts";
+
+const require = createRequire(import.meta.url);
+const properLockfile = require("proper-lockfile") as {
+	lock(path: string, options: {
+		realpath: boolean;
+		stale: number;
+		update: number;
+		retries: { retries: number; factor: number; minTimeout: number; maxTimeout: number };
+	}): Promise<() => Promise<void>>;
+};
+
+const PROVIDER_ID = "pi-cockpit";
+const PROVIDER_VERSION = "1.0.0";
+const CONFIG_RESOURCE_ID = "cockpit.json";
+
+const CONFIG_KEYS = [
+	"enabled",
+	"staticMode",
+	"pinEditorBottom",
+	"doubleEscapeClearInput",
+	"fullscreenInput",
+	"copyOnSelect",
+	"historyEnabled",
+	"currency",
+	"currencyRate",
+	"quietMode",
+	"quietSymbols",
+	"agentsMode",
+	"todoMode",
+	"todoExpanded",
+	"todoDurationChart",
+	"stackStyle",
+	"hideNativeAgents",
+	"toolPalette",
+	"icons.mode",
+	"sidebar.mode",
+	"sidebar.width",
+	"sidebar.density",
+	"title.enabled",
+	"title.showSession",
+	"title.showCwd",
+	"title.showModel",
+	"title.showThinking",
+	"title.showGit",
+	"title.showMaestro",
+	"title.generationModel",
+	"title.maxLength",
+	"usage.enabled",
+	"usage.footer",
+	"usage.pollIntervalMs",
+	"usage.barWidth",
+	"usage.commandKey",
+] as const;
+
+type CockpitSettingKey = (typeof CONFIG_KEYS)[number];
+
+export interface CockpitSettingsProvider extends SettingsProviderV1 {
+	readonly providerId: typeof PROVIDER_ID;
+	readonly instanceId: string;
+}
+
+export interface CockpitSettingsProviderOptions {
+	hostVersion?: unknown;
+	getConfigPath?: () => string;
+	getRuntimeConfig: () => CockpitConfig;
+	applyRuntimeConfig: (config: CockpitConfig, changedKeys: readonly string[], context: SettingsContextV1) => Promise<void> | void;
+	getThemeName?: () => string | undefined;
+	getThinkingFolded?: () => boolean | undefined;
+	openLegacySettings?: () => Promise<void> | void;
+	openThemeSettings?: () => Promise<void> | void;
+	toggleThinkingFold?: () => Promise<boolean | void> | boolean | void;
+}
+
+interface ConfigDocument {
+	path: string;
+	content: string;
+	raw: unknown;
+	config: CockpitConfig;
+	revision: SettingsResourceRevision;
+	error?: string;
+}
+
+interface PreparedCockpitChange {
+	token: string;
+	transactionId: string;
+	path: string;
+	temporaryPath: string;
+	beforeContent: string;
+	config: CockpitConfig;
+	changedKeys: readonly string[];
+	activation: readonly SettingsActivationPlan[];
+	release: () => Promise<void>;
+	committedRevision?: SettingsResourceRevision;
+}
+
+const CATALOGS = {
+	en: {
+		"cockpit.provider": "Cockpit",
+		"cockpit.provider.description": "Terminal layout, widgets and presentation settings",
+		"cockpit.group.general": "General",
+		"cockpit.group.layout": "Layout",
+		"cockpit.group.panels": "Panels",
+		"cockpit.group.sidebar": "Sidebar",
+		"cockpit.group.title": "Tab title",
+		"cockpit.group.appearance": "Appearance",
+		"cockpit.enabled": "Cockpit enabled",
+		"cockpit.staticMode": "Static rendering mode",
+		"cockpit.pinEditorBottom": "Pin input editor to bottom",
+		"cockpit.pinEditorBottom.description": "Experimental: add elastic space above the editor when the conversation is shorter than the terminal",
+		"cockpit.doubleEscapeClearInput": "Double Escape clears input",
+		"cockpit.doubleEscapeClearInput.description": "Press Escape twice quickly to clear a non-empty input draft. The first Escape keeps its native meaning and an empty-draft double Escape stays pi's rewind/tree action. Requires /reload.",
+		"cockpit.fullscreenInput": "Fullscreen input",
+		"cockpit.fullscreenInput.description": "Alternate screen with the editor fixed at the bottom and an application-scrolled transcript. Terminal-native scrollback/search is replaced by transcript scrolling. Requires /reload.",
+		"cockpit.copyOnSelect": "Copy on selection",
+		"cockpit.historyEnabled": "Input history",
+		"cockpit.historyEnabled.description": "Persistent ↑/↓ prompt history owned by the Cockpit editor. On by default; disable to leave the editor to pi. Requires /reload.",
+		"cockpit.copyOnSelect.description": "Copy transcript text to the clipboard when a drag selection is released. Effective only while fullscreen input is active.",
+		"cockpit.currency": "Cost currency",
+		"cockpit.currency.description": "Footer cost currency: USD ($) or CNY (¥). CNY converts the USD estimate using the rate below.",
+		"cockpit.currencyRate": "CNY per 1 USD",
+		"cockpit.currencyRate.description": "Exchange rate used to convert the estimated USD spend to CNY. Only applies while currency is CNY.",
+		"cockpit.option.usd": "USD ($)",
+		"cockpit.option.cny": "CNY (¥)",
+		"cockpit.quietMode": "Quiet tool rendering",
+		"cockpit.quietMode.description": "Compact built-in tools and Maestro tools such as teammate, observe and Todo without changing their execution or parameters. Other extensions own their tool styles. Reload may be required when toggling.",
+		"cockpit.quietSymbols": "Quiet symbols",
+		"cockpit.agentsMode": "Agent display",
+		"cockpit.todoMode": "Todo display",
+		"cockpit.todoExpanded": "Todo expanded",
+		"cockpit.todoDurationChart": "Advance duration chart",
+		"cockpit.todoDurationChart.description": "Show a task-duration chart after advance completes the entire Todo list.",
+		"cockpit.stackStyle": "Stack projection",
+		"cockpit.hideNativeAgents": "Hide native agent widget",
+		"cockpit.icons.mode": "Icon mode",
+		"cockpit.sidebar.mode": "Sidebar mode",
+		"cockpit.sidebar.width": "Sidebar width",
+		"cockpit.sidebar.density": "Sidebar density",
+		"cockpit.toolPalette": "Tool palette",
+		"cockpit.toolPalette.description": "Tool-name color source. Applies on /reload.",
+		"cockpit.title.enabled": "Tab title enabled",
+		"cockpit.title.enabled.description": "Show a session summary in the terminal tab title.",
+		"cockpit.title.showSession": "Title: show session",
+		"cockpit.title.showCwd": "Title: show working directory",
+		"cockpit.title.showModel": "Title: show model",
+		"cockpit.title.showThinking": "Title: show thinking level",
+		"cockpit.title.showGit": "Title: show git branch",
+		"cockpit.title.showMaestro": "Title: show maestro status",
+		"cockpit.title.generationModel": "Title generation model",
+		"cockpit.title.generationModel.description": "Model used to generate the session title after the first turn (provider/model). Empty falls back to the offline rule-based suggest.",
+		"cockpit.title.maxLength": "Title max length",
+		"cockpit.title.maxLength.description": "Hard cap on the composed tab title (the middle is ellided).",
+		"cockpit.option.classic": "Classic",
+		"cockpit.option.zen": "Zen",
+		"cockpit.option.family": "Family",
+		"cockpit.option.readwrite": "Read/Write",
+		"cockpit.option.search": "Search",
+		"cockpit.option.mono": "Mono",
+		"cockpit.theme": "Theme",
+		"cockpit.thinkingFold": "Thinking fold",
+		"cockpit.action.legacy": "Open legacy Cockpit settings",
+		"cockpit.option.check": "Check marks",
+		"cockpit.option.dot": "Dots",
+		"cockpit.option.list": "List",
+		"cockpit.option.compact": "Compact",
+		"cockpit.option.auto": "Automatic",
+		"cockpit.option.nerd": "Nerd Font",
+		"cockpit.option.ascii": "ASCII",
+		"cockpit.option.on": "On",
+		"cockpit.option.off": "Off",
+		"cockpit.option.comfortable": "Comfortable",
+		"cockpit.runtime.reloadQuiet": "Turning Quiet off requires /reload to restore native tool renderers",
+		"cockpit.runtime.reloadInteractions": "Editor interaction settings require /reload to take effect",
+		"cockpit.group.usage": "Usage bars",
+		"cockpit.usage.enabled": "Usage bars",
+		"cockpit.usage.enabled.description": "Show provider quota, balance, and spend indicators in the footer and a /usage selector. Ports the hknet/pi-usage-bars extension.",
+		"cockpit.usage.footer": "Show in footer",
+		"cockpit.usage.footer.description": "Render the live quota bar on a dedicated footer line. The /usage command works regardless of this toggle.",
+		"cockpit.usage.pollIntervalMs": "Poll interval (ms)",
+		"cockpit.usage.pollIntervalMs.description": "How often to refresh usage data. Clamped to 30s..30min; 0 = manual refresh only (no polling, no footer bar; /usage fetches on open and with `r`). Lower values hit provider APIs more often.",
+		"cockpit.usage.barWidth": "Bar width",
+		"cockpit.usage.barWidth.description": "Characters per quota bar in the footer. Clamped to 4..16.",
+		"cockpit.usage.commandKey": "Command key",
+		"cockpit.usage.commandKey.description": "The /-command that opens the usage selector overlay. Requires /reload.",
+	},
+	"zh-CN": {
+		"cockpit.provider": "驾驶舱",
+		"cockpit.provider.description": "终端布局、面板与显示设置",
+		"cockpit.group.general": "常规",
+		"cockpit.group.layout": "布局",
+		"cockpit.group.panels": "面板",
+		"cockpit.group.sidebar": "侧边栏",
+		"cockpit.group.title": "标签页标题",
+		"cockpit.group.appearance": "外观",
+		"cockpit.enabled": "启用 Cockpit",
+		"cockpit.staticMode": "静态渲染模式",
+		"cockpit.pinEditorBottom": "固定输入框到底部",
+		"cockpit.pinEditorBottom.description": "实验功能：当会话内容少于终端高度时，在输入框上方自动填充空间",
+		"cockpit.doubleEscapeClearInput": "双击 Esc 清空输入",
+		"cockpit.doubleEscapeClearInput.description": "在输入非空时快速按两次 Esc 清空草稿。第一次 Esc 保持原生含义，空输入框的双 Esc 仍是 pi 的 rewind/tree 操作。需执行 /reload 生效。",
+		"cockpit.fullscreenInput": "全屏输入模式",
+		"cockpit.fullscreenInput.description": "使用 alternate screen 将输入框固定到底部，历史内容由应用内滚动代替。终端原生滚动/搜索被替代。需执行 /reload 生效。",
+		"cockpit.copyOnSelect": "选中即复制",
+		"cockpit.historyEnabled": "输入历史",
+		"cockpit.historyEnabled.description": "由 Cockpit 编辑器持有的持久 ↑/↓ 输入历史。默认开启；关闭则编辑器交还 pi。执行 /reload 后生效。",
+		"cockpit.copyOnSelect.description": "在拖选 transcript 文本并松开时自动复制到剪贴板。仅在全屏输入模式开启时生效。",
+		"cockpit.currency": "花费货币",
+		"cockpit.currency.description": "状态栏花费货币：美元（$）或人民币（¥）。人民币按下方汇率换算美元估算值。",
+		"cockpit.currencyRate": "1 美元兑人民币",
+		"cockpit.currencyRate.description": "将估算美元花费换算为人民币使用的汇率；仅在选择人民币时生效。",
+		"cockpit.option.usd": "美元（$）",
+		"cockpit.option.cny": "人民币（¥）",
+		"cockpit.quietMode": "紧凑工具渲染",
+		"cockpit.quietMode.description": "紧凑显示内置工具及 teammate、observe、Todo 等 Maestro 工具，不改变执行能力或参数。其他扩展工具的样式由各自插件控制。切换后可能需要重载。",
+		"cockpit.quietSymbols": "紧凑状态符号",
+		"cockpit.agentsMode": "Agent 显示",
+		"cockpit.todoMode": "Todo 显示",
+		"cockpit.todoExpanded": "展开 Todo",
+		"cockpit.todoDurationChart": "Advance 耗时图",
+		"cockpit.todoDurationChart.description": "当 advance 完成整个 Todo 列表后显示任务耗时统计图。",
+		"cockpit.stackStyle": "栈投影",
+		"cockpit.hideNativeAgents": "隐藏原生 Agent 面板",
+		"cockpit.icons.mode": "图标模式",
+		"cockpit.sidebar.mode": "侧边栏模式",
+		"cockpit.sidebar.width": "侧边栏宽度",
+		"cockpit.sidebar.density": "侧边栏密度",
+		"cockpit.toolPalette": "工具调色板",
+		"cockpit.toolPalette.description": "工具名称配色来源。需执行 /reload 生效。",
+		"cockpit.title.enabled": "启用标签页标题",
+		"cockpit.title.enabled.description": "在终端标签页标题显示会话摘要。",
+		"cockpit.title.showSession": "标题：显示会话",
+		"cockpit.title.showCwd": "标题：显示工作目录",
+		"cockpit.title.showModel": "标题：显示模型",
+		"cockpit.title.showThinking": "标题：显示思考级别",
+		"cockpit.title.showGit": "标题：显示 git 分支",
+		"cockpit.title.showMaestro": "标题：显示 Maestro 状态",
+		"cockpit.title.generationModel": "标题生成模型",
+		"cockpit.title.generationModel.description": "首轮后用于生成会话标题的模型（provider/model）。留空则回退到离线的规则建议。",
+		"cockpit.title.maxLength": "标题最大长度",
+		"cockpit.title.maxLength.description": "组合标签页标题的硬上限（中间省略）。",
+		"cockpit.option.classic": "经典",
+		"cockpit.option.zen": "Zen",
+		"cockpit.option.family": "族",
+		"cockpit.option.readwrite": "读写",
+		"cockpit.option.search": "搜索",
+		"cockpit.option.mono": "单色",
+		"cockpit.theme": "主题",
+		"cockpit.thinkingFold": "折叠思考过程",
+		"cockpit.action.legacy": "打开旧版 Cockpit 设置",
+		"cockpit.option.check": "对勾",
+		"cockpit.option.dot": "圆点",
+		"cockpit.option.list": "列表",
+		"cockpit.option.compact": "紧凑",
+		"cockpit.option.auto": "自动",
+		"cockpit.option.nerd": "Nerd Font",
+		"cockpit.option.ascii": "ASCII",
+		"cockpit.option.on": "开启",
+		"cockpit.option.off": "关闭",
+		"cockpit.option.comfortable": "舒适",
+		"cockpit.runtime.reloadQuiet": "关闭紧凑渲染后需执行 /reload 才能恢复原生工具界面",
+		"cockpit.runtime.reloadInteractions": "编辑器交互设置需执行 /reload 才能生效",
+		"cockpit.group.usage": "用量条",
+		"cockpit.usage.enabled": "用量条",
+		"cockpit.usage.enabled.description": "在状态栏和 /usage 选择器中显示各供应商的配额、余额与花费。移植自 hknet/pi-usage-bars 扩展。",
+		"cockpit.usage.footer": "在状态栏显示",
+		"cockpit.usage.footer.description": "在专属状态栏行渲染实时配额条。/usage 命令不受此开关影响。",
+		"cockpit.usage.pollIntervalMs": "轮询间隔（毫秒）",
+		"cockpit.usage.pollIntervalMs.description": "刷新用量数据的频率，钳制在 30 秒..30 分钟；0 = 仅手动刷新（不轮询、不显示状态栏；进入 /usage 时抓取并按 r 刷新）。值越小调用供应商 API 越频繁。",
+		"cockpit.usage.barWidth": "进度条宽度",
+		"cockpit.usage.barWidth.description": "状态栏中每条配额条的字符宽度，钳制在 4..16。",
+		"cockpit.usage.commandKey": "命令键",
+		"cockpit.usage.commandKey.description": "打开用量选择器浮层的 /-命令。需执行 /reload 生效。",
+	},
+} as const;
+
+const DEFINITIONS: readonly SettingDefinition[] = [
+	booleanDefinition("enabled", "cockpit.group.general", 0, "cockpit.enabled", "live"),
+	booleanDefinition("staticMode", "cockpit.group.general", 1, "cockpit.staticMode", "live"),
+	booleanDefinition(
+		"pinEditorBottom",
+		"cockpit.group.layout",
+		0,
+		"cockpit.pinEditorBottom",
+		"live",
+		"cockpit.pinEditorBottom.description",
+	),
+	booleanDefinition(
+		"doubleEscapeClearInput",
+		"cockpit.group.layout",
+		1,
+		"cockpit.doubleEscapeClearInput",
+		"extension-reload",
+		"cockpit.doubleEscapeClearInput.description",
+	),
+	booleanDefinition(
+		"fullscreenInput",
+		"cockpit.group.layout",
+		2,
+		"cockpit.fullscreenInput",
+		"extension-reload",
+		"cockpit.fullscreenInput.description",
+	),
+	booleanDefinition(
+		"copyOnSelect",
+		"cockpit.group.layout",
+		3,
+		"cockpit.copyOnSelect",
+		"live",
+		"cockpit.copyOnSelect.description",
+	),
+	booleanDefinition(
+		"historyEnabled",
+		"cockpit.group.layout",
+		4,
+		"cockpit.historyEnabled",
+		"extension-reload",
+		"cockpit.historyEnabled.description",
+	),
+	enumDefinition("currency", "cockpit.group.general", 4, "cockpit.currency", ["usd", "cny"], "live", "cockpit.currency.description"),
+	{
+		key: "currencyRate",
+		group: "cockpit.group.general",
+		order: 5,
+		labelKey: "cockpit.currencyRate",
+		descriptionKey: "cockpit.currencyRate.description",
+		defaultValue: DEFAULT_CONFIG.currencyRate,
+		scopes: ["global"],
+		merge: "override",
+		activation: "live",
+		sensitivity: "public",
+		reversibility: "full",
+		editor: { kind: "number", min: 0.01, max: 100, step: 0.01 },
+	},
+	booleanDefinition("quietMode", "cockpit.group.general", 2, "cockpit.quietMode", "extension-reload", "cockpit.quietMode.description"),
+	enumDefinition("quietSymbols", "cockpit.group.general", 3, "cockpit.quietSymbols", ["check", "dot"], "live"),
+	enumDefinition("agentsMode", "cockpit.group.panels", 0, "cockpit.agentsMode", ["list", "compact"], "live"),
+	enumDefinition("todoMode", "cockpit.group.panels", 1, "cockpit.todoMode", ["list", "compact"], "live"),
+	booleanDefinition("todoExpanded", "cockpit.group.panels", 2, "cockpit.todoExpanded", "live"),
+	booleanDefinition("todoDurationChart", "cockpit.group.panels", 3, "cockpit.todoDurationChart", "live", "cockpit.todoDurationChart.description"),
+	enumDefinition("stackStyle", "cockpit.group.layout", 4, "cockpit.stackStyle", ["classic", "zen"], "live"),
+	booleanDefinition("hideNativeAgents", "cockpit.group.panels", 4, "cockpit.hideNativeAgents", "live"),
+	enumDefinition("sidebar.mode", "cockpit.group.sidebar", 0, "cockpit.sidebar.mode", ["auto", "on", "off"], "live"),
+	{
+		key: "sidebar.width",
+		group: "cockpit.group.sidebar",
+		order: 1,
+		labelKey: "cockpit.sidebar.width",
+		defaultValue: DEFAULT_CONFIG.sidebar.width,
+		scopes: ["global"],
+		merge: "override",
+		activation: "live",
+		sensitivity: "public",
+		reversibility: "full",
+		editor: { kind: "integer", min: 32, max: 56, step: 1 },
+	},
+	enumDefinition("sidebar.density", "cockpit.group.sidebar", 2, "cockpit.sidebar.density", ["comfortable", "compact"], "live"),
+	enumDefinition("icons.mode", "cockpit.group.appearance", 0, "cockpit.icons.mode", ["auto", "nerd", "ascii"], "live"),
+	enumDefinition("toolPalette", "cockpit.group.appearance", 0, "cockpit.toolPalette", ["classic", "family", "readwrite", "search", "mono"], "extension-reload", "cockpit.toolPalette.description"),
+	booleanDefinition("title.enabled", "cockpit.group.title", 0, "cockpit.title.enabled", "live", "cockpit.title.enabled.description"),
+	booleanDefinition("title.showSession", "cockpit.group.title", 1, "cockpit.title.showSession", "live"),
+	booleanDefinition("title.showCwd", "cockpit.group.title", 2, "cockpit.title.showCwd", "live"),
+	booleanDefinition("title.showModel", "cockpit.group.title", 3, "cockpit.title.showModel", "live"),
+	booleanDefinition("title.showThinking", "cockpit.group.title", 4, "cockpit.title.showThinking", "live"),
+	booleanDefinition("title.showGit", "cockpit.group.title", 5, "cockpit.title.showGit", "live"),
+	booleanDefinition("title.showMaestro", "cockpit.group.title", 6, "cockpit.title.showMaestro", "live"),
+	modelDefinition("title.generationModel", "cockpit.group.title", 7, "cockpit.title.generationModel", "live", "cockpit.title.generationModel.description"),
+	{
+		key: "title.maxLength",
+		group: "cockpit.group.title",
+		order: 8,
+		labelKey: "cockpit.title.maxLength",
+		descriptionKey: "cockpit.title.maxLength.description",
+		defaultValue: DEFAULT_CONFIG.title.maxLength,
+		scopes: ["global"],
+		merge: "override",
+		activation: "live",
+		sensitivity: "public",
+		reversibility: "full",
+		editor: { kind: "integer", min: 20, max: 200, step: 1 },
+	},
+	actionDefinition("thinkingFold", "cockpit.group.appearance", 2, "cockpit.thinkingFold", "cockpit.thinkingFold"),
+	booleanDefinition("usage.enabled", "cockpit.group.usage", 0, "cockpit.usage.enabled", "live", "cockpit.usage.enabled.description"),
+	booleanDefinition("usage.footer", "cockpit.group.usage", 1, "cockpit.usage.footer", "live", "cockpit.usage.footer.description"),
+	{
+		key: "usage.pollIntervalMs",
+		group: "cockpit.group.usage",
+		order: 2,
+		labelKey: "cockpit.usage.pollIntervalMs",
+		descriptionKey: "cockpit.usage.pollIntervalMs.description",
+		defaultValue: DEFAULT_CONFIG.usage.pollIntervalMs,
+		scopes: ["global"],
+		merge: "override",
+		activation: "live",
+		sensitivity: "public",
+		reversibility: "full",
+		editor: { kind: "integer", min: 0, max: 1_800_000, step: 1000 },
+	},
+	{
+		key: "usage.barWidth",
+		group: "cockpit.group.usage",
+		order: 3,
+		labelKey: "cockpit.usage.barWidth",
+		descriptionKey: "cockpit.usage.barWidth.description",
+		defaultValue: DEFAULT_CONFIG.usage.barWidth,
+		scopes: ["global"],
+		merge: "override",
+		activation: "live",
+		sensitivity: "public",
+		reversibility: "full",
+		editor: { kind: "integer", min: 4, max: 16, step: 1 },
+	},
+	{
+		key: "usage.commandKey",
+		group: "cockpit.group.usage",
+		order: 4,
+		labelKey: "cockpit.usage.commandKey",
+		descriptionKey: "cockpit.usage.commandKey.description",
+		defaultValue: DEFAULT_CONFIG.usage.commandKey,
+		scopes: ["global"],
+		merge: "override",
+		activation: "extension-reload",
+		sensitivity: "public",
+		reversibility: "reload-required",
+		editor: { kind: "text" },
+	},
+];
+
+export function createCockpitSettingsProvider(options: CockpitSettingsProviderOptions): CockpitSettingsProvider {
+	const instanceId = randomUUID();
+	const configPath = options.getConfigPath ?? getConfigPath;
+	const quietRequiresReload = getPiHostMode(options.hostVersion ?? VERSION) !== "native";
+	const prepared = new Map<string, PreparedCockpitChange>();
+
+	return {
+		providerId: PROVIDER_ID,
+		instanceId,
+		describe: () => ({
+			id: PROVIDER_ID,
+			version: PROVIDER_VERSION,
+			instanceId,
+			labelKey: "cockpit.provider",
+			descriptionKey: "cockpit.provider.description",
+			order: 10,
+			capabilities: { read: true, write: true, prepareCommit: true, rollback: "full", hotUpdate: true },
+			settings: DEFINITIONS.map((definition) => definition.key === "quietMode" && !quietRequiresReload
+				? { ...definition, activation: "live", reversibility: "full" }
+				: definition),
+			catalogs: CATALOGS,
+		}),
+		read: () => {
+			const path = configPath();
+			ensureConfigDocument(path);
+			return snapshot(readDocument(path), instanceId, options);
+		},
+		validate: (request) => validateRequest(configPath(), request.changes, request.expectedRevisions),
+		prepare: async (request) => {
+			const path = configPath();
+			ensureConfigDocument(path);
+			const release = await properLockfile.lock(path, {
+				realpath: false,
+				stale: 10_000,
+				update: 2_000,
+				retries: { retries: 4, factor: 1.5, minTimeout: 25, maxTimeout: 250 },
+			});
+			try {
+				const current = readDocument(path);
+				const validation = validateRequest(path, request.changes, request.expectedRevisions, current);
+				if (!validation.valid) {
+					await release();
+					return { prepared: false, validation, conflicts: validation.conflicts };
+				}
+				const nextConfig = applyConfigChanges(current.config, request.changes);
+				const document = mergeConfigDocument(current.raw, nextConfig);
+				const content = `${JSON.stringify(document, null, 2)}\n`;
+				const token = randomUUID();
+				const temporaryPath = `${path}.${process.pid}.${token}.tmp`;
+				writeSyncedFile(temporaryPath, content);
+				const changedKeys = request.changes.map((change) => change.key);
+				const activation = activationFor(request.changes, current.config, nextConfig, quietRequiresReload);
+				prepared.set(token, {
+					token,
+					transactionId: request.transactionId,
+					path,
+					temporaryPath,
+					beforeContent: current.content,
+					config: nextConfig,
+					changedKeys,
+					activation,
+					release,
+				});
+				return {
+					prepared: true,
+					prepareToken: token,
+					validation,
+					activation,
+				};
+			} catch (error) {
+				await release().catch(() => undefined);
+				throw error;
+			}
+		},
+		commit: async (request) => {
+			const state = requirePrepared(prepared, request.prepareToken, request.transactionId);
+			let published = false;
+			try {
+				renameSync(state.temporaryPath, state.path);
+				published = true;
+				const document = readDocument(state.path);
+				state.committedRevision = document.revision;
+				return {
+					snapshot: snapshot(document, instanceId, options),
+					revisions: [document.revision],
+					changedKeys: state.changedKeys,
+					activation: state.activation,
+				};
+			} catch (error) {
+				// Rename already happened: restore the previous bytes while still holding the lock
+				// so a post-publish read/release failure cannot leave a half-applied config.
+				if (published) {
+					try {
+						atomicWrite(state.path, state.beforeContent);
+					} catch (restoreError) {
+						throw new AggregateError(
+							[error, restoreError],
+							"Cockpit config was published but its restore failed",
+						);
+					}
+				}
+				throw error;
+			} finally {
+				// Lock release failure must not turn an already-published commit into a reported failure.
+				await state.release().catch(() => undefined);
+			}
+		},
+		abort: async (request) => {
+			const state = prepared.get(request.prepareToken);
+			if (!state) return;
+			try { if (existsSync(state.temporaryPath)) rmSync(state.temporaryPath); } finally {
+				prepared.delete(request.prepareToken);
+				await state.release().catch(() => undefined);
+			}
+		},
+		rollback: async (request) => {
+			const state = prepared.get(request.prepareToken);
+			if (!state || state.transactionId !== request.transactionId) return { rolledBack: false };
+			const release = await properLockfile.lock(state.path, {
+				realpath: false,
+				stale: 10_000,
+				update: 2_000,
+				retries: { retries: 4, factor: 1.5, minTimeout: 25, maxTimeout: 250 },
+			});
+			try {
+				const current = readDocument(state.path);
+				if (state.committedRevision && current.revision.etag !== state.committedRevision.etag) {
+					return { rolledBack: false, conflicts: [conflict(current.revision, state.committedRevision.etag)] };
+				}
+				atomicWrite(state.path, state.beforeContent);
+				const restored = readDocument(state.path);
+				prepared.delete(request.prepareToken);
+				return { rolledBack: true, snapshot: snapshot(restored, instanceId, options) };
+			} finally {
+				await release();
+			}
+		},
+		applyRuntime: async (request) => {
+			const state = [...prepared.values()].find((entry) => entry.transactionId === request.transactionId);
+			const config = state?.config ?? readDocument(configPath()).config;
+			const changedKeys = request.changes.map((change) => change.key);
+			await options.applyRuntimeConfig(config, changedKeys, request.context);
+			if (state) prepared.delete(state.token);
+			const deferred = (state?.activation ?? activationFor(request.changes, options.getRuntimeConfig(), config, quietRequiresReload))
+				.filter((entry) => entry.boundary !== "live");
+			return {
+				appliedKeys: changedKeys.filter((key) => !deferred.some((entry) => entry.keys.includes(key))),
+				deferred,
+				failed: [],
+			};
+		},
+		invokeAction: async (request) => {
+			if (request.actionId === "cockpit.thinkingFold" && options.toggleThinkingFold) {
+				const next = await options.toggleThinkingFold();
+				return { handled: true, refresh: true, message: next ? "Thinking fold enabled" : "Thinking fold disabled" };
+			}
+			return { handled: false };
+		},
+	};
+}
+
+export function registerCockpitSettingsProvider(
+	events: SettingsEventBus,
+	provider: CockpitSettingsProvider,
+): () => void {
+	const announce = (requestId?: string): void => {
+		const payload: SettingsAnnounceEventV1 = {
+			version: SETTINGS_PROTOCOL_VERSION,
+			requestId,
+			providerId: provider.providerId,
+			instanceId: provider.instanceId,
+			provider,
+		};
+		events.emit(SETTINGS_ANNOUNCE_EVENT, payload);
+	};
+	const result = events.on(SETTINGS_DISCOVER_EVENT, (payload) => {
+		if (isDiscover(payload)) announce(payload.requestId);
+	});
+	announce();
+	return () => { if (typeof result === "function") result(); };
+}
+
+function snapshot(document: ConfigDocument, instanceId: string, options: CockpitSettingsProviderOptions): SettingsSnapshot {
+	const resource = document.revision.resource;
+	const configured: ConfiguredSettingValue[] = CONFIG_KEYS.map((key) => ({
+		key,
+		scope: "global" as const,
+		state: document.error ? "invalid" as const : "set" as const,
+		...(!document.error ? { value: getConfigValue(document.config, key) } : {}),
+		resource,
+		...(document.error ? { messageKey: document.error } : {}),
+	}));
+	configured.push(
+		{ key: "thinkingFold", scope: "global", state: "absent" },
+	);
+	return {
+		providerId: PROVIDER_ID,
+		providerInstanceId: instanceId,
+		configured: { values: configured, resources: [document.revision] },
+		effective: {
+			values: [
+				...CONFIG_KEYS.map((key) => ({ key, value: getConfigValue(document.config, key), source: "configured" as const, scope: "global" as const, resource })),
+				{ key: "thinkingFold", value: options.getThinkingFolded?.() ?? false, source: "runtime" as const },
+			],
+		},
+	};
+}
+
+function validateRequest(
+	path: string,
+	changes: readonly SettingsChange[],
+	expectedRevisions: readonly SettingsResourceRevision[] | undefined,
+	current = readDocument(path),
+) {
+	const issues: SettingsValidationIssue[] = [];
+	const expected = expectedRevisions?.find((revision) => revision.resource.id === CONFIG_RESOURCE_ID);
+	const conflicts = expected && expected.etag !== current.revision.etag
+		? [conflict(current.revision, expected.etag)]
+		: [];
+	for (const change of changes) {
+		if (change.scope !== "global") issues.push(issue(change, "cockpit.settings.globalOnly"));
+		if (!isConfigKey(change.key)) issues.push(issue(change, "cockpit.settings.unknownKey"));
+		else if (change.operation === "set" && !validValue(change.key, change.value)) {
+			issues.push(issue(change, "cockpit.settings.invalidValue"));
+		}
+	}
+	return { valid: issues.length === 0 && conflicts.length === 0, issues, conflicts };
+}
+
+function readDocument(path: string): ConfigDocument {
+	if (!existsSync(path)) {
+		return {
+			path,
+			content: "",
+			raw: {},
+			config: structuredClone(DEFAULT_CONFIG),
+			revision: revision(path, ""),
+		};
+	}
+	const content = readFileSync(path, "utf8");
+	try {
+		const raw = JSON.parse(content) as unknown;
+		return { path, content, raw, config: mergeConfig(DEFAULT_CONFIG, raw), revision: revision(path, content) };
+	} catch (error) {
+		return {
+			path,
+			content,
+			raw: {},
+			config: structuredClone(DEFAULT_CONFIG),
+			revision: revision(path, content),
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+function revision(path: string, content: string): SettingsResourceRevision {
+	return {
+		resource: { providerId: PROVIDER_ID, scope: "global", id: CONFIG_RESOURCE_ID },
+		etag: createHash("sha256").update(content || "<missing>").digest("hex"),
+		size: Buffer.byteLength(content),
+	};
+}
+
+function conflict(actual: SettingsResourceRevision, expectedEtag: string): SettingsResourceConflict {
+	return {
+		resource: actual.resource,
+		expectedEtag,
+		actualEtag: actual.etag,
+		messageKey: "settings.conflict",
+	};
+}
+
+function applyConfigChanges(config: CockpitConfig, changes: readonly SettingsChange[]): CockpitConfig {
+	let next = structuredClone(config);
+	for (const change of changes) {
+		if (!isConfigKey(change.key)) continue;
+		const value = change.operation === "unset" ? getConfigValue(DEFAULT_CONFIG, change.key) : change.value;
+		next = setConfigValue(next, change.key, value);
+	}
+	return next;
+}
+
+function getConfigValue(config: CockpitConfig, key: CockpitSettingKey): JsonValue {
+	if (key === "icons.mode") return config.icons.mode;
+	if (key === "sidebar.mode") return config.sidebar.mode;
+	if (key === "sidebar.width") return config.sidebar.width;
+	if (key === "sidebar.density") return config.sidebar.density;
+	if (key.startsWith("title.")) return getTitleValue(config.title, key.slice("title.".length));
+	if (key.startsWith("usage.")) return getUsageValue(config.usage, key.slice("usage.".length));
+	return config[key as keyof CockpitConfig] as JsonValue;
+}
+
+function getTitleValue(title: CockpitConfig["title"], field: string): JsonValue {
+	switch (field) {
+		case "enabled": return title.enabled;
+		case "showSession": return title.showSession;
+		case "showCwd": return title.showCwd;
+		case "showModel": return title.showModel;
+		case "showThinking": return title.showThinking;
+		case "showGit": return title.showGit;
+		case "showMaestro": return title.showMaestro;
+		case "generationModel": return title.generationModel ?? "";
+		case "maxLength": return title.maxLength;
+		default: return "";
+	}
+}
+
+function getUsageValue(usage: CockpitConfig["usage"], field: string): JsonValue {
+	switch (field) {
+		case "enabled": return usage.enabled;
+		case "footer": return usage.footer;
+		case "pollIntervalMs": return usage.pollIntervalMs;
+		case "barWidth": return usage.barWidth;
+		case "commandKey": return usage.commandKey;
+		default: return "";
+	}
+}
+
+function setConfigValue(config: CockpitConfig, key: CockpitSettingKey, value: JsonValue): CockpitConfig {
+	if (key === "icons.mode") return { ...config, icons: { mode: value as CockpitConfig["icons"]["mode"] } };
+	if (key === "sidebar.mode") return { ...config, sidebar: { ...config.sidebar, mode: value as CockpitConfig["sidebar"]["mode"] } };
+	if (key === "sidebar.width") return { ...config, sidebar: { ...config.sidebar, width: value as number } };
+	if (key === "sidebar.density") return { ...config, sidebar: { ...config.sidebar, density: value as CockpitConfig["sidebar"]["density"] } };
+	if (key.startsWith("title.")) return { ...config, title: setTitleValue(config.title, key.slice("title.".length), value) };
+	if (key.startsWith("usage.")) return { ...config, usage: setUsageValue(config.usage, key.slice("usage.".length), value) };
+	return { ...config, [key]: value } as CockpitConfig;
+}
+
+function setTitleValue(title: CockpitConfig["title"], field: string, value: JsonValue): CockpitConfig["title"] {
+	return { ...title, [field]: value } as CockpitConfig["title"];
+}
+
+function setUsageValue(usage: CockpitConfig["usage"], field: string, value: JsonValue): CockpitConfig["usage"] {
+	return { ...usage, [field]: value } as CockpitConfig["usage"];
+}
+
+function validValue(key: CockpitSettingKey, value: JsonValue): boolean {
+	if (["enabled", "staticMode", "pinEditorBottom", "doubleEscapeClearInput", "fullscreenInput", "copyOnSelect", "historyEnabled", "quietMode", "todoExpanded", "todoDurationChart", "hideNativeAgents"].includes(key)) return typeof value === "boolean";
+	if (key === "sidebar.width") return typeof value === "number" && Number.isSafeInteger(value) && value >= 32 && value <= 56;
+	if (key === "title.maxLength") return typeof value === "number" && Number.isSafeInteger(value) && value >= 20 && value <= 200;
+	if (key === "title.generationModel") return typeof value === "string";
+	if (key.startsWith("title.")) return typeof value === "boolean";
+	if (key === "usage.enabled" || key === "usage.footer") return typeof value === "boolean";
+	if (key === "usage.pollIntervalMs") return typeof value === "number" && Number.isSafeInteger(value) && (value === 0 || (value >= 30_000 && value <= 1_800_000));
+	if (key === "usage.barWidth") return typeof value === "number" && Number.isSafeInteger(value) && value >= 4 && value <= 16;
+	if (key === "usage.commandKey") return typeof value === "string" && value.trim().length > 0;
+	if (key === "quietSymbols") return value === "check" || value === "dot";
+	if (key === "stackStyle") return value === "classic" || value === "zen";
+	if (key === "toolPalette") return ["classic", "family", "readwrite", "search", "mono"].includes(String(value));
+	if (key === "agentsMode" || key === "todoMode") return value === "list" || value === "compact";
+	if (key === "icons.mode") return value === "auto" || value === "nerd" || value === "ascii";
+	if (key === "sidebar.mode") return value === "auto" || value === "on" || value === "off";
+	return value === "comfortable" || value === "compact";
+}
+
+function activationFor(
+	changes: readonly SettingsChange[],
+	before: CockpitConfig,
+	after: CockpitConfig,
+	quietRequiresReload: boolean,
+): SettingsActivationPlan[] {
+	const live: string[] = [];
+	const reloadQuiet: string[] = [];
+	const reloadInteractions: string[] = [];
+	for (const change of changes) {
+		if (change.key === "quietMode" && before.quietMode && !after.quietMode && quietRequiresReload) reloadQuiet.push(change.key);
+		else if (change.key === "doubleEscapeClearInput" || change.key === "fullscreenInput" || change.key === "historyEnabled") reloadInteractions.push(change.key);
+		else live.push(change.key);
+	}
+	return [
+		...(live.length > 0 ? [{ boundary: "live" as const, keys: live }] : []),
+		...(reloadQuiet.length > 0
+			? [{ boundary: "extension-reload" as const, keys: reloadQuiet, messageKey: "cockpit.runtime.reloadQuiet" }]
+			: []),
+		...(reloadInteractions.length > 0
+			? [{ boundary: "extension-reload" as const, keys: reloadInteractions, messageKey: "cockpit.runtime.reloadInteractions" }]
+			: []),
+	];
+}
+
+function isConfigKey(key: string): key is CockpitSettingKey {
+	return (CONFIG_KEYS as readonly string[]).includes(key);
+}
+
+function issue(change: SettingsChange, messageKey: string): SettingsValidationIssue {
+	return { severity: "error", messageKey, key: change.key, scope: change.scope };
+}
+
+function booleanDefinition(
+	key: CockpitSettingKey,
+	group: string,
+	order: number,
+	labelKey: string,
+	activation: SettingDefinition["activation"],
+	descriptionKey?: string,
+): SettingDefinition {
+	return {
+		key,
+		group,
+		order,
+		labelKey,
+		...(descriptionKey ? { descriptionKey } : {}),
+		defaultValue: getConfigValue(DEFAULT_CONFIG, key),
+		scopes: ["global"],
+		merge: "override",
+		activation,
+		sensitivity: "public",
+		reversibility: activation === "extension-reload" ? "reload-required" : "full",
+		editor: { kind: "boolean" },
+	};
+}
+
+function enumDefinition(
+	key: CockpitSettingKey,
+	group: string,
+	order: number,
+	labelKey: string,
+	values: readonly string[],
+	activation: SettingDefinition["activation"],
+	descriptionKey?: string,
+): SettingDefinition {
+	return {
+		key,
+		group,
+		order,
+		labelKey,
+		...(descriptionKey ? { descriptionKey } : {}),
+		defaultValue: getConfigValue(DEFAULT_CONFIG, key),
+		scopes: ["global"],
+		merge: "override",
+		activation,
+		sensitivity: "public",
+		reversibility: "full",
+		editor: {
+			kind: "enum",
+			options: values.map((value) => ({ value, labelKey: `cockpit.option.${value}` })),
+		},
+	};
+}
+
+function modelDefinition(
+	key: CockpitSettingKey,
+	group: string,
+	order: number,
+	labelKey: string,
+	activation: SettingDefinition["activation"],
+	descriptionKey?: string,
+): SettingDefinition {
+	return {
+		key,
+		group,
+		order,
+		labelKey,
+		...(descriptionKey ? { descriptionKey } : {}),
+		defaultValue: getConfigValue(DEFAULT_CONFIG, key),
+		scopes: ["global"],
+		merge: "override",
+		activation,
+		sensitivity: "public",
+		reversibility: "full",
+		editor: { kind: "model" },
+	};
+}
+
+function actionDefinition(key: string, group: string, order: number, labelKey: string, actionId: string): SettingDefinition {
+	return {
+		key,
+		group,
+		order,
+		labelKey,
+		scopes: ["global"],
+		merge: "provider-defined",
+		activation: "live",
+		sensitivity: "private",
+		reversibility: "full",
+		editor: { kind: "action", actionId },
+	};
+}
+
+function requirePrepared(
+	prepared: Map<string, PreparedCockpitChange>,
+	token: string,
+	transactionId: string,
+): PreparedCockpitChange {
+	const state = prepared.get(token);
+	if (!state || state.transactionId !== transactionId) throw new Error("prepared Cockpit settings transaction is unavailable");
+	return state;
+}
+
+function ensureConfigDocument(path: string): void {
+	if (existsSync(path)) return;
+	atomicWrite(path, `${JSON.stringify(mergeConfigDocument({}, DEFAULT_CONFIG), null, 2)}\n`);
+}
+
+function atomicWrite(path: string, content: string): void {
+	const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		writeSyncedFile(temporaryPath, content);
+		renameSync(temporaryPath, path);
+	} catch (error) {
+		try { if (existsSync(temporaryPath)) rmSync(temporaryPath); } catch { /* best effort */ }
+		throw error;
+	}
+}
+
+function writeSyncedFile(path: string, content: string): void {
+	mkdirSync(dirname(path), { recursive: true });
+	const descriptor = openSync(path, "wx", 0o600);
+	try {
+		writeFileSync(descriptor, content, "utf8");
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+function isDiscover(payload: unknown): payload is SettingsDiscoverEventV1 {
+	return Boolean(payload && typeof payload === "object"
+		&& (payload as Partial<SettingsDiscoverEventV1>).version === SETTINGS_PROTOCOL_VERSION
+		&& typeof (payload as Partial<SettingsDiscoverEventV1>).requestId === "string");
+}

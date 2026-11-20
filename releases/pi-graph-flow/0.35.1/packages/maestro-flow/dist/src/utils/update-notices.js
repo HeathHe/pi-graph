@@ -1,0 +1,443 @@
+/**
+ * update-notices.ts — Version-keyed update notices for `maestro update`.
+ *
+ * Each notice describes what a release introduced and (optionally) interactive
+ * actions the user can run after upgrading. The framework is invoked by
+ * `maestro update` post-`npm install` so the running code is from the NEW
+ * binary, ensuring the latest notice registry is loaded.
+ *
+ * Registry pattern mirrors migration-registry.ts. New notices are appended
+ * at the bottom of this file and run automatically for any user whose old
+ * version is below the notice's `version` field.
+ */
+import { execSync } from 'node:child_process';
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+const NOTICES = [];
+export function registerNotice(notice) {
+    if (NOTICES.some(n => n.version === notice.version && n.title === notice.title))
+        return;
+    NOTICES.push(notice);
+}
+export function listNotices() {
+    return [...NOTICES].sort((a, b) => compareSemver(a.version, b.version));
+}
+/**
+ * Return notices that apply to the upgrade range (fromVersion, toVersion].
+ * Pass an empty fromVersion ("" or "0.0.0") to list everything up to toVersion.
+ */
+export function planNotices(fromVersion, toVersion) {
+    const from = fromVersion || '0.0.0';
+    return listNotices().filter(n => {
+        if (compareSemver(n.version, from) <= 0)
+            return false;
+        if (toVersion && compareSemver(n.version, toVersion) > 0)
+            return false;
+        return true;
+    });
+}
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+/** Render the plan to stderr (header + highlights, no execution). */
+export function printNoticePlan(plan) {
+    if (plan.length === 0) {
+        console.error('  No pending update notices.');
+        return;
+    }
+    console.error('');
+    console.error(`  Update notices (${plan.length}):`);
+    for (const notice of plan) {
+        console.error('');
+        console.error(`    ▸ v${notice.version} — ${notice.title}`);
+        for (const h of notice.highlights)
+            console.error(`        • ${h}`);
+        if (notice.actions.length > 0) {
+            console.error('      Actions:');
+            for (const a of notice.actions) {
+                const tag = a.auto ? '[auto]' : `[ask, default=${a.defaultYes ? 'Y' : 'N'}]`;
+                console.error(`        ${tag} ${a.id} — ${a.description}`);
+            }
+        }
+    }
+    console.error('');
+}
+/**
+ * Execute each notice's actions in order. Prompts the user for non-auto
+ * actions unless opts.nonInteractive is true. Failures are logged but never
+ * abort the loop — the rest of the notices still get a chance to run.
+ */
+export async function applyNotices(plan, fromVersion, toVersion, opts = {}) {
+    if (plan.length === 0)
+        return;
+    const ctx = {
+        fromVersion,
+        toVersion,
+        nonInteractive: opts.nonInteractive ?? false,
+    };
+    let confirmFn;
+    if (!opts.nonInteractive && !opts.dryRun) {
+        try {
+            const mod = await import('@inquirer/prompts');
+            confirmFn = mod.confirm;
+        }
+        catch {
+            // No prompts available — fall back to defaults
+            ctx.nonInteractive = true;
+        }
+    }
+    for (const notice of plan) {
+        console.error('');
+        console.error(`  ▸ v${notice.version} — ${notice.title}`);
+        for (const h of notice.highlights)
+            console.error(`      • ${h}`);
+        console.error('');
+        for (const action of notice.actions) {
+            let shouldRun = action.auto ?? false;
+            if (!shouldRun) {
+                if (opts.dryRun) {
+                    console.error(`      [dry-run] ${action.id} — ${action.description}`);
+                    continue;
+                }
+                if (ctx.nonInteractive || !confirmFn) {
+                    shouldRun = action.defaultYes ?? false;
+                }
+                else {
+                    try {
+                        shouldRun = await confirmFn({
+                            message: action.description,
+                            default: action.defaultYes ?? true,
+                        });
+                    }
+                    catch {
+                        shouldRun = false; // user cancelled (Ctrl+C)
+                    }
+                }
+            }
+            if (!shouldRun) {
+                console.error(`      [skip] ${action.id}`);
+                continue;
+            }
+            if (opts.dryRun) {
+                console.error(`      [dry-run] ${action.id} — ${action.description}`);
+                continue;
+            }
+            try {
+                const summary = await action.run(ctx);
+                console.error(`      [+] ${action.id}: ${summary}`);
+            }
+            catch (err) {
+                console.error(`      [x] ${action.id}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function compareSemver(a, b) {
+    const pa = a.split('.').map(Number);
+    const pb = b.split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+        const na = pa[i] ?? 0;
+        const nb = pb[i] ?? 0;
+        if (na > nb)
+            return 1;
+        if (na < nb)
+            return -1;
+    }
+    return 0;
+}
+function runShell(cmd) {
+    execSync(cmd, { stdio: 'inherit' });
+    return cmd;
+}
+// ===========================================================================
+// Registered notices — newest at the bottom
+// ===========================================================================
+registerNotice({
+    version: '0.4.9',
+    title: 'Antigravity CLI (agy) support',
+    highlights: [
+        '新增 agy 工具：Google Antigravity CLI 作为 delegate target',
+        'cli-tools.json 升级时自动追加缺失工具条目（保留你已自定义的字段）',
+        '`.agy/skills/` 含 57 个 commands + 11 个 skills（从 .claude/ 转换）',
+        '`.agy/agents/` 含 22 个 sub-agent 定义（供 define_subagent 加载）',
+        'Antigravity hooks 接口已预留（AGY_HOOK_DEFS / --agy-hooks 标志）',
+    ],
+    actions: [
+        {
+            id: 'install-agy-global',
+            description: '为全局 ~/.gemini/ 安装 agy skills + agents + GEMINI.md 注入（约 5 MB）',
+            defaultYes: true,
+            run: () => runShell('maestro install --force --global --components agy-context,agy-skills,agy-agents,agy-md-chinese'),
+        },
+    ],
+});
+registerNotice({
+    version: '0.4.11',
+    title: 'Multi-CLI/IDE MCP registration + neutral .agents/ mirror',
+    highlights: [
+        '`install` 新增 7 个可选 MCP 目标：Cursor / Qoder / Trae / Kiro / Roo / VS Code Copilot / Gemini CLI',
+        'ExtraMcpConfig 多选 TUI：默认全部不勾选，目标路径在 UI 中可见',
+        '新增中性 `.agents/` 镜像（从 .claude/ 转换）+ 8 个 opt-in 组件给非 Claude IDE',
+        'maestro-ralph 状态机重排：goal-checklist 与 status.json 单一信息源对齐',
+        '新增快速入门页面（QuickStartPage）+ docs-site 布局/样式重构',
+    ],
+    actions: [
+        {
+            id: 'install-neutral-agents-global',
+            description: '为全局 ~/.agents/ 安装中性 skills + agents（供 Cursor/Qoder/Trae/Kiro/Roo/VS Code 等通用 IDE 使用）',
+            defaultYes: false,
+            run: () => runShell('maestro install --force --global --components agents-standard-skills,agents-standard-agents'),
+        },
+    ],
+});
+registerNotice({
+    version: '0.4.12',
+    title: '工作流拓扑重构 + maestro-amend + context-package 统一',
+    highlights: [
+        'blueprint 独立命令、Milestone 层级重排、双层 analyze 架构',
+        '新增 maestro-amend skill：生成工作流命令 overlay',
+        'context-package 体系统一，harvest --prune 支持 state.json 管理',
+        'analyze/brainstorm/roadmap 三命令新增 interview_protocol',
+        'spec 工具 seed 模板单一来源 + YAML frontmatter 保证',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.4.16',
+    title: 'Ralph CLI 子命令族 + 三存储知识淘汰入口',
+    highlights: [
+        '新增 maestro ralph 子命令族（session/skills/next/check/complete）+ step 加载脚本化',
+        '新增 manage-knowledge-audit 命令：spec / wiki / knowhow 三存储的对称淘汰入口',
+        'ralph-execute 描述精简：A_EXEC_STEP 改为纯指令、路径展开 + emit 格式重设计',
+        'statusline line 2 链式渲染简化，48h 过期 + 兼容旧 schema',
+        'install manifest 记录 hook level，TUI 默认值从上次安装恢复',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.4.18',
+    title: '统一知识检索 + maestro-next 单链推荐',
+    highlights: [
+        '新增 codebase/session 虚拟节点：wiki 检索自动聚合源码与当前会话',
+        '新增 workflows/finish-work.md：收尾工作流统一驱动 store-knowhow',
+        '新增 maestro-next 命令：从命令池单链推荐下一步并执行',
+        'ralph CLI 同时识别 maestro-* 与 ralph-* 两类 session',
+        '统一 codex skills spawn_agents_on_csv 契约：强制 worker 终止 + 严格 output_schema',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.4.19',
+    title: 'team-swarm 蚁群智能 + Agy hooks 安装支持',
+    highlights: [
+        '新增 team-swarm 技能：ACO 驱动多智能体探索 + 信息素优化控制器',
+        '安装器新增 Agy (Antigravity) hooks 配置步骤，与 Claude/Codex hooks 独立',
+        'InstallFlow 改为按 scope+target 加载 manifest 默认值，避免跨 scope 污染',
+        'maestro-next 命令优化：单链推荐改进 + 多源 session 识别',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.4.20',
+    title: 'UA 知识图谱集成 + Swarm Workflow 并行加速',
+    highlights: [
+        '新增 Understand-Anything 知识图谱：深度集成 Wiki 搜索与 codebase-rebuild 管道',
+        '新增 maestro-swarm-workflow 并行加速层：8 个固定 Workflow 脚本覆盖核心命令',
+        '新增 maestro-companion 技能：任务上下文管理与知识路由',
+        'plan 命令修复：P3 agent 强制调用 + read_first/action 字段对齐',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.4.21',
+    title: '原生图索引模块 + 对抗蚁群工作流',
+    highlights: [
+        '移除 UA 外部依赖，创建原生 src/graph/ 模块：类型、合并、加载、查询、FsAnalyzer',
+        '新增 maestro kg index 命令：本地代码库扫描生成 knowledge-graph.json',
+        '图索引增强：调用图提取(calls)、测试配对(tested_by)、git 感知枚举、拓扑排序 tour',
+        '新增 team-adversarial-swarm：ACO 蚁群 + 模块化 Workflow + 对抗决策门',
+        '新增 maestro-universal-workflow：动态对抗工作流生成',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.4.25',
+    title: 'Spec 范围过滤 + Codegraph 图模块集成',
+    highlights: [
+        'spec load 新增范围过滤：按项目或全局维度加载规范',
+        'codegraph 增强功能集成至原生 graph 模块（DB 迁移 + 查询优化）',
+        '新增多个命令及中文描述，快速启动页面功能增强',
+        '修复 AskUserQuestion 括注式写法导致交互被跳过的问题',
+    ],
+    actions: [],
+});
+NOTICES.push({
+    version: '0.4.26',
+    title: 'Delegate 代理配置 + Codex Adapter 修复',
+    highlights: [
+        'cli-tools.json 新增 proxy 配置：per-tool 代理开关，仅注入子进程环境变量',
+        'Codex adapter 修复：Rust tracing stderr（RMCP/MCP 错误）归类为非致命诊断信息',
+        'wiki/spec list 和 search 输出增强：增加上下文和描述显示',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.0',
+    title: '知识系统改革 + Install 管线重构 + 命令规范化',
+    highlights: [
+        '.agy/ 从 git 移除，install 时从 .claude/ 实时转换——镜像不再占版本库空间',
+        '知识系统统一搜索入口 + KG Hook 自动注入 + CodeGraph 函数级调用图',
+        'spec/knowhow 条目新增 title/description 属性，搜索结果更丰富',
+        'ralph skills --platform 强制化：新增 agent/agy 平台，缺失时警告',
+        'maestro-verify 合并到 maestro-execute 作为内置验证 gate',
+    ],
+    actions: [
+        {
+            id: 'reinstall-agy-global',
+            description: '重新安装全局 agy skills + agents（.agy/ 不再从 git 获取，需从 .claude/ 实时生成）',
+            defaultYes: true,
+            run: () => runShell('maestro install --force --global --components agy-context,agy-skills,agy-agents,agy-md-chinese'),
+        },
+    ],
+});
+registerNotice({
+    version: '0.5.3',
+    title: 'MaestroGraph 知识图谱引擎 + Odyssey 长时命令族',
+    highlights: [
+        'MaestroGraph 自研 KG 引擎：9 语言提取器 + 24 框架 resolver + BM25F 搜索',
+        '新增 Odyssey 5 命令：debug / improve / planex / ui / review-test-fix',
+        'Domain 领域知识系统：glossary CRUD + 代码发现 + Hook 注入',
+        'Install TUI 重设计：分组 Hub + Hooks 颗粒度 + Config Profile 导出导入',
+        '跨工作空间知识共享：workspace link/unlink/list/status',
+    ],
+    actions: [
+        {
+            id: 'reinstall-commands-global',
+            description: '重新安装全局 commands + skills + agents（含 Odyssey 全族 + Domain 系统）',
+            defaultYes: true,
+            run: () => runShell('maestro install --force --global --components agy-context,agy-skills,agy-agents,agy-md-chinese'),
+        },
+    ],
+});
+registerNotice({
+    version: '0.5.32',
+    title: 'Install Toggle 独立控制 + 脚本插件安全加固',
+    highlights: [
+        '新增 maestro install toggle：按技能/命令独立启禁用，三态 Tab 视图',
+        '细粒度安装选择：每个新增技能独立可选 + 命令族分组选择',
+        'KG 代码索引流式写入 + 原子提交，大仓库不再 OOM',
+        'Odyssey 全族零遗留执行强化：6 项系统性修复消除过早停止',
+        '脚本插件默认禁用（secure by default），需显式启用',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.36',
+    title: 'Session Anchor 锚定 + Search Daemon + API Explore',
+    highlights: [
+        'Session Anchor：每个 step 自动注入 intent/boundary/goal 上下文锚定',
+        'Re-grounding 漂移熔断：周期性意图保真检查 + 漂移安全门',
+        'Search Daemon 常驻进程：ONNX 模型热缓存，搜索响应提速',
+        '新增 api-explore 轻量代码探索 subagent + 独立配置文件',
+        'Boundary Grill 协议：analyze/collab/plan/brainstorm 边界冲突审查',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.38',
+    title: 'Dashboard 入口恢复 + Install TUI 重构 + 反漂移防护',
+    highlights: [
+        '恢复 maestro view/stop 命令，前端 dashboard 入口重新启用',
+        'install TUI 重构：平台驱动安装 + update 迁移修复',
+        '新增 manage-drift-realign 命令 + maestro timeline CLI',
+        'ralph 反漂移 4 层防护 + 目标热修改 --amend',
+        'codex 完整移植 re-grounding 子系统',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.40',
+    title: '原生插件安装 + 代码框复制按钮 + shell_exec 统一',
+    highlights: [
+        '新增 maestro plugin 命令：原生插件安装模式，第三方插件直接安装到工作区',
+        'docs-site 代码框增加复制按钮 + 亮色模式深色背景修复',
+        '修复 7 个核心 skill 的确认门控缺失和 wave 流程缺陷',
+        'CLI 裸 intent 拦截优化 + codex skill shell_exec 统一抽象',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.42',
+    title: '.agents/ 指令注入 + explore 增强 + 命令内容分离',
+    highlights: [
+        '新增 AGENTS.md 指令注入组件：.agents/ 平台自动注入项目指令',
+        'explore 指令增强：Context Injection + Cross-Search 交叉验证',
+        '8 个命令文件内容分离：过程性逻辑下沉到 workflow 层',
+        'spec-loader category 匹配放宽 + codex skill dedupe 修复',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.43',
+    title: 'KG 代码嵌入引擎 + MCP 语义搜索工具 + zvec 向量存储',
+    highlights: [
+        '新增代码嵌入模块：结构化文本提取 + 向量索引 + 混合搜索（BM25F + 向量）',
+        '新增 MCP 工具 maestro_wiki_search / maestro_code_semantic_search',
+        '集成 zvec 向量存储后端：多分块嵌入 + 并行索引 + GPU 加速',
+        'ralph CLI 委托架构重构 + S_POST_ANALYZE 产物偏离自动修正',
+        '修复 skill/command 238 个执行歧义问题',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.44',
+    title: 'Ralph Agent 编排器 + rmux-collab 协作系统 + explore 增强',
+    highlights: [
+        '新增 Claude Agent 专属 ralph 编排器 + 执行器命令',
+        'rmux-collab 多 Agent 频道协作系统：atomic send+wait + 结构化 AgentResult',
+        'explore 重构：去除 maxTurns 限制、并行 tool calls、async ripgrep',
+        'graph 模块迁移至 node:sqlite，消除 better-sqlite3 deprecated 警告',
+        'search daemon 类型去重 + 过度获取级联修复 + MCP fallback 对齐',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.46',
+    title: 'MOA 多模型聚合引擎 + Ralph dual-dispatch 编排',
+    highlights: [
+        '新增 MOA (Mixture of Agents) 核心循环：per-turn 模式 + reference 磁盘缓存 + 成本跟踪',
+        'Ralph-v2 dual dispatch：executor 支持多 agent 编排 + CLI delegate 三模式',
+        '集成 WikiIndexer BM25 搜索到 keyword-spec-injector',
+        '修复知识图谱代码搜索多词查询 + 泛化搜索 OR 降级',
+        '修复 odyssey 举一反三阶段被跳过 + ralph agent 异步 mailbox 空转',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.48',
+    title: 'Embedding 模型管理 + Ralph 嵌套套娃编排',
+    highlights: [
+        '新增 embedding 模型管理命令：download / status / index rebuild',
+        'Ralph-v2 executor 重构为 unnamed 嵌套套娃模型',
+        'commands 入口参数统一从 phase 改为 milestone',
+        '安装界面 EmbeddingPanel 配置 + circuit breaker 保护',
+    ],
+    actions: [],
+});
+registerNotice({
+    version: '0.5.49',
+    title: '知识演化链 + Explore 三层容错',
+    highlights: [
+        'Explore circuit-breaker 持久化 + pre-flight 探测 + 即时 fallback',
+        '知识系统演化链替代机制 + 遗忘曲线搜索权重',
+        'Spec 冲突标记条目搜索降级评分',
+        'Wiki indexer streaming 写入 + embedding 构建 abort 支持',
+        'Search daemon 连接数上限 + socket 超时保护',
+    ],
+    actions: [],
+});
+//# sourceMappingURL=update-notices.js.map

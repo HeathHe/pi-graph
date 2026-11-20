@@ -1,0 +1,43 @@
+import { type Language } from '../../db/types.js';
+import type { LanguageExtractionResult } from './tree-sitter-types.js';
+import type { PluginExtractionResult } from './plugin-types.js';
+export declare class PluginEngine {
+    private projectRoot;
+    private config;
+    private configPath;
+    private scriptDir;
+    private configMtime;
+    private scriptModules;
+    private globCache;
+    constructor(projectRoot: string);
+    load(options?: {
+        allowScripts?: boolean;
+    }): Promise<boolean>;
+    private parseConfig;
+    private normalizeDefaults;
+    private validatePluginDefinition;
+    private validatePatternRule;
+    private parseSimpleYaml;
+    private parseInlineKeyValues;
+    private parseValue;
+    private loadScriptPlugins;
+    hasMatchingPlugin(filePath: string, language: Language): boolean;
+    run(filePath: string, sourceCode: string, language: Language, tree: unknown, coreResult: LanguageExtractionResult): Promise<PluginExtractionResult>;
+    private runDeclarative;
+    private matchPattern;
+    private matchRegex;
+    private matchCall;
+    private matchAssignment;
+    private extractCallArgs;
+    private buildSymbol;
+    private resolveTemplate;
+    private createPluginContext;
+    mergeResults(coreResult: LanguageExtractionResult, pluginResult: PluginExtractionResult): LanguageExtractionResult;
+    private matchesLanguage;
+    private matchesFile;
+    private globMatch;
+    private getOnError;
+    private handleFailure;
+    hasPlugins(): boolean;
+}
+//# sourceMappingURL=plugin-engine.d.ts.map

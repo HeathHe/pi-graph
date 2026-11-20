@@ -1,0 +1,5562 @@
+import { resolveFlowResourceRoots } from "../host/flow-resource-roots.ts";
+import { updateStatusLine as updateBudgetGoalStatusLine } from "../goal-coordinator/presentation.ts";
+import { modelOriginApi } from "../sdk-host/model-completion.ts";
+import { installModelRequestGate } from "../sdk-host/model-request-gate.ts";
+import { createGoalBudgetHost, createChildBudgetHost } from "../sdk-host/goal-budget-host.ts";
+import { captureSelectedGoalBudget, assertNoGoalBudget, readGoalBudget, configureGoalBudgetHost, goalBudgetView, refreshGoalBudgetView } from "../goal-coordinator/state.ts";
+import { getGoalModelBudgetPort, getGoalCoverageContinuityPort, getGoalBudgetViewPort, getGoalBudgetConfigurationPort } from "../task-workflow/commands.ts";
+import { recoverPendingTaskClear, hasPendingTaskClearRecovery } from "../task-workflow/commands.ts";
+import { registerRootCompactionHooks, registerChildCompactionHooks } from "../compaction/compaction-hooks.ts";
+import {registerObservabilityHostServices} from '../observability/host-services.ts';
+import { readChildTodoParentContext, readTodoSourceHost, assertTodoSourceScope } from "pi-maestro-teammate/v1/todo-context";
+import { captureTodoSourceExecution, assertTodoSourceExecution, runTodoSourceExecution, invalidateTodoSource, refreshTodoSourceAfterCompact, type TodoSourceExecution } from "../task-workflow/commands.ts";
+import { registerTaskDispatchProvider, CHILD_MODEL_BUDGET_BROKER } from "pi-maestro-teammate/v1/task-dispatch-binding";
+import { getTaskDispatchBindingProvider } from "../tools/todo.ts";
+/**
+ * Maestro Agent Extension Entry Point
+ *
+ * Registers tools:
+ *   - maestro: Main tool with action-based dispatch (explore, delegate, moa)
+ *   - goal: Autonomous Goal read/create surface with automatic loop-end verification
+ *   - ask-user-question: Structured questionnaire for user input
+ *   - todo: Task management with plain context, optional skills, and step tracking
+ *   - session_history: bounded current-session recovery and authorized historical discovery
+ *   - lsp: Language-server diagnostics, navigation, refactors, and raw requests
+ *   - browser: Named-tab Chromium control and screenshots
+ *   - computer_use: Serialized physical desktop observation and control
+ *   - search_tool_bm25: Legacy 0.87–0.98 tool discovery; Pi 0.99+ owns native tool_search
+ *
+ * Also registers:
+ *   - /goal command
+ *   - /swarm bundled Skill activation + native teammate/MMAS dashboard
+ *   - /plan command + Alt+Shift+P shortcut (Plan/Act mode toggle)
+ *   - Shift+Tab approval-mode cycle (after remapping Pi effort cycling to Ctrl+Shift+E)
+ *   - Dynamic LLM providers
+ */
+
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { registerCompanionPackages } from "../../scripts/register-companion-packages.mjs";
+import { Check } from "typebox/value";
+
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, copyToClipboard, getAgentDir, parseArgs, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
+import { getPiFeatureOwner, getPiHostMode } from "pi-maestro-settings-core/v1";
+import { isNativeDiscoverySelected, withNativeToolPolicy } from "../tools/native-tool-policy.ts";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+  COCKPIT_TODO_TOGGLE_EVENT,
+  COCKPIT_UI_OWNERSHIP_QUERY_EVENT,
+  MAESTRO_TODO_STATE_CHANGED_EVENT,
+  type CockpitUiOwnershipV1,
+} from "pi-cockpit/v1/events";
+import { installReturnedToolErrorBridge, type FlowToolResult } from "../tools/tool-result.ts";
+import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  MaestroParams,
+  GoalToolParams,
+  AskUserQuestionParams,
+  TodoToolParams,
+  TodoModelParams,
+  formatTodoArgumentError,
+  OcrReviewParams,
+} from "./schemas.ts";
+import { altKey } from "../key-labels.ts";
+import { resolveGlyphs, setQuietMode, supportsCustomOverlay } from "pi-maestro-settings-core/ui";
+import { isTodoDurationChartEnabled, setTodoDurationChartEnabled } from "../todo-chart-state.ts";
+import { toolCallLine, toolResultCard, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
+import { registerKeybindingsCommand } from "../keybindings-command.ts";
+import { executeExplore, type ExploreParams } from "../tools/explore.ts";
+import { executeOcrReview, type OcrReviewInput } from "../tools/ocr-review.ts";
+import { executeDelegate, type DelegateParams } from "../tools/delegate.ts";
+import { executeMoa, type MoaParams } from "../tools/moa.ts";
+import { registerSwarmDisplay } from "../tools/swarm.ts";
+import { bindGoalCurrentDisplay, resetGoalCurrentDisplay, readGoalCurrentDisplay, currentGoalTasks, refreshGoalCurrentDisplay, subscribeGoalCurrentDisplay } from "../goal-coordinator/presentation.ts";
+import { MaestroUiPublisher, registerMaestroUiQuery } from "../ui-projection.ts";
+import { registerMaestroProviders } from "../providers/provider-registry.ts";
+import { registerApiProviderConfigs } from "../providers/api-provider-config.ts";
+import { registerDevinProvider } from "../providers/devin-provider.ts";
+import { onSessionShutdown as goalSessionShutdown } from "../goal-coordinator/lifecycle.ts";
+import { registerNextSuggest } from "../next-suggest/index.ts";
+import { registerPromptEnhance } from "../prompt-enhance/index.ts";
+import { registerPromptOptimize } from "../prompt-optimize/index.ts";
+import { registerExploreConfigManager } from "../providers/explore-config-manager.ts";
+import { registerModelFailover } from "../providers/model-failover.ts";
+import { showModelFailoverOverlay } from "../tui/model-failover-settings.ts";
+import registerMcpAdapter from "../mcp/index.ts";
+import { registerNativeMcpMigration } from "../mcp/native-migration.ts";
+import {
+  initGoal,
+  registerGoalCommand,
+  executeGoal,
+  executeGoalCommand,
+  onSessionStart as goalSessionStart,
+  resumeAfterPlanReplacementRecovery,
+  onBeforeCompact as goalBeforeCompact,
+  onCompactionCancelled as goalCompactionCancelled,
+  onCompact as goalCompact,
+  onInput as goalInput,
+  onBeforeAgentStart as goalBeforeAgentStart,
+  onAgentEnd as goalAgentEnd,
+  onAgentSettled as goalAgentSettled,
+  onProviderPressureSettled as goalProviderPressureSettled,
+  getActiveGoal,
+  getGoalCompactionSnapshot,
+  getGoalPanelEntries,
+  currentGoalPhase,
+  switchCurrentGoal,
+  reconcileWorkflowGoal,
+  recoverPendingGoalTodoDetachesAfterTodoStart,
+  hasPendingGoalTodoDetachRecovery,
+  setWorkflowCoordinator,
+  setGoalStateChangeListener,
+  setGoalPanelOwnership,
+  setGoalStaticMode,
+  parseGoalActionParams,
+} from "../tools/goal.ts";
+import {
+  executeAsk,
+  resolvePlanAutoAskPolicyGrant,
+  type AskParams,
+  type AskResultDetails,
+} from "../tools/ask.ts";
+import {
+  initTodo,
+  isolateTodoForTeammateAttach,
+  executeTodo,
+  delegateTodoTaskToAgent,
+  delegateTodoTasksToAgent,
+  sealTodoTasksOnAgentComplete,
+  observeTaskExecution,
+  formatTodoActorSelector,
+  getVisibleTasks,
+  getTodoCompactionSnapshot,
+  onAgentEndTodo,
+  onBeforeAgentStartTodo,
+  onContextTodo,
+  registerTodoActor,
+  recordTodoActorCompletion,
+  setTodoStateChangeListener,
+  onSessionStart as todoSessionStart,
+  readyTodoStateForGoalDetachRecovery,
+  hasPendingPlanReplacementRecovery,
+  recoverPendingPlanReplacement,
+  onSessionShutdown as todoSessionShutdown,
+  reconcileMirrorTasks,
+  type TodoActorRef,
+  type TodoParams,
+  type TodoResultDetails,
+  type TodoTask,
+  type TodoTaskSnapshot,
+} from "../tools/todo.ts";
+import { WorkflowBridge, buildTodoMirrorSpecs } from "../session/bridge.ts";
+import { guiEnabled, startGuiSubsystem, registerGuiTool, asGuiDirectTool, isGuiToolAllowed, getGuiTool, createGuiEventForwarder, GUI_EVENTS, bindGuiStartupIfCurrent, guiContextForGeneration, type GuiServerHandle, type GuiPermissionGateway } from "../gui/index.ts";
+import { loadLatestTeamSwarmProjection, type TeamSwarmProjection } from "../swarm/projection.ts";
+import { RunCliAdapter } from "../session/cli-adapter.ts";
+import { publicWorkflowErrorMessage, WorkflowCoordinator } from "../session/coordinator.ts";
+import { activeWorkflowRun, type WorkflowSnapshot } from "../session/types.ts";
+import {
+  deriveWorkflowStatus,
+  deriveWorkflowViewModel,
+  workflowStatusLabel,
+  type WorkflowSnapshotLike,
+  type WorkflowViewModel,
+} from "../session/view-model.ts";
+import { createRunEventComponent, type RunEventDetails } from "../session/run-event.ts";
+import {
+  exportSessionHistory,
+  formatBytes,
+  formatSessionLocation,
+  probeSessionFile,
+  resolveExportTarget,
+  tryCopyToClipboard,
+  type SessionLocationInfo,
+} from "../session/session-export.ts";
+import {
+  classifyRunControlArgv,
+  executeRunControl,
+  isRunControlReadAction,
+  isRunControlReadArgv,
+  RunControlParams,
+  type RunControlInput,
+} from "../tools/run-control.ts";
+import {
+  assertPublishedPlanSnapshot,
+  assertPublishedPlanSnapshotV3,
+  derivePlanPublishRequestId,
+  parseProjectedPublishedPlanIdentity,
+  requirePublishedExecutionRun,
+} from "../tools/plan-workflow.ts";
+import { SessionOverlay, type SessionOverlayAction } from "../tui/session-overlay.ts";
+import { GatewayOverlay } from "../tui/gateway-overlay.ts";
+import { GATEWAY_FABRIC_MONITOR_EVENT } from "../gateway/fabric/monitor-projection.ts";
+import { GatewayControlClient } from "../gateway/control-client.ts";
+import {
+  FabricOriginRouteResolverProvider,
+  type GenerationTrackedFabricRouteResolverProvider,
+} from "../gateway/fabric/origin-runtime.ts";
+import { registerFabricRouteResolverProvider } from "pi-maestro-teammate/v1/fabric-runtime";
+import { startWorkspaceLease, stopWorkspaceLease, registerGatewayWorkspacePermanent, removeGatewayWorkspaceByPath, isGatewayConfigured, isGatewayFabricEnabled } from "../gateway/workspace-client.ts";
+import { TodoOverlay as CockpitTodoOverlay } from "pi-cockpit/src/todo-overlay.ts";
+import type { TodoItem as CockpitTodoItem } from "pi-cockpit/src/types.ts";
+import { GoalOverlay, type GoalOverlayAction } from "../tui/goal-overlay.ts";
+import { KnowledgeOverlay, type KnowledgeOverlayAction } from "../tui/knowledge-overlay.ts";
+import { KnowledgeCliAdapter, resolveLatestSessionId } from "../knowledge/cli-adapter.ts";
+import { completedKnowledgeSessions, createKnowledgeCloseoutRequester, stagedKnowledgeCloseoutTarget } from "../knowledge/closeout.ts";
+import { stageWindowKnowledgeCandidate } from "../knowledge/extractor.ts";
+import { SkillCliAdapter, type SkillCliListOptions } from "../skills/skill-cli-adapter.ts";
+import { buildKnowledgeCenterView, type KnowledgeCenterView } from "../knowledge/view-model.ts";
+import {
+  initPlan,
+  PLAN_TOGGLE_KEY,
+  PLAN_TOGGLE_LABEL,
+  registerPlanCommand,
+  registerPlanTools,
+  isPlanMode,
+  toggleMode as planToggleMode,
+  exitModeAndRestore as planExitMode,
+  onSessionStartPlan,
+  onSessionShutdownPlan,
+  fencePlanArtifactReads,
+  onCompactPlan,
+  onContextPlan,
+  onBeforeAgentStartPlan,
+  onToolCallPlan,
+  onAgentEndPlan,
+  hasPendingPlanCompactHandoff,
+  onAgentSettledPlan,
+  consumePlanCleanContextCompaction,
+  applyPlanContextToCompaction,
+  isPlanCleanContextCompactionInstructions,
+  getMode as getPlanMode,
+  hasPlan,
+  getPlanText,
+  getPlanArtifactSummary,
+  getPlanCompactionSnapshot,
+  getPlanNewContextPayload,
+  getPlanHandoffStatus,
+  setPlanModeChangeListener,
+  refreshPlanModeStatus,
+  type PlanContext,
+  type PlanWorkflowPublicationResult,
+} from "../tools/plan.ts";
+import { registerPlanAuto } from "../tools/plan-auto.ts";
+import type { HostAskPolicyGrant } from "../decision-policy/service.ts";
+import type { PlanWorkflowConfirmationOptions } from "../tools/plan-confirm.ts";
+import type { LoadedPlan, PlanExecutionChoice, PlanWorkflowBinding } from "../tools/plan-store.ts";
+import { registerPlanModelSelection } from "../tools/plan-model.ts";
+import { registerArtifactCommand } from "../tools/session-artifact-command.ts";
+import { installStatusline } from "../statusline/statusline.ts";
+import { registerCodexHookAdapter } from "../hooks/pi-adapter.ts";
+import { createPermissionController } from "../permissions/controller.ts";
+import {
+  DEFAULT_PERMISSION_MODE,
+  PERMISSION_MODES,
+  type PermissionMode,
+} from "../permissions/types.ts";
+import {
+  COMPACTION_STATUS_KEY,
+  createMaestroCompaction,
+  persistMaestroCompactionKnowhow,
+  runWithCompactionStatus,
+  type MaestroRecoveryState,
+  type WorkflowRecoveryIdentity,
+} from "../compaction/maestro-compaction.ts";
+import {
+  buildNewContextRecoveryCapsule,
+  createNewContextController,
+  NEW_CONTEXT_RECOVERY_BROKER_NAME,
+  newContextFirstKeptEntryId,
+} from "../compaction/new-context.ts";
+import { createNewContextToolSurface } from "../compaction/new-context-tool-surface.ts";
+import { buildNewContextContinuation } from "../compaction/recovery-focus.ts";
+import {
+  commitProjectedCompactionInput,
+  createMidTurnAutoCompaction,
+  shouldCancelCompletedTurnThreshold,
+  shouldPreserveCompletedTurn,
+} from "../compaction/auto-compaction.ts";
+import {
+  CompactionArbiter,
+  blocksNativeCompactionFallback,
+  compactionRequestFromInstructions,
+  isNativeFallbackCompactionInstructions,
+  isProviderPressureCompactionTrigger,
+  runObservedCompaction,
+} from "../compaction/compaction-arbiter.ts";
+import { registerCompactionSettingsCommand, showCompactionSettingsOverlay } from "../tui/compaction-settings.ts";
+import { flowTuiText, registerTuiLocaleEvents } from "../tui/locale.ts";
+import { registerMaestroPackageResources } from "../resources/maestro-package.ts";
+import { registerNotifyMode } from "../notify/notify-mode.ts";
+import { registerNotifyListeners } from "../notify/notify-listeners.ts";
+import type { UserAttentionHandler } from "../notify/user-attention.ts";
+import { registerSkillManager, runSkillManager } from "../skills/skill-manager.ts";
+import { SkillManagerStore } from "../skills/skill-manager-store.ts";
+import { registerIntelligenceTools, shutdownIntelligenceTools } from "../tools/intelligence.ts";
+import type { CuratorHostOptions } from "../tools/web-access/curator-host.ts";
+import { browserHostSessionId } from "../tools/browser/session-scope.ts";
+import { registerGatewayBoardTool } from "../tools/gateway-board.ts";
+import { TODO_RESOURCE_URI_GUIDANCE } from "../tools/todo-contract.ts";
+import { registerGatewayFabricTools } from "../tools/fabric.ts";
+import { createLspTool } from "../tools/lsp-tool.ts";
+import { LspManager, lspManager } from "../tools/lsp/manager.ts";
+import { registerSmartSearchTool } from "../tools/smart-search.ts";
+import { createSourceCheckTool } from "../tools/web-access/source-check-tool.ts";
+import { registerFff, SearchToolParameters, type SearchToolInput } from "../tools/fff.ts";
+import { registerSearchScopeGuard, resolveSearchScopePath, searchScopeBlockReason } from "../tools/search-scope-guard.ts";
+import { registerBashBg } from "../tools/bash-bg.ts";
+import { registerLoop } from "../tools/loop.ts";
+import { registerFlowSchedule } from "../flow-schedule/register.ts";
+import { registerModelAvailability } from "../tools/model-availability.ts";
+import { registerTeammateSessionRouting } from "../tools/teammate-session-routing.ts";
+import { acquirePlanArtifactResource } from "../gateway/fabric/plan-artifact-source.ts";
+import { registerResourceTool } from "../tools/resource.ts";
+import { registerSessionHistoryTool } from "../tools/session-history.ts";
+import {
+  registerNewContextTool,
+  registerNewContextWithoutLlmCommand,
+} from "../tools/new-context.ts";
+import { isNewContextCompactionEnabled } from "../compaction/compaction-settings.ts";
+import {
+  appendTodoContextPressureAdvisory,
+  appendTodoContextTransitionFailure,
+} from "../compaction/context-pressure-advisory.ts";
+import { registerConflictTool } from "../tools/conflict.ts";
+import {
+  capturePublishedAgentResult,
+  filterUnacknowledgedResults,
+  persistStructuredResults,
+} from "../teammate/agent-output-capture.ts";
+import { registerDataManagerCommand } from "../tools/data-manager.ts";
+import { isDecisionPolicyConfiguring } from "../decision-policy/extension.ts";
+import {
+  createTeammateChildComputerUseTool,
+  TeammateComputerUseBroker,
+} from "../teammate/computer-use-broker.ts";
+import {
+  createTeammateChildBrowserTool,
+  TeammateBrowserBroker,
+} from "../teammate/browser-broker.ts";
+import { registerMarkdownReviewCommand } from "../tools/markdown-review-command.ts";
+import {
+  proxyTeammateChildTool,
+  registerChildBudgetReceiptRetirement,
+  isManagedWorkerWindow,
+  registerTeammateChildExtension,
+  registerTeammateChildToolBroker,
+  registerTeammatePermissionBroker,
+  type TeammatePermissionBroker,
+} from "pi-maestro-teammate/v1/child-extensions";
+import { registerFlowTodoPromptContextProvider } from "../teammate/todo-prompt-context.ts";
+import {
+  TEAMMATE_STARTED_EVENT,
+  TEAMMATE_MESSAGE_EVENT,
+  TEAMMATE_RESULT_PUBLISHED_EVENT,
+  TEAMMATE_COMPLETE_EVENT,
+} from "pi-maestro-teammate/v1/types";
+import type { TeammateCompleteEvent, TeammateStartedEvent } from "pi-maestro-teammate/v1/events";
+import type { MailboxHostRegistry } from "pi-maestro-teammate/v1/mailbox";
+import { getCompletionDurabilityRegistry } from "pi-maestro-teammate/v1";
+import { sharedModelCircuitBreaker } from "pi-maestro-teammate/v1/retry";
+import { journalConsumedInitialCompletion } from "../teammate/consumed-initial-completion.ts";
+import { FlowCompletionDurabilityProvider } from "../teammate/completion-durability-provider.ts";
+import { createFlowSettingsProvider, registerFlowSettingsProvider } from "../settings/flow-settings-provider.ts";
+import {
+  createApiManagerSettingsProvider,
+  registerApiManagerSettingsProvider,
+} from "../settings/api-manager-settings-provider.ts";
+import {
+  createMcpSettingsProvider,
+  registerMcpSettingsProvider,
+} from "../settings/mcp-settings-provider.ts";
+import {
+  createSkillsSettingsProvider,
+  registerSkillsSettingsProvider,
+} from "../settings/skills-settings-provider.ts";
+import {
+  createSmartSearchSettingsProvider,
+  registerSmartSearchSettingsProvider,
+} from "../settings/smart-search-settings-provider.ts";
+import {
+  createVisionDelegationSettingsProvider,
+  registerVisionDelegationSettingsProvider,
+} from "../settings/vision-delegation-provider.ts";
+import {
+  createExploreSettingsProvider,
+  registerExploreSettingsProvider,
+} from "../settings/explore-settings-provider.ts";
+import {
+  createHooksSettingsProvider,
+  registerHooksSettingsProvider,
+} from "../settings/hooks-settings-provider.ts";
+import {
+  createTeammateBackendsSettingsProvider,
+  registerTeammateBackendsSettingsProvider,
+  type BackendDescriptor,
+} from "../settings/teammate-backends-settings-provider.ts";
+import dshBackend, { DSH_SETTINGS_CATALOGS } from "pi-maestro-backends/dsh";
+import acpCliBackend, { ACP_CLI_SETTINGS_CATALOGS } from "pi-maestro-teammate/v1/acp-cli";
+import { PI_SUBPROCESS, PI_SUBPROCESS_CONFIG_FIELDS, PI_SUBPROCESS_SETTINGS_CATALOGS } from "pi-maestro-teammate/v1/backends";
+import { registerInstallCommand } from "../install/install-command.ts";
+import { registerSshManager } from "../ssh-manager/extension.ts";
+
+type BrokeredTodoResultDetails = TodoResultDetails & {
+  newContextRecoveryState?: MaestroRecoveryState;
+};
+
+export const MAESTRO_CHILD_TOOL_NAMES = [
+  "ask-user-question",
+  "bash_bg",
+  "teammate-session-routing",
+  "smart_search",
+  "source_check",
+  "resource",
+  "session_history",
+  "new_context",
+  "board",
+  "device",
+  "workspace",
+  "endpoint",
+  "route",
+  "lsp",
+  "browser",
+  "computer_use",
+  "todo",
+  "search",
+] as const;
+
+function newContextToolsEnabled(cwd: string): boolean {
+  try {
+    return isNewContextCompactionEnabled(cwd);
+  } catch {
+    return false;
+  }
+}
+
+interface MaestroState {
+  baseCwd: string;
+  activeToolCalls: Map<
+    string,
+    {
+      action: string;
+      startedAt: number;
+      correlationId: string;
+    }
+  >;
+}
+
+export const APPROVAL_MODE_CYCLE_KEY = "shift+tab";
+// Plan is a separate durable workflow entered through /plan, Alt+Shift+P, or an LLM
+// plan tool. Shift+Tab only cycles permission-engine approval modes.
+export const APPROVAL_MODES: readonly PermissionMode[] = PERMISSION_MODES.filter(
+  (mode) => mode !== "plan",
+);
+
+export function nextApprovalMode(
+  current: PermissionMode,
+  disabled: ReadonlySet<PermissionMode> = new Set(),
+): PermissionMode {
+  let index = APPROVAL_MODES.indexOf(current);
+  for (let offset = 0; offset < APPROVAL_MODES.length; offset++) {
+    index = (index + 1) % APPROVAL_MODES.length;
+    const candidate = APPROVAL_MODES[index] ?? "default";
+    if (!disabled.has(candidate)) return candidate;
+  }
+  return "default";
+}
+
+/**
+ * Permission mode used to authorize tool calls. Plan mode is advisory and
+ * display-only: it no longer overrides the approval mode, so entering Plan
+ * mode keeps whatever approval mode was active before (including YOLO). The
+ * legacy "plan" approval-mode carousel entry evaluates as "default".
+ */
+export function effectivePermissionMode(approvalMode: PermissionMode): PermissionMode {
+  return approvalMode === "plan" ? "default" : approvalMode;
+}
+
+const TODO_TOGGLE_KEY = "alt+t";
+const TODO_TOGGLE_LABEL = altKey("T");
+const COCKPIT_UI_OWNERSHIP_EVENT = "cockpit:ui-ownership";
+const TEAMMATE_ATTACH_ENTRY = "maestro-teammate-attach";
+const GOAL_OVERLAY_KEY = "alt+g";
+const GOAL_OVERLAY_LABEL = altKey("G");
+
+// Terminals whose default config never delivers alt+X on macOS (no Meta, no
+// enhanced key reporting). WezTerm/Ghostty/Kitty negotiate the Kitty protocol
+// at startup and need no hint.
+const MAC_ALT_HINT_BY_TERMINAL: Record<string, string> = {
+  Apple_Terminal: "终端 → 设置 → 描述文件 → 键盘 → 勾选「使用 Option 键作为 Meta 键」",
+  "iTerm.app": "iTerm2 → Settings → Profiles → Keys → General → 将 Left/Right Option 设为 Esc+",
+  vscode: "VS Code 设置 terminal.integrated.macOptionIsMeta = true",
+};
+let macAltHintShown = false;
+
+/** One-shot macOS advisory: Alt shortcuts stay dead until Option acts as Meta. */
+function notifyMacAltShortcutHint(ctx: { ui: { notify(message: string, level?: "info" | "warning" | "error") : void } }): void {
+  if (process.platform !== "darwin" || macAltHintShown) return;
+  const fix = MAC_ALT_HINT_BY_TERMINAL[process.env.TERM_PROGRAM ?? ""];
+  if (!fix) return;
+  macAltHintShown = true;
+  ctx.ui.notify(
+    `macOS 检测：${TODO_TOGGLE_LABEL} 等 Alt 快捷键默认不生效。启用方法：${fix}。命令兜底：/maestro-todo、/maestro-goal、/plan。`,
+    "info",
+  );
+}
+
+export function shouldRestoreWorkflowGoal(
+  reason: "startup" | "reload" | "new" | "resume" | "fork" | undefined,
+  goal: { workflowSessionId?: string } | undefined,
+  snapshot: WorkflowSnapshot | undefined,
+): boolean {
+  if (reason === "new" || reason === "fork" || !goal?.workflowSessionId) return false;
+  const sessionId = snapshot?.session?.sessionId;
+  return snapshot?.source === "canonical"
+    && snapshot.canonicalClaim?.status === "valid"
+    && Boolean(sessionId && snapshot.canonicalClaim.activeSessionId === sessionId);
+}
+
+export function isWorkflowSessionMatchable(
+  snapshot: WorkflowSnapshot | undefined,
+): boolean {
+  if (
+    snapshot?.source !== "canonical"
+    || snapshot.canonicalClaim?.status === "invalid"
+    || !snapshot.session
+  ) return false;
+  const derived = deriveWorkflowStatus(snapshot);
+  return derived.authority === "execution-derived"
+    ? derived.lifecycle !== "archived"
+    : snapshot.session.status === "running";
+}
+
+export function shouldAttachWorkflowSession(
+  snapshot: WorkflowSnapshot | undefined,
+): boolean {
+  if (!isWorkflowSessionMatchable(snapshot)) return false;
+  const derived = deriveWorkflowStatus(snapshot!);
+  return derived.authority === "execution-derived"
+    ? snapshot?.execution?.status === "active"
+    : snapshot?.session?.status === "running";
+}
+
+export function sealedWorkflowExecutionTransition(
+  previous: WorkflowSnapshot | undefined,
+  next: WorkflowSnapshot,
+): { sessionId: string; executionId: string } | undefined {
+  const previousExecution = previous?.execution;
+  const nextSession = next.session;
+  if (
+    !previousExecution
+    || previousExecution.legacyProjection
+    || !nextSession
+    || nextSession.lifecycleAuthority !== "execution-derived"
+    || previousExecution.sessionId !== nextSession.sessionId
+    || previousExecution.status === "sealed"
+  ) return undefined;
+  const sealed = next.execution?.executionId === previousExecution.executionId
+    && next.execution.status === "sealed";
+  const cleared = !next.execution && nextSession.latestExecutionId === previousExecution.executionId;
+  return sealed || cleared
+    ? { sessionId: nextSession.sessionId, executionId: previousExecution.executionId }
+    : undefined;
+}
+
+/**
+ * v3 complete receipts: `session complete` (operation session-complete) and
+ * `run complete <run_id> --advance` (operation run-complete-and-seal) seal a
+ * Session/Run and fire the knowledge pipeline. session/3.0 has no
+ * Execution/lease entity, so these replace the v2 execution-seal projection
+ * transition (sealedWorkflowExecutionTransition) as the seal detector.
+ */
+interface V3CompleteReceipt {
+  operation: "session-complete" | "run-complete-and-seal";
+  sessionId?: string;
+  runId?: string;
+}
+
+function v3CompleteReceipt(command: string, argv: readonly string[]): V3CompleteReceipt | undefined {
+  const tokens = argv.length > 0
+    ? [...argv]
+    : command.trim().split(/\s+/).filter((token) => token && token !== "maestro" && token !== "maestro.cmd");
+  if (tokens[0] === "session" && tokens[1] === "complete") {
+    return { operation: "session-complete", sessionId: flagValue(tokens, "--session") };
+  }
+  if (tokens[0] === "run" && tokens[1] === "complete" && tokens.includes("--advance")) {
+    return {
+      operation: "run-complete-and-seal",
+      runId: tokens[2] && !tokens[2].startsWith("-") ? tokens[2] : undefined,
+      sessionId: flagValue(tokens, "--session"),
+    };
+  }
+  return undefined;
+}
+
+function flagValue(tokens: readonly string[], flag: string): string | undefined {
+  const index = tokens.indexOf(flag);
+  return index >= 0 && index + 1 < tokens.length ? tokens[index + 1] : undefined;
+}
+
+/** Knowledge summary shape surfaced from a run's own knowledge-delta.json. */
+interface RunKnowledgeDeltaView {
+  inputs: Array<{ run_id: string; signal: string; count: number }>;
+  candidates: Array<{
+    run_ids: string[];
+    status: string;
+    reconciliation: { promotion_eligibility: string } | null;
+  }>;
+}
+
+/**
+ * session/3.0 run knowledge delta (run-knowledge-delta/1.0) written by
+ * `run complete` at runs/<run_id>/knowledge-delta.json. Read-only projection
+ * of the raw ledger: delta inputs carry no per-item run_id (the file owns its
+ * run) and delta candidates carry no reconciliation (added by `knowledge
+ * review`), so both are derived here. Returns undefined when the delta is
+ * missing or unreadable (run had no knowledge activity).
+ */
+function readRunKnowledgeDelta(workflowRoot: string, sessionId: string, runId: string): RunKnowledgeDeltaView | undefined {
+  try {
+    const raw = readFileSync(
+      join(workflowRoot, ".workflow", "sessions", sessionId, "runs", runId, "knowledge-delta.json"),
+      "utf8",
+    );
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    const inputs = Array.isArray(value.inputs) ? value.inputs : [];
+    const candidates = Array.isArray(value.candidates) ? value.candidates : [];
+    return {
+      inputs: inputs.map((input) => {
+        const record = (input ?? {}) as Record<string, unknown>;
+        return {
+          run_id: runId,
+          signal: String(record.signal ?? "consumed"),
+          count: typeof record.count === "number" ? record.count : 0,
+        };
+      }),
+      candidates: candidates.map((candidate) => {
+        const record = (candidate ?? {}) as Record<string, unknown>;
+        const reconciliation = (record.reconciliation ?? null) as Record<string, unknown> | null;
+        return {
+          run_ids: [runId],
+          status: String(record.status ?? "pending"),
+          reconciliation: reconciliation
+            ? { promotion_eligibility: String(reconciliation.promotion_eligibility ?? "") }
+            : null,
+        };
+      }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A canonical Workflow Session is workspace-wide, while Todo is owned by the
+ * current Pi session. Never project or attach it into a fresh/forked Pi
+ * session until that session explicitly resumes its workflow-owned Goal or
+ * performs a Workflow write.
+ */
+export function shouldActivateWorkflowSession(
+  snapshot: WorkflowSnapshot | undefined,
+  workflowSessionOptedIn: boolean,
+): boolean {
+  return workflowSessionOptedIn && isWorkflowSessionMatchable(snapshot);
+}
+
+export function currentWorkflowPlanTarget(
+  snapshot: WorkflowSnapshot,
+): { available: boolean; hasActiveWork: boolean; reason?: string } {
+  const session = snapshot.session;
+  if (snapshot.source !== "canonical" || snapshot.canonicalClaim?.status === "invalid" || !session) {
+    return { available: false, hasActiveWork: false, reason: "No valid canonical Workflow Session to bind" };
+  }
+
+  const derived = deriveWorkflowStatus(snapshot);
+  if (derived.authority === "legacy-session") {
+    const active = activeWorkflowRun(snapshot);
+    const firstPendingStep = session.chain.find((step) => step.status === "pending");
+    if (session.status !== "running") {
+      return { available: false, hasActiveWork: Boolean(active), reason: `Workflow Session is ${session.status}` };
+    }
+    if (active) {
+      return {
+        available: false,
+        hasActiveWork: true,
+        reason: `Workflow Session has active Run ${active.runId}`,
+      };
+    }
+    if (!firstPendingStep) {
+      return { available: false, hasActiveWork: false, reason: "Workflow Session has no pending execution step" };
+    }
+    if (firstPendingStep.command !== "execute") {
+      return {
+        available: false,
+        hasActiveWork: false,
+        reason: `Next Workflow step is ${firstPendingStep.command}, not execute`,
+      };
+    }
+    return { available: true, hasActiveWork: false };
+  }
+
+  const execution = snapshot.execution;
+  if (derived.lifecycle === "archived") {
+    return { available: false, hasActiveWork: false, reason: "Workflow Session is archived" };
+  }
+  if (!execution) {
+    return { available: false, hasActiveWork: false, reason: "Workflow Session has no pending execution step" };
+  }
+  const hasActiveWork = Boolean(
+    execution.activeRunId || execution.chain.some((step) => step.status === "running"),
+  );
+  if (execution.status === "paused") {
+    return { available: false, hasActiveWork, reason: "Workflow Execution is paused" };
+  }
+  if (execution.status === "sealed") {
+    return { available: false, hasActiveWork: false, reason: "Workflow Execution is sealed" };
+  }
+  if (derived.lifecycle === "blocked") {
+    return { available: false, hasActiveWork, reason: "Workflow Execution is blocked" };
+  }
+  if (execution.activeRunId) {
+    return {
+      available: false,
+      hasActiveWork: true,
+      reason: `Workflow Execution has active Run ${execution.activeRunId}`,
+    };
+  }
+  const runningStep = execution.chain.find((step) => step.status === "running");
+  if (runningStep) {
+    return {
+      available: false,
+      hasActiveWork: true,
+      reason: `Workflow Execution step ${runningStep.step} is running`,
+    };
+  }
+  const firstPendingStep = execution.chain.find((step) => step.status === "pending");
+  if (!firstPendingStep) {
+    return { available: false, hasActiveWork: false, reason: "Workflow Session has no pending execution step" };
+  }
+  if (firstPendingStep.command !== "execute") {
+    return {
+      available: false,
+      hasActiveWork: false,
+      reason: `Next Workflow step is ${firstPendingStep.command}, not execute`,
+    };
+  }
+  return { available: true, hasActiveWork: false };
+}
+
+/**
+ * A canonical Session is workspace-wide, so every Pi session can read it. The
+ * statusline must only surface the Session the current Pi session actually
+ * leases; otherwise an unattached session would display a Session owned by
+ * another Pi session.
+ */
+export function workflowSnapshotForAttachedSession(
+  snapshot: WorkflowSnapshotLike | undefined,
+  attachedSessionId: string | undefined,
+): WorkflowSnapshotLike | undefined {
+  const sessionId = snapshot?.session?.sessionId;
+  return sessionId && attachedSessionId === sessionId ? snapshot : undefined;
+}
+
+export function workflowArtifactKnowledgeSessionId(
+  snapshot: WorkflowSnapshotLike | undefined,
+  workflowSessionOptedIn: boolean,
+  attachedSessionId: string | undefined,
+): string | undefined {
+  if (!workflowSessionOptedIn) return undefined;
+  return workflowSnapshotForAttachedSession(snapshot, attachedSessionId)?.session?.sessionId;
+}
+
+export function isWorkflowOptInCommand(command: string): boolean {
+  if (/\bmaestro\s+ralph\b/.test(command)) return true;
+  const runAction = /\bmaestro\s+run\s+([\w-]+)/.exec(command)?.[1];
+  return Boolean(runAction && !isRunControlReadAction(runAction));
+}
+
+export function todoActorFromTeammateStarted(event: unknown): TodoActorRef | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const record = event as Record<string, unknown>;
+  const correlationId = typeof record.correlationId === "string" ? record.correlationId.trim() : "";
+  if (!correlationId || correlationId === "unknown") return undefined;
+  const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : undefined;
+  const agent = typeof record.agent === "string" && record.agent.trim() ? record.agent.trim() : undefined;
+  return {
+    kind: "teammate",
+    id: correlationId,
+    label: name ?? agent ?? correlationId.slice(0, 8),
+    ...(agent ? { agentType: agent } : {}),
+  };
+}
+
+/**
+ * Access the teammate extension's published v1 mailbox registry (durable task
+ * notification + pending-count + capability negotiation for teammate agents).
+ * Available only while the teammate extension runs an active mailbox in this
+ * process (root host, mailbox not disabled); undefined otherwise.
+ */
+export function mailboxRegistry(): MailboxHostRegistry | undefined {
+  const bridge = globalThis as typeof globalThis & Record<symbol, unknown>;
+  return bridge[Symbol.for("pi-maestro-teammate.mailbox-registry")] as MailboxHostRegistry | undefined;
+}
+
+const CHINESE_RESPONSE_STATE_ENTRY = "maestro-chinese-response-mode";
+const CHINESE_GLOBAL_STATE_FILE = "maestro-chinese-response-mode.json";
+const CHINESE_RESPONSE_PROMPT_MARKER = "<chinese_response_mode>";
+
+export function chineseGlobalStatePath(homeDir: string): string {
+  return join(homeDir, ".pi", CHINESE_GLOBAL_STATE_FILE);
+}
+
+/** Load the global chinese mode state, or undefined when absent/invalid. */
+export function loadChineseGlobalState(homeDir: string): boolean | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(chineseGlobalStatePath(homeDir), "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const enabled = (parsed as { enabled?: unknown }).enabled;
+      if (typeof enabled === "boolean") return enabled;
+    }
+  } catch {
+    // Missing or malformed state falls back to the session branch.
+  }
+  return undefined;
+}
+
+/** Persist the global chinese mode state (atomic write, last toggle wins). */
+export function saveChineseGlobalState(enabled: boolean, homeDir: string): void {
+  const filePath = chineseGlobalStatePath(homeDir);
+  mkdirSync(dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify({ version: 1, enabled }, null, 2)}\n`, "utf8");
+    renameSync(temporary, filePath);
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
+export const CHINESE_RESPONSE_PROMPT = `<chinese_response_mode>
+# 中文回复准则
+
+## 核心原则
+
+- 所有回复使用简体中文
+- 技术术语保留英文，首次出现可添加中文解释
+- 代码变量名保持英文，注释使用中文
+
+## 格式规范
+
+- 中英文/数字间加空格：\`使用 TypeScript 开发\`、\`共 3 个文件\`
+- 使用中文标点：，。！？：；
+- 代码/命令用反引号：\`npm install\`
+
+## Git Commit
+
+- 若项目已有提交信息规范（CONTRIBUTING、git log 惯例），遵循项目规范
+- 否则使用中文提交信息，格式：\`类型: 简短描述\`（feat/fix/refactor/docs/test/chore）
+
+## 保持英文
+
+- 代码文件内容
+- 错误信息和日志
+- 文件路径和命令
+</chinese_response_mode>`;
+
+export function appendChineseResponsePrompt(systemPrompt: string): string {
+  if (systemPrompt.includes(CHINESE_RESPONSE_PROMPT_MARKER)) return systemPrompt;
+  return `${systemPrompt}\n\n${CHINESE_RESPONSE_PROMPT}`;
+}
+
+export interface ChineseResponseModeHandle {
+  isEnabled(): boolean;
+  setEnabled(value: boolean, ctx: ExtensionContext): void;
+  toggle(ctx: ExtensionContext): void;
+}
+
+export function registerChineseResponseMode(
+  pi: ExtensionAPI,
+  options: { homeDir?: string } = {},
+): ChineseResponseModeHandle {
+  let enabled = false;
+  const stateHomeDir = options.homeDir ?? homedir();
+  const setEnabled = (value: boolean, ctx: ExtensionContext): void => {
+    enabled = value;
+    pi.appendEntry(CHINESE_RESPONSE_STATE_ENTRY, { enabled });
+    try {
+      saveChineseGlobalState(enabled, stateHomeDir);
+      ctx.ui.notify(`中文回复模式已${enabled ? "开启" : "关闭"}（全局持久化）。`, "info");
+    } catch {
+      ctx.ui.notify(`中文回复模式已${enabled ? "开启" : "关闭"}，但全局配置保存失败。`, "warning");
+    }
+  };
+
+  pi.registerCommand("chinese", {
+    description: "切换中文回复模式，支持 on、off、status",
+    async handler(args, ctx) {
+      const action = args.trim().toLowerCase();
+      if (action === "status") {
+        ctx.ui.notify(`中文回复模式：${enabled ? "已开启" : "已关闭"}。`, "info");
+        return;
+      }
+      if (action && !["on", "off", "enable", "disable"].includes(action)) {
+        ctx.ui.notify("用法：/chinese [on|off|status]", "warning");
+        return;
+      }
+
+      setEnabled(
+        action === "on" || action === "enable"
+          ? true
+          : action === "off" || action === "disable"
+            ? false
+            : !enabled,
+        ctx,
+      );
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    const globalState = loadChineseGlobalState(stateHomeDir);
+    if (globalState !== undefined) {
+      enabled = globalState;
+      return;
+    }
+    const entries = ctx.sessionManager.getBranch() as Array<{
+      type?: string;
+      customType?: string;
+      data?: unknown;
+    }>;
+    const state = entries
+      .filter((entry) => entry.type === "custom" && entry.customType === CHINESE_RESPONSE_STATE_ENTRY)
+      .at(-1)?.data as { enabled?: unknown } | undefined;
+    enabled = state?.enabled === true;
+  });
+
+  pi.on("before_agent_start", (event) => {
+    if (!enabled) return undefined;
+    return { systemPrompt: appendChineseResponsePrompt(event.systemPrompt) };
+  });
+
+  return {
+    isEnabled: () => enabled,
+    setEnabled,
+    toggle: (ctx) => setEnabled(!enabled, ctx),
+  };
+}
+
+export { settleFailedCompaction } from "../compaction/compaction-hooks.ts";
+
+const TODO_RESULT_WINDOW_SIZE = 8;
+const TODO_RECENT_COMPLETED_LIMIT = 2;
+const TODO_DURATION_CHART_HEIGHT = 4;
+
+function sanitizeTodoRenderText(value: string, maximum = 240): string {
+  const cleaned = value
+    .replace(/[\r\n\t]/g, " ")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim();
+  return cleaned.length > maximum ? `${cleaned.slice(0, maximum - 1)}…` : cleaned;
+}
+
+function todoResultTextLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => sanitizeTodoRenderText(line))
+    .filter(Boolean);
+}
+
+function recentCompletedTasks(tasks: readonly TodoTaskSnapshot[]): TodoTaskSnapshot[] {
+  return tasks
+    .filter((task) => task.status === "completed" && !task.reviewRequired)
+    .sort((left, right) => {
+      const leftAt = typeof left.completedAt === "number" && Number.isFinite(left.completedAt) ? left.completedAt : 0;
+      const rightAt = typeof right.completedAt === "number" && Number.isFinite(right.completedAt) ? right.completedAt : 0;
+      return leftAt - rightAt;
+    })
+    .slice(-TODO_RECENT_COMPLETED_LIMIT);
+}
+
+function formatTodoDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) return "<1s";
+  const seconds = Math.round(milliseconds / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${seconds % 60 === 0 ? "" : `${seconds % 60}s`}`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${minutes % 60 === 0 ? "" : `${minutes % 60}m`}`;
+}
+
+function todoCompletionDetail(
+  task: TodoTaskSnapshot,
+  theme: Parameters<typeof toolResultCard>[0],
+): string | undefined {
+  const parts = [
+    task.summary ? sanitizeTodoRenderText(task.summary, 180) : "",
+    typeof task.durationMs === "number" && Number.isFinite(task.durationMs) && task.durationMs >= 0
+      ? `active ${formatTodoDuration(task.durationMs)}`
+      : "",
+  ].filter(Boolean);
+  return parts.length > 0 ? theme.fg("dim", `  ↳ ${parts.join(" · ")}`) : undefined;
+}
+
+function todoDurationChart(
+  tasks: readonly TodoTaskSnapshot[],
+  theme: Parameters<typeof toolResultCard>[0],
+  width: number,
+): string[] {
+  const completed = tasks.filter((task) => task.status === "completed" && !task.reviewRequired);
+  if (completed.length === 0) return [];
+  const entries = completed.map((task) => {
+    const id = sanitizeTodoRenderText(task.id, 6).replace(/^#/, "");
+    const duration = typeof task.durationMs === "number" && Number.isFinite(task.durationMs) && task.durationMs >= 0
+      ? task.durationMs
+      : undefined;
+    return { label: `#${id}`, duration };
+  });
+  const maximum = Math.max(1, ...entries.map((entry) => entry.duration ?? 0));
+  const cellWidth = Math.max(3, ...entries.map((entry) => visibleWidth(entry.label)));
+  const center = (value: string): string => {
+    const valueWidth = visibleWidth(value);
+    const left = Math.floor((cellWidth - valueWidth) / 2);
+    return `${" ".repeat(left)}${value}${" ".repeat(cellWidth - valueWidth - left)}`;
+  };
+  const ticks = Array.from({ length: TODO_DURATION_CHART_HEIGHT }, (_, index) =>
+    formatTodoDuration(maximum * ((TODO_DURATION_CHART_HEIGHT - index) / TODO_DURATION_CHART_HEIGHT))
+  );
+  const yWidth = Math.max(2, ...ticks.map((tick) => tick.length));
+  const plotWidth = Math.max(0, Math.floor(width) - yWidth - 3);
+  if (plotWidth < cellWidth) return [];
+
+  const spacedWidth = entries.length * cellWidth + Math.max(0, entries.length - 1);
+  const gap = spacedWidth <= plotWidth ? 1 : 0;
+  const capacity = Math.max(1, Math.floor((plotWidth + gap) / (cellWidth + gap)));
+  const separator = " ".repeat(gap);
+  const rows: string[] = [];
+  for (let start = 0; start < entries.length; start += capacity) {
+    const band = entries.slice(start, start + capacity);
+    const heights = band.map((entry) => entry.duration === undefined
+      ? 0
+      : Math.max(1, Math.round((entry.duration / maximum) * TODO_DURATION_CHART_HEIGHT)));
+    if (start > 0) rows.push("");
+    for (const [index, tick] of ticks.entries()) {
+      const level = TODO_DURATION_CHART_HEIGHT - index;
+      const columns = heights
+        .map((height) => center(height >= level ? theme.fg("accent", "█") : " "))
+        .join(separator);
+      rows.push(`${tick.padStart(yWidth)} ${theme.fg("dim", "┤")} ${columns}`);
+    }
+    const axisWidth = band.length * cellWidth + Math.max(0, band.length - 1) * gap;
+    rows.push(`${"0s".padStart(yWidth)} ${theme.fg("dim", "┼")} ${theme.fg("dim", "─".repeat(axisWidth))}`);
+    rows.push(`${" ".repeat(yWidth + 3)}${band.map((entry) => center(entry.label)).join(separator)}`);
+  }
+  return rows;
+}
+
+function todoResultWindow(tasks: readonly TodoTaskSnapshot[], action: string): {
+  tasks: TodoTaskSnapshot[];
+  before: number;
+  after: number;
+} {
+  if (action === "advance") {
+    const scoped = tasks.filter((task) => task.status !== "deleted");
+    let anchor = scoped.findIndex((task) => task.status === "in_progress");
+    if (anchor < 0) anchor = scoped.findIndex((task) => task.reviewRequired || task.status === "pending" || task.status === "blocked");
+    if (anchor < 0) {
+      const recentCompleted = recentCompletedTasks(scoped);
+      return {
+        tasks: recentCompleted,
+        before: scoped.length - recentCompleted.length,
+        after: 0,
+      };
+    }
+
+    const recentCompleted = recentCompletedTasks(scoped.slice(0, anchor));
+    const remainingSlots = TODO_RESULT_WINDOW_SIZE - recentCompleted.length;
+    const currentAndFuture = scoped
+      .slice(anchor)
+      .filter((task) => task.status !== "completed" || task.reviewRequired)
+      .slice(0, remainingSlots);
+    return {
+      tasks: [...recentCompleted, ...currentAndFuture],
+      before: Math.max(0, anchor - recentCompleted.length),
+      after: Math.max(0, scoped.length - anchor - currentAndFuture.length),
+    };
+  }
+
+  const scoped = [...tasks];
+  if (action === "create" || scoped.length <= TODO_RESULT_WINDOW_SIZE) {
+    return { tasks: scoped, before: 0, after: 0 };
+  }
+
+  let anchor = scoped.findIndex((task) => task.status === "in_progress");
+  if (anchor < 0) anchor = scoped.findIndex((task) => task.reviewRequired || task.status === "pending" || task.status === "blocked");
+  if (anchor < 0) anchor = scoped.length - 1;
+  const start = Math.max(
+    0,
+    Math.min(anchor - Math.floor(TODO_RESULT_WINDOW_SIZE / 2), scoped.length - TODO_RESULT_WINDOW_SIZE),
+  );
+  return {
+    tasks: scoped.slice(start, start + TODO_RESULT_WINDOW_SIZE),
+    before: start,
+    after: scoped.length - start - TODO_RESULT_WINDOW_SIZE,
+  };
+}
+
+function todoTaskCardRow(
+  task: TodoTaskSnapshot,
+  theme: Parameters<typeof toolResultCard>[0],
+  showAssignee = false,
+): string {
+  const id = sanitizeTodoRenderText(task.id, 64);
+  const subject = sanitizeTodoRenderText(task.subject);
+  const label = id.startsWith("#") ? id : `#${id}`;
+  const assignment = showAssignee && task.assignee
+    ? theme.fg("dim", `  @${sanitizeTodoRenderText(task.assignee.label, 64)}`)
+    : "";
+  if (task.reviewRequired) return `${theme.fg("warning", "? review required")}  ${theme.fg("accent", label)}  ${subject}${assignment}`;
+  if (task.resolution === "skipped") return `${theme.fg("dim", "↷ skipped")}      ${theme.fg("accent", label)}  ${subject}${assignment}`;
+  if (task.status === "in_progress") {
+    return `${theme.fg("warning", "▶ in progress")}  ${theme.fg("accent", label)}  ${subject}${assignment}`;
+  }
+  if (task.status === "blocked") {
+    const blockers = (task.blockedBy ?? [])
+      .map((blocker) => sanitizeTodoRenderText(blocker, 64).replace(/^#/, ""))
+      .filter(Boolean)
+      .map((blocker) => `#${blocker}`)
+      .join(", ");
+    const relation = blockers ? theme.fg("dim", `  ← ${blockers}`) : "";
+    return `${theme.fg("error", "! blocked")}      ${theme.fg("accent", label)}  ${subject}${assignment}${relation}`;
+  }
+  if (task.status === "completed") {
+    return `${theme.fg("success", "✓ completed")}    ${theme.fg("accent", label)}  ${theme.fg("dim", subject)}${assignment}`;
+  }
+  if (task.status === "deleted") {
+    return `${theme.fg("dim", "⊘ deleted")}      ${theme.fg("accent", label)}  ${theme.fg("dim", subject)}${assignment}`;
+  }
+  return `${theme.fg("dim", "○ pending")}      ${theme.fg("accent", label)}  ${subject}${assignment}`;
+}
+
+function renderTodoToolResult(
+  result: FlowToolResult,
+  expanded: boolean,
+  theme: Parameters<typeof toolResultCard>[0],
+  args: Record<string, unknown>,
+  contextIsError = false,
+) {
+  const details = result.details as TodoResultDetails | undefined;
+  const rawText = result.content.find((item) => item.type === "text" && "text" in item)?.text ?? "";
+  const isError = contextIsError || result.isError === true || !!details?.error;
+  const action = sanitizeTodoRenderText(String(args.action ?? details?.action ?? "?"), 32);
+  const advancedTaskId = action === "advance" && typeof args.id === "string"
+    ? args.id.replace(/^#/, "")
+    : undefined;
+  let callDetail = "";
+  if (action === "create") {
+    const batch = Array.isArray(args.tasks) ? args.tasks : undefined;
+    if (batch?.length) callDetail = ` ${batch.length} tasks`;
+    else {
+      const subject = sanitizeTodoRenderText(String(args.subject ?? ""), 40);
+      if (subject) callDetail = ` ${subject}`;
+    }
+  } else if (action === "update" || action === "get" || action === "delete") {
+    const batchSize = action === "update" && Array.isArray(args.updates)
+      ? args.updates.length
+      : action === "delete" && Array.isArray(args.ids)
+        ? args.ids.length
+        : 0;
+    if (batchSize > 0) callDetail = ` ${batchSize} tasks`;
+    else {
+      const id = sanitizeTodoRenderText(String(args.id ?? ""), 64);
+      if (id) callDetail = ` #${id.replace(/^#/, "")}`;
+    }
+  }
+  const arg = `${action}${callDetail}`.trim();
+  const displayTasks = !details?.tasks
+    ? undefined
+    : details.displayTaskIds === undefined
+      ? details.tasks
+      : details.displayTaskIds
+        .map((id) => details.tasks.find((task) => task.id === id))
+        .filter((task): task is TodoTaskSnapshot => task !== undefined);
+
+  if (isError || !displayTasks || action === "get" || displayTasks.length === 0) {
+    const rows = todoResultTextLines(rawText);
+    return toolResultCard(theme, {
+      name: "todo",
+      ok: !isError,
+      arg,
+      summary: rows[0] ?? (isError ? "failed" : "done"),
+      groups: rows.length > 0 ? [expanded ? rows : rows.slice(0, 8)] : [],
+    });
+  }
+
+  const displayTaskIds = new Set(displayTasks.map((task) => task.id));
+  const recentCompleted = action === "create"
+    ? recentCompletedTasks((details?.tasks ?? []).filter((task) => !displayTaskIds.has(task.id)))
+    : [];
+  const allTasks = action === "create" ? [...recentCompleted, ...displayTasks] : displayTasks;
+  const summaryTasks = action === "create" ? displayTasks : allTasks;
+  const completed = summaryTasks.filter((task) => task.status === "completed" && !task.reviewRequired).length;
+  const skipped = summaryTasks.filter((task) => task.resolution === "skipped" && !task.reviewRequired).length;
+  const reviewRequired = summaryTasks.filter(task=>task.reviewRequired).length;
+  const running = summaryTasks.filter((task) => task.status === "in_progress").length;
+  const pending = summaryTasks.filter((task) => task.status === "pending").length;
+  const total = action === "advance"
+    ? allTasks.filter((task) => (task.status !== "completed" || task.reviewRequired) && task.status !== "deleted").length
+    : summaryTasks.length;
+  const showTerminalSummary = action === "advance" && total === 0;
+  const window = todoResultWindow(allTasks, action);
+  const rows: string[] = [];
+  if (showTerminalSummary) {
+    rows.push(theme.fg("success", "✓ all tasks complete"));
+  } else {
+    if (window.before > 0) rows.push(theme.fg("dim", `↑ ${window.before} earlier tasks`));
+    for (const task of window.tasks) {
+      rows.push(todoTaskCardRow(task, theme, action === "advance"));
+      const showCompletion = task.status === "completed" && task.id.replace(/^#/, "") === advancedTaskId;
+      if (!showCompletion) continue;
+      const detail = todoCompletionDetail(task, theme);
+      if (detail) rows.push(detail);
+    }
+    if (window.after > 0) rows.push(theme.fg("dim", `↓ ${window.after} later tasks`));
+  }
+  const counts = [
+    action === "create"
+      ? `${total} created`
+      : `${total} ${action === "advance" ? "remaining" : `task${total === 1 ? "" : "s"}`}`,
+    running > 0 ? `${running} in progress` : "",
+    pending > 0 ? `${pending} pending` : "",
+    completed > 0 ? `${completed} done` : "",
+    skipped > 0 ? `${skipped} skipped` : "",
+    reviewRequired > 0 ? `${reviewRequired} review required` : "",
+    recentCompleted.length > 0 ? `${recentCompleted.length} recent done` : "",
+  ].filter(Boolean);
+  const card = (groups: string[][] | undefined) => toolResultCard(theme, {
+    name: "todo",
+    ok: true,
+    arg,
+    summary: counts.join(" · "),
+    groups,
+  });
+  if (!showTerminalSummary) return card(rows.length > 0 ? [rows] : undefined);
+  return {
+    render(width: number): string[] {
+      const terminalRows = [...rows];
+      if (isTodoDurationChartEnabled()) {
+        terminalRows.push(...todoDurationChart(allTasks, theme, Math.max(1, width - 5)));
+      }
+      return card([terminalRows]).render(width);
+    },
+    invalidate(): void {},
+  };
+}
+
+export default function registerMaestroExtension(pi: ExtensionAPI, assembly: { lspConfigHomeDir?: string; curator?: CuratorHostOptions; maestroDelegateConfigPath?: string; modelFailoverStateHome?: string; chineseResponseStateHome?: string; notifyStateHome?: string; planStoreFactory?: NonNullable<Parameters<typeof initPlan>[1]>['storeFactory'] } = {}): void {
+  // Explicit process profile roots are available to real FILE loading as well as inline hosts.
+  // Keep every caller-supplied assembly field; absent profile overrides retain legacy defaults.
+  assembly = { ...assembly, ...resolveFlowResourceRoots(assembly, {
+    agentDir: process.env.PI_CODING_AGENT_DIR ? getAgentDir() : undefined,
+    maestroHome: process.env.MAESTRO_HOME,
+    cwd: process.cwd(), homeDir: homedir(),
+  }) };
+  // One original manager per explicitly isolated host, shared by every LSP surface.
+  const hostLspManager = assembly.lspConfigHomeDir === undefined
+    ? lspManager
+    : new LspManager(undefined, assembly.lspConfigHomeDir);
+  // Register first, before curator/Goal resume can start any model request.
+  let requestGate: ReturnType<typeof installModelRequestGate> | undefined;
+  let budgetHostContext: ExtensionContext | undefined;
+  let budgetReceiptHost: ReturnType<typeof createGoalBudgetHost> | undefined;
+  let bindBudgetHost: (() => void) | undefined;
+  let attachBudgetHost: ((host: ReturnType<typeof createGoalBudgetHost>) => void) | undefined;
+  let rejectBudgetHost: ((error: Error) => void) | undefined;
+  let disposeBudgetHostCapability: (() => void) | undefined;
+  let captureBudgetClose: (() => { token: object; port: ReturnType<typeof getGoalCoverageContinuityPort> }) | undefined;
+  let closingBudgetCoverage: { token: object; port: ReturnType<typeof getGoalCoverageContinuityPort> } | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    rejectBudgetHost?.(new Error("Model budget SDK session was replaced before source load"));
+    requestGate?.dispose(); requestGate = undefined;
+    disposeBudgetHostCapability?.();
+    budgetHostContext = ctx;
+    let resolveHost!: (host: ReturnType<typeof createGoalBudgetHost>) => void;
+    const ready = new Promise<ReturnType<typeof createGoalBudgetHost>>((resolve, reject) => { resolveHost = resolve; rejectBudgetHost = reject; });
+    // The pending promise always has a rejection consumer, including unsupported hosts.
+    void ready.catch(() => {});
+    attachBudgetHost = host => {
+      if (budgetHostContext !== ctx) throw new Error("Budget host belongs to a previous SDK session");
+      requestGate?.bindHost(host); budgetReceiptHost = host; resolveHost(host);
+    };
+    bindBudgetHost = () => {
+      if (budgetHostContext !== ctx) throw new Error("Model budget source load belongs to a previous session");
+      const gate = requestGate, manager = ctx.sessionManager;
+      const host = createGoalBudgetHost({ manager,
+        assertFactCurrent: () => { if (!gate) throw new Error("Original budget fact host unavailable"); gate.assertFactCurrent(); },
+        assertCurrent: () => { if (budgetHostContext !== ctx) throw new Error("Model budget source was replaced"); requestGate?.assertCurrent(); },
+        capture: () => {
+          if (process.env.PI_TEAMMATE_CHILD === "1") throw new Error("Child model request parent budget source capability unavailable");
+          return captureSelectedGoalBudget(ctx);
+        },
+        assertNone: assertNoGoalBudget,
+        read: scope => { const declaration = readGoalBudget(scope, "send"); return { poolScope: declaration.poolScope, goalEntry: declaration.goalEntry }; },
+        budget: getGoalModelBudgetPort,
+      });
+      attachBudgetHost!(host);
+      if (gate) {
+        const continuity = getGoalCoverageContinuityPort(), closing: { token?: object } = {};
+        // This raw SDK writer never leaves this fixed-type publisher closure.
+        const publishCoverage = (committed: object) => {
+          const body = continuity.committed(committed, manager);
+          const append = Reflect.get(manager, "appendCustomEntry");
+          if (typeof append !== "function") throw new Error("Original coverage journal writer unavailable");
+          Reflect.apply(append, manager, ["pi-graph-next:coverage-seal-v1", body]);
+        };
+        gate.bindReceipts({read:continuity.readReceiptInstruction,accept:continuity.acceptReceipt});
+        continuity.bindReceiptRoute({route:gate.routeReceipt,read:gate.readReceiptEnvelope,publish:publishCoverage});
+        gate.bindContinuity(point => { if (closing.token) continuity.finalize(closing.token, point); });
+        captureBudgetClose = () => {
+          const token = continuity.capture(publishCoverage, gate.readFinalPoint);
+          closing.token = token; return { token, port: continuity };
+        };
+      }
+    };
+    try { requestGate = installModelRequestGate(VERSION, ctx, () => ready); }
+    catch (error) {
+      disposeBudgetHostCapability = configureGoalBudgetHost(ctx, error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    captureBudgetClose = undefined; closingBudgetCoverage = undefined;
+    const releaseViewCapability = configureGoalBudgetHost(ctx, undefined, requestGate.coverage, getGoalCoverageContinuityPort().readAdoption, getGoalBudgetViewPort(), getGoalBudgetConfigurationPort());
+    let viewActive = true;
+    const unsubscribeView = getGoalBudgetViewPort().subscribe(goalId => {
+      if (!viewActive || budgetHostContext !== ctx) return;
+      refreshGoalBudgetView(goalId, ctx);
+      const current = getActiveGoal(); if (current) updateBudgetGoalStatusLine(ctx, current);
+      publishMaestroUi();
+    });
+    disposeBudgetHostCapability = () => { viewActive = false; unsubscribeView(); releaseViewCapability(); };
+  });
+  pi.on("session_shutdown", () => {
+    rejectBudgetHost?.(new Error("Model budget session shut down")); rejectBudgetHost = undefined;
+    try { closingBudgetCoverage = captureBudgetClose?.(); }
+    finally {
+      requestGate?.closeAdmission(); requestGate = undefined; bindBudgetHost = undefined; attachBudgetHost = undefined; budgetHostContext = undefined; budgetReceiptHost = undefined;
+      captureBudgetClose = undefined; disposeBudgetHostCapability?.(); disposeBudgetHostCapability = undefined;
+    }
+  });
+  const hostMode = getPiHostMode(VERSION);
+  let nativeDiscoverySelected = false;
+  if (hostMode === "native") {
+    try {
+      const settings = SettingsManager.create(process.cwd(), getAgentDir());
+      const configuration = settings.getSettings();
+      nativeDiscoverySelected = isNativeDiscoverySelected({
+        defaultTools: configuration.defaultTools,
+        extensions: configuration.extensions,
+        cli: parseArgs(process.argv.slice(2)),
+      });
+    } catch (error) {
+      console.warn(`[maestro] Native discovery configuration unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  pi = withNativeToolPolicy(pi, VERSION, nativeDiscoverySelected);
+  let hostDiagnosed = false;
+  pi.on("session_start", (_event, ctx) => {
+    if (hostDiagnosed) return;
+    hostDiagnosed = true;
+    if (hostMode === "unknown") {
+      ctx.ui.notify(`Pi host ${VERSION} is unverified; Maestro does not replace native MCP or tool discovery.`, "warning");
+    }
+  });
+  if (hostMode !== "native") installReturnedToolErrorBridge(pi);
+  const completionDurabilityRegistry = getCompletionDurabilityRegistry();
+  const completionDurabilityProvider = new FlowCompletionDurabilityProvider(
+    undefined,
+    (intent, witness) => todoRootContext !== undefined && journalConsumedInitialCompletion(todoRootContext, intent, witness),
+  );
+  const disposeCompletionDurabilityProvider = completionDurabilityRegistry.register(
+    completionDurabilityProvider,
+  );
+  // These SDK boundaries follow the original assistant append. Close only the
+  // exact producer messages in that event, never arbitrary pending work.
+  const drainBudgetMessages = async (messages: readonly unknown[], ctx: ExtensionContext) => {
+    if (!budgetHostContext || !budgetReceiptHost) return;
+    try { if (ctx.sessionManager !== budgetHostContext.sessionManager) return; requestGate?.assertFactCurrent(); }
+    catch { return; } // An old SDK callback cannot finalize the replacement owner.
+    await budgetReceiptHost.drainMessages?.(messages);
+  };
+  pi.on("turn_end", (event, ctx) => drainBudgetMessages([event.message], ctx));
+  pi.on("agent_end", (event, ctx) => drainBudgetMessages(event.messages, ctx));
+  if (process.env.PI_TEAMMATE_CHILD === "1") {
+    let childBudgetHost: Awaited<ReturnType<typeof createChildBudgetHost>> | undefined;
+    let disposeReceiptRetirement: (() => void) | undefined;
+    // All local relay setup after spawn is synchronous; the original bounded
+    // proxy settles startup before the first model can receive a bound source.
+    pi.on("session_start", async (_event, ctx) => {
+      try {
+        const host = await createChildBudgetHost(async (input, signal) => {
+          const result = await proxyTeammateChildTool<Record<string, unknown>>(CHILD_MODEL_BUDGET_BROKER, { ...input }, signal);
+          if (result.isError) throw new Error(result.content.map(part => part.type === "text" ? part.text : "").join("\n") || "Parent budget authority unavailable");
+          return result.details;
+        }, ctx.sessionManager);
+        childBudgetHost = host;
+        if (budgetHostContext !== ctx) throw new Error("Child budget handshake belongs to a previous session");
+        if (!attachBudgetHost) throw new Error("Child budget startup host is unavailable");
+        attachBudgetHost(host);
+        disposeReceiptRetirement?.();
+        disposeReceiptRetirement = registerChildBudgetReceiptRetirement(ctx.sessionManager, ctx.sessionManager.getSessionId(), () => host.retireTerminalProducers());
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        rejectBudgetHost?.(failure);
+        requestGate?.bindHost({ capture() { throw failure; }, async beforePhysical() { throw failure; }, beforeDelegate() { throw failure; }, onResult() {}, observeAppend() {} });
+        throw failure;
+      }
+    });
+    pi.on("session_shutdown", async () => {
+      try { await childBudgetHost?.flush(); }
+      finally { disposeReceiptRetirement?.(); disposeReceiptRetirement = undefined; disposeCompletionDurabilityProvider(); }
+    });
+    // Teammate children resolve --model against providers registered in their
+    // own process. Pi core composes only models.json providers by itself, so
+    // an extension-only provider like devin must be registered here too —
+    // otherwise dispatching devin/* to a teammate fails startup with
+    // "Model not found".
+    try {
+      registerDevinProvider(pi);
+    } catch (error) {
+      console.error(
+        `[maestro] Devin provider registration warning: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    registerMaestroChildSurface(pi, hostLspManager);
+    return;
+  }
+
+  registerSshManager(pi);
+  const disposeTuiLocaleEvents = registerTuiLocaleEvents(pi.events);
+  // Dispose EventBus subscriptions on shutdown (defensive; framework may auto-dispose).
+  const disposers: Array<() => void> = [];
+
+  // pi install's SettingsManager overwrites postinstall's settings.json writes
+  // with its stale in-memory cache. Re-register companion packages at load time
+  // so the next pi startup picks them up.
+  try {
+    const companionRegistration = registerCompanionPackages();
+    for (const entry of companionRegistration.preservedUnowned) {
+      console.warn(`[pi-graph-flow] Preserved local companion override for ${entry.name}: ${entry.source}`);
+    }
+    for (const entry of companionRegistration.versionMismatch) {
+      console.warn(`[pi-graph-flow] ${entry.name} resolved ${entry.actual ?? "unknown"}, but Flow requires ${entry.expected}; reinstall the versioned Flow package.`);
+    }
+  } catch (error) {
+    console.warn(`[pi-graph-flow] Companion package registration skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Gateway workspace registration is deliberately opt-in: the /gateway panel's
+  // e key registers/unregisters the current window with the built-in runtime
+  // (default: not registered), so startup never mutates Gateway configuration.
+
+  // UCL: capture only the locked extension-tool surface. pi.getAllTools() exposes
+  // schemas but not execute(), so the registry is the invocation source for the
+  // GUI sidecar. Do not capture built-ins or unrelated extension registrations.
+  const originalRegisterTool = pi.registerTool.bind(pi);
+  (pi as unknown as { registerTool: (tool: unknown) => unknown }).registerTool = (tool: unknown) => {
+    const candidate = tool as { name?: unknown; execute?: unknown; label?: unknown };
+    if (candidate && typeof candidate.name === "string" && typeof candidate.execute === "function") {
+      const owner = typeof candidate.label === "string" && candidate.label.startsWith("MCP:") ? "mcp" : "pi-maestro-flow";
+      if (!isGuiToolAllowed(candidate.name, owner)) return originalRegisterTool(tool as ToolDefinition);
+      try {
+        registerGuiTool(asGuiDirectTool(tool as ToolDefinition), owner);
+      } catch {
+        // GUI capture must never break tool registration.
+      }
+    }
+    return originalRegisterTool(tool as ToolDefinition);
+  };
+
+  const teammateExtensionPath = fileURLToPath(import.meta.url);
+  const teammateAuthorityOwner = `pi-maestro-flow:${teammateExtensionPath}`;
+  const childBrowserBroker = new TeammateBrowserBroker();
+  const childComputerUseBroker = new TeammateComputerUseBroker();
+  const childBrowserCleanups = new Set<Promise<unknown>>();
+  const childComputerUseCleanups = new Set<Promise<unknown>>();
+  const trackChildBrowserCleanup = (operation: Promise<unknown>): Promise<unknown> => {
+    const contained = operation.catch((error) => {
+      console.warn(`[pi-graph-flow] teammate browser cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    childBrowserCleanups.add(contained);
+    void contained.then(() => childBrowserCleanups.delete(contained));
+    return contained;
+  };
+  const trackChildComputerUseCleanup = (operation: Promise<unknown>): Promise<unknown> => {
+    const contained = operation.catch((error) => {
+      console.warn(`[pi-graph-flow] teammate computer-use cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    childComputerUseCleanups.add(contained);
+    void contained.then(() => childComputerUseCleanups.delete(contained));
+    return contained;
+  };
+  let todoRootContext: ExtensionContext | undefined;
+  // Only this root host resolves memory authorization. Never read a root grant
+  // through a child cwd wrapper (that would revoke an unrelated root scope).
+  const resolveRootAskGrant = (ctx: ExtensionContext, actor?: { correlationId: string; cwd?: string }): HostAskPolicyGrant | undefined => {
+    const root = todoRootContext;
+    const grant = resolvePlanAutoAskPolicyGrant(ctx, root, actor, actor ? getVisibleTasks() : []);
+    return grant ? { ...grant, isCurrent: () => todoRootContext === root && grant.isCurrent() } : undefined;
+  };
+  let guiServer: GuiServerHandle | null = null;
+  let guiLifecycleGeneration = 0;
+  const guiEvents = createGuiEventForwarder();
+  const acknowledgedPublications = new Map<string, number>();
+  const rememberPublishedResult = (publicationId: string): void => {
+    acknowledgedPublications.delete(publicationId);
+    acknowledgedPublications.set(publicationId, Date.now());
+    while (acknowledgedPublications.size > 2_000) {
+      const oldest = acknowledgedPublications.keys().next().value as string | undefined;
+      if (!oldest) break;
+      acknowledgedPublications.delete(oldest);
+    }
+  };
+  const compatibilityResults = (results: unknown): unknown =>
+    filterUnacknowledgedResults(results, acknowledgedPublications);
+  // Forward teammate lifecycle events (shared EventBus) to the GUI SSE stream.
+  disposers.push(pi.events.on(TEAMMATE_STARTED_EVENT, (payload) => {
+    guiEvents.emit(GUI_EVENTS.teammateStarted, payload as TeammateStartedEvent);
+  }));
+  disposers.push(pi.events.on(TEAMMATE_MESSAGE_EVENT, (event) => guiEvents.emit(GUI_EVENTS.teammateProgress, event)));
+  disposers.push(pi.events.on(TEAMMATE_COMPLETE_EVENT, (payload) => {
+    guiEvents.emit(GUI_EVENTS.teammateComplete, payload as TeammateCompleteEvent);
+  }));
+  // Persist each published node before runGraph releases its dependents. Keep
+  // this listener alive after provider retirement until every dispatch pinned
+  // to this Flow generation has drained.
+  const disposePublishedResultCapture = pi.events.on(TEAMMATE_RESULT_PUBLISHED_EVENT, (event) => {
+    capturePublishedAgentResult(event, rememberPublishedResult);
+  });
+  // agent:// data source for background/detached runs: the root tool_result of
+  // a background dispatch carries empty results, so the authoritative completion
+  // event is the persistence channel for its structured outputs.
+  disposers.push(pi.events.on(TEAMMATE_COMPLETE_EVENT, (event) => {
+    try {
+      const payload = event as { structuredResults?: unknown };
+      const remaining = compatibilityResults(payload.structuredResults);
+      if (!Array.isArray(remaining) || remaining.length === 0) return;
+      void persistStructuredResults(remaining, undefined).catch((err) => {
+        console.warn(`[pi-graph-flow] agent output capture failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    } catch (err) {
+      console.warn(`[pi-graph-flow] agent output capture failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }));
+  disposers.push(pi.events.on("pi-graph-next:task-dispatch-observation/1", observation => {
+    if (todoRootContext) observeTaskExecution(observation);
+  }));
+  // Auto-seal delegated Todo work and reclaim browser tabs owned by the agent.
+  disposers.push(pi.events.on(TEAMMATE_COMPLETE_EVENT, (event) => {
+    const record = event as { correlationId?: unknown; agent?: unknown; exitCode?: unknown; cancelled?: unknown; wakeable?: unknown };
+    const cid = typeof record.correlationId === "string" ? record.correlationId.trim() : "";
+    if (!cid || cid === "unknown") return;
+    trackChildBrowserCleanup(childBrowserBroker.closeActor(cid));
+    trackChildComputerUseCleanup(childComputerUseBroker.closeActor(cid));
+
+    if (!todoRootContext) return;
+    const rootCtx = todoRootContext;
+    const agent = typeof record.agent === "string" && record.agent.trim() ? record.agent.trim() : undefined;
+    const actor: TodoActorRef = {
+      kind: "teammate",
+      id: cid,
+      label: agent ?? cid.slice(0, 8),
+      ...(agent ? { agentType: agent } : {}),
+    };
+    recordTodoActorCompletion(actor, record.wakeable === true);
+    void sealTodoTasksOnAgentComplete(actor, Number(record.exitCode ?? 1), record.cancelled === true, rootCtx)
+      .then((result) => {
+        if (result.sealed.length === 0 && result.failed.length === 0) return;
+        updateTodoWidget();
+        if (result.sealed.length > 0) {
+          rootCtx.ui?.notify?.(`Todo recovery: auto-sealed ${result.sealed.length} task(s) for @${actor.label}; the agent did not explicitly advance them when work finished`, "warning");
+        }
+        // A rejected seal (typically an unverified Goal quality gate) leaves the
+        // task in_progress; without a warning it dangles silently.
+        for (const failure of result.failed) {
+          rootCtx.ui?.notify?.(`Todo: task #${failure.id} for @${actor.label} was not auto-sealed: ${failure.reason}`, "warning");
+        }
+      });
+  }));
+  const emitGoalChanged = (): void => {
+    if (!guiEvents.isActive()) return;
+    const goal = getActiveGoal();
+    guiEvents.emitDeduped(GUI_EVENTS.goalChanged, JSON.stringify(goal ?? null), goal);
+  };
+  setTodoStateChangeListener(() => {
+    refreshGoalCurrentDisplay();
+    publishMaestroUi();
+    updateTodoWidget();
+    pi.events.emit(MAESTRO_TODO_STATE_CHANGED_EVENT, { version: 1 });
+  });
+  setGoalStateChangeListener(() => {
+    refreshGoalCurrentDisplay();
+    emitGoalChanged();
+    publishMaestroUi();
+  });
+  let childTodoMutationQueue: Promise<void> = Promise.resolve();
+  let teammateRegistrationGeneration = 0;
+  let teammateRegistrationDisposers: Array<() => void> = [];
+  let disposeFabricOriginProvider: (() => void) | undefined;
+  const childTodoBroker = (request: Parameters<Parameters<typeof registerTeammateChildToolBroker>[1]>[0]) => {
+    const fail = (error: unknown): FlowToolResult => ({ content: [{ type: "text", text: String(error) }], isError: true, details: {} });
+    let execution: TodoSourceExecution;
+    let sourceCtx: ExtensionContext;
+    let input: TodoParams;
+    const registration = teammateRegistrationGeneration;
+    try {
+      const parent = readChildTodoParentContext(request.parentContext);
+      assertTodoSourceScope(parent.sourceScope);
+      const host = readTodoSourceHost(parent.sourceScope);
+      const ctx = todoRootContext;
+      if (!ctx || ctx.sessionManager !== host.manager || ctx.cwd !== host.cwd) throw new Error("Todo root source is unavailable.");
+      sourceCtx = { ...ctx, cwd: host.cwd, sessionManager: host.manager as ExtensionContext["sessionManager"] };
+      input = structuredClone(request.input) as unknown as TodoParams;
+      execution = Object.freeze({ sourceScope: parent.sourceScope, signal: request.signal,
+        assertParentCurrent: () => {
+          readChildTodoParentContext(request.parentContext);
+          if (registration !== teammateRegistrationGeneration) throw new Error("Todo broker registration changed.");
+        } });
+      assertTodoSourceExecution(execution);
+      if (!request.actor.correlationId || request.actor.correlationId === "unknown") throw new Error("Teammate Todo request has no trusted correlation id.");
+    } catch (error) { return Promise.resolve(fail(error)); }
+    const actor: TodoActorRef = Object.freeze({ kind: "teammate", id: request.actor.correlationId,
+      label: request.actor.name ?? request.actor.agent ?? request.actor.correlationId.slice(0, 8),
+      ...(request.actor.agent ? { agentType: request.actor.agent } : {}) });
+    const execute = async (): Promise<FlowToolResult> => {
+      try {
+      assertTodoSourceExecution(execution);
+      const result = await executeTodo(input, sourceCtx, actor, execution);
+      if(result.isError)return result; // Preserve a real unknown-write/reconcile receipt.
+      assertTodoSourceExecution(execution);
+      updateTodoWidget();
+      const details = result.details as TodoResultDetails | undefined;
+      if ((result as { isError?: boolean }).isError || details?.transition !== "new_context") return result;
+      const workflow = workflowRecoveryIdentity();
+      const recoveryState: MaestroRecoveryState = {
+        todo: getTodoCompactionSnapshot(),
+        goal: getGoalCompactionSnapshot(),
+        plan: getPlanCompactionSnapshot(),
+        ...(workflow ? { workflow } : {}),
+      };
+      return {
+        ...result,
+        details: { ...details, newContextRecoveryState: recoveryState } satisfies BrokeredTodoResultDetails,
+      };
+      } catch (error) { return fail(error); }
+    };
+    const result = childTodoMutationQueue.then(execute, execute);
+    childTodoMutationQueue = result.then(() => undefined, () => undefined);
+    return result;
+  };
+
+  const compactionArbiter = new CompactionArbiter();
+  const newContextController = createNewContextController(compactionArbiter, {
+    continueAfterReset(_ctx, request) {
+      const message = buildNewContextContinuation({
+        todo: getTodoCompactionSnapshot(),
+        goal: getGoalCompactionSnapshot(),
+        plan: getPlanCompactionSnapshot(),
+        workflow: workflowRecoveryIdentity(),
+        newContext: request,
+      });
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
+    },
+    getPlanRecoveryPayload: getPlanNewContextPayload,
+  });
+  const newContextToolSurface = createNewContextToolSurface(pi, () => {
+    registerNewContextTool(pi, newContextController, "root");
+  });
+  registerNewContextWithoutLlmCommand(pi, newContextController, "root");
+  const midTurnAutoCompaction = createMidTurnAutoCompaction(pi, { arbiter: compactionArbiter });
+  const state: MaestroState = {
+    baseCwd: "",
+    activeToolCalls: new Map(),
+  };
+  let workflowBridge: WorkflowBridge | undefined;
+  let workflowCoordinator: WorkflowCoordinator | undefined;
+  let attachedWorkflowSessionId: string | undefined;
+  let attachedWorkflowHostSessionId: string | undefined;
+  let lastRunStates = new Map<string, string>();
+
+  /** v3 `session complete` / `run complete --advance` receipts captured at
+   * tool_execution_end; consumed by the next refreshWorkflow to fire the
+   * knowledge pipeline (session/3.0 has no Execution-seal transition). */
+  let pendingV3CompleteReceipts: V3CompleteReceipt[] = [];
+  const requestKnowledgeCloseout = createKnowledgeCloseoutRequester(pi);
+
+  // Knowledge-pending UI indicator: persistent status-bar segment + 0→N
+  // notify so manual resolve (review_required) is surfaced without opening
+  // the knowledge center.
+  const KNOWLEDGE_PENDING_STATUS_KEY = "maestro-knowledge-pending";
+  let lastKnowledgePendingNotify = "";
+  let artifactKnowledgeSessionId: string | undefined;
+  let artifactKnowledgeCandidateCount = 0;
+
+  function updateKnowledgePendingStatus(
+    ctx: ExtensionContext,
+    counts: { pending: number; reviewRequired: number },
+  ): void {
+    try {
+      const total = counts.pending + counts.reviewRequired;
+      if (total === 0) {
+        ctx.ui.setStatus(KNOWLEDGE_PENDING_STATUS_KEY, undefined);
+        return;
+      }
+      const value = counts.reviewRequired > 0
+        ? `${counts.reviewRequired} review · ${counts.pending} pending`
+        : `${counts.pending} pending`;
+      ctx.ui.setStatus(KNOWLEDGE_PENDING_STATUS_KEY, value);
+      // One-shot notify on 0→N transition (dedup by key).
+      const key = `${counts.reviewRequired}:${counts.pending}`;
+      if (lastKnowledgePendingNotify !== key) {
+        lastKnowledgePendingNotify = key;
+        ctx.ui.notify(
+          `Knowledge: ${counts.reviewRequired} candidate(s) need a human decision`
+            + ` (${counts.pending} pending total). The completion owner presents candidates in Ask.`,
+          "info",
+        );
+      }
+    } catch {
+      // Status bar is cosmetic — never break the refresh flow.
+    }
+  }
+
+  async function refreshKnowledgePendingStatus(ctx: ExtensionContext, sessionId: string): Promise<void> {
+    try {
+      const summary = await new KnowledgeCliAdapter(ctx.cwd).review(sessionId).catch(() => null);
+      if (!summary) return;
+      updateKnowledgePendingStatus(ctx, {
+        pending: summary.candidates.filter((candidate) => candidate.status === "pending").length,
+        reviewRequired: summary.candidates.filter(
+          (candidate) => candidate.reconciliation?.promotion_eligibility === "review_required",
+        ).length,
+      });
+      if (workflowArtifactKnowledgeSessionId(workflowSnapshotForUi(), workflowSessionOptedIn, attachedWorkflowSessionId) === sessionId) {
+        artifactKnowledgeSessionId = sessionId;
+        artifactKnowledgeCandidateCount = summary.candidates.length;
+        publishMaestroUi();
+      }
+    } catch {
+      // Ignore — next seal/refresh will retry.
+    }
+  }
+  async function closeoutSessionKnowledge(ctx: ExtensionContext, sessionId: string, sealedBy: string): Promise<void> {
+    let summary;
+    try {
+      summary = await new KnowledgeCliAdapter(ctx.cwd).review(sessionId);
+    } catch (error) {
+      ctx.ui.notify(`${sealedBy} — knowledge review unavailable: ${publicWorkflowErrorMessage(error)}. Backlog retained.`, "warning");
+      return;
+    }
+    const pending = summary.candidates.filter(candidate => candidate.status === "pending");
+    const reviewRequired = pending.filter(candidate => candidate.reconciliation?.promotion_eligibility === "review_required").length;
+    updateKnowledgePendingStatus(ctx, { pending: pending.length, reviewRequired });
+    ctx.ui.notify(`${sealedBy} — ${pending.length} candidate(s) pending, ${reviewRequired} need human review.`, "info");
+    requestKnowledgeCloseout(ctx, [{
+      sessionId,
+      candidateIds: pending.filter(candidate => candidate.reconciliation?.promotion_eligibility !== "suppressed")
+        .map(candidate => candidate.candidate_id),
+    }]);
+  }
+
+  let lastSessionStatus: string | undefined;
+  let lastWorkflowLifecycleSnapshot: WorkflowSnapshot | undefined;
+  let workflowSessionOptedIn = true;
+  let approvalMode: PermissionMode = DEFAULT_PERMISSION_MODE;
+  let currentSwarmProjection: TeamSwarmProjection | undefined;
+  let maestroUiSessionActive = false;
+  let preserveCompletedTurnFromNativeThreshold = false;
+  let lastCompactionCancel: { reason: string; at: number; operationId?: number } | undefined;
+  let teammateAttachTodoIsolated = false;
+  let flowSettingsContext: ExtensionContext | undefined;
+  const maestroUiPublisher = new MaestroUiPublisher({
+    read: () => {
+      const knowledgeSessionId = workflowArtifactKnowledgeSessionId(
+        workflowSnapshotForUi(),
+        workflowSessionOptedIn,
+        attachedWorkflowSessionId,
+      );
+      const knowledgeAvailable = artifactKnowledgeCandidateCount > 0
+        && artifactKnowledgeSessionId === knowledgeSessionId;
+      return {
+        workflow: deriveWorkflowViewModel(workflowSnapshotForUi()),
+        goals: getGoalPanelEntries(),
+        currentGoalId: getActiveGoal()?.id,
+        currentDisplay: readGoalCurrentDisplay(),
+        swarm: currentSwarmProjection,
+        artifact: {
+          ...getPlanArtifactSummary(),
+          knowledgeAvailable,
+          knowledgeSessionId: knowledgeAvailable ? knowledgeSessionId : undefined,
+        },
+        planMode: getPlanMode(),
+        approvalMode: effectivePermissionMode(approvalMode),
+      };
+    },
+    emit: (event, snapshot) => pi.events.emit(event, snapshot),
+  });
+  registerMaestroUiQuery(pi.events, maestroUiPublisher, () => maestroUiSessionActive);
+  let disposeGoalDisplayListener: (() => void) | undefined;
+
+  let refreshingGoalDisplay = false;
+  function publishMaestroUi(): void {
+    if (!maestroUiSessionActive) return;
+    if (!refreshingGoalDisplay) {
+      refreshingGoalDisplay = true;
+      try { refreshGoalCurrentDisplay(); } finally { refreshingGoalDisplay = false; }
+    }
+    maestroUiPublisher.publish();
+  }
+
+  // Cockpit's footer consumes extension statuses, so the Maestro tool-call count
+  // is published here when Cockpit owns the footer (Flow's own statusline reads
+  // the live state instead).
+  function updateMaestroToolCallStatus(ctx: ExtensionContext): void {
+    const count = state.activeToolCalls.size;
+    ctx.ui.setStatus(
+      "maestro-tool-calls",
+      count > 0 ? `⚙ ${count} call${count > 1 ? "s" : ""}` : undefined,
+    );
+  }
+
+  // Register dynamic providers from cli-tools.json
+  let apiProviderHandle: ReturnType<typeof registerApiProviderConfigs> | undefined;
+  try {
+    apiProviderHandle = registerApiProviderConfigs(pi);
+    registerExploreConfigManager(pi);
+    registerMaestroProviders(pi, assembly.maestroDelegateConfigPath);
+  } catch (error) {
+    // Provider registration failures should not block extension load
+    console.error(
+      `[maestro] Provider registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Devin account login: Pi owns the OAuth flow through /login and /logout;
+  // this only registers the provider so the account appears in the login list.
+  try {
+    registerDevinProvider(pi);
+  } catch (error) {
+    console.error(
+      `[maestro] Devin provider registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Next-step suggestion: independent switch/model/thinking settings live in
+  // the API manager (api-manager.json nextSuggest section); model selection is
+  // exposed through /api-manager nextsuggest and the api.nextsuggest shell action.
+  try {
+    registerNextSuggest(modelOriginApi(pi), {
+      defaultsPath: join(getAgentDir(), "api-manager.json"),
+    });
+  } catch (error) {
+    console.error(
+      `[maestro] Next-suggest registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Prompt enhance: on-demand prompt rewriting (/enhance or Alt+Shift+E) with
+  // codebase + Maestro knowledge context; settings live in the API manager
+  // (api-manager.json enhance section); exposed through /api-manager enhance
+  // and the api.enhance shell action.
+  try {
+    registerPromptEnhance(modelOriginApi(pi), {
+      defaultsPath: join(getAgentDir(), "api-manager.json"),
+    });
+  } catch (error) {
+    console.error(
+      `[maestro] Prompt-enhance registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Prompt optimize: on-demand prompt optimization (/optimize or Alt+Shift+O)
+  // — classifier routes the draft (translate/format/polish) and the model
+  // emits an always-English optimized prompt; settings live in the API
+  // manager (api-manager.json optimize section).
+  try {
+    registerPromptOptimize(modelOriginApi(pi), {
+      defaultsPath: join(getAgentDir(), "api-manager.json"),
+    });
+  } catch (error) {
+    console.error(
+      `[maestro] Prompt-optimize registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const planModelSelection = registerPlanModelSelection(pi);
+  try {
+    registerModelFailover(pi, { homeDir: assembly.modelFailoverStateHome });
+  } catch (error) {
+    console.error(
+      `[maestro] Model failover registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  let mcpAdapterHandle: ReturnType<typeof registerMcpAdapter> | undefined;
+  const mcpOwner = getPiFeatureOwner(VERSION, typeof pi.registerMcpServer === "function");
+  if (hostMode === "native") registerNativeMcpMigration(pi);
+  // Registering /mcp excludes the whole native extension, before session_start.
+  if (mcpOwner === "legacy" && process.env.MAESTRO_DISABLE_VENDORED_MCP !== "1") {
+    try {
+      mcpAdapterHandle = registerMcpAdapter(pi);
+    } catch (error) {
+      console.error(
+        `[maestro] MCP adapter registration warning: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  } else if (mcpOwner === "unavailable") {
+    console.warn(`[maestro] Native MCP is unavailable on Pi ${VERSION}; no legacy adapter was started.`);
+  }
+
+  registerMaestroPackageResources(pi);
+  const chineseResponseMode = registerChineseResponseMode(pi, { homeDir: assembly.chineseResponseStateHome });
+  // Model turn notification: `/notify` toggles a toast on model error/completion.
+  const notifyMode = registerNotifyMode(pi, { homeDir: assembly.notifyStateHome });
+  const notifyController = registerNotifyListeners(pi, notifyMode);
+  registerSkillManager(pi);
+  registerCompactionSettingsCommand(pi);
+  pi.registerCommand("compaction-status", {
+    description: "Show maestro auto-compaction state: arbiter owner, pending intents, breaker, and the last cancel reason.",
+    async handler(_args, ctx) {
+      const state = midTurnAutoCompaction.describeState();
+      const arbiterOwner = compactionArbiter.currentOwner();
+      const operationId = compactionArbiter.currentOperationId();
+      const tombstone = compactionArbiter.timeoutTombstone();
+      const lines: string[] = [
+        `turn: ${state.turnCount}`,
+        `running: ${state.running ? `yes${state.activeRequestOwner ? ` (${state.activeRequestOwner})` : ""}` : "no"}`,
+        state.zombieOwner !== undefined
+          ? `zombie: owner#${state.zombieOwner} may still be settling (new submissions held)`
+          : "zombie: (none)",
+        `arbiter owner: ${arbiterOwner ?? "(idle)"}${operationId !== undefined ? ` op#${operationId}` : ""}`,
+        tombstone
+          ? `arbiter tombstone: holding extension submissions for ~${Math.ceil(tombstone.remainingMs / 1000)}s after a lease timeout`
+          : "arbiter tombstone: (none)",
+        state.pendingIntent
+          ? `pending intent: ${state.pendingIntent.tokens.toLocaleString("en-US")}/${state.pendingIntent.thresholdTokens.toLocaleString("en-US")} tokens${state.pendingIntent.contextExhausted ? " (context exhausted)" : ""}${state.pendingIntent.requestBlocked ? " (request blocked)" : ""}`
+          : "pending intent: (none)",
+        state.pressureSnapshot
+          ? `pressure snapshot: ${state.pressureSnapshot.band} ${state.pressureSnapshot.estimatedTokens.toLocaleString("en-US")}/${state.pressureSnapshot.contextWindow.toLocaleString("en-US")} tokens; hard ${state.pressureSnapshot.hardThresholdTokens.toLocaleString("en-US")} (${state.pressureSnapshot.remainingToHard.toLocaleString("en-US")} remaining)`
+          : "pressure snapshot: (none)",
+        `output-limit intent: ${state.outputLimitIntentPending ? "pending" : "(none)"}`,
+        state.breaker.trippedAtTurn !== undefined && state.breaker.cooldownRemainingTurns !== undefined
+          ? `breaker: TRIPPED after ${state.breaker.consecutiveFailures} consecutive failures; cooldown has ${state.breaker.cooldownRemainingTurns} completed turn(s) left`
+          : `breaker: ok (${state.breaker.consecutiveFailures} consecutive failures)`,
+        lastCompactionCancel
+          ? `last cancel: ${lastCompactionCancel.reason} (at ${new Date(lastCompactionCancel.at).toLocaleTimeString()})`
+          : "last cancel: (none)",
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  // === Main Tool: maestro ===
+  const maestroTool: ToolDefinition<typeof MaestroParams> = {
+    name: "maestro",
+    label: "Maestro",
+    description: `Maestro flow command tool with three actions:
+
+- **explore**: Parallel code search via independent external-CLI search processes. Each prompt spawns one search process.
+  { action: "explore", prompts: ["FIND: auth middleware\\nSCOPE: src/"], model: "..." }
+
+- **delegate**: Delegate a task to a specific model/provider for analysis or implementation.
+  { action: "delegate", prompt: "Analyze the auth flow", tool: "gemini", mode: "analysis" }
+
+- **moa**: Mixture-of-Agents — parallel reference analysis across models, then aggregator synthesis.
+  { action: "moa", prompts: ["Compare auth strategies"], preset: "deep" }
+
+These actions route to external CLI endpoints (gemini/codex CLI processes). Results are returned inline in the tool response as text. Prefer the **teammate** tool for ordinary delegation and exploration.
+
+This tool is NOT the Maestro Session/Run lifecycle CLI: use the **run-control** tool for session/run commands (or the bash \`maestro\` CLI for knowledge search/load), never this tool.
+
+Progressive fallback: when a user explicitly requests an external model (codex, gemini, claude, opencode) NOT in <available_teammate_models>, call **model-availability** first, then route via bash:
+  maestro delegate "<PROMPT>" --to <tool> --mode analysis
+The --to flag is MANDATORY. A bare \`maestro delegate codex\` treats "codex" as the prompt and falls back to the first enabled tool.`,
+
+    promptSnippet: "External-CLI-endpoint routing (explore/delegate/moa) with a delegate-as-teammate-fallback path. Prefer teammate; fall back to maestro delegate --to <tool> for explicit external models missing from the teammate catalog.",
+    promptGuidelines: [
+      "In the pi-agent, use the teammate tool for all delegation, code exploration, and multi-model synthesis — teammate supports prompt templates (prompt field) and model selection (model field). Do not call the maestro tool's explore/delegate/moa for ordinary pi-agent work.",
+      "Reserve the maestro tool (explore/delegate/moa) for the rare case of routing work directly to an external CLI endpoint (gemini/codex CLI process); for knowledge search use the maestro search/load bash CLI.",
+      "Session/Run lifecycle commands belong to the run-control tool (argv passthrough shell), not this tool and not hand-written bash `maestro run/session` calls.",
+    ],
+
+    parameters: MaestroParams,
+
+    async execute(
+      id: string,
+      params: Record<string, unknown>,
+      signal: AbortSignal,
+      onUpdate:
+        | ((result: FlowToolResult) => void)
+        | undefined,
+      ctx: ExtensionContext,
+    ): Promise<FlowToolResult> {
+      const action = params.action as string;
+
+      // Track run
+      state.activeToolCalls.set(id, {
+        action,
+        startedAt: Date.now(),
+        correlationId: id,
+      });
+      updateMaestroToolCallStatus(ctx);
+
+      try {
+        switch (action) {
+          case "explore":
+            return await executeExplore(
+              params as unknown as ExploreParams,
+              signal,
+              ctx,
+              pi,
+            );
+
+          case "delegate":
+            return await executeDelegate(
+              params as unknown as DelegateParams,
+              signal,
+              ctx,
+              pi,
+            );
+
+          case "moa":
+            return await executeMoa(
+              params as unknown as MoaParams,
+              signal,
+              ctx,
+              pi,
+            );
+
+          default:
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Unknown action "${action}". Valid actions: explore, delegate, moa`,
+                },
+              ],
+              isError: true,
+              details: {},
+            };
+        }
+      } finally {
+        state.activeToolCalls.delete(id);
+        updateMaestroToolCallStatus(ctx);
+      }
+    },
+
+    renderShell: "self",
+    renderCall(args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      const action = (args.action as string) ?? "?";
+      let arg = action;
+      if (action === "explore") {
+        const prompts = args.prompts as string[] | undefined;
+        if (prompts) arg += ` (${prompts.length})`;
+      } else if (action === "delegate") {
+        const tool = (args.tool as string) ?? "";
+        if (tool) arg += ` ${tool}`;
+      }
+      return toolCallLine(theme, "maestro", arg);
+    },
+    renderResult(result, opts, theme, ctx) {
+      if (opts.isPartial) return new Text("", 0, 0);
+      const text = result.content.find((item) => item.type === "text");
+      const message = text && "text" in text ? text.text : "";
+      const isError = ctx.isError || (result as { isError?: boolean }).isError === true;
+      const action = String(ctx.args.action ?? "?");
+      let arg = action;
+      if (action === "explore") {
+        const prompts = ctx.args.prompts as string[] | undefined;
+        if (prompts) arg += ` (${prompts.length})`;
+      } else if (action === "delegate") {
+        const tool = String(ctx.args.tool ?? "");
+        if (tool) arg += ` ${tool}`;
+      }
+      return toolResultLine(theme, { name: "maestro", ok: !isError, arg, summary: resultSummary(result), expanded: opts.expanded, detail: message });
+    },
+  };
+
+  pi.registerTool(maestroTool);
+
+  // === Goal Tool ===
+  initGoal(pi);
+  registerGoalCommand(pi);
+
+  const goalTool: ToolDefinition<typeof GoalToolParams> = {
+    name: "goal",
+    label: "Goal",
+    description: `Read, create, or update an autonomous Goal. Lifecycle control belongs to the user through /goal commands.
+
+- get: Read the current Goal state. { action: "get" }
+- create: Create a new Goal without a budget by default. { action: "create", objective: "..." }
+- update: Replace the active Goal objective and resume it automatically. { action: "update", objective: "..." }
+- complete: Request completion verification after all work is done. Declared acceptance commands are rerun and decide the result directly; without commands, provide review with original evidenceRefs and per-criterion assessments; an existing complete group can supply its current host reports. The verifier role runs only when explicitly selected in the Goal contract. { action: "complete", summary: "..." }
+- optional evidenceRefs on complete: Up to 16 requirement-labelled exact session://id/entry/id or agent://publication-id[/subpath] URIs, or explicit local paths (including outside the workspace), with optional 1-based offset/limit and URI-only 0-based UTF-16 charOffset to recover long single-line evidence. Keep summary <= 4000 characters. Prefer immutable publications and original test output, not executor PASS reports. Unavailable/ambiguous sources cannot verify completion.
+- optional budget: Include tokenBudget only when the user explicitly requests one. { action: "create", objective: "...", tokenBudget: "100k" }
+- optional acceptance: Declare or replace up to 5 acceptance commands on create or update. Commands run from the workspace with the platform system shell, so keep them focused and cross-platform. { action: "create", objective: "...", acceptance: ["npm test -- foo.test.ts"] }
+
+When to use:
+- create a Goal for multi-turn autonomous work that needs sustained momentum, a token budget, or verified completion.
+
+When NOT to use:
+- single-turn tasks; or when an active Workflow Session already tracks its Runs — do not create a competing one.
+
+Only request completion after all work is done. Business acceptance first waits for the actual final main reply; the host commits delivered only after observing its canonical entry. Internal Task quality gates finish independently. The model cannot stop, resume, or clear a Goal.`,
+
+    promptSnippet: "Read, create, update, or request host business verification and final-reply delivery for an autonomous Goal",
+    promptGuidelines: [
+      "When a goal is active, keep working until it is complete; do not stop with only a plan or partial progress.",
+      "Use goal get to inspect state. Use goal create only when no Goal exists; use goal update to replace its objective and resume it.",
+      "Omit tokenBudget by default. Set it only when the user explicitly requests a Token budget.",
+      "Use goal complete only after all requirements are met and provide concise verification evidence; the extension owns the done transition.",
+      "Prefer focused, cross-platform acceptance commands whenever completion is mechanically checkable — declared commands rerun during verification and decide the result directly, skipping the agent verifier's bounded-evidence fallback.",
+      "If a Workflow-bound Goal is gate-paused or reports a canonical authority mismatch, do not resume it with goal update. Continue through run-control and let Workflow reconciliation replace or retire the stale Goal.",
+    ],
+
+    parameters: GoalToolParams,
+
+    async execute(
+      _id: string,
+      params: Record<string, unknown>,
+      _signal: AbortSignal,
+      _onUpdate: ((result: FlowToolResult) => void) | undefined,
+      ctx: ExtensionContext,
+    ): Promise<FlowToolResult> {
+      const goalParams = parseGoalActionParams(params);
+      if (!goalParams) {
+        return {
+          content: [{ type: "text", text: "Invalid Goal parameters: complete requires summary <= 4000 characters and at most 16 valid, unambiguous evidenceRefs." }],
+          isError: true,
+          details: { classification: "input-error" },
+        };
+      }
+      const result = await executeGoal(goalParams, ctx, _signal);
+      return {
+        content: [{ type: "text", text: result.text }],
+        isError: result.isError,
+        details: result.details ?? {},
+      };
+    },
+
+    renderShell: "self",
+    renderCall(args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      const action = (args.action as string) ?? "?";
+      const obj = action === "create" || action === "update" ? ((args.objective as string) ?? "") : "";
+      return toolCallLine(theme, "goal", obj ? `${action} ${obj.slice(0, 40)}` : action);
+    },
+
+    renderResult(result, options, theme, ctx) {
+      if (options.isPartial) return new Text("", 0, 0);
+      const block = result.content.find((item) => item.type === "text");
+      const text = block && "text" in block ? block.text : "Goal action completed.";
+      const isError = ctx.isError || (result as { isError?: boolean }).isError === true;
+      const action = String(ctx.args.action ?? "?");
+      const objective = action === "create" || action === "update" ? String(ctx.args.objective ?? "") : "";
+      const arg = objective ? `${action} ${objective.slice(0, 40)}` : action;
+      return toolResultLine(theme, { name: "goal", ok: !isError, arg, summary: resultSummary(result), expanded: options.expanded, detail: text });
+    },
+  };
+
+  pi.registerTool(goalTool);
+
+  // === OpenCodeReview Tool ===
+  const openCodeReviewTool: ToolDefinition<typeof OcrReviewParams> = {
+    name: "open-code-review",
+    label: "OpenCodeReview",
+    description: `Run OpenCodeReview (ocr CLI) on Git changes. Actions:
+
+- preview: { action: "preview" } — deterministic reviewable-file selection + mode/ref metadata (merge_base for range mode). No LLM. Always the first step of a self-driven review.
+- rules: { action: "rules", paths: [...] } — per-file review rule groups resolved by OpenCodeReview's rule engine. No LLM.
+- review: { action: "review" } — full OpenCodeReview-managed review; the session's current model and runtime-resolved API manager gateway authentication are injected via OCR_LLM_* env, so no separate ocr config is needed. Returns structured line-level findings (severity/category/path/start_line/end_line). Model selection: { model: "provider/modelId" } per call, or pin api-manager.json "ocr.modelRef"; default follows the session model.
+- health: { action: "health" } — OpenCodeReview version + injected-model connectivity check.
+
+Scope: default reviews workspace changes (staged+unstaged+untracked); { commit } for one commit; { from, to } for a branch range; { resume } continues an interrupted review; { exclude } filters paths; { background } adds business context.
+
+Self-driven review (delegate mode): preview → collect diffs per returned refs → rules → review each file → report by severity with file:line evidence. Every reviewable_files entry must end reviewed or explicitly skipped (coverage is mandatory).`,
+    promptSnippet: "Review Git changes via OpenCodeReview — deterministic scope/rules (delegate) or full managed review with the injected current gateway model",
+    promptGuidelines: [
+      "Requires the ocr binary on PATH (npm i -g @alibaba-group/open-code-review); health action reports install/model problems.",
+      "For self-driven reviews run preview first, then rules, then review every listed file — coverage is mandatory, report skipped files with reasons.",
+      "review action injects the current session model through Pi's runtime model registry, including the API manager gateway URL, credentials, and headers; if the provider api is unsupported (non-anthropic/openai), fall back to preview+rules and review yourself.",
+    ],
+
+    parameters: OcrReviewParams,
+
+    async execute(
+      _id: string,
+      params: Record<string, unknown>,
+      signal: AbortSignal | undefined,
+      _onUpdate: ((result: FlowToolResult) => void) | undefined,
+      ctx: ExtensionContext,
+    ): Promise<FlowToolResult> {
+      return executeOcrReview(params as OcrReviewInput, signal, ctx);
+    },
+
+    renderShell: "self",
+    renderCall(args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      const action = String(args.action ?? "review");
+      const target = String(args.commit ?? (args.from ? `${args.from}..${args.to ?? "?"}` : "") ?? "");
+      return toolCallLine(theme, "open-code-review", target ? `${action} ${target}` : action);
+    },
+    renderResult(result, opts, theme, ctx) {
+      if (opts.isPartial) return new Text("", 0, 0);
+      const text = result.content.find((item) => item.type === "text");
+      const message = text && "text" in text ? text.text : "";
+      const isError = ctx.isError || (result as { isError?: boolean }).isError === true;
+      const action = String(ctx.args.action ?? "review");
+      return toolResultLine(theme, { name: "open-code-review", ok: !isError, arg: action, summary: resultSummary(result), expanded: opts.expanded, detail: message });
+    },
+  };
+  pi.registerTool(openCodeReviewTool);
+
+  const openCodeReviewCommand = {
+    description: "Review code changes with OpenCodeReview — workspace (default), --commit, or --from/--to range",
+    async handler(args: string, ctx: ExtensionContext) {
+      if (ctx.isIdle?.() === false) {
+        ctx.ui.notify("Agent is busy; run /open-code-review when idle.", "warning");
+        return;
+      }
+      const trimmed = args.trim();
+      pi.sendUserMessage([
+        "Run a code review with the open-code-review tool (OpenCodeReview CLI).",
+        trimmed
+          ? `User intent/target/background: ${trimmed}`
+          : "Target: current workspace changes (workspace mode, default).",
+        "Prefer action=review (OpenCodeReview-managed, current API manager gateway model auto-injected). If it reports the model cannot be injected, fall back to delegate mode: action=preview, then action=rules for the listed files, review each diff yourself, and report findings grouped by severity with file:line evidence.",
+      ].join("\n"));
+    },
+  };
+  pi.registerCommand("open-code-review", openCodeReviewCommand);
+  pi.registerCommand("ocr-review", {
+    ...openCodeReviewCommand,
+    description: "Compatibility alias for /open-code-review",
+  });
+
+  // === Ask User Question Tool ===
+  registerAskUserQuestionTool(pi, notifyController.requestInput, resolveRootAskGrant);
+
+  // === Todo Tool ===
+  initTodo(pi);
+  disposers.push(pi.events.on(TEAMMATE_STARTED_EVENT, (event) => {
+    if (!todoRootContext) return;
+    const rootCtx = todoRootContext;
+    const actor = todoActorFromTeammateStarted(event);
+    if (actor) registerTodoActor(actor);
+    const record = event as { todos?: unknown; todo?: unknown };
+    const todos = Array.isArray(record.todos)
+      ? record.todos.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : typeof record.todo === "string" && record.todo.trim()
+        ? [record.todo]
+        : [];
+    // Assignment now occurs only in the awaited, all-batch Task dispatch owner.
+    // STARTED is planned activity, not permission to reassign a frozen binding.
+
+  }));
+
+  const todoTool: ToolDefinition<typeof TodoModelParams> = {
+    name: "todo",
+    label: "Todo",
+    description: `Task management with progressive reads. Store full task state, return small indexes and execution briefs, and fetch details only when needed.
+
+Actions and results:
+- create: use subject for one task or tasks[] for an atomic batch. Returns an index of up to 20 created tasks and remaining IDs; does not activate tasks or echo detail. Batch blockedBy uses earlier 0-based array indexes; single-task dependencies use task IDs. Status and summary are update-only.
+- list: returns IDs, short titles, status, ownership, and dependencies. No detail or summaries. offset/limit page filtered tasks in creation order (0-based; default 20, max 50).
+- get: id alone returns a bounded overview with resourceUris. Add field (all|subject|description|context|summary|resourceUris|handoff|skills) to page full content. offset/limit count Unicode code points (0-based; default 4096, max 16384). Without field, paging selects all. Text fields are raw text; structured fields/all are JSON.
+- advance: without an active task, omit completion fields to activate the next assigned runnable task. With an active task, pass its id and non-empty summary to complete it and activate the next one. Returns a completion receipt and the next task's bounded brief. Optional resourceUris/handoff retain completion evidence and resumption guidance.
+- update: completion requires a host business report. The canonical root submits review={evidenceRefs,assessments}; each assessment names the exact current criterion, satisfied judgment, reason, and evidence excerpts [{ref,observedText}]. The host actually reads material and issues the report; summary/exit0/child JSON cannot complete a Task. acceptanceCriteria declares exact criteria; omission uses subject.
+- explicit approved Plan replacement: root first reads todo list canonical deliveryGroups CAS pins, then create one complete tasks batch with new planHandoffKey, completeGroup=true and replacePlan {expectedGroupId, expectedGroupDigest, expectedPlanHandoffKey, reason}; retain the same parent deliveryGoalId. Ordinary duplicate create remains rejected. Pending/aborted/complete receipts are readable through root list.
+- create complete delivery group: one whole tasks batch plus deliveryGoalId; goalId remains a separate quality gate. An approved planHandoffKey is checked against the actual immutable Plan snapshot. Optional members require optional=true and an advance skipPolicy; root review with skip=true resolves that policy without accepting/completing the Task.
+- update: use id or atomic updates[]. updateFields selects changed fields; omission uses supplied fields. Empty strings/arrays clear clearable values. resourceUris replaces the reference list; omitted handoff children preserve existing values.
+- delete: id or atomic ids[]. clear removes the shared list (root only). next is the activation-only compatibility action.
+
+Read Continue/truncation hints only when more information is needed; field=summary retrieves a task's full outcome. Activation includes at most five bounded summaries from the same plan, or from the same assignee only when the task has no plan binding.
+
+Each actor has at most one in_progress task and advances only its own work. Bind teammate tasks[].todo for delegation. Skills are optional and require exactly one primary when present. context records current progress/next action; summary records outcome and evidence. resourceUris retain references without loading content; prefer immutable agent publication IDs. handoff stores up to 3 next steps and file reading values (required|conditional|skip|unknown) for New Context.
+
+${TODO_RESOURCE_URI_GUIDANCE}
+Todo is a tool, not a shell command; call it with structured arguments rather than running \`todo update\` in Bash.
+
+Completion-form advance may request transition=keep_context|new_context. A single update of the caller's active in_progress task may request transition=new_context to persist intermediate state before scheduling the reset. new_context requires compaction.newContext.enabled=true or fails before mutation; transition receipts are not persisted. Omission keeps existing context behavior.`,
+
+    promptSnippet: "Lay out a whole multi-step plan in one batch create (≥3 steps), then keep it live by advancing each task immediately when its outcome is complete.",
+    promptGuidelines: [
+      "Use todo when work has ≥3 steps/phases, step dependencies, or cross-turn context — create the COMPLETE plan in one batch create BEFORE executing.",
+      "A task is a verifiable outcome (feature, phase, component), not a single edit or command; put affected files and verification criteria in description/context.",
+      "Create short task outlines; keep evidence content behind supported resourceUris, never put paths or evidence text in that array. Use the activation brief first, then get only the fields needed; never automatically drain every Continue page.",
+      "Batch blockedBy: tasks[i].blockedBy = [N] means tasks[i] depends on tasks[N], where 0 <= N < i.",
+      "Todo is a live execution state machine: immediately after a task meets its acceptance criteria, call todo advance with its id and summary before any tool call or work belonging to another Todo; never batch-complete finished tasks during finalization.",
+      "Only provide handoff.nextSteps when an authorized later phase exists; for final or blocked work, explicitly clear stale nextSteps with an empty array and report or settle instead of inventing work. At completion, annotate only files/resources relevant to resumption as required, conditional with an explicit trigger, skip with a reason that prevents wasteful reload, or unknown; clear stale files with an empty array when nothing remains worth carrying, and do not read extra files merely to classify them.",
+      "On completion, attach validated resourceUris for durable evidence and prefer exact immutable publication IDs over mutable aliases.",
+      "Transitions are request-only: active completion-form advance accepts keep_context or new_context; a single update of the caller's active in_progress task accepts only new_context so progress/handoff/resources commit before reset scheduling. new_context requires compaction.newContext.enabled=true, receipts are not persisted, and omission preserves current behavior.",
+      "When a completed todo advance result includes [context-pressure-advisory], inspect the task activated in that same result. Dynamic reminders exist only at this Todo completion checkpoint: late auto-prune recommends new_context, while critical makes it a priority before beginning the next Todo. Call the standalone new_context tool only if a next phase exists, persisted state is sufficient, the boundary is loosely coupled, and no messages are pending; otherwise continue or settle. During active Todo work, automatic compaction remains the capacity fallback. The advisory cannot change the completed advance retroactively and must not be carried to an unrelated Todo; never infer a pressure reminder without a Todo completion checkpoint.",
+      "Advance is actor-scoped and only completes or activates tasks assigned to the caller. Use update immediately instead when work becomes blocked, is paused, or must be completed without activating another task.",
+    ],
+
+    parameters: TodoModelParams,
+
+    async execute(
+      _id: string,
+      params: Record<string, unknown>,
+      signal: AbortSignal,
+      _onUpdate: ((result: FlowToolResult) => void) | undefined,
+      ctx: ExtensionContext,
+    ): Promise<FlowToolResult> {
+      if (!Check(TodoToolParams, params)) {
+        return { content: [{ type: "text", text: formatTodoArgumentError(params) }], isError: true, details: {} };
+      }
+      const todoParams = params as unknown as TodoParams;
+      const execution = captureTodoSourceExecution(ctx, signal);
+      const result = await executeTodo(todoParams, ctx, undefined, execution);
+      const details = result.details as TodoResultDetails | undefined;
+      const advisoryEnabled = todoParams.action === "advance"
+        ? (() => {
+            try {
+              return isNewContextCompactionEnabled(ctx.cwd);
+            } catch {
+              // Advisory delivery must never turn a successful Todo mutation
+              // into a tool failure when settings are temporarily unreadable.
+              return false;
+            }
+          })()
+        : false;
+      const withPressureAdvisory = (candidate: FlowToolResult): FlowToolResult =>
+        appendTodoContextPressureAdvisory(
+          candidate,
+          todoParams,
+          midTurnAutoCompaction.describeState().pressureSnapshot,
+          advisoryEnabled,
+        );
+      if (!(result as { isError?: boolean }).isError && details?.transition === "new_context") {
+        try {
+          const receipt = newContextController.schedule({
+            source: "todo-transition",
+            actorId: "root",
+            resourceUris: todoParams.resourceUris,
+          }, ctx);
+          return withPressureAdvisory({
+            ...result,
+            details: {
+              ...details,
+              contextTransition: receipt.coalesced ? "coalesced" : "scheduled",
+              contextTransitionRequestId: receipt.requestId,
+            } satisfies TodoResultDetails,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Todo was committed, but its new-context transition could not be scheduled: ${message}`, "warning");
+          return appendTodoContextTransitionFailure({
+            ...result,
+            details: {
+              ...details,
+              contextTransition: "failed",
+              contextTransitionError: message,
+            } satisfies TodoResultDetails,
+          }, message);
+        }
+      }
+      return withPressureAdvisory(result);
+    },
+
+    renderShell: "self",
+    renderCall(_args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      return toolCallLine(theme, "todo");
+    },
+
+    renderResult(result, opts, theme, ctx) {
+      if (opts.isPartial) return new Text("", 0, 0);
+      return renderTodoToolResult(result, opts.expanded, theme, ctx.args, ctx.isError);
+    },
+  };
+
+  pi.registerTool(todoTool);
+
+  // === Canonical Workflow Run Control ===
+  const runControlTool: ToolDefinition<typeof RunControlParams> = {
+    name: "run-control",
+    label: "Run Control",
+    description: `Transparent argv shell over the canonical Maestro CLI for the v3 Session/Run lifecycle and Artifact compatibility authority. Pass arguments exactly as the CLI takes them, without the leading \`maestro\` executable.
+Valid reads include { argv: ["session","status","--session","session-123","--json"] }, { argv: ["run","brief","run-123","--session","session-123","--json"] }, and { argv: ["run","check","run-123","--session","session-123","--json"] }. Valid lifecycle writes include { argv: ["session","open","Build the release","--id","release-2026","--json"] }, { argv: ["session","chain","insert","--session","session-123","--step-id","review-1","--command","review","--arg","src","--json"] }, { argv: ["session","chain","update","--session","session-123","--step-id","review-1","--stage","verification","--json"] }, { argv: ["run","next","--session","session-123","--json"] }, and { argv: ["run","complete","run-123","--session","session-123","--verdict","done","--advance","--json"] }.
+Read-only queries need no mutation authority. Under session/3.0 there is no workflow mutation lease: the coordinator injects the current Pi host identity as --actor (the CLI derives --participant from it), plus --request-id, --reason, and --json. A caller-supplied --participant that conflicts with coordinator authority is refused. Opening a new Session with \`session open\` has no target --session or CAS revision. Operations on an active or explicitly named Session receive the exact --session and the applicable --expected-orchestration-revision; Run-entity mutations also receive --expected-run-revision. \`session migrate\` is the exception and receives legacy --expected-identity-revision and --expected-activity-revision fences. Legacy/execution workspaces remain compatibility-only. Lifecycle writes are blocked in Plan mode.
+The Workflow Coordinator must be available for every call, including opening a Session. An already active Session is not required for \`session open\`; other lifecycle mutations operate on an active or explicitly named Session. This is the single LLM surface for lifecycle and Artifact compatibility commands: do not hand-write \`maestro\` run/session/execution/artifact calls in bash. Artifact republish is a capability-gated registry mutation and receives host identity plus a fresh inspect-derived CAS fence.
+
+When to use:
+- Open a new Maestro Workflow Session.
+- Read or mutate an active or explicitly named Session/Run.
+- Inspect or republish a compatible Artifact through coordinator authority.
+
+When NOT to use:
+- The Workflow Coordinator is unavailable; the call errors.
+- Knowledge writes (knowledge stage/record/promote) and explore/delegate/moa belong to the bash \`maestro\` CLI and the \`maestro\` tool respectively; read-only knowledge lookups (search/load/review) may pass through this shell.`,
+    promptSnippet: "Maestro CLI passthrough shell for Session/Run lifecycle and Artifact compatibility authority",
+    parameters: RunControlParams,
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      const sourceExecution = captureTodoSourceExecution(ctx, _signal);
+      if (!workflowCoordinator) {
+        return {
+          content: [{ type: "text", text: "Workflow Coordinator is not attached." }],
+          isError: true,
+          details: { ok: false, action: "exec", message: "Workflow Coordinator is not attached." },
+        };
+      }
+      const argv = Array.isArray(params.argv) ? params.argv.map(String) : [];
+      const actionOptsIn = classifyRunControlArgv(argv).write;
+      const hostSessionId = workflowHostSessionId(ctx);
+      if (actionOptsIn && hostSessionId) {
+        await ensureWorkflowHostIdentity(ctx, hostSessionId);
+        const snapshot = workflowBridge?.getSnapshot() ?? await refreshWorkflow(ctx, false, false, false, sourceExecution);
+        if (snapshot && shouldAttachWorkflowSession(snapshot)
+          && (attachedWorkflowSessionId !== snapshot.session?.sessionId
+            || attachedWorkflowHostSessionId !== hostSessionId)) {
+          if (await attachWorkflowSession(ctx, snapshot, hostSessionId)) workflowSessionOptedIn = true;
+        }
+      }
+      const result = await executeRunControl(
+        params as RunControlInput,
+        workflowCoordinator,
+        hostSessionId ? { hostSessionId, requestId: id } : undefined,
+      );
+      if (result.ok) {
+        await refreshWorkflow(ctx, actionOptsIn, actionOptsIn, actionOptsIn, sourceExecution);
+      }
+      return {
+        content: [{ type: "text", text: result.message }],
+        isError: !result.ok,
+        details: result,
+      };
+    },
+    renderShell: "self",
+    renderCall(args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      const argv = Array.isArray(args.argv) ? args.argv.join(" ") : "?";
+      return toolCallLine(theme, "run-control", argv);
+    },
+    renderResult(result, opts, theme, ctx) {
+      if (opts.isPartial) return new Text("", 0, 0);
+      const details = result.details as { ok?: boolean; message?: string } | undefined;
+      const text = result.content.find((item) => item.type === "text");
+      const message = text && "text" in text ? text.text : "";
+      const arg = Array.isArray(ctx.args.argv) ? ctx.args.argv.join(" ") : "?";
+      return toolResultLine(theme, { name: "run-control", ok: !ctx.isError && (result as { isError?: boolean }).isError !== true && details?.ok !== false, arg, summary: resultSummary(result), expanded: opts.expanded, detail: message });
+    },
+  };
+  pi.registerTool(runControlTool);
+
+  pi.registerMessageRenderer<RunEventDetails>("run-event", (message, options) => {
+    const details = message.details;
+    return details ? createRunEventComponent(details, options.expanded) : undefined;
+  });
+
+  // === Plan Mode ===
+  initPlan(pi, {
+    storeFactory: assembly.planStoreFactory,
+    compactionArbiter,
+    restoreActModel: planModelSelection.restoreActModel,
+    describeModelTransition: planModelSelection.describeTransition,
+    scheduleNewContext: (ctx, input) => newContextController.schedule({
+      source: "plan-confirm",
+      actorId: "root",
+      carryForward: input.executionMessage,
+      plan: input.plan,
+      continueAfterReset: input.continueAfterReset,
+      onCancelled: input.onCancelled,
+    }, ctx),
+    workflowConfirmation: planWorkflowConfirmation,
+    publishWorkflowPlan: publishApprovedPlanToWorkflow,
+  });
+  registerPlanTools(pi, { onUserAttention: notifyController.requestInput });
+  registerPlanCommand(pi);
+  registerPlanAuto(pi, { isPlanMode, onStateChange: refreshPlanModeStatus });
+  registerArtifactCommand(pi, {
+    getKnowledgeSessionId: () => workflowArtifactKnowledgeSessionId(
+      workflowSnapshotForUi(),
+      workflowSessionOptedIn,
+      attachedWorkflowSessionId,
+    ),
+    onKnowledgeLoaded: (sessionId, candidateCount) => {
+      if (workflowArtifactKnowledgeSessionId(workflowSnapshotForUi(), workflowSessionOptedIn, attachedWorkflowSessionId) !== sessionId) return;
+      artifactKnowledgeSessionId = sessionId;
+      artifactKnowledgeCandidateCount = candidateCount;
+      publishMaestroUi();
+    },
+  });
+  registerSwarmDisplay(pi, {
+    onProjectionChange(projection) {
+      currentSwarmProjection = projection;
+      publishMaestroUi();
+    },
+  });
+
+  // === Language intelligence, browser control, and tool discovery ===
+  const curatorHost = registerIntelligenceTools(pi, { curator: assembly.curator ?? { agentDataDir: () => getAgentDir() }, lsp: hostLspManager });
+  pi.on("session_start", (_event, ctx) => curatorHost?.start(ctx));
+  pi.on("session_tree", (_event, ctx) => curatorHost?.tree(ctx));
+  pi.on("session_shutdown", () => curatorHost?.shutdown());
+  const fffSearch = registerFff(pi);
+  registerGatewayBoardTool(pi);
+  registerGatewayFabricTools(pi);
+  registerBashBg(pi);
+  registerLoop(pi);
+  registerFlowSchedule(pi, {
+    managedWorker: isManagedWorkerWindow(),
+    todoMutationSupported: isManagedWorkerWindow(),
+  });
+  registerModelAvailability(pi);
+  registerTeammateSessionRouting(pi);
+  registerResourceTool(pi, { fabricArtifactFactory: acquirePlanArtifactResource });
+  registerSessionHistoryTool(pi);
+  registerConflictTool(pi);
+  registerDataManagerCommand(pi);
+  registerKeybindingsCommand(pi);
+  registerMarkdownReviewCommand(pi);
+
+  pi.registerShortcut(PLAN_TOGGLE_KEY, {
+    description: `Toggle Plan/Act mode (${PLAN_TOGGLE_LABEL})`,
+    async handler(ctx: ExtensionContext) {
+      await planToggleMode(ctx);
+      syncApprovalModeStatus(ctx, approvalMode);
+    },
+  });
+
+  setPlanModeChangeListener((ctx) => {
+    updateTodoWidget();
+    syncApprovalModeStatus(ctx, approvalMode);
+    publishMaestroUi();
+  });
+  const permissionController = createPermissionController({
+    onUserAttention: notifyController.requestInput,
+    async setMode(mode, ctx) {
+      if (mode === "plan" && !isPlanMode()) await planToggleMode(ctx);
+      if (mode !== "plan" && isPlanMode()) await planExitMode(ctx);
+      approvalMode = mode;
+      syncApprovalModeStatus(ctx, approvalMode);
+      publishMaestroUi();
+    },
+  });
+  pi.registerCommand("permissions", {
+    description: "查看、重新加载权限规则，或用 /permissions yolo 启用全权限模式",
+    async handler(args, ctx) {
+      const action = args.trim().toLowerCase();
+      if (action === "yolo" || action === "bypasspermissions") {
+        if (permissionController.bypassDisabled()) {
+          ctx.ui.notify("YOLO mode is disabled by permissions.disableBypassPermissionsMode.", "warning");
+          return;
+        }
+        await permissionController.setDefaultMode(ctx, "bypassPermissions");
+        ctx.ui.notify("Approval mode: YOLO (saved as the project default)", "warning");
+        return;
+      }
+      if (action === "reload") {
+        const configuredMode = await permissionController.reload(ctx);
+        if (configuredMode === "plan" && !isPlanMode()) await planToggleMode(ctx);
+        if (configuredMode && configuredMode !== "plan" && isPlanMode()) await planExitMode(ctx);
+        if (configuredMode) approvalMode = configuredMode;
+        syncApprovalModeStatus(ctx, approvalMode);
+        publishMaestroUi();
+        ctx.ui.notify("权限配置已重新加载。", "info");
+        return;
+      }
+      ctx.ui.notify(permissionController.summary(effectivePermissionMode(approvalMode)), "info");
+    },
+  });
+  pi.registerShortcut(APPROVAL_MODE_CYCLE_KEY, {
+    description: "Cycle approval mode",
+    async handler(ctx: ExtensionContext) {
+      const current: PermissionMode = effectivePermissionMode(approvalMode);
+      const disabled = permissionController.bypassDisabled()
+        ? new Set<PermissionMode>(["bypassPermissions"])
+        : new Set<PermissionMode>();
+      const next = nextApprovalMode(current, disabled);
+
+      await permissionController.setDefaultMode(ctx, next);
+      ctx.ui.notify(`Approval mode: ${next} (saved as the project default)`, "info");
+    },
+  });
+
+  function workflowSnapshotForUi(): WorkflowSnapshotLike | undefined {
+    const snapshot = workflowBridge?.getSnapshot();
+    if (!snapshot) return undefined;
+    const goal = getActiveGoal();
+    return {
+      ...snapshot,
+      goal: goal ? {
+        objective: goal.text,
+        status: goal.status,
+        tokensUsed: goal.tokensUsed,
+        tokenBudget: goal.tokenBudget,
+        budgetView: goalBudgetView(goal),
+      } : null,
+      todos: getVisibleTasks().map((task) => ({
+        id: task.id,
+        subject: task.subject,
+        status: task.status,
+        origin: task.origin ? "mirror" : "local",
+        blockedBy: task.blockedBy,
+        createdBy: { id: task.createdBy.id, label: task.createdBy.label },
+        assignee: { id: task.assignee.id, label: task.assignee.label },
+      })),
+    };
+  }
+
+  function workflowRecoveryIdentity(): WorkflowRecoveryIdentity | undefined {
+    const snapshot = workflowBridge?.getSnapshot();
+    const session = snapshot?.session;
+    if (!snapshot || !session) return undefined;
+    const run = activeWorkflowRun(snapshot);
+    if (!run) return undefined;
+    const task = getVisibleTasks().find((candidate) => candidate.origin?.runId === run.runId)
+      ?? getVisibleTasks().find((candidate) => candidate.status === "in_progress" && candidate.origin);
+    const gates = run?.gates ?? [];
+    const next = Array.isArray(run?.handoff?.next) ? run?.handoff?.next[0] : undefined;
+    const handoffAction = next && typeof next === "object" && typeof (next as { command?: unknown }).command === "string"
+      ? (next as { command: string }).command
+      : undefined;
+    return {
+      sessionId: session.sessionId,
+      runId: run.runId,
+      todoId: task?.id,
+      stackRevision: task?.skillActivation?.stackRevision,
+      gates: {
+        passed: gates.filter((gate) => ["passed", "waived", "skipped"].includes(gate.status)).length,
+        total: gates.length,
+        failed: gates.filter((gate) => ["failed", "blocked"].includes(gate.status)).length,
+      },
+      artifactRefs: session.artifacts.map((artifact) => artifact.artifactId),
+      nextAction: handoffAction ?? `maestro run brief ${run.runId}`,
+    };
+  }
+
+  async function refreshWorkflow(
+    ctx: ExtensionContext,
+    emitEvents = false,
+    allowOptIn = false,
+    allowLeaseMutation = false,
+    sourceExecution: TodoSourceExecution = captureTodoSourceExecution(ctx),
+  ): Promise<WorkflowSnapshot | undefined> {
+    if (!workflowBridge) return undefined;
+    const previous = lastWorkflowLifecycleSnapshot ?? workflowBridge.getSnapshot();
+    const next = await workflowBridge.refresh();
+    if (!workflowSessionOptedIn && allowOptIn && isWorkflowSessionMatchable(next)) {
+      workflowSessionOptedIn = true;
+    }
+
+    const activateWorkflowSession = shouldActivateWorkflowSession(next, workflowSessionOptedIn);
+    const nextSession = activateWorkflowSession ? next.session : undefined;
+    const attachableSession = shouldAttachWorkflowSession(next) ? next.session : undefined;
+    const nextAttachSessionId = attachableSession?.sessionId;
+    if (allowLeaseMutation
+      && attachedWorkflowSessionId
+      && attachedWorkflowSessionId !== nextAttachSessionId) {
+      try { await workflowCoordinator?.fenceContinuation(); } catch { /* a lost lease is already fail-closed */ }
+      await workflowCoordinator?.release();
+      attachedWorkflowSessionId = undefined;
+      attachedWorkflowHostSessionId = undefined;
+    }
+    if (allowLeaseMutation && emitEvents && attachableSession
+      && attachedWorkflowSessionId !== attachableSession.sessionId) {
+      await attachWorkflowSession(ctx, next);
+    }
+    try {
+      runTodoSourceExecution(sourceExecution, () => {
+        reconcileMirrorTasks(activateWorkflowSession ? buildTodoMirrorSpecs(next) : [], ctx, next.sessionGeneration);
+        if (workflowSessionOptedIn) reconcileWorkflowGoal(next, ctx);
+      });
+    } catch (error) {
+      // The canonical workflow command may have succeeded even when its old
+      // Todo projection lost authority. Report that fact without regranting it.
+      ctx.ui.notify(`Todo workflow projection was not updated: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+    const sealedExecution = sealedWorkflowExecutionTransition(previous, next);
+    // session/3.0 has no Execution entity to transition, so `session complete`
+    // and `run complete --advance` (operation session-complete /
+    // run-complete-and-seal) arrive as tool_execution_end receipts and seal
+    // the knowledge pipeline exactly like the legacy execution-seal projection.
+    // Intermediate Runs only stage/report; the terminal Session owns the Ask.
+    const completedSessionIds = completedKnowledgeSessions(
+      pendingV3CompleteReceipts.splice(0), sealedExecution?.sessionId, next.session?.sessionId,
+    );
+    for (const sessionId of completedSessionIds) {
+      const sealedBy = sealedExecution?.sessionId === sessionId
+        ? `Workflow Execution ${sealedExecution.executionId} sealed in Session ${sessionId}`
+        : `Workflow Session ${sessionId} completed`;
+      await closeoutSessionKnowledge(ctx, sessionId, sealedBy);
+    }
+    // Session sealed notification: legacy session/1.x keeps its persisted sealed
+    // status; session/3.0 maps `session complete` receipts to the same sealed
+    // transition (completed -> sealed projection). Both fire the knowledge
+    // review hint; v3 sessions are labelled with their receipt origin.
+    if (nextSession?.lifecycleAuthority !== "execution-derived"
+      && nextSession?.status
+      && nextSession.status !== lastSessionStatus) {
+      if (nextSession.status === "sealed" && lastSessionStatus !== undefined) {
+        const sealedSessionId = nextSession.sessionId;
+        const v3Session = nextSession.schemaVersion === "session/3.0";
+        if (!completedSessionIds.includes(sealedSessionId)) {
+          const sealedBy = v3Session
+            ? `Workflow Session ${sealedSessionId} completed (v3 session complete)`
+            : `Workflow Session ${sealedSessionId} sealed (legacy session/1.x)`;
+          await closeoutSessionKnowledge(ctx, sealedSessionId, sealedBy);
+        }
+      }
+      lastSessionStatus = nextSession.status;
+    }
+    if (emitEvents && activateWorkflowSession) emitRunTransitions(next, ctx);
+    else lastRunStates = new Map(next.session?.runs.map((run) => [run.runId, run.status]) ?? []);
+    lastWorkflowLifecycleSnapshot = next;
+    updateTodoWidget();
+    publishMaestroUi();
+    return next;
+  }
+
+  async function planWorkflowConfirmation(ctx: PlanContext): Promise<PlanWorkflowConfirmationOptions> {
+    const hostSessionId = workflowHostSessionId(ctx as ExtensionContext);
+    if (!workflowCoordinator || !workflowBridge || !hostSessionId) {
+      return { allowNew: false };
+    }
+    try {
+      if (!await workflowCoordinator.supportsPlanPublish()
+        || !await workflowCoordinator.supportsNewPlanSession()) {
+        return { allowNew: false };
+      }
+      const snapshot = await workflowBridge.refresh();
+      const session = snapshot.session;
+      if (!session) return { allowNew: true };
+      const target = currentWorkflowPlanTarget(snapshot);
+      const ownership = await workflowCoordinator.ownership(hostSessionId);
+      // stale leases are reclaimable (WorkflowLeaseStore.acquire treats a
+      // heartbeat past staleAfterMs as unowned), so they never block binding
+      // the current Session or creating a new one.
+      const ownedHere = ownership?.state === "unowned"
+        || ownership?.state === "stale"
+        || (ownership?.isOwner === true && ownership.isAttached === true);
+      let reason = target.reason;
+      if (!reason && !ownedHere) {
+        reason = ownership?.ownerHostSessionId
+          ? `Workflow Session is owned by Pi session ${ownership.ownerHostSessionId}`
+          : "Workflow Session mutation lease is unavailable";
+      }
+      return {
+        current: {
+          sessionId: session.sessionId,
+          intent: session.intent,
+          available: reason === undefined,
+          ...(reason ? { reason } : {}),
+        },
+        allowNew: !target.hasActiveWork && (ownership?.state === "unowned" || ownedHere),
+      };
+    } catch (error) {
+      return {
+        current: {
+          sessionId: "unavailable",
+          intent: "Workflow capability check failed",
+          available: false,
+          reason: publicWorkflowErrorMessage(error),
+        },
+        allowNew: false,
+      };
+    }
+  }
+
+  async function publishApprovedPlanToWorkflow(
+    ctx: PlanContext,
+    approved: LoadedPlan,
+    execution: PlanExecutionChoice,
+  ): Promise<PlanWorkflowPublicationResult> {
+    const sourceExecution = captureTodoSourceExecution(ctx);
+    if (execution.backend !== "workflow" || !execution.workflowTarget) {
+      throw new Error("Workflow publication requires an explicit Workflow target");
+    }
+    if (!workflowCoordinator || !workflowBridge) throw new Error("Workflow Coordinator is not attached");
+    const hostSessionId = workflowHostSessionId(ctx as ExtensionContext);
+    if (!hostSessionId) {
+      throw new Error("Current Pi host does not expose a stable session id; Workflow publication is refused");
+    }
+    if (!await workflowCoordinator.supportsPlanPublish()) {
+      throw new Error("Installed Maestro CLI does not support `maestro plan publish`");
+    }
+    const handoffKey = approved.manifest.handoffKey;
+    const approvedChecksum = approved.manifest.approvedChecksum;
+    const approvedAt = approved.manifest.approvedAt;
+    const approvedPath = approved.manifest.approvedPath;
+    if (!handoffKey || !approvedChecksum || !approvedAt || !approvedPath) {
+      throw new Error("Approved Plan is missing canonical approval identity");
+    }
+
+    let targetSessionId: string | undefined;
+    if (execution.workflowTarget === "current") {
+      const snapshot = await workflowBridge.refresh();
+      const session = snapshot.session;
+      if (!session) throw new Error("No canonical Workflow Session to bind");
+      const target = currentWorkflowPlanTarget(snapshot);
+      if (!target.available) {
+        throw new Error(target.reason ?? "Current Workflow Session cannot bind an approved Plan");
+      }
+      workflowSessionOptedIn = true;
+      if (!await attachWorkflowSession(ctx as ExtensionContext, snapshot, hostSessionId)) {
+        throw new Error(`Could not acquire Workflow Session ${session.sessionId}`);
+      }
+      targetSessionId = session.sessionId;
+    } else {
+      await workflowCoordinator.release();
+      attachedWorkflowSessionId = undefined;
+      attachedWorkflowHostSessionId = undefined;
+    }
+
+    const sourcePath = join(approved.plansDir, approvedPath);
+    const expectedRequestId = derivePlanPublishRequestId(handoffKey);
+    const publication = await workflowCoordinator.publishPlan({
+      sourcePath,
+      sourceRoot: approved.plansDir,
+      ...(targetSessionId ? { sessionId: targetSessionId } : {}),
+      intent: planIntent(approved.markdown, handoffKey),
+      topic: planIntent(approved.markdown, handoffKey),
+      handoffKey,
+      sourcePiSession: hostSessionId,
+      planRevision: approved.manifest.revision,
+      approvedAt,
+      requestId: expectedRequestId,
+    }, { hostSessionId });
+    const published = parsePlanPublishResult(
+      publication.command.stdout,
+      handoffKey,
+      expectedRequestId,
+    );
+    if (published.source_checksum !== `sha256:${approvedChecksum}`) {
+      throw new Error("Published Plan source checksum does not match the approved revision");
+    }
+    const assertPlanSnapshot = await workflowCoordinator.mode() === "session-v3"
+      ? assertPublishedPlanSnapshotV3
+      : assertPublishedPlanSnapshot;
+    assertPlanSnapshot(publication.snapshot, published, targetSessionId);
+
+    workflowSessionOptedIn = true;
+    if (!await attachWorkflowSession(ctx as ExtensionContext, publication.snapshot, hostSessionId)) {
+      throw new Error(`Published Workflow Session ${published.session_id} could not be attached`);
+    }
+    const publicationStatus = deriveWorkflowStatus(publication.snapshot);
+    const existingExecution = publicationStatus.authority === "execution-derived"
+      ? publication.snapshot.session?.runs.find(
+        (run) => run.runId === publication.snapshot.execution?.activeRunId,
+      )
+      : activeWorkflowRun(publication.snapshot);
+    if (existingExecution) {
+      requirePublishedExecutionRun(publication.snapshot, published);
+    }
+    const executionRun = existingExecution
+      ? {
+          command: await workflowCoordinator.brief(existingExecution.runId),
+          snapshot: await workflowBridge.refresh(),
+        }
+      : await workflowCoordinator.next(undefined, { hostSessionId });
+    assertPlanSnapshot(executionRun.snapshot, published, published.session_id);
+    const active = requirePublishedExecutionRun(executionRun.snapshot, published);
+    await refreshWorkflow(ctx as ExtensionContext, true, true, true, sourceExecution);
+
+    const binding: PlanWorkflowBinding = {
+      status: "bound",
+      handoffKey,
+      sourceChecksum: approvedChecksum,
+      workflowSessionId: published.session_id,
+      ...(executionRun.snapshot.sessionGeneration
+        ? { workflowSessionGeneration: executionRun.snapshot.sessionGeneration }
+        : {}),
+      artifactId: published.artifact_id,
+      producerRunId: published.run_id,
+      executionRunId: active.runId,
+      requestId: published.request_id,
+      updatedAt: new Date().toISOString(),
+    };
+    const executionMessage = executionRun.command.stdout.trim()
+      || `Continue Workflow Run ${active.runId} in Session ${published.session_id}.`;
+    return { binding, executionMessage };
+  }
+
+  function planIntent(markdown: string, handoffKey: string): string {
+    const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
+    const firstLine = markdown.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    return (heading || firstLine || `Approved Plan request ${derivePlanPublishRequestId(handoffKey)}`).slice(0, 240);
+  }
+
+  function parsePlanPublishResult(
+    stdout: string,
+    expectedHandoffKey: string,
+    expectedRequestId: string,
+  ): import("../tools/plan-workflow.ts").PublishedPlanIdentity {
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(stdout.trim());
+    } catch {
+      throw new Error("Maestro plan publisher returned invalid JSON");
+    }
+    if (!envelope || typeof envelope !== "object") {
+      throw new Error("Maestro plan publisher returned an invalid envelope");
+    }
+    const record = envelope as Record<string, unknown>;
+    return parseProjectedPublishedPlanIdentity({
+
+      ok: record.ok === true,
+      request_id: typeof record.request_id === "string" ? record.request_id : null,
+      result: record.result,
+    }, expectedHandoffKey, expectedRequestId);
+  }
+
+  async function withPublicWorkflowErrors<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      throw new Error(publicWorkflowErrorMessage(error));
+    }
+  }
+
+  function workflowHostSessionId(ctx: ExtensionContext): string | undefined {
+    const value = (ctx.sessionManager as { getSessionId?: () => string }).getSessionId?.();
+    const normalized = value?.trim();
+    return normalized || undefined;
+  }
+
+  async function ensureWorkflowHostIdentity(
+    ctx: ExtensionContext,
+    hostSessionId: string,
+  ): Promise<void> {
+    if (!attachedWorkflowSessionId || attachedWorkflowHostSessionId === hostSessionId) return;
+    await workflowCoordinator?.release();
+    attachedWorkflowSessionId = undefined;
+    attachedWorkflowHostSessionId = undefined;
+    const snapshot = workflowBridge?.getSnapshot() ?? await workflowBridge?.refresh();
+    if (snapshot && workflowSessionOptedIn && shouldAttachWorkflowSession(snapshot)) {
+      await attachWorkflowSession(ctx, snapshot, hostSessionId);
+    }
+  }
+
+  async function attachWorkflowSession(
+    ctx: ExtensionContext,
+    snapshot: WorkflowSnapshot,
+    hostSessionId = workflowHostSessionId(ctx),
+  ): Promise<boolean> {
+    if (!workflowCoordinator || !shouldAttachWorkflowSession(snapshot)) return false;
+    if (!hostSessionId) {
+      ctx.ui.notify(
+        "Workflow Session remains read-only because this Pi host does not expose a stable session id.",
+        "warning",
+      );
+      return false;
+    }
+    const sessionId = snapshot.session!.sessionId;
+    if (attachedWorkflowSessionId === sessionId && attachedWorkflowHostSessionId === hostSessionId) return true;
+    try {
+      const ownership = await workflowCoordinator.ownership(hostSessionId);
+      if (ownership?.sessionId === sessionId && ownership.isOwner && ownership.isAttached) {
+        attachedWorkflowSessionId = sessionId;
+        attachedWorkflowHostSessionId = hostSessionId;
+        return true;
+      }
+      await workflowCoordinator.attach(hostSessionId, sessionId);
+      attachedWorkflowSessionId = sessionId;
+      attachedWorkflowHostSessionId = hostSessionId;
+      return true;
+    } catch (error) {
+      attachedWorkflowSessionId = undefined;
+      attachedWorkflowHostSessionId = undefined;
+      ctx.ui.notify(
+        `Workflow Session attach is read-only because continuation ownership was unavailable: ${publicWorkflowErrorMessage(error)}`,
+        "warning",
+      );
+      return false;
+    }
+  }
+
+  function emitRunTransitions(snapshot: WorkflowSnapshot, ctx: ExtensionContext): void {
+    const nextStates = new Map(snapshot.session?.runs.map((run) => [run.runId, run.status]) ?? []);
+    for (const run of snapshot.session?.runs ?? []) {
+      const previous = lastRunStates.get(run.runId);
+      if (!previous || previous === run.status) continue;
+      const handoff = run.handoff ?? {};
+      const next = Array.isArray(handoff.next) ? handoff.next[0] : undefined;
+      pi.sendMessage({
+        customType: "run-event",
+        content: `Run ${run.runId} changed from ${previous} to ${run.status}`,
+        display: true,
+        details: {
+          runId: run.runId,
+          command: run.command,
+          status: run.status,
+          verdict: typeof handoff.verdict === "string" ? handoff.verdict : undefined,
+          artifactsCount: snapshot.session?.artifacts.filter((artifact) => artifact.runId === run.runId).length ?? 0,
+          nextAction: next && typeof next === "object" && typeof (next as { command?: unknown }).command === "string"
+            ? (next as { command: string }).command
+            : undefined,
+        } satisfies RunEventDetails,
+      });
+      guiEvents.emit(GUI_EVENTS.runTransition, {
+        runId: run.runId,
+        from: previous,
+        to: run.status,
+        command: run.command,
+      });
+      guiEvents.emit(GUI_EVENTS.stateChanged, { subsystem: GUI_EVENTS.runTransition, runId: run.runId });
+      // Run seal completes the knowledge pipeline for this step: surface the
+      // attribution and staged-candidate summary without blocking the refresh.
+      // session/3.0 runs own a per-run knowledge-delta.json written by
+      // `run complete` (runs/<run_id>/knowledge-delta.json); legacy
+      // (execution-derived) sessions fall back to the session-level
+      // `knowledge review` aggregation.
+      if (previous !== "sealed" && run.status === "sealed") {
+        const sealedSessionId = snapshot.session?.sessionId;
+        if (sealedSessionId) {
+          void (async () => {
+            const cwd = flowSettingsContext?.cwd ?? process.cwd();
+            const v3 = snapshot.session?.schemaVersion === "session/3.0";
+            const summary = v3
+              ? readRunKnowledgeDelta(cwd, sealedSessionId, run.runId)
+              : await new KnowledgeCliAdapter(cwd).review(sealedSessionId).catch(() => null);
+            if (!summary) return;
+            const signals: Record<string, number> = { consumed: 0, cited: 0, validated: 0, contradicted: 0 };
+            for (const input of summary.inputs ?? []) {
+              if (input.run_id !== run.runId) continue;
+              signals[input.signal] += input.count;
+            }
+            const staged = summary.candidates
+              .filter(candidate => candidate.run_ids.includes(run.runId)).length;
+            const reviewRequired = summary.candidates
+              .filter(candidate => candidate.reconciliation?.promotion_eligibility === "review_required").length;
+            updateKnowledgePendingStatus(ctx, {
+              pending: summary.candidates.filter(candidate => candidate.status === "pending").length,
+              reviewRequired,
+            });
+            const reviewHint = reviewRequired > 0
+              ? ` · ${reviewRequired} need human review at owner closeout (Ask)`
+              : " · pending candidates are reviewed in Ask at owner closeout";
+            pi.sendMessage({
+              customType: "run-knowledge",
+              content: `Run ${run.runId}/${run.command} sealed — knowledge: consumed ${signals.consumed} · `
+                + `cited ${signals.cited} · validated ${signals.validated} · contradicted ${signals.contradicted}`
+                + ` · staged ${staged} candidate(s)${reviewHint}`,
+              display: true,
+              details: { runId: run.runId, signals, staged, reviewRequired },
+            });
+          })();
+        }
+      }
+    }
+    lastRunStates = nextStates;
+  }
+
+  const requireCustomOverlay = (ctx: ExtensionContext, surface: string): boolean => {
+    if (supportsCustomOverlay(ctx)) return true;
+    ctx.ui.notify(`${surface} requires an interactive TUI; this mode does not support overlays.`, "warning");
+    return false;
+  };
+
+  async function openGatewayOverlay(ctx: ExtensionContext, initialPage: "home" | "config" | "tunnel" = "home"): Promise<void> {
+    if (!requireCustomOverlay(ctx, "Gateway panel")) return;
+    await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+      const overlay = new GatewayOverlay({
+        cwd: ctx.cwd,
+        initialPage,
+        requestRender: () => tui.requestRender(),
+        getTerminalRows: () => tui.terminal.rows,
+        input: (title, placeholder) => ctx.ui.input(title, placeholder ?? ""),
+        close: () => done(undefined),
+        onFabricProjection: (snapshot) => pi.events.emit(GATEWAY_FABRIC_MONITOR_EVENT, snapshot),
+        onRegisterWorkspace: async (path) => registerWindowWithMode(path, false),
+        onRegisterWorkspacePermanent: async (path) => registerWindowWithMode(path, true),
+        onUnregisterWorkspace: async (path) => {
+          stopWorkspaceLease();
+          const result = await removeGatewayWorkspaceByPath(path);
+          return result.ok ? `unregistered: ${path}` : `remove failed: ${result.message}`;
+        },
+        onComposeWindowMessage: async (target, session, targetMode) => {
+          const title = targetMode === "new"
+            ? `新建 managed Pi 窗口 · ${session.workspace || session.sessionId.slice(0, 8)}`
+            : `发送到 ${target?.displayName ?? "Pi 窗口"}`;
+          const message = await ctx.ui.input(title, "任务消息");
+          if (!message?.trim()) return undefined;
+          let name: string | undefined;
+          if (targetMode === "new") {
+            const entered = await ctx.ui.input("窗口名称（可选）", "");
+            if (entered === undefined) return undefined;
+            name = entered.trim() || undefined;
+          }
+          return { purpose: message.trim(), message: message.trim(), name };
+        },
+      });
+      // Shared by e (lease) and E (permanent). First-run configuration stays in
+      // the same two-page surface instead of opening a second wizard overlay.
+      const registerWindowWithMode = async (path: string, permanent: boolean): Promise<string> => {
+        if (!isGatewayConfigured()) {
+          overlay.showConfigPage();
+          ctx.ui.notify("未完成初始配置，已切换到 Gateway 配置页；保存后再按 e 注册窗口", "info");
+          return "未完成初始配置，已切换到配置页（保存后再按 e 注册窗口）";
+        }
+        if (permanent) {
+          const registered = await registerGatewayWorkspacePermanent(path);
+          return registered
+            ? `registered（永久，无租约，窗口关闭后保留）: ${path}`
+            : `register failed（Built-in Gateway workspace registry 未写入）: ${path}`;
+        }
+        const registered = await startWorkspaceLease(path);
+        return registered
+          ? `registered（动态租约，窗口存活期间自动续租）: ${path}`
+          : `register failed（Built-in Gateway workspace registry 未写入）: ${path}`;
+      };
+      return overlay;
+    }, {
+      overlay: true,
+      overlayOptions: { anchor: "center", width: "92%", maxHeight: "90%" },
+    });
+  }
+
+  async function openSessionOverlay(ctx: ExtensionContext): Promise<void> {
+    if (!requireCustomOverlay(ctx, "Session panel")) return;
+    const view = deriveWorkflowViewModel(workflowSnapshotForUi());
+    if (!view || !workflowCoordinator) {
+      ctx.ui.notify("No active canonical Workflow Session.", "info");
+      return;
+    }
+    const knowledgeAdapter = new KnowledgeCliAdapter(ctx.cwd);
+    const withKnowledge = async (vm: WorkflowViewModel): Promise<WorkflowViewModel> => {
+      try {
+        const summary = await knowledgeAdapter.review(vm.sessionId);
+        return {
+          ...vm,
+          knowledge: {
+            consumed: summary.input_totals.consumed,
+            cited: summary.input_totals.cited,
+            validated: summary.input_totals.validated,
+            contradicted: summary.input_totals.contradicted,
+            pendingCandidates: summary.candidates.filter((c) => c.status === "pending").length,
+            corroboratedCandidates: summary.candidates.filter(
+              (c) => c.status === "pending" && c.stage === "corroborated",
+            ).length,
+            reviewRequired: summary.candidates.filter((c) => c.reconciliation?.promotion_eligibility === "review_required").length,
+            promotedCandidates: summary.candidates.filter((c) => c.status === "promoted").length,
+            bySource: summary.input_totals_by_source ?? {},
+            inputs: [...(summary.inputs ?? [])]
+              .reverse()
+              .slice(0, 20)
+              .map((input) => ({
+                runId: input.run_id,
+                knowledgeId: input.knowledge_id,
+                signal: input.signal,
+                source: input.source,
+                count: input.count,
+              })),
+          },
+        };
+      } catch {
+        return vm;
+      }
+    };
+    const enrichedView = await withKnowledge(view);
+    await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+      let overlay: SessionOverlay;
+      overlay = new SessionOverlay({
+        view: enrichedView,
+        requestRender: () => tui.requestRender(),
+        close: () => done(undefined),
+        theme: _theme,
+        onAction: async (action: SessionOverlayAction, runId?: string) => {
+          const sourceExecution = captureTodoSourceExecution(ctx);
+          if (action !== "decision") {
+            const planBlock = onToolCallPlan({ toolName: "run-control", input: { action } }, approvalMode === "bypassPermissions");
+            if (planBlock) throw new Error(planBlock.reason);
+          }
+          const hostSessionId = workflowHostSessionId(ctx);
+          const mutatesOwnership = ["pause", "resume", "next", "done"].includes(action);
+          if (mutatesOwnership) {
+            if (!hostSessionId) {
+              throw new Error("Current Pi host does not expose a stable session id; Workflow mutation is refused");
+            }
+            await ensureWorkflowHostIdentity(ctx, hostSessionId);
+          }
+          if (action === "pause" || action === "resume") {
+            if (action === "resume" && !workflowSessionOptedIn) {
+              workflowSessionOptedIn = true;
+              const snapshot = workflowBridge?.getSnapshot();
+              if (snapshot && await attachWorkflowSession(ctx, snapshot, hostSessionId)) {
+                reconcileWorkflowGoal(snapshot, ctx);
+              }
+            }
+            const goal = getActiveGoal();
+            if ((action === "pause" && goal?.status === "active")
+              || (action === "resume" && (goal?.status === "paused" || goal?.status === "active"))) {
+              if (action === "pause") {
+                await withPublicWorkflowErrors(() => workflowCoordinator!.fenceContinuation());
+              }
+              const result = await executeGoalCommand({ action: action === "pause" ? "stop" : "resume" }, ctx);
+              if (result.isError) throw new Error(result.text);
+            }
+          } else if (action === "brief") {
+            await workflowCoordinator!.brief(runId);
+          } else if (action === "check") {
+            await workflowCoordinator!.check(runId);
+          } else if (action === "next") {
+            await withPublicWorkflowErrors(() =>
+              workflowCoordinator!.next(undefined, { hostSessionId: hostSessionId! }));
+          } else if (action === "done") {
+            if (!runId) throw new Error("No Run selected");
+            await withPublicWorkflowErrors(() =>
+              workflowCoordinator!.done(runId, { verdict: "done" }, { hostSessionId: hostSessionId! }));
+          } else {
+            ctx.ui.notify("Resolve the decision through AskUserQuestion; the overlay is a recovery fallback only.", "info");
+          }
+          await refreshWorkflow(ctx, mutatesOwnership, mutatesOwnership, mutatesOwnership, sourceExecution);
+          const updated = deriveWorkflowViewModel(workflowSnapshotForUi());
+          if (updated) overlay.update(await withKnowledge(updated));
+        },
+      });
+      return overlay;
+    }, {
+      overlay: true,
+      overlayOptions: { anchor: "center", width: "92%", maxHeight: "90%" },
+    });
+  }
+
+  async function openTodoOverlay(ctx: ExtensionContext): Promise<void> {
+    if (!requireCustomOverlay(ctx, "Todo panel")) return;
+    const tasks = getVisibleTasks().filter((task) => !task.origin && task.status !== "deleted");
+    if (tasks.length === 0) {
+      ctx.ui.notify("No local or teammate Todo tasks to display.", "info");
+      return;
+    }
+    // The center overlay is Cockpit's shared TodoOverlay component; Flow only
+    // owns the data and the Alt+T inline toggle forwarding.
+    const glyphs = resolveGlyphs("auto");
+    await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
+      new CockpitTodoOverlay({
+        getTodos: () => getVisibleTasks()
+          .filter((task) => !task.origin && task.status !== "deleted")
+          .map(toCockpitTodoItem),
+        requestRender: () => tui.requestRender(),
+        close: () => done(undefined),
+        theme,
+        glyphs,
+      }), {
+      overlay: true,
+      overlayOptions: { anchor: "center", width: "94%", maxHeight: "90%" },
+    });
+  }
+
+  function toCockpitTodoItem(task: TodoTask): CockpitTodoItem {
+    return {
+      id: task.id,
+      subject: task.subject,
+      status: task.status === "deleted" ? "pending" : task.status,
+      blockedBy: [...task.blockedBy],
+      createdBy: task.createdBy ? { id: task.createdBy.id, label: task.createdBy.label } : undefined,
+      assignee: task.assignee ? { id: task.assignee.id, label: task.assignee.label } : undefined,
+      skills: task.skills.map((skill) => ({ name: skill.name, role: skill.role })),
+      updatedAt: task.updatedAt,
+    };
+  }
+
+  async function openGoalOverlay(ctx: ExtensionContext): Promise<void> {
+    if (!requireCustomOverlay(ctx, "Goal panel")) return;
+    await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
+      new GoalOverlay({
+        getEntries: () => getGoalPanelEntries(),
+        getCurrentGoalId: () => getActiveGoal()?.id,
+        getPhase: () => currentGoalPhase(),
+        requestRender: () => tui.requestRender(),
+        close: () => done(undefined),
+        theme,
+        getTerminalRows: () => tui.terminal?.rows,
+        onAction: async (action: GoalOverlayAction, goalId: string) => {
+          // Lifecycle commands act on the current goal, so surface the selected one first.
+          if (getActiveGoal()?.id !== goalId && !switchCurrentGoal(goalId, ctx)) {
+            throw new Error(`Unknown goal: ${goalId}`);
+          }
+          if (action === "switch") return;
+          const result = await executeGoalCommand(
+            { action: action === "stop" ? "stop" : action === "resume" ? "resume" : "clear" },
+            ctx,
+          );
+          if (result.isError) throw new Error(result.text);
+        },
+      }), {
+      overlay: true,
+      overlayOptions: { anchor: "center", width: "92%", maxHeight: "90%" },
+    });
+  }
+
+  async function openKnowledgeOverlay(ctx: ExtensionContext, sessionIdArg?: string): Promise<void> {
+    if (!requireCustomOverlay(ctx, "Knowledge panel")) return;
+    const adapter = new KnowledgeCliAdapter(ctx.cwd);
+    const sessionId = sessionIdArg?.trim()
+      || workflowSnapshotForUi()?.session?.sessionId
+      || resolveLatestSessionId(ctx.cwd);
+    if (!sessionId) {
+      ctx.ui.notify("No Workflow Session found to review.", "info");
+      return;
+    }
+
+    const loadView = async (refresh: boolean): Promise<KnowledgeCenterView> => {
+      const [reviewResult, auditResult] = await Promise.allSettled([
+        adapter.review(sessionId, { refresh }),
+        adapter.audit("all"),
+      ]);
+      const review = reviewResult.status === "fulfilled" ? reviewResult.value : null;
+      const audit = auditResult.status === "fulfilled" ? auditResult.value : null;
+      const error = reviewResult.status === "rejected"
+        ? (reviewResult.reason instanceof Error ? reviewResult.reason.message : String(reviewResult.reason))
+        : null;
+      return buildKnowledgeCenterView(review, audit, error);
+    };
+
+    const view = await loadView(false);
+    await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+      let overlay: KnowledgeOverlay;
+      overlay = new KnowledgeOverlay({
+        view,
+        requestRender: () => tui.requestRender(),
+        theme: _theme,
+        close: () => {
+          void refreshKnowledgePendingStatus(ctx, sessionId);
+          done(undefined);
+        },
+        onAction: async (action: KnowledgeOverlayAction) => {
+          if (action.kind === "refresh") {
+            overlay.update(await loadView(true));
+            return;
+          }
+          if (action.kind === "resolve-batch") {
+            const current = await loadView(false);
+            const byId = new Map(current.candidates.map((c) => [c.candidate.candidate_id, c]));
+            const items = action.candidateIds.map((candidateId) => {
+              const summary = byId.get(candidateId);
+              const target = action.as !== "unique"
+                ? (summary?.canonicalId ?? summary?.candidate.reconciliation?.matches[0]?.knowledge_id)
+                : undefined;
+              return { candidateId, as: action.as, target, reason: action.reason };
+            });
+            const result = await adapter.resolveMany(sessionId, items);
+            overlay.update(await loadView(false));
+            if (result.failed.length > 0) {
+              throw new Error(
+                `resolved ${result.resolved}, failed ${result.failed.length}: `
+                + result.failed.map((f) => f.candidateId).join(", "),
+              );
+            }
+            return;
+          }
+          if (action.kind === "resolve") {
+            await adapter.resolve(sessionId, action.candidateId, {
+              as: action.as,
+              target: action.target,
+              reason: action.reason,
+            });
+          } else if (action.kind === "promote") {
+            await adapter.promote(sessionId, { candidates: [action.candidateId] });
+          } else if (action.kind === "promote-all") {
+            await adapter.promote(sessionId, { all: true });
+          }
+          overlay.update(await loadView(false));
+        },
+      });
+      return overlay;
+    }, {
+      overlay: true,
+      overlayOptions: { anchor: "center", width: "92%", maxHeight: "90%" },
+    });
+  }
+
+  pi.registerCommand("maestro-session", {
+    description: "Open the canonical Workflow Session control center",
+    async handler(_args, ctx) { await openSessionOverlay(ctx); },
+  });
+  pi.registerCommand("gateway", {
+    description: "Open Pi Maestro Gateway — home/config control center. Usage: /gateway [config|wizard|tunnel]",
+    async handler(args, ctx) {
+      const requested = args.trim().toLowerCase();
+      const page = requested === "tunnel" ? "tunnel" : ["config", "wizard"].includes(requested) ? "config" : "home";
+      await openGatewayOverlay(ctx, page);
+    },
+  });
+  pi.registerCommand("gateway-tunnel", {
+    description: "Open the dedicated Pi Maestro Gateway tunnel operator page",
+    async handler(_args, ctx) { await openGatewayOverlay(ctx, "tunnel"); },
+  });
+  pi.registerCommand("gateway-config", {
+    description: "Open the dedicated Pi Maestro Gateway configuration TUI. Standalone: pi-maestro-gateway config [--config PATH]",
+    async handler(_args, ctx) { await openGatewayOverlay(ctx, "config"); },
+  });
+  pi.registerCommand("maestro-knowledge", {
+    description: "Open the Knowledge center — review session candidates, reconciliation matches, and corpus health",
+    async handler(args, ctx) { await openKnowledgeOverlay(ctx, args); },
+  });
+  pi.registerCommand("maestro-knowledge-stage", {
+    description: "Stage a knowledge candidate (spec|knowhow) on the active Run, optionally with an attribution signal. Usage: maestro-knowledge-stage <spec|knowhow> <title> <content> [--category <c>] [--action <propose|reaffirm|supersede|contest>] [--signal <consumed|cited|validated|contradicted> --signal-ids <id1,id2>] [--evidence <ref1,ref2>]",
+    async handler(args, ctx) {
+      const parsed = parseKnowledgeStageArgs(args);
+      if (parsed instanceof Error) {
+        ctx.ui.notify(parsed.message, "error");
+        return;
+      }
+      const snapshot = workflowBridge?.getSnapshot();
+      const session = snapshot?.session;
+      const run = session ? activeWorkflowRun(snapshot) : undefined;
+      const adapter = new KnowledgeCliAdapter(ctx.cwd);
+      try {
+        const result = await adapter.stage({
+          target: parsed.target,
+          title: parsed.title,
+          content: parsed.content,
+          runId: run?.runId,
+          sessionId: run ? session?.sessionId : undefined,
+          action: parsed.action,
+          category: parsed.category,
+          signal: parsed.signal,
+          signalIds: parsed.signalIds,
+          evidence: parsed.evidence,
+        });
+        const signal = parsed.signal ? `; recorded ${result.signal_recorded} signal(s) as ${parsed.signal}` : "";
+        const location = result.run_id
+          ? `${result.session_id}/${result.run_id}`
+          : `${result.session_id} (session source)`;
+        ctx.ui.notify(
+          `Staged ${result.candidate_id} on ${location}${signal} `
+          + `— review with \"maestro knowledge review ${result.session_id}\"`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      }
+    },
+  });
+  pi.registerCommand("maestro-knowledge-from-window", {
+    description: "Stage a spec/knowhow candidate with explicit distilled content plus evidence from the latest readable entry in this Pi window. Usage: maestro-knowledge-from-window <spec|knowhow> <title> <content> [--category <c>] [--action <propose|reaffirm|supersede|contest>] [--signal <consumed|cited|validated|contradicted> --signal-ids <id1,id2>] [--evidence <ref1,ref2>]",
+    async handler(args, ctx) {
+      const parsed = parseKnowledgeStageArgs(args);
+      if (parsed instanceof Error) {
+        ctx.ui.notify(parsed.message, "error");
+        return;
+      }
+      const snapshot = workflowBridge?.getSnapshot();
+      const session = snapshot?.session;
+      const run = session ? activeWorkflowRun(snapshot) : undefined;
+      const adapter = new KnowledgeCliAdapter(ctx.cwd);
+      try {
+        const outcome = await stageWindowKnowledgeCandidate(
+          ctx,
+          workflowHostSessionId(ctx),
+          {
+            target: parsed.target,
+            title: parsed.title,
+            content: parsed.content,
+            runId: run?.runId,
+            sessionId: run ? session?.sessionId : undefined,
+            action: parsed.action,
+            category: parsed.category,
+            signal: parsed.signal,
+            signalIds: parsed.signalIds,
+            evidence: parsed.evidence,
+          },
+          options => adapter.stage(options),
+        );
+        if (!outcome.result) {
+          ctx.ui.notify(outcome.reason ?? "No readable transcript entry is available", "error");
+          return;
+        }
+        const result = outcome.result;
+        const signal = parsed.signal ? `; recorded ${result.signal_recorded} signal(s) as ${parsed.signal}` : "";
+        const location = result.run_id
+          ? `${result.session_id}/${result.run_id}`
+          : `${result.session_id} (session source)`;
+        ctx.ui.notify(
+          `Staged ${result.candidate_id} from this Pi window on ${location}${signal} `
+          + `— review with "maestro knowledge review ${result.session_id}"`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    },
+  });
+  pi.registerCommand("maestro-skills", {
+    description: "List Maestro CLI skills/steps for the pi platform. Usage: maestro-skills [--steps] [--platform <claude|codex|agent|agy|pi>]",
+    async handler(args, ctx) {
+      const steps = /--steps\b/.test(args);
+      const platform = /--platform\s+(\S+)/.exec(args)?.[1] ?? "pi";
+      const adapter = new SkillCliAdapter(ctx.cwd);
+      try {
+        const entries = await adapter.list({ platform: platform as SkillCliListOptions["platform"], steps });
+        const skills = entries.filter((entry) => entry.type === "skill");
+        const commands = entries.filter((entry) => entry.type === "command");
+        const stepCount = steps ? entries.filter((entry) => entry.type === "step").length : 0;
+        const names = [...new Set(skills.map((entry) => entry.name))].slice(0, 12).join(", ");
+        ctx.ui.notify(
+          `maestro skills (${platform}): ${skills.length} skills · ${commands.length} commands`
+          + (stepCount > 0 ? ` · ${stepCount} run-resolvable steps` : "")
+          + `${names ? ` — ${names}${skills.length > 12 ? " …" : ""}` : ""}`
+          + (entries.length === 0 ? " — CLI found no entries for this platform" : ""),
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      }
+    },
+  });
+  pi.registerCommand("maestro-knowledge-record", {
+    description: "Record pure knowledge attribution on the active Run without staging a candidate. Usage: maestro-knowledge-record <knowledge-id...> [--signal <consumed|cited|validated|contradicted>] [--source <search|load|manual>]",
+    async handler(args, ctx) {
+      const parsed = parseKnowledgeRecordArgs(args);
+      if (parsed instanceof Error) {
+        ctx.ui.notify(parsed.message, "error");
+        return;
+      }
+      const snapshot = workflowBridge?.getSnapshot();
+      const session = snapshot?.session;
+      const run = session ? activeWorkflowRun(snapshot) : undefined;
+      const adapter = new KnowledgeCliAdapter(ctx.cwd);
+      try {
+        const result = await adapter.recordInputs({
+          knowledgeIds: parsed.knowledgeIds,
+          signal: parsed.signal,
+          source: parsed.source,
+          runId: run?.runId,
+          sessionId: run ? session?.sessionId : undefined,
+        });
+        ctx.ui.notify(
+          `Recorded ${result.recorded} input(s) as ${parsed.signal ?? "consumed"} `
+          + `(source ${parsed.source ?? "search"}) on ${result.session_id}/${result.run_id}; `
+          + `review with "maestro knowledge review ${result.session_id}"`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      }
+    },
+  });
+  pi.registerCommand("maestro-todo", {
+    description: "Open the shared root and teammate Todo center",
+    async handler(_args, ctx) { await openTodoOverlay(ctx); },
+  });
+  pi.registerCommand("maestro-goal", {
+    description: "Open the Goal control center — every goal with full details, switch/stop/resume/clear",
+    async handler(_args, ctx) { await openGoalOverlay(ctx); },
+  });
+  const systemPromptCommand: {
+    description: string;
+    handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+  } = {
+    description: "Inspect the active system prompt — mode, size, key markers, and Chinese response mode. Use 'full' to dump the whole prompt, 'reload' to re-read SYSTEM.md and resources.",
+    async handler(args, ctx) {
+      const sub = args.trim().toLowerCase();
+      if (sub === "reload") {
+        await ctx.reload();
+        ctx.ui.notify("Reloaded extensions, skills, prompts, themes, and context files.", "info");
+        return;
+      }
+      const prompt = ctx.getSystemPrompt();
+      const opts = ctx.getSystemPromptOptions();
+      if (sub === "full") {
+        ctx.ui.notify(prompt, "info");
+        return;
+      }
+      const lines = prompt.split("\n");
+      const has = (marker: string) => (prompt.includes(marker) ? "yes" : "NO");
+      const contextFiles = (opts.contextFiles ?? []).map((f) => f.path);
+      const summary = [
+        `System prompt: ${prompt.length} chars / ${lines.length} lines`,
+        `Mode: ${opts.customPrompt ? "customPrompt (SYSTEM.md or --system-prompt)" : "default base prompt"}`,
+        `Chinese response mode: ${chineseResponseMode.isEnabled() ? "enabled" : "disabled"}`,
+        `First line: ${lines[0]?.slice(0, 90) ?? "(empty)"}`,
+        `Markers:`,
+        `  # Project Knowledge Gate       : ${has("# Project Knowledge Gate")}`,
+        `  # Engineering                  : ${has("# Engineering")}`,
+        `  # Task Tracking                : ${has("# Task Tracking")}`,
+        `  # Plan Mode                    : ${has("# Plan Mode")}`,
+        `  # Tool Routing                 : ${has("# Tool Routing")}`,
+        `  # Teammates                    : ${has("# Teammates")}`,
+        `  # Knowledge Operations         : ${has("# Knowledge Operations")}`,
+        `  Available tools: (default only): ${has("Available tools:")}`,
+        `  <project_instructions>         : ${has("<project_instructions>")}`,
+        `  <available_skills>             : ${has("<available_skills>")}`,
+        `Context files (${contextFiles.length}): ${contextFiles.join(", ") || "(none)"}`,
+      ].join("\n");
+      ctx.ui.notify(summary, "info");
+    },
+  };
+  pi.registerCommand("sysprompt", systemPromptCommand);
+
+  interface SessionInfoMessageDetails {
+    sessionId?: string;
+    fileState: "exists" | "missing" | "unbound";
+    copied?: boolean;
+    exportedTo?: string;
+  }
+
+  pi.registerMessageRenderer<SessionInfoMessageDetails>("maestro-session-info", (message, options, theme) => {
+    const details = message.details;
+    if (!details) return undefined;
+    const content = typeof message.content === "string"
+      ? message.content
+      : message.content.map((entry) => entry.type === "text" ? entry.text : "").filter(Boolean).join("\n");
+    if (options.expanded) return new Text(theme.fg("toolOutput", content), 0, 0);
+    const shortId = details.sessionId ? details.sessionId.slice(0, 8) : "unknown";
+    const action = details.exportedTo
+      ? "exported"
+      : details.copied === true
+        ? "copied"
+        : details.copied === false
+          ? "clipboard unavailable"
+          : details.fileState;
+    const tone = details.fileState === "missing" ? "error" : "success";
+    return new Text(
+      `  ${theme.fg(tone, details.fileState === "missing" ? "!" : "✓")} ${theme.fg("toolTitle", theme.bold("session-info"))} ${theme.fg("muted", `${shortId} · ${action}`)}`,
+      0,
+      0,
+    );
+  });
+
+  pi.registerCommand("export-session-info", {
+    description:
+      "Show the current session id and where its history (transcript) is stored, and copy it to the clipboard. Pass a destination path to also export a copy of the history file there.",
+    async handler(args, ctx) {
+      const manager = ctx.sessionManager;
+      const info: SessionLocationInfo = {
+        sessionId: manager.getSessionId(),
+        sessionName: manager.getSessionName(),
+        sessionFile: manager.getSessionFile(),
+        sessionDir: manager.getSessionDir(),
+      };
+      const destination = args.trim();
+      if (!destination) {
+        const status = info.sessionFile ? await probeSessionFile(info.sessionFile) : undefined;
+        const report = formatSessionLocation(info, status);
+        const copied = await tryCopyToClipboard(report, copyToClipboard);
+        const suffix = copied ? "\nCopied to clipboard." : "\n(Clipboard unavailable.)";
+        pi.sendMessage({
+          customType: "maestro-session-info",
+          content: `${report}${suffix}`,
+          display: true,
+          details: {
+            sessionId: info.sessionId,
+            fileState: !info.sessionFile ? "unbound" : status?.exists ? "exists" : "missing",
+            copied,
+          } satisfies SessionInfoMessageDetails,
+        }, { triggerTurn: false });
+        return;
+      }
+      if (!info.sessionFile) {
+        ctx.ui.notify("No active session history file to export.", "warning");
+        return;
+      }
+      const status = await probeSessionFile(info.sessionFile);
+      if (!status.exists) {
+        ctx.ui.notify(`Session history file not found on disk:\n${info.sessionFile}`, "warning");
+        return;
+      }
+      try {
+        const target = await resolveExportTarget(destination, info.sessionFile, ctx.cwd);
+        const { written, bytes } = await exportSessionHistory(info.sessionFile, target);
+        pi.sendMessage({
+          customType: "maestro-session-info",
+          content: `${formatSessionLocation(info, status)}\nExported to : ${written} (${formatBytes(bytes)})`,
+          display: true,
+          details: {
+            sessionId: info.sessionId,
+            fileState: "exists",
+            exportedTo: written,
+          } satisfies SessionInfoMessageDetails,
+        }, { triggerTurn: false });
+      } catch (error) {
+        ctx.ui.notify(`Export failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  registerInstallCommand(pi);
+
+  // === Statusline ===
+  registerObservabilityHostServices(pi,{root:()=>getAgentDir()});
+  installStatusline(pi, () => state, () =>
+    workflowSnapshotForAttachedSession(workflowSnapshotForUi(), attachedWorkflowSessionId),
+  );
+
+  // === Maestro Panel (above editor) ===
+  let widgetCtx: ExtensionContext | undefined;
+  let panelMode: "collapsed" | "expanded" = "collapsed";
+  let cockpitOwnsTodo = false;
+
+  function updateTodoWidget(): void {
+    const tasks = getVisibleTasks();
+    if (guiEvents.isActive()) {
+      const todoFp = JSON.stringify(tasks.map((task) => [task.id, task.status, task.subject, task.summary]));
+      guiEvents.emitDeduped(GUI_EVENTS.todoUpdated, todoFp, { count: tasks.length, tasks });
+      const effectiveMode = isPlanMode() ? "plan" : approvalMode === "plan" ? "default" : approvalMode;
+      guiEvents.emitDeduped(GUI_EVENTS.planMode, effectiveMode, { mode: effectiveMode, isPlanMode: isPlanMode() });
+    }
+    if (!widgetCtx) return;
+    if (cockpitOwnsTodo) {
+      widgetCtx.ui.setWidget("todo-panel", undefined);
+      return;
+    }
+    const view = deriveWorkflowViewModel(workflowSnapshotForUi());
+    const currentTasks = currentGoalTasks(tasks, widgetCtx);
+    const display = readGoalCurrentDisplay();
+    let nativeSourceMatches = false;
+    try { nativeSourceMatches = !!display && display.source.cwd === widgetCtx.cwd
+      && display.source.sessionId === widgetCtx.sessionManager.getSessionId()
+      && widgetCtx.sessionManager.getBranch().some(entry => entry.id === display.source.branchAnchor); } catch { /* Keep unknown current rows. */ }
+    const delivered = nativeSourceMatches ? display!.deliveries : [];
+    const workflowSettled = view && delivered.some(d => d.phase === "settled" && d.workflowSessionId === view.sessionId)
+      && view.status === "completed" && !view.nextAction && !view.recoveryAction && !view.decisionPending
+      && view.chain.running === 0 && view.chain.pending === 0 && view.runs.every(run => run.status === "completed" || run.status === "sealed")
+      && (!view.gates || view.gates.passed === view.gates.total)
+      && (!view.knowledge || (view.knowledge.pendingCandidates === 0 && view.knowledge.reviewRequired === 0 && view.knowledge.contradicted === 0));
+    const runs = workflowSettled ? [] : view?.runs;
+    if (currentTasks.length === 0 && !(runs && runs.length > 0)) {
+      widgetCtx.ui.setWidget("todo-panel", undefined);
+      return;
+    }
+    widgetCtx.ui.setWidget("todo-panel", () => ({
+      render(width: number): string[] {
+        return renderTodoWidget(currentTasks, panelMode !== "collapsed", width, runs);
+      },
+      invalidate() {},
+    }), { placement: "aboveEditor" });
+  }
+
+  disposers.push(pi.events.on(COCKPIT_UI_OWNERSHIP_EVENT, (payload) => {
+    if (!payload || typeof payload !== "object") return;
+    const ownership = payload as Partial<CockpitUiOwnershipV1>;
+    cockpitOwnsTodo = ownership.todo === true;
+    setGoalPanelOwnership(ownership.goal === true, widgetCtx);
+    setGoalStaticMode(ownership.static === true);
+    setQuietMode(ownership.quiet === true, ownership.quietSymbols);
+    setTodoDurationChartEnabled(ownership.todoDurationChart !== false);
+    if (typeof ownership.todoExpanded === "boolean") {
+      panelMode = ownership.todoExpanded ? "expanded" : "collapsed";
+    }
+    updateTodoWidget();
+  }));
+  // Handshake: this subscription may have been registered after Cockpit's
+  // session_start broadcast; ask once instead of waiting for the next
+  // config-driven re-broadcast. No answer means Cockpit is absent/disabled.
+  pi.events.emit(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined);
+
+
+  pi.registerShortcut(TODO_TOGGLE_KEY, {
+    description: "Toggle the inline Todo panel (collapsed ↔ expanded); use /maestro-todo for the full center",
+    async handler(_ctx: ExtensionContext) {
+      panelMode = panelMode === "collapsed" ? "expanded" : "collapsed";
+      if (cockpitOwnsTodo) {
+        pi.events.emit(COCKPIT_TODO_TOGGLE_EVENT, { expanded: panelMode === "expanded" });
+      }
+      updateTodoWidget();
+    },
+  });
+
+  pi.registerShortcut(GOAL_OVERLAY_KEY, {
+    description: `Open the Goal overlay (${GOAL_OVERLAY_LABEL}) — full details for every goal, switch/stop/resume/clear`,
+    async handler(ctx: ExtensionContext) {
+      await openGoalOverlay(ctx);
+    },
+  });
+
+  // === Session lifecycle ===
+  pi.on("session_start", async (event, ctx) => {
+    const guiGeneration = ++guiLifecycleGeneration;
+    // Re-ask ownership on every session boundary: a reload re-runs extension
+    // factories and Cockpit's broadcast may have landed before we subscribed.
+    pi.events.emit(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined);
+    const previousGuiServer = guiServer;
+    guiServer = null;
+    guiEvents.bind(null);
+    previousGuiServer?.close("session-restart");
+    disposeGoalDisplayListener?.(); resetGoalCurrentDisplay();
+    disposeGoalDisplayListener = subscribeGoalCurrentDisplay(() => { publishMaestroUi(); updateTodoWidget(); });
+    maestroUiPublisher.beginSession();
+    maestroUiSessionActive = true;
+    artifactKnowledgeSessionId = undefined;
+    artifactKnowledgeCandidateCount = 0;
+    disposeFabricOriginProvider?.();
+    disposeFabricOriginProvider = undefined;
+    invalidateTodoSource();
+    await disposeTeammateSessionRegistrations();
+    state.baseCwd = ctx.cwd;
+    // K9: inject the host session identity into the process environment so all
+    // maestro CLI subprocesses can resolve knowledge write authority via the
+    // lease/channel tiers. Env-only by design (no capability probe, no new CLI
+    // flag): older CLIs simply ignore it and degrade to prior behavior.
+    try {
+      const hostSessionId = workflowHostSessionId(ctx);
+      if (hostSessionId) process.env.PI_HOST_SESSION_ID = hostSessionId;
+      else delete process.env.PI_HOST_SESSION_ID;
+    } catch {
+      // Identity injection is best-effort; resolution falls back to other tiers.
+    }
+    compactionArbiter.reset();
+    newContextToolSurface.sync(newContextToolsEnabled(ctx.cwd));
+    newContextController.onSessionStart(ctx);
+    preserveCompletedTurnFromNativeThreshold = false;
+    teammateAttachTodoIsolated = false;
+    midTurnAutoCompaction.onSessionStart(ctx, event);
+    todoRootContext = ctx;
+    widgetCtx = ctx;
+    panelMode = "collapsed";
+    try {
+      await goalSessionStart(ctx, { ...event, deferResume: true });
+      todoSessionStart(ctx);
+      bindGoalCurrentDisplay(ctx);
+      if (requestGate) {
+        try {
+          const previous = requestGate.continuityError(); if (previous) throw previous;
+          await getGoalCoverageContinuityPort().resume();
+        } catch (error) {
+          ctx.ui.notify(`Goal budget history could not be confirmed; existing declared requests remain blocked: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        }
+      }
+      bindBudgetHost?.();
+      for (const goal of getGoalPanelEntries()) refreshGoalBudgetView(goal.id, ctx);
+      const budgetDisplayGoal = getActiveGoal(); if (budgetDisplayGoal) updateBudgetGoalStatusLine(ctx, budgetDisplayGoal);
+    } catch (error) {
+      rejectBudgetHost?.(error instanceof Error ? error : new Error(String(error))); throw error;
+    }
+    const restoredGoal = getActiveGoal();
+    workflowSessionOptedIn = false;
+    const sourceExecution = captureTodoSourceExecution(ctx);
+    notifyMacAltShortcutHint(ctx);
+    try {
+      if (hasPendingTaskClearRecovery()) await recoverPendingTaskClear(ctx);
+      if (hasPendingPlanReplacementRecovery()) await recoverPendingPlanReplacement(ctx, {deferResume:true});
+      if (hasPendingGoalTodoDetachRecovery()) await readyTodoStateForGoalDetachRecovery(ctx);
+      recoverPendingGoalTodoDetachesAfterTodoStart(ctx);
+    } catch (error) {
+      ctx.ui.notify(`Goal cleanup recovery remains pending: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+    if (event.reason === "resume" && !hasPendingTaskClearRecovery() && !hasPendingPlanReplacementRecovery()) await resumeAfterPlanReplacementRecovery(ctx);
+    workflowBridge = new WorkflowBridge(ctx.cwd);
+    workflowCoordinator = WorkflowCoordinator.create(
+      workflowBridge,
+      new RunCliAdapter(ctx.cwd),
+      ctx.cwd,
+    );
+    setWorkflowCoordinator(workflowCoordinator);
+    const snapshot = await workflowBridge.refresh();
+    workflowSessionOptedIn = shouldRestoreWorkflowGoal(event.reason, restoredGoal, snapshot);
+    if (workflowSessionOptedIn && snapshot) {
+      try { runTodoSourceExecution(sourceExecution, () => reconcileWorkflowGoal(snapshot, ctx)); }
+      catch (error) { ctx.ui.notify(`Goal workflow projection remains pending: ${error instanceof Error ? error.message : String(error)}`, "warning"); }
+    }
+    if (snapshot && shouldActivateWorkflowSession(snapshot, workflowSessionOptedIn)) {
+      if (await attachWorkflowSession(ctx, snapshot)) {
+        await refreshWorkflow(ctx, true, false, true, sourceExecution);
+        const recovery = workflowRecoveryIdentity();
+        if (recovery) {
+          pi.sendMessage({
+            customType: "workflow-attach",
+            content: `Attached canonical Workflow Session ${recovery.sessionId} at Run ${recovery.runId}.`,
+            display: false,
+            details: recovery,
+          });
+        }
+      } else {
+        await refreshWorkflow(ctx, false, false, false, sourceExecution);
+      }
+    } else {
+      await refreshWorkflow(ctx, false, false, false, sourceExecution);
+    }
+    await onSessionStartPlan(ctx);
+    const knowledgeSessionId = workflowArtifactKnowledgeSessionId(
+      workflowSnapshotForUi(),
+      workflowSessionOptedIn,
+      attachedWorkflowSessionId,
+    );
+    if (knowledgeSessionId) await refreshKnowledgePendingStatus(ctx, knowledgeSessionId);
+    const configuredMode = await permissionController.reload(ctx);
+    if (configuredMode === "plan" && !isPlanMode()) await planToggleMode(ctx);
+    if (configuredMode) approvalMode = configuredMode;
+    syncApprovalModeStatus(ctx, approvalMode);
+    updateTodoWidget();
+    publishMaestroUi();
+    await activateTeammateSessionRegistrations(ctx);
+    // Registration is process-local and lazy: no owner IPC or bearer grant is
+    // acquired until a dispatch carries an explicit Fabric placement.
+    if (isGatewayFabricEnabled()) {
+      const control = new GatewayControlClient({ cwd: ctx.cwd });
+      const registerGenerationTrackedProvider = registerFabricRouteResolverProvider as unknown as (
+        provider: GenerationTrackedFabricRouteResolverProvider,
+        options: { readonly ownerId: string },
+      ) => { dispose(): void };
+      const registration = registerGenerationTrackedProvider(
+        new FabricOriginRouteResolverProvider({ control }),
+        { ownerId: `flow-${process.pid}-${teammateRegistrationGeneration}` },
+      );
+      disposeFabricOriginProvider = registration.dispose;
+    }
+    if (guiEnabled()) {
+      const guiSessionId =
+        (ctx.sessionManager as { getSessionId?: () => string }).getSessionId?.() ?? "unknown";
+      const getGuiCtx = () => guiContextForGeneration(
+        ctx,
+        guiGeneration,
+        guiLifecycleGeneration,
+        todoRootContext,
+      );
+      const startedGuiServer = await startGuiSubsystem({
+        sessionId: guiSessionId,
+        cwd: ctx.cwd,
+        getHealth: () => ({ approvalMode }),
+        listAllTools: () => pi.getAllTools(),
+        gateway: buildGuiPermissionGateway(ctx),
+        getCtx: getGuiCtx,
+        isCurrent: () => getGuiCtx() !== undefined,
+        stateProviders: {
+          workflow: () => deriveWorkflowViewModel(workflowSnapshotForUi()),
+          todos: () => getVisibleTasks(),
+          goal: () => getActiveGoal(),
+          plan: () => ({
+            mode: getPlanMode(),
+            isPlanMode: isPlanMode(),
+            hasPlan: hasPlan(),
+            text: getPlanText(),
+            handoffStatus: getPlanHandoffStatus(),
+          }),
+          teammates: async () => {
+            const entry = getGuiTool("teammate-list");
+            if (!entry) return null;
+            const result = await entry.execute(
+              "gui-state-teammates",
+              { view: "active" } as never,
+              new AbortController().signal,
+              undefined,
+              ctx,
+            );
+            return (result.details as { agents?: unknown } | undefined)?.agents ?? null;
+          },
+          swarm: () => loadLatestTeamSwarmProjection(ctx.cwd) ?? null,
+          approvalMode: () => effectivePermissionMode(approvalMode),
+          sessionId: () => guiSessionId,
+        },
+      });
+      bindGuiStartupIfCurrent(
+        startedGuiServer,
+        guiGeneration,
+        guiLifecycleGeneration,
+        (server) => {
+          guiServer = server;
+          guiEvents.bind(server);
+        },
+      );
+    }
+  });
+
+  pi.on("before_agent_start", (_event, ctx) => {
+    newContextToolSurface.sync(newContextToolsEnabled(ctx.cwd));
+  });
+
+  pi.on("session_shutdown", async (event, ctx) => {
+    fencePlanArtifactReads();
+    // SDK reasons: quit/reload/new/resume/fork; there is no "switch" reason.
+    // Capture the outgoing live host identity and fence its browser scope before
+    // any await. Cleanup is scope-local for every reason; the bridge stays shared.
+    const intelligenceCleanup = shutdownIntelligenceTools(undefined, 5_000, browserHostSessionId(ctx), hostLspManager);
+    // Fence compaction and retire this provider before the first await. Retiring
+    // hides it from new dispatches; dispatch pins keep admitted publications on
+    // this exact generation until teammate shutdown drains them.
+    midTurnAutoCompaction.onSessionShutdown(ctx);
+    // Fence provider discovery before any awaited shutdown work. Backend-held
+    // leases retain their exact grant object until their own cleanup releases it.
+    disposeFabricOriginProvider?.();
+    disposeFabricOriginProvider = undefined;
+    preserveCompletedTurnFromNativeThreshold = false;
+    lastCompactionCancel = undefined;
+    newContextController.onSessionShutdown();
+    newContextToolSurface.deactivate();
+    compactionArbiter.reset();
+    disposeCompletionDurabilityProvider();
+    const completionOwnershipDrained = completionDurabilityRegistry.waitForProviderIdle?.(
+      completionDurabilityProvider,
+    ) ?? Promise.resolve();
+    // ExtensionRunner awaits shutdown handlers serially. Do not await the pin
+    // barrier here: teammate shutdown may be the later handler that releases it.
+    // The listener disposer itself remains ordered after that release.
+    void completionOwnershipDrained.then(disposePublishedResultCapture).catch((error) => {
+      console.warn(`[pi-graph-flow] completion capture shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    if (event.reason === "quit" || event.reason === "reload") disposeTuiLocaleEvents();
+    // Other observers do not own canonical result persistence and can leave
+    // immediately; disposePublishedResultCapture is released after the pin barrier.
+    for (const d of disposers) {
+      try { d(); } catch {}
+    }
+    stopWorkspaceLease();
+    guiLifecycleGeneration += 1;
+    const closingGuiServer = guiServer;
+    guiServer = null;
+    guiEvents.bind(null);
+    closingGuiServer?.close("session-shutdown");
+    disposeGoalDisplayListener?.(); disposeGoalDisplayListener = undefined; resetGoalCurrentDisplay();
+    maestroUiSessionActive = false;
+    artifactKnowledgeSessionId = undefined;
+    artifactKnowledgeCandidateCount = 0;
+    maestroUiPublisher.clear();
+    await disposeTeammateSessionRegistrations();
+    // Non-destructive: preserve the prune manifest and spill resources so a
+    // resumed session replays the identical transformed prefix. Destructive
+    // teardown stays with reset()/onCompact().
+    state.activeToolCalls.clear();
+    ctx.ui.setStatus("maestro-tool-calls", undefined);
+    widgetCtx?.ui.setWidget("todo-panel", undefined);
+    widgetCtx = undefined;
+    todoRootContext = undefined;
+    // Keep the cwd captured by the initial teammate tool_result: detached work
+    // may publish its completion after the session context has shut down.
+    panelMode = "collapsed";
+    let coverageCloseError: unknown;
+    try { if (closingBudgetCoverage) await closingBudgetCoverage.port.prepare(closingBudgetCoverage.token); }
+    catch (error) { coverageCloseError = error; }
+    try {
+      goalSessionShutdown(ctx, { afterSuccessfulPersist: () => {
+        if (!coverageCloseError && closingBudgetCoverage) closingBudgetCoverage.port.publication(closingBudgetCoverage.token);
+      } });
+    } finally { todoSessionShutdown(ctx); }
+    await workflowCoordinator?.release();
+    attachedWorkflowSessionId = undefined;
+    attachedWorkflowHostSessionId = undefined;
+    workflowCoordinator = undefined;
+    workflowBridge = undefined;
+    workflowSessionOptedIn = true;
+    lastRunStates.clear();
+    lastWorkflowLifecycleSnapshot = undefined;
+    setWorkflowCoordinator(undefined);
+    onSessionShutdownPlan(ctx);
+    ctx.ui.setStatus("approval-mode", undefined);
+    await intelligenceCleanup;
+    if (coverageCloseError) throw coverageCloseError;
+  });
+
+  pi.on("session_tree", (_event, ctx) => {
+    todoRootContext = ctx;
+    todoSessionStart(ctx);
+    updateTodoWidget();
+  });
+  pi.on("session_compact", (_event, ctx) => {
+    todoRootContext = ctx;
+    refreshTodoSourceAfterCompact(ctx);
+  });
+
+  registerRootCompactionHooks(modelOriginApi(pi), {
+    compactionArbiter, newContextController, autoCompaction: midTurnAutoCompaction,
+    workflowRecoveryIdentity,
+    state: {
+      get preserveCompletedTurnFromNativeThreshold() { return preserveCompletedTurnFromNativeThreshold; },
+      set preserveCompletedTurnFromNativeThreshold(value) { preserveCompletedTurnFromNativeThreshold = value; },
+      get lastCompactionCancel() { return lastCompactionCancel; },
+      set lastCompactionCancel(value) { lastCompactionCancel = value; },
+    },
+  });
+
+  // agent:// data source: capture teammate structured outputs when the tool
+  // result arrives (foreground) or the authoritative completion event fires
+  // (background/detached, whose root tool_result carries empty results).
+  pi.on("tool_result", (event, ctx) => {
+    if ((event as { toolName?: unknown }).toolName !== "teammate") return;
+    try {
+      const details = (event as { details?: unknown }).details as
+        | { results?: unknown; progress?: unknown }
+        | undefined;
+      void persistStructuredResults(
+        compatibilityResults(details?.results),
+        details?.progress,
+        ctx.cwd,
+      ).catch((err) => {
+        console.warn(`[pi-graph-flow] agent output capture failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    } catch (err) {
+      console.warn(`[pi-graph-flow] agent output capture failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  
+
+  
+
+  pi.on("input", (event) => {
+    return goalInput(event);
+  });
+
+  // A hard-threshold intent must settle before the next tool executes.
+  // Top-level batches use block+terminate; a nested call also aborts its outer
+  // operation because nested executors consume terminate locally. agent_settled
+  // remains the single owner of compact() and CONTINUE resume.
+  pi.on("tool_call", (event, ctx) => midTurnAutoCompaction.onToolCall(ctx, event.parentToolCallId));
+
+  // Keep the tool panel stable for prompt-cache reuse; this hook enforces the hard
+  // read-only boundary until Plan approval, before the interactive permission chain.
+  pi.on("tool_call", (event) => onToolCallPlan(event, approvalMode === "bypassPermissions"));
+  registerSearchScopeGuard(pi);
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    // This is Pi's strongest public session-input boundary. It is correlated by
+    // the durable wake marker before any later agent lifecycle is accepted.
+    midTurnAutoCompaction.onBeforeAgentStart(event, ctx);
+    // Pick up compaction settings edited while idle; cached again within the turn.
+    midTurnAutoCompaction.refreshSettings();
+    // Reset per-turn notify error latch so each turn starts clean.
+    notifyController.reset();
+    // Plan owns the stable mode prompt; Goal only acknowledges continuation markers.
+    const planResult = onBeforeAgentStartPlan(event);
+    goalBeforeAgentStart(event);
+    onBeforeAgentStartTodo();
+    return planResult;
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    midTurnAutoCompaction.onAgentStart(ctx);
+  });
+
+  pi.on("context", async (event, ctx) => {
+    try {
+    if (!teammateAttachTodoIsolated) {
+      const branch = ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string }>;
+      if (branch.some((entry) => entry.type === "custom" && entry.customType === TEAMMATE_ATTACH_ENTRY)) {
+        runTodoSourceExecution(captureTodoSourceExecution(ctx), () => isolateTodoForTeammateAttach());
+        teammateAttachTodoIsolated = true;
+      }
+    }
+    const planResult = onContextPlan(event.messages);
+    const todoResult = await onContextTodo(planResult?.messages ?? event.messages, captureTodoSourceExecution(ctx));
+    const messages = todoResult?.messages ?? planResult?.messages ?? event.messages;
+    let pressureMessages: AgentMessage[] | undefined;
+    try {
+      pressureMessages = await midTurnAutoCompaction.evaluate(messages, ctx);
+    } catch (error) {
+      // The context transform must never take down the request: fall back to
+      // the plain messages and surface the failure instead of throwing.
+      ctx.ui.notify(
+        `Mid-turn pressure evaluation failed; continuing without pruning: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    const finalMessages = pressureMessages ?? messages;
+    return { messages: curatorHost?.materialize(ctx, finalMessages) ?? finalMessages };
+    } catch (error) {
+      ctx.ui.notify(`Curator context was withheld after a context transform failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      return { messages: curatorHost?.stripTickets(event.messages) ?? event.messages };
+    }
+  });
+
+  // Persist each recorded prune as a context_edit so the session projection —
+  // not just the request-time transform — carries it across turns, resume, and
+  // forked child sessions.
+  pi.on("turn_end", (event) => {
+    const drafts = midTurnAutoCompaction.contextEditDrafts(event.context.contextEntries);
+    return drafts.length > 0 ? { entries: [...event.entries, ...drafts] } : undefined;
+  });
+
+  pi.on("before_provider_request", (event, ctx) =>
+    midTurnAutoCompaction.beforeProviderRequest(event.payload, ctx));
+
+  // Eight independent end-of-turn side effects across five subsystems. Chained bare, the
+  // first throw skips every step after it — so a Goal failure would silently leave the
+  // Todo widget stale and mid-turn compaction bookkeeping unrun, with no clue which
+  // subsystem broke. Isolate each step and name it in the warning instead.
+  pi.on("agent_end", async (event, ctx) => {
+    const sourceExecution = captureTodoSourceExecution(ctx);
+    const syntheticInterruption = midTurnAutoCompaction.isSyntheticCompactionInterruptionActive();
+    const step = async (label: string, run: () => unknown) => {
+      try {
+        await run();
+      } catch (error) {
+        ctx.ui.notify(
+          `${label} failed at the end of the turn: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+    };
+    await step("Plan", () => onAgentEndPlan(event, ctx));
+    await step("Workflow refresh", () => refreshWorkflow(ctx, true, false, false, sourceExecution));
+    if (!syntheticInterruption) {
+      await step("Goal attempt", () => goalAgentEnd(event, ctx));
+    }
+    await step("Output-limit compaction", () =>
+      midTurnAutoCompaction.onOutputLimit(event.messages as AgentMessage[], ctx));
+    await step("Goal change event", () => emitGoalChanged());
+    await step("Todo", () => onAgentEndTodo());
+    preserveCompletedTurnFromNativeThreshold = shouldPreserveCompletedTurn(
+      event.messages as AgentMessage[],
+      Boolean(ctx.hasPendingMessages?.()),
+    );
+    await step("Todo widget", () => updateTodoWidget());
+  });
+
+  // Model failover registered its agent_settled arbiter before this consolidated
+  // root handler. Goal consumes the authoritative settlement first. An explicit
+  // new-context request wins a same-settlement Plan compact handoff so the Plan
+  // implementation follow-up is delivered only after the deterministic reset.
+  pi.on("agent_settled", async (_event, ctx) => {
+    const syntheticInterruption = midTurnAutoCompaction.isSyntheticCompactionInterruptionActive();
+    const planCompactPending = hasPendingPlanCompactHandoff(ctx);
+    const newContextPending = newContextController.hasPending();
+    try {
+      if (syntheticInterruption) goalProviderPressureSettled(ctx);
+      else await goalAgentSettled(ctx, { suppressContinuation: planCompactPending || newContextPending });
+    } catch (error) {
+      ctx.ui.notify(
+        `Goal settlement failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    try {
+      emitGoalChanged();
+    } catch (error) {
+      ctx.ui.notify(
+        `Goal change event failed after settlement: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    if (newContextPending) {
+      try {
+        await newContextController.onAgentSettled(ctx);
+      } catch (error) {
+        ctx.ui.notify(
+          `New-context settlement failed: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+    }
+    try {
+      onAgentSettledPlan(ctx);
+    } catch (error) {
+      ctx.ui.notify(
+        `Plan settlement failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    if (!newContextPending) {
+      try {
+        await newContextController.onAgentSettled(ctx);
+      } catch (error) {
+        ctx.ui.notify(
+          `New-context settlement failed: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+    }
+    try {
+      await midTurnAutoCompaction.onAgentEnd(ctx);
+    } catch (error) {
+      ctx.ui.notify(
+        `Settled context compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    } finally {
+      preserveCompletedTurnFromNativeThreshold = false;
+    }
+  });
+
+  pi.on("tool_execution_end", async (event, ctx) => {
+    const sourceExecution = captureTodoSourceExecution(ctx);
+    if (event.toolName === "todo") updateTodoWidget();
+    if (event.toolName === "goal") emitGoalChanged();
+    const command = event.toolName === "bash"
+      ? String((event as { input?: { command?: unknown } }).input?.command ?? "")
+      : "";
+    // Knowledge evolution operations (record/stage/promote/review/load/search)
+    // change attribution or candidates; refresh the UI snapshot and GUI state so
+    // the current Session's knowledge view stays live.
+    if (event.toolName === "bash" && /\bmaestro\s+(?:knowledge\s+(?:record|stage|promote|review|reconcile)|load|search)\b/.test(command)) {
+      guiEvents.emit(GUI_EVENTS.stateChanged, { subsystem: "knowledge", at: Date.now() });
+      const knowledgeSessionId = workflowArtifactKnowledgeSessionId(
+        workflowSnapshotForUi(),
+        workflowSessionOptedIn,
+        attachedWorkflowSessionId,
+      );
+      if (!event.isError && knowledgeSessionId) await refreshKnowledgePendingStatus(ctx, knowledgeSessionId);
+      else publishMaestroUi();
+      if (!event.isError && /\bmaestro\s+knowledge\s+stage\b/.test(command)) {
+        const result: FlowToolResult = event.result;
+        const output = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+        const target = stagedKnowledgeCloseoutTarget(output);
+        if (target) requestKnowledgeCloseout(ctx, [target]);
+      }
+    }
+    // Session/Run lifecycle writes (run/session/execution/artifact/ralph) refresh
+    // the canonical Workflow snapshot. The v3 surface (run next/complete,
+    // session complete/chain, ...) carries no v2 mutation-lease semantics; the
+    // refresh below re-projects session/run state and the v3 complete receipts
+    // captured here fire the knowledge pipeline (session complete /
+    // run complete --advance -> knowledge review), mirroring the legacy
+    // execution-seal transition detector.
+    if (event.toolName === "run-control" || /\bmaestro\s+(?:run|session|execution|artifact|ralph)\b/.test(command)) {
+      const runControlArgv = event.toolName === "run-control"
+        ? Array.isArray((event as { input?: { argv?: unknown } }).input?.argv)
+          ? ((event as { input?: { argv?: unknown } }).input!.argv as unknown[]).map(String)
+          : []
+        : [];
+      const allowOptIn = event.toolName === "run-control"
+        ? Boolean(runControlArgv.length && !isRunControlReadArgv(runControlArgv))
+        : isWorkflowOptInCommand(command);
+      const completeReceipt = v3CompleteReceipt(command, runControlArgv);
+      if (!event.isError && completeReceipt && workflowBridge) pendingV3CompleteReceipts.push(completeReceipt);
+      await refreshWorkflow(ctx, true, allowOptIn, allowOptIn, sourceExecution);
+    }
+  });
+
+  // Hook denial runs after Plan's advisory tool_call pass and before the interactive prompt.
+  const hookAdapter = registerCodexHookAdapter(pi, {
+    getPermissionMode: () => effectivePermissionMode(approvalMode),
+    shouldSkipStopHook: () => midTurnAutoCompaction.shouldSkipStopHook(),
+    onCompactionCancelled: () => {
+      compactionArbiter.complete("cancel");
+      goalCompactionCancelled();
+      lastCompactionCancel = {
+        reason: "PreCompact hook rejected the compaction",
+        at: Date.now(),
+      };
+    },
+  });
+  const requireFlowSettingsContext = (surface: string): ExtensionContext | undefined => {
+    const ctx = flowSettingsContext;
+    if (!ctx) console.error(`[maestro] Cannot open ${surface}: no active Flow session context`);
+    else if (!ctx.hasUI) ctx.ui.notify(flowTuiText("surface.needTui", { surface }), "warning");
+    return ctx?.hasUI ? ctx : undefined;
+  };
+  /** Run an action with a unified status-line lifecycle (set before, clear after). */
+  const withActionStatus = async (status: string, run: (ctx: ExtensionContext) => Promise<string | void> | string | void): Promise<string | void> => {
+    const ctx = requireFlowSettingsContext(status);
+    if (!ctx) return undefined;
+    ctx.ui.setStatus("maestro-settings", status);
+    try {
+      return await run(ctx);
+    } finally {
+      ctx.ui.setStatus("maestro-settings", undefined);
+    }
+  };
+  const flowSettingsProvider = createFlowSettingsProvider({
+    getAgentResponseLanguage: () => chineseResponseMode.isEnabled() ? "zh-CN" : "default",
+    getPermissionOverview: () => permissionController.overview(effectivePermissionMode(approvalMode)),
+    actions: {
+      "compaction.manage": () => withActionStatus(flowTuiText("compaction.opening"), async (ctx) => {
+        await showCompactionSettingsOverlay(ctx as ExtensionCommandContext);
+      }),
+      "failover.manage": () => withActionStatus(flowTuiText("failover.opening"), async (ctx) => {
+        await showModelFailoverOverlay(ctx, sharedModelCircuitBreaker);
+      }),
+      "responseLanguage.manage": () => withActionStatus(flowTuiText("response.opening"), async (ctx) => {
+        chineseResponseMode.toggle(ctx);
+        return chineseResponseMode.isEnabled() ? flowTuiText("response.zh") : flowTuiText("response.default");
+      }),
+      "skills.manage": () => withActionStatus(flowTuiText("skills.opening"), async (ctx) => {
+        const result = await runSkillManager(ctx, new SkillManagerStore(ctx.cwd));
+        if (result.configChanged) ctx.ui.notify(flowTuiText("skills.reload"), "info");
+      }),
+      "mcp.manage": () => withActionStatus(flowTuiText("mcp.opening"), async (ctx) => {
+        if (mcpAdapterHandle) await mcpAdapterHandle.openManager(ctx);
+        else if (hostMode === "native") {
+          const nativeMcpLoaded = pi.getCommands().some((command) => command.name === "mcp" && command.sourceInfo.path === "builtin:mcp");
+          if (!nativeMcpLoaded) {
+            ctx.ui.notify("Native MCP is supported but is disabled or replaced by another extension. Enable builtin:mcp to use the native manager; Maestro does not start a substitute.", "warning");
+          } else {
+            if (ctx.hasUI && ctx.ui.getEditorText() === "") ctx.ui.setEditorText("/mcp");
+            ctx.ui.notify("Run /mcp for Pi's native manager. Before upgrading legacy config, disable builtin:mcp and use /maestro-mcp-migrate to preview and approve migration; native startup reads mcp.json before this command can migrate it.", "info");
+          }
+        }
+        else ctx.ui.notify(flowTuiText("mcp.unavailable"), "warning");
+      }),
+      "hooks.manage": () => withActionStatus(flowTuiText("hooks.opening"), async (ctx) => {
+        await hookAdapter.openSettings(ctx);
+      }),
+    },
+  });
+  // Settings providers re-register at each session boundary so a host reload
+  // cannot accumulate stale shared-bus listeners from previous instances
+  // (see issue ISS-20260803-005; cockpit follows the same pattern).
+  let flowSettingsDisposer: (() => void) | undefined;
+  const registerFlowSettings = (): void => {
+    if (flowSettingsDisposer) return;
+    flowSettingsDisposer = registerFlowSettingsProvider(pi.events, flowSettingsProvider);
+  };
+  const disposeFlowSettings = (): void => {
+    flowSettingsDisposer?.();
+    flowSettingsDisposer = undefined;
+  };
+  const openApiManager = async (args: string, surface: string): Promise<void> => {
+    const ctx = requireFlowSettingsContext(surface);
+    if (!ctx) return;
+    if (!apiProviderHandle) {
+      ctx.ui.notify("API provider manager is unavailable.", "warning");
+      return;
+    }
+    ctx.ui.setStatus("maestro-settings", `正在打开 ${surface}…`);
+    try {
+      await apiProviderHandle.openManager(ctx as ExtensionCommandContext, args);
+    } finally {
+      ctx.ui.setStatus("maestro-settings", undefined);
+    }
+  };
+  const apiManagerSettingsProvider = createApiManagerSettingsProvider({
+    actions: {
+      "api.manage": () => openApiManager("", "API provider manager"),
+      "api.configure": () => openApiManager("configure", "API provider editor"),
+      "api.retry": () => openApiManager("retry", "API retry settings"),
+      "api.cache": () => openApiManager("cache", "Prompt cache policy"),
+      "api.nextsuggest": () => openApiManager("nextsuggest", "Next-step suggestion settings"),
+      "api.ocr": () => openApiManager("ocr", "OCR review settings"),
+      "api.enhance": () => openApiManager("enhance", "Prompt enhance settings"),
+      "api.prompt-enhance": () => openApiManager("prompt-enhance", "Prompt enhance (optimize) settings"),
+      "api.optimize": () => openApiManager("optimize", "Prompt optimize settings"),
+      "api.list": () => openApiManager("list", "API provider overview"),
+      "api.filter": () => openApiManager("filter", "Teammate model filter"),
+    },
+  });
+  let apiManagerSettingsDisposer: (() => void) | undefined;
+  const registerApiManagerSettings = (): void => {
+    if (apiManagerSettingsDisposer) return;
+    apiManagerSettingsDisposer = registerApiManagerSettingsProvider(pi.events, apiManagerSettingsProvider);
+  };
+  const disposeApiManagerSettings = (): void => {
+    apiManagerSettingsDisposer?.();
+    apiManagerSettingsDisposer = undefined;
+  };
+  // Provider-only registrations: mcp/skills/smart-search expose their managed
+  // state through the settings shell without a legacy action surface.
+  const mcpSettingsProvider = createMcpSettingsProvider({});
+  let mcpSettingsDisposer: (() => void) | undefined;
+  const registerMcpSettings = (): void => {
+    if (mcpSettingsDisposer || mcpOwner !== "legacy" || !mcpAdapterHandle) return;
+    mcpSettingsDisposer = registerMcpSettingsProvider(pi.events, mcpSettingsProvider);
+  };
+  const disposeMcpSettings = (): void => {
+    mcpSettingsDisposer?.();
+    mcpSettingsDisposer = undefined;
+  };
+  const skillsSettingsProvider = createSkillsSettingsProvider({});
+  let skillsSettingsDisposer: (() => void) | undefined;
+  const registerSkillsSettings = (): void => {
+    if (skillsSettingsDisposer) return;
+    skillsSettingsDisposer = registerSkillsSettingsProvider(pi.events, skillsSettingsProvider);
+  };
+  const disposeSkillsSettings = (): void => {
+    skillsSettingsDisposer?.();
+    skillsSettingsDisposer = undefined;
+  };
+  const smartSearchSettingsProvider = createSmartSearchSettingsProvider({});
+  let smartSearchSettingsDisposer: (() => void) | undefined;
+  const registerSmartSearchSettings = (): void => {
+    if (smartSearchSettingsDisposer) return;
+    smartSearchSettingsDisposer = registerSmartSearchSettingsProvider(pi.events, smartSearchSettingsProvider);
+  };
+  const disposeSmartSearchSettings = (): void => {
+    smartSearchSettingsDisposer?.();
+    smartSearchSettingsDisposer = undefined;
+  };
+
+  const visionDelegationSettingsProvider = createVisionDelegationSettingsProvider({});
+  let visionDelegationSettingsDisposer: (() => void) | undefined;
+  const registerVisionDelegationSettings = (): void => {
+    if (visionDelegationSettingsDisposer) return;
+    visionDelegationSettingsDisposer = registerVisionDelegationSettingsProvider(pi.events, visionDelegationSettingsProvider);
+  };
+  const disposeVisionDelegationSettings = (): void => {
+    visionDelegationSettingsDisposer?.();
+    visionDelegationSettingsDisposer = undefined;
+  };
+
+  const exploreSettingsProvider = createExploreSettingsProvider({});
+  let exploreSettingsDisposer: (() => void) | undefined;
+  const registerExploreSettings = (): void => {
+    if (exploreSettingsDisposer) return;
+    exploreSettingsDisposer = registerExploreSettingsProvider(pi.events, exploreSettingsProvider);
+  };
+  const disposeExploreSettings = (): void => {
+    exploreSettingsDisposer?.();
+    exploreSettingsDisposer = undefined;
+  };
+
+  const hooksSettingsProvider = createHooksSettingsProvider({});
+  let hooksSettingsDisposer: (() => void) | undefined;
+  const registerHooksSettings = (): void => {
+    if (hooksSettingsDisposer) return;
+    hooksSettingsDisposer = registerHooksSettingsProvider(pi.events, hooksSettingsProvider);
+  };
+  const disposeHooksSettings = (): void => {
+    hooksSettingsDisposer?.();
+    hooksSettingsDisposer = undefined;
+  };
+
+  // The backends this build ships. Each descriptor carries the module specifier
+  // the registry loader resolves, so a document written from the shell names
+  // something importable rather than the registration's own name.
+  const teammateBackendDescriptors: readonly BackendDescriptor[] = [
+    { name: PI_SUBPROCESS, module: PI_SUBPROCESS, configFields: PI_SUBPROCESS_CONFIG_FIELDS, catalogs: PI_SUBPROCESS_SETTINGS_CATALOGS },
+    {
+      name: dshBackend.name,
+      module: "pi-maestro-backends/dsh",
+      configFields: dshBackend.configFields,
+      catalogs: DSH_SETTINGS_CATALOGS,
+    },
+    // One descriptor serves every ACP CLI: a deployment registers the module
+    // once per tool with its own command, so the shell renders each
+    // registration's fields — including the model picker, whose values come
+    // from that registration's own agent rather than from this build.
+    {
+      name: acpCliBackend.name,
+      module: "pi-maestro-teammate/v1/acp-cli",
+      configFields: acpCliBackend.configFields,
+      catalogs: ACP_CLI_SETTINGS_CATALOGS,
+      ...(acpCliBackend.listConfigOptions === undefined
+        ? {}
+        : { listConfigOptions: acpCliBackend.listConfigOptions.bind(acpCliBackend) }),
+    },
+  ];
+  const teammateBackendsSettingsProvider = createTeammateBackendsSettingsProvider({
+    workspaceRoot: process.cwd(),
+    backends: teammateBackendDescriptors,
+  });
+  let teammateBackendsSettingsDisposer: (() => void) | undefined;
+  const registerTeammateBackendsSettings = (): void => {
+    if (teammateBackendsSettingsDisposer) return;
+    teammateBackendsSettingsDisposer = registerTeammateBackendsSettingsProvider(
+      pi.events,
+      teammateBackendsSettingsProvider,
+    );
+  };
+  const disposeTeammateBackendsSettings = (): void => {
+    teammateBackendsSettingsDisposer?.();
+    teammateBackendsSettingsDisposer = undefined;
+  };
+  pi.on("session_start", (_event, ctx) => {
+    flowSettingsContext = ctx;
+    registerFlowSettings();
+    registerApiManagerSettings();
+    registerMcpSettings();
+    registerSkillsSettings();
+    registerSmartSearchSettings();
+    registerVisionDelegationSettings();
+    registerExploreSettings();
+    registerHooksSettings();
+    registerTeammateBackendsSettings();
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (flowSettingsContext === ctx) flowSettingsContext = undefined;
+    disposeFlowSettings();
+    disposeApiManagerSettings();
+    disposeMcpSettings();
+    disposeSkillsSettings();
+    disposeSmartSearchSettings();
+    disposeVisionDelegationSettings();
+    disposeExploreSettings();
+    disposeHooksSettings();
+    disposeTeammateBackendsSettings();
+  });
+
+  const teammatePermissionBroker: TeammatePermissionBroker = async (call, ctx) => {
+    const planBlock = onToolCallPlan(call, approvalMode === "bypassPermissions");
+    if (planBlock) return { action: "deny", reason: planBlock.reason };
+    const hookBlock = await hookAdapter.beforeToolCall(call, ctx);
+    if (hookBlock) return { action: "deny", reason: hookBlock.reason };
+    const block = await permissionController.authorize(
+      call,
+      ctx,
+      effectivePermissionMode(approvalMode),
+      hookAdapter,
+    );
+    if (block) return { action: "deny", reason: block.reason };
+    return { action: "allow_once" as const, updatedInput: call.input };
+  };
+
+  // UCL permission gateway: GUI tool invocation runs the exact same chain as the
+  // LLM tool-call path (advisory plan pass -> codex hooks -> authorize). The
+  // interactive approval prompt (ctx.ui.select) surfaces over RPC as
+  // extension_ui_request for the GUI to answer.
+  function buildGuiPermissionGateway(ctx: ExtensionContext): GuiPermissionGateway {
+    const mode = (): PermissionMode => effectivePermissionMode(approvalMode);
+    return {
+      mode,
+      authorize: async (toolName, input, signal) => {
+        signal.throwIfAborted();
+        const call = { toolName, input };
+        const planBlock = onToolCallPlan(call, approvalMode === "bypassPermissions");
+        if (planBlock) return { block: true, reason: planBlock.reason };
+        const hookBlock = await hookAdapter.beforeToolCall(call, ctx);
+        signal.throwIfAborted();
+        if (hookBlock) return { block: true, reason: hookBlock.reason };
+        const block = await permissionController.authorize(call, ctx, mode(), hookAdapter);
+        signal.throwIfAborted();
+        if (block) return { block: true, reason: block.reason };
+        return undefined;
+      },
+    };
+  }
+
+  async function activateTeammateSessionRegistrations(ctx: ExtensionContext): Promise<void> {
+    await disposeTeammateSessionRegistrations();
+    const generation = ++teammateRegistrationGeneration;
+    const nextDisposers: Array<() => void> = [];
+    try {
+      // Teammates run in separate Pi processes. These registrations are scoped
+      // to the live root session so a reload cannot retain stale child or Todo
+      // projection authority. Projection reads only immutable prompt fields;
+      // the awaited Task dispatch owner alone prepares assignment/activation.
+      nextDisposers.push(registerFlowTodoPromptContextProvider());
+      nextDisposers.push(registerTaskDispatchProvider(getTaskDispatchBindingProvider()));
+      nextDisposers.push(registerTeammateChildExtension(teammateExtensionPath, {
+        tools: MAESTRO_CHILD_TOOL_NAMES,
+      }));
+      nextDisposers.push(registerTeammateChildToolBroker(CHILD_MODEL_BUDGET_BROKER, async request => {
+        const fail = (error: unknown) => ({ content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true, details: {} });
+        try {
+          if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) throw new Error("Parent budget registration changed");
+          const parent = readChildTodoParentContext(request.parentContext);
+          assertTodoSourceScope(parent.sourceScope);
+          const source = readTodoSourceHost(parent.sourceScope);
+          if (source.manager !== ctx.sessionManager || source.cwd !== ctx.cwd || request.actor.correlationId !== parent.correlationId) throw new Error("Parent model source or actor mismatch");
+          if (!parent.modelBudget) throw new Error("Actual child model budget invocation is unavailable");
+          const input = request.input;
+          if (input.op === "open" && Object.keys(input).length === 1) {
+            const details = await parent.modelBudget.open();
+            readChildTodoParentContext(request.parentContext);
+            if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) throw new Error("Parent budget registration changed during handshake");
+            return { content: [], details };
+          }
+          if (input.op === "prepare" && Object.keys(input).sort().join(",") === "nonce,op,requestId"
+            && typeof input.nonce === "string" && typeof input.requestId === "string") {
+            const signals = [parent.signal, request.signal].filter((signal): signal is AbortSignal => signal !== undefined);
+            const details = await parent.modelBudget.prepare(input.nonce, input.requestId, { signal: signals.length ? AbortSignal.any(signals) : undefined });
+            readChildTodoParentContext(request.parentContext);
+            if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) throw new Error("Parent budget registration changed during reservation");
+            return { content: [], details };
+          }
+          if (input.op === "mark" && Object.keys(input).sort().join(",") === "claim,digest,entryId,nonce,op"
+            && typeof input.nonce === "string" && typeof input.claim === "string" && typeof input.entryId === "string" && typeof input.digest === "string") {
+            await parent.modelBudget.mark(input.nonce, input.claim, input.entryId, input.digest);
+            readChildTodoParentContext(request.parentContext);
+            if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) throw new Error("Parent budget registration changed during mark");
+            return { content: [], details: { marked: true } };
+          }
+          if (input.op !== "authorize-none" || Object.keys(input).sort().join(",") !== "nonce,op,requestId" || typeof input.nonce !== "string" || typeof input.requestId !== "string") throw new Error("Invalid fixed child model budget operation");
+          await parent.modelBudget.authorizeNone(input.nonce, input.requestId);
+          readChildTodoParentContext(request.parentContext);
+          if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) throw new Error("Parent budget registration changed during authorization");
+          return { content: [], details: { authorized: true } };
+        } catch (error) { return fail(error); }
+      }, { owner: `${teammateAuthorityOwner}:model-budget` }));
+      nextDisposers.push(registerTeammateChildToolBroker("todo", async (request) => {
+        if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) {
+          return {
+            content: [{ type: "text", text: "Root Todo authority belongs to a newer session generation." }],
+            isError: true,
+            details: {},
+          };
+        }
+        return childTodoBroker(request);
+      }, { owner: `${teammateAuthorityOwner}:todo` }));
+      nextDisposers.push(registerTeammateChildToolBroker(NEW_CONTEXT_RECOVERY_BROKER_NAME, async (request) => {
+        if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) {
+          return {
+            content: [{ type: "text", text: "Root recovery authority belongs to a newer session generation." }],
+            isError: true,
+            details: {},
+          };
+        }
+        if (!request.actor.correlationId || request.actor.correlationId === "unknown") {
+          return {
+            content: [{ type: "text", text: "Teammate recovery request has no trusted correlation id." }],
+            isError: true,
+            details: {},
+          };
+        }
+        // Child and root have different Pi session ids. The registration
+        // generation and trusted child correlation id fence this request;
+        // never compare the child's id with the root id here.
+        const rootSessionId = (ctx.sessionManager as { getSessionId?: () => string }).getSessionId?.() ?? "unknown-session";
+        const workflow = workflowRecoveryIdentity();
+        const recoveryState: MaestroRecoveryState = {
+          todo: getTodoCompactionSnapshot(),
+          goal: getGoalCompactionSnapshot(),
+          plan: getPlanCompactionSnapshot(),
+          ...(workflow ? { workflow } : {}),
+        };
+        return {
+          content: [{ type: "text", text: "Root recovery state refreshed." }],
+          details: { recoveryState, sessionId: rootSessionId },
+        };
+      }, { owner: `${teammateAuthorityOwner}:new-context-recovery` }));
+      nextDisposers.push(registerTeammateChildToolBroker("browser", async (request) => {
+        if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) {
+          return {
+            content: [{ type: "text", text: "Root browser authority belongs to a newer session generation." }],
+            isError: true,
+            details: {},
+          };
+        }
+        return childBrowserBroker.execute(request, ctx);
+      }, { owner: `${teammateAuthorityOwner}:browser` }));
+      nextDisposers.push(registerTeammateChildToolBroker("computer_use", async (request) => {
+        if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) {
+          return {
+            content: [{ type: "text", text: "Root computer-use authority belongs to a newer session generation." }],
+            isError: true,
+            details: {},
+          };
+        }
+        return childComputerUseBroker.execute(request, ctx);
+      }, { owner: `${teammateAuthorityOwner}:computer_use` }));
+      nextDisposers.push(registerTeammateChildToolBroker("search", async (request) => {
+        if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) {
+          return {
+            content: [{ type: "text", text: "Root search authority belongs to a newer session generation." }],
+            isError: true,
+            details: {},
+          };
+        }
+        const blocked = await searchScopeBlockReason("search", request.input, ctx.cwd);
+        if (blocked) {
+          return { content: [{ type: "text", text: blocked }], isError: true, details: {} };
+        }
+        try {
+          return await fffSearch.search(request.input as unknown as SearchToolInput, ctx.cwd, request.signal);
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+            isError: true,
+            details: {},
+          };
+        }
+      }, { owner: `${teammateAuthorityOwner}:search` }));
+      nextDisposers.push(registerTeammateChildToolBroker("ask-user-question", async (request) => {
+        if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx || request.actor.correlationId === "unknown") {
+          return { content: [{ type: "text", text: "Root question authority is unavailable or belongs to a newer session." }], isError: true, details: {} };
+        }
+        // The task cwd is supplied by the parent's active-run registry, not child params.
+        const questionCtx = Object.create(ctx) as ExtensionContext;
+        Object.defineProperty(questionCtx, "cwd", { value: request.actor.cwd ?? ctx.cwd });
+        return executeAsk(request.input as unknown as AskParams, questionCtx, {
+          signal: request.signal,
+          humanOnly: isDecisionPolicyConfiguring(ctx) || !request.actor.cwd || request.actor.cwd.startsWith("remote:"),
+          resolveAskGrant: () => generation === teammateRegistrationGeneration ? resolveRootAskGrant(ctx, request.actor) : undefined,
+          onUserAttention: notifyController.requestInput,
+          requestId: `question:${request.actor.correlationId}`,
+        });
+      }, { owner: `${teammateAuthorityOwner}:ask-user-question` }));
+      const sessionPermissionBroker: TeammatePermissionBroker = async (call, requestCtx) => {
+        if (generation !== teammateRegistrationGeneration) {
+          return { action: "deny", reason: "Root permission authority belongs to a newer session generation." };
+        }
+        return teammatePermissionBroker(call, requestCtx);
+      };
+      nextDisposers.push(registerTeammatePermissionBroker(
+        sessionPermissionBroker,
+        { owner: `${teammateAuthorityOwner}:permission` },
+      ));
+      teammateRegistrationDisposers = nextDisposers;
+    } catch (error) {
+      for (const dispose of nextDisposers.reverse()) dispose();
+      teammateRegistrationGeneration++;
+      throw error;
+    }
+  }
+
+  async function disposeTeammateSessionRegistrations(): Promise<void> {
+    teammateRegistrationGeneration++;
+    const disposers = teammateRegistrationDisposers;
+    teammateRegistrationDisposers = [];
+    for (const dispose of disposers.reverse()) dispose();
+    trackChildBrowserCleanup(childBrowserBroker.closeAll());
+    trackChildComputerUseCleanup(childComputerUseBroker.closeAll());
+    await Promise.all([...childBrowserCleanups, ...childComputerUseCleanups]);
+  }
+
+  pi.on("tool_call", async (event, ctx) => permissionController.authorize(
+    event,
+    ctx,
+    effectivePermissionMode(approvalMode),
+    hookAdapter,
+  ));
+}
+
+/**
+ * Teammate children inherit this extension for interaction and permission RPC.
+ * They must not register the root Workflow/Goal/Todo lifecycle because only the
+ * parent Pi session may own the canonical continuation lease.
+ */
+function registerMaestroChildSurface(pi: ExtensionAPI, hostLspManager: LspManager = lspManager): void {
+  const childActorId = process.env.PI_TEAMMATE_CORRELATION_ID ?? "child";
+  const compactionArbiter = new CompactionArbiter();
+  const newContextController = createNewContextController(compactionArbiter, {
+    continueAfterReset(_ctx, request) {
+      // A child must use the root-authorized snapshot, never another actor's local queue.
+      const message = request.recoveryState
+        ? buildNewContextContinuation({ ...request.recoveryState, newContext: request })
+        : "Continue from the recovery capsule. Root-authorized recovery state is unavailable; retrieve your own live Todo and scope before acting. Do not infer authorization or restart a Plan from its presence.";
+      // Match automatic recovery: at an idle compaction callback start a new
+      // prompt, rather than relying on a future follow-up drain boundary.
+      pi.sendUserMessage(message, _ctx.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
+    },
+    async refreshRecoveryState(request, ctx) {
+      const sessionId = (ctx.sessionManager as { getSessionId?: () => string }).getSessionId?.() ?? "unknown-session";
+      const result = await proxyTeammateChildTool<{ recoveryState?: MaestroRecoveryState }>(
+        NEW_CONTEXT_RECOVERY_BROKER_NAME,
+        { requestId: request.requestId, sessionId },
+      );
+      if ((result as { isError?: boolean }).isError) {
+        const text = result.content.find((item) => item.type === "text");
+        throw new Error(text && "text" in text ? text.text : "Root recovery state broker rejected the request");
+      }
+      const recoveryState = result.details?.recoveryState;
+      if (!recoveryState) throw new Error("Root-authorized recovery state was unavailable");
+      return recoveryState;
+    },
+  });
+  const newContextToolSurface = createNewContextToolSurface(pi, () => {
+    registerNewContextTool(pi, newContextController, childActorId);
+  });
+  const autoCompaction = createMidTurnAutoCompaction(pi, { arbiter: compactionArbiter });
+  let preserveCompletedTurnFromNativeThreshold = false;
+  let childEpoch = 0;
+  let childLifecycle: Readonly<{ epoch: number; manager: ExtensionContext["sessionManager"]; sessionId: string }> | undefined;
+  const isCurrentChildLifecycle = (lifecycle: NonNullable<typeof childLifecycle>, ctx: ExtensionContext): boolean => {
+    if (childLifecycle !== lifecycle) return false;
+    // SDK metadata getters reject retired contexts. Unreadable identity means
+    // this callback has no current lifecycle; business/controller errors are
+    // handled separately and retain their original active-session warnings.
+    try {
+      return ctx.sessionManager === lifecycle.manager
+        && lifecycle.manager.getSessionId() === lifecycle.sessionId;
+    } catch { return false; }
+  };
+  const captureChildLifecycle = (ctx: ExtensionContext) => {
+    const lifecycle = childLifecycle;
+    return lifecycle && isCurrentChildLifecycle(lifecycle, ctx) ? lifecycle : undefined;
+  };
+
+  pi.on("session_start", (event, ctx) => {
+    childLifecycle = undefined;
+    const manager = ctx.sessionManager;
+    childLifecycle = Object.freeze({ epoch: ++childEpoch, manager, sessionId: manager.getSessionId() });
+    preserveCompletedTurnFromNativeThreshold = false;
+    compactionArbiter.reset();
+    newContextToolSurface.sync(newContextToolsEnabled(ctx.cwd));
+    newContextController.onSessionStart(ctx);
+    autoCompaction.onSessionStart(ctx, event);
+  });
+  pi.on("before_agent_start", (event, ctx) => {
+    if (!captureChildLifecycle(ctx)) return;
+    autoCompaction.onBeforeAgentStart(event, ctx);
+    newContextToolSurface.sync(newContextToolsEnabled(ctx.cwd));
+  });
+  pi.on("agent_start", (_event, ctx) => {
+    if (!captureChildLifecycle(ctx)) return;
+    autoCompaction.onAgentStart(ctx);
+  });
+  // Nested gates abort the outer child operation; top-level batches still settle through terminate.
+  pi.on("tool_call", (event, ctx) => {
+    if (!captureChildLifecycle(ctx)) return;
+    return autoCompaction.onToolCall(ctx, event.parentToolCallId);
+  });
+  registerSearchScopeGuard(pi);
+  pi.on("context", async (event, ctx) => {
+    const lifecycle = captureChildLifecycle(ctx);
+    if (!lifecycle) return;
+    try {
+      const messages = await autoCompaction.evaluate(event.messages, ctx);
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+      return messages ? { messages } : undefined;
+    } catch (error) {
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+      ctx.ui.notify(
+        `Mid-turn pressure evaluation failed; continuing without pruning: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+      return undefined;
+    }
+  });
+  pi.on("turn_end", (event, ctx) => {
+    if (!captureChildLifecycle(ctx)) return;
+    const drafts = autoCompaction.contextEditDrafts(event.context.contextEntries);
+    return drafts.length > 0 ? { entries: [...event.entries, ...drafts] } : undefined;
+  });
+  pi.on("before_provider_request", (event, ctx) => {
+    if (!captureChildLifecycle(ctx)) return;
+    return autoCompaction.beforeProviderRequest(event.payload, ctx);
+  });
+  pi.on("agent_end", async (event, ctx) => {
+    const lifecycle = captureChildLifecycle(ctx);
+    if (!lifecycle) return;
+    try {
+      await autoCompaction.onOutputLimit(event.messages as AgentMessage[], ctx);
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+    } catch (error) {
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+      ctx.ui.notify(
+        `Child output-limit compaction failed at the end of the turn: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+    preserveCompletedTurnFromNativeThreshold = shouldPreserveCompletedTurn(
+      event.messages as AgentMessage[],
+      Boolean(ctx.hasPendingMessages?.()),
+    );
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    const lifecycle = captureChildLifecycle(ctx);
+    if (!lifecycle) return;
+    try {
+      await newContextController.onAgentSettled(ctx);
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+    } catch (error) {
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+      ctx.ui.notify(
+        `Child new-context settlement failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+    try {
+      await autoCompaction.onAgentEnd(ctx);
+    } catch (error) {
+      if (!isCurrentChildLifecycle(lifecycle, ctx)) return;
+      ctx.ui.notify(
+        `Child settled context compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    } finally {
+      if (isCurrentChildLifecycle(lifecycle, ctx)) preserveCompletedTurnFromNativeThreshold = false;
+    }
+  });
+  registerChildCompactionHooks(modelOriginApi(pi), {
+    compactionArbiter, newContextController, autoCompaction,
+    state: {
+      get preserveCompletedTurnFromNativeThreshold() { return preserveCompletedTurnFromNativeThreshold; },
+      set preserveCompletedTurnFromNativeThreshold(value) { preserveCompletedTurnFromNativeThreshold = value; },
+    },
+  });
+  
+  
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (!captureChildLifecycle(ctx)) return;
+    // Retire before any controller or async cleanup; an old finally cannot
+    // clear a replacement epoch or read its predecessor's stale SDK context.
+    childLifecycle = undefined;
+    autoCompaction.onSessionShutdown(ctx);
+    preserveCompletedTurnFromNativeThreshold = false;
+    newContextController.onSessionShutdown();
+    newContextToolSurface.deactivate();
+    compactionArbiter.reset();
+    await hostLspManager.shutdown();
+  });
+
+  registerAskUserQuestionTool(pi);
+  registerBashBg(pi);
+  registerTeammateSessionRouting(pi);
+  registerSmartSearchTool(pi);
+  pi.registerTool(createSourceCheckTool() as never);
+  registerResourceTool(pi);
+  registerSessionHistoryTool(pi);
+  registerGatewayBoardTool(pi);
+  registerGatewayFabricTools(pi);
+  pi.registerTool(createLspTool(hostLspManager) as never);
+  pi.registerTool(createTeammateChildBrowserTool());
+  pi.registerTool(createTeammateChildComputerUseTool());
+  const todoProxyTool: ToolDefinition<typeof TodoModelParams> = {
+    name: "todo",
+    label: "Todo",
+    description: `Manage the shared root Todo list from this teammate.
+
+Tasks created here are attributed to this teammate and assigned to self by default.
+create returns a compact index (up to 20 entries, then remaining IDs). list discovers tasks without detail/summaries; offset/limit count filtered tasks (0-based, default 20, max 50). get returns a bounded overview with resourceUris; field/offset/limit page full details or summary (Unicode code points, default 4096, max 16384; field defaults to all when paging). advance returns a completion receipt and the next task's bounded execution brief. Related summaries come from the same plan, or the same assignee only when no plan is bound. Follow Continue/read hints only when more information is needed; never automatically drain every page.
+Use assignee="root" to hand work back to root. Teammates can update tasks they created or were assigned; only root can clear the shared list.
+
+${TODO_RESOURCE_URI_GUIDANCE}
+Todo is a tool, not a shell command; call it with structured arguments rather than running \`todo update\` in Bash.
+
+If root delegated a task to you (spawned with todo: "<id>"), it is usually already active (in_progress) — check with \`todo list\`, work on it, and immediately finish it with \`todo advance\` using that id, a one-line summary, optional resourceUris/handoff, and optional transition (keep_context|new_context). Advance only completes or activates tasks assigned to you. Use \`todo advance\` without id/summary/resourceUris/handoff when you have no active task and need to activate your next assigned task. Use a single \`todo update\` with transition=new_context to persist intermediate progress on your active task before scheduling a reset; use ordinary update when blocked, paused, or completing without continuing.`,
+    promptSnippet: "Keep teammate-owned tasks live in the shared root Todo list and advance each one immediately when its work finishes.",
+    promptGuidelines: [
+      "Use todo for newly discovered follow-up work, explicit blockers, and resumable steps.",
+      "Todo is live state tracking: immediately when your active task finishes, call todo advance with its id and summary before doing work for another Todo; never defer several completions until your final answer.",
+      "Keep context to current progress and the exact next action; summaries should record outcome, evidence, decisions, and downstream impact. Attach durable resourceUris using exact immutable publication IDs when available.",
+      "Use durable Todo.handoff for up to 3 ordered next steps and task-relative file values: required, conditional with an explicit trigger, skip, or unknown. Only provide nextSteps when an authorized later phase exists; for final or blocked work, explicitly clear stale nextSteps with an empty array and report or settle instead of inventing work.",
+      "Transitions are request-only: active completion-form advance accepts keep_context or new_context; a single update of your active in_progress task accepts only new_context so progress/handoff/resources commit before reset scheduling. new_context requires compaction.newContext.enabled=true and otherwise fails before Todo mutation; receipts are not persisted.",
+      "When a completed todo advance result includes [context-pressure-advisory], inspect the task activated in that same result. Dynamic reminders exist only at this Todo completion checkpoint: late auto-prune recommends new_context, while critical makes it a priority before beginning the next Todo. Call the standalone new_context tool only if a next phase exists, persisted state is sufficient, the boundary is loosely coupled, and no messages are pending; otherwise continue or settle. During active Todo work, automatic compaction remains the capacity fallback. The advisory cannot change the completed advance retroactively and must not be carried to an unrelated Todo; never infer a pressure reminder without a Todo completion checkpoint.",
+      "Advance is actor-scoped. Complete, block, or pause your active Todo before activating another task assigned to you; a final-answer Todo check is recovery only, not the normal update boundary.",
+    ],
+    parameters: TodoModelParams,
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (!Check(TodoToolParams, params)) {
+        return { content: [{ type: "text", text: formatTodoArgumentError(params) }], isError: true, details: {} };
+      }
+      const result = await proxyTeammateChildTool("todo", params as unknown as Record<string, unknown>, signal);
+      const todoParams = params as unknown as TodoParams;
+      const details = result.details as BrokeredTodoResultDetails | undefined;
+      const advisoryEnabled = todoParams.action === "advance"
+        ? (() => {
+            try {
+              return isNewContextCompactionEnabled(ctx.cwd);
+            } catch {
+              return false;
+            }
+          })()
+        : false;
+      const withPressureAdvisory = (candidate: FlowToolResult): FlowToolResult =>
+        appendTodoContextPressureAdvisory(
+          candidate,
+          todoParams,
+          autoCompaction.describeState().pressureSnapshot,
+          advisoryEnabled,
+        );
+      if (!(result as { isError?: boolean }).isError && details?.transition === "new_context") {
+        const { newContextRecoveryState, ...publicDetails } = details;
+        try {
+          if (!newContextRecoveryState) {
+            throw new Error("Root-authorized recovery state was unavailable");
+          }
+          const receipt = newContextController.schedule({
+            source: "todo-transition",
+            actorId: childActorId,
+            resourceUris: params.resourceUris,
+            recoveryState: newContextRecoveryState,
+          }, ctx);
+          return withPressureAdvisory({
+            ...result,
+            details: {
+              ...publicDetails,
+              contextTransition: receipt.coalesced ? "coalesced" : "scheduled",
+              contextTransitionRequestId: receipt.requestId,
+            } satisfies TodoResultDetails,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Todo was committed, but its new-context transition could not be scheduled: ${message}`, "warning");
+          return appendTodoContextTransitionFailure({
+            ...result,
+            details: {
+              ...publicDetails,
+              contextTransition: "failed",
+              contextTransitionError: message,
+            } satisfies TodoResultDetails,
+          }, message);
+        }
+      }
+      return withPressureAdvisory(result as FlowToolResult);
+    },
+    renderShell: "self",
+    renderCall(_args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      return toolCallLine(theme, "todo");
+    },
+    renderResult(result, options, theme, ctx) {
+      if (options.isPartial) return new Text("", 0, 0);
+      return renderTodoToolResult(
+        result as FlowToolResult,
+        options.expanded,
+        theme,
+        ctx.args,
+        ctx.isError,
+      );
+    },
+  };
+  pi.registerTool(todoProxyTool);
+  pi.registerTool({
+    name: "search",
+    label: "Search",
+    description:
+      "Search workspace file contents via the root session's shared index — literal, regex, or fuzzy matching with lines/files/count output. Falls back to ripgrep when the index cannot serve the query. Prefer this over the built-in grep for workspace content search.",
+    promptSnippet: "Search workspace file contents (literal/regex/fuzzy) via the shared root index.",
+    parameters: SearchToolParameters,
+    async execute(id, params, signal, _onUpdate, ctx) {
+      // Resolve path against the child's cwd before forwarding: tasks[].cwd may
+      // differ from the root workspace, and the broker re-checks the absolute
+      // path against the root workspace boundary.
+      const forwarded = { ...params, path: resolveSearchScopePath(params.path, ctx.cwd) };
+      return proxyTeammateChildTool("search", forwarded as unknown as Record<string, unknown>, signal, id);
+    },
+  });
+  const permissionController = createPermissionController();
+  pi.on("tool_call", (event, ctx) => {
+    // structured_output is a schema-validated, child-local termination tool.
+    // Relaying it deadlocks direct runners, which have no interaction handler.
+    if (event.toolName === "structured_output") return;
+    return permissionController.authorize(event, ctx, "default");
+  });
+}
+
+function registerAskUserQuestionTool(
+  pi: ExtensionAPI,
+  onUserAttention?: UserAttentionHandler,
+  resolveAskGrant?: (ctx: ExtensionContext) => HostAskPolicyGrant | undefined,
+): void {
+  const askTool: ToolDefinition<typeof AskUserQuestionParams> = {
+    name: "ask-user-question",
+    label: "Ask User",
+    description: `Collect structured user answers through a keyboard-first TUI wizard.
+
+- Single question: { questions: [{ question: "Which approach?", options: [{label: "A"}, {label: "B"}] }] }
+- Multiple questions: up to 4 questions in one call
+- Multi-select: { questions: [{ question: "Which features?", multiSelect: true, options: [...] }] }
+- Open-ended: { questions: [{ question: "What should the name be?" }] }
+
+Users may add supplementary details to any option (including a free-form answer for "None of the above"); these come back in each answer's details map and text field.
+
+The tool returns structured human answers. An enabled project decision policy may instead return explicit machine recommendations in decisions. With a human-enabled /auto ask on [seconds] grant (default 60s), remaining safe questions may adopt options marked recommended: true after timeout, returned in recommendations with source: timeout. Policy classification takes priority; external/uncertain/degraded decisions, human-only questions, missing or ambiguous recommendations and sensitive approvals never auto-confirm. Both forms are NOT user answers or approval. Mixed batches preserve original questionIndex.
+
+When to use:
+- A genuine decision fork the user must own (approach A vs B, which features, naming) that you cannot resolve by reading code or docs.
+
+When NOT to use:
+- Questions you could answer yourself with a grep or a doc read — investigate first, then ask only a specific question.
+- Confirming a proposed plan — plan confirmation is owned by the plan-confirm flow; never use this tool to approve a plan.`,
+
+    promptSnippet: "Collect a structured user decision via a keyboard-first TUI wizard (up to 4 questions)",
+    promptGuidelines: [
+      "Before asking, investigate code/docs/knowledge and consult the confirmed project decision policy. The runtime may return advisory decisions instead of asking a human; use those recommendations to continue, never as user approval. Configuration, Plan, permission, and knowledge-promotion approvals remain human.",
+    ],
+
+    parameters: AskUserQuestionParams,
+    executionMode: "sequential",
+
+    async execute(
+      _id: string,
+      params: Record<string, unknown>,
+      signal: AbortSignal | undefined,
+      _onUpdate: ((result: FlowToolResult) => void) | undefined,
+      ctx: ExtensionContext,
+    ): Promise<FlowToolResult> {
+      return executeAsk(params as unknown as AskParams, ctx, {
+        onUserAttention,
+        requestId: `question:${_id}`,
+        toolCallId: _id,
+        signal,
+        resolveAskGrant: resolveAskGrant ? () => resolveAskGrant(ctx) : undefined,
+      });
+    },
+
+    renderShell: "self",
+    renderCall(args, theme, ctx) {
+      if (ctx?.isPartial === false) return new Text("", 0, 0);
+      const qs = args.questions as unknown[] | undefined;
+      const count = qs?.length ?? 0;
+      return toolCallLine(theme, "ask", `${count} question${count !== 1 ? "s" : ""}`);
+    },
+
+    renderResult(result, opts, theme, ctx) {
+      if (opts.isPartial) return new Text("", 0, 0);
+      const details = result.details as AskResultDetails | undefined;
+      const isError = ctx.isError || (result as { isError?: boolean }).isError === true;
+      const questions = ctx.args.questions as unknown[] | undefined;
+      const arg = `${questions?.length ?? 0} question${questions?.length === 1 ? "" : "s"}`;
+      if (details?.cancelled) {
+        return toolResultLine(theme, { name: "ask", ok: false, arg, summary: "cancelled" });
+      }
+      if (isError || !details) {
+        const text = result.content[0];
+        const fallback = text && "text" in text ? text.text : "Questionnaire failed.";
+        return toolResultLine(theme, { name: "ask", ok: false, arg, summary: fallback });
+      }
+      const count = details.answers.length;
+      const recommendations = details.decisions?.filter((decision) => decision.evaluation.owner === "internal" && decision.evaluation.advice) ?? [];
+      const timeoutRecommendations = details.recommendations ?? [];
+      const answerLines = details.answers.map((answer, index) => {
+        const chosen = answer.selected.map((label) => {
+          const detail = answer.details?.[label];
+          return detail ? `${label} (${detail})` : label;
+        });
+        const value = [...chosen, ...(answer.text ? [answer.text] : [])].join(" — ") || "No answer";
+        return `${(answer.questionIndex ?? index) + 1}. ${answer.question} → ${value}`;
+      });
+      return toolResultLine(theme, {
+        name: "ask",
+        ok: true,
+        arg,
+        summary: `${count} answer${count !== 1 ? "s" : ""}${recommendations.length + timeoutRecommendations.length ? ` · ${recommendations.length + timeoutRecommendations.length} machine recommendation(s)` : ""}`,
+        expanded: opts.expanded,
+        detail: [...answerLines, ...recommendations.map((decision) => `${decision.questionIndex + 1}. ${decision.question} → [machine advisory] ${decision.evaluation.advice!.recommendation}`),
+          ...timeoutRecommendations.map((item) => `${item.questionIndex + 1}. ${item.question} → [timeout recommendation] ${item.selected.join("、")}`)].join("\n"),
+      });
+    },
+  };
+
+  pi.registerTool(askTool);
+}
+
+/**
+ * Plan owns the mode indicator while it is active, so non-YOLO approval modes
+ * are hidden to avoid a stale second indicator. YOLO is the exception: it is
+ * safety-relevant and must stay visible, inherited unchanged into Plan mode.
+ */
+export function approvalModeStatusValue(
+  planMode: boolean,
+  approvalMode: PermissionMode,
+): string | undefined {
+  if (approvalMode === "bypassPermissions") return "YOLO";
+  if (planMode) return undefined;
+  return `APPROVAL ${approvalMode}`;
+}
+
+function syncApprovalModeStatus(
+  ctx: Pick<ExtensionContext, "ui">,
+  approvalMode: PermissionMode,
+): void {
+  ctx.ui.setStatus("approval-mode", approvalModeStatusValue(isPlanMode(), approvalMode));
+}
+
+// ---------------------------------------------------------------------------
+// Todo widget renderer — width-aware string[] for setWidget (above editor)
+// ---------------------------------------------------------------------------
+
+const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
+const dim = (s: string) => `\x1b[2m${s}\x1b[22m`;
+const green = (s: string) => `\x1b[32m${s}\x1b[39m`;
+const yellow = (s: string) => `\x1b[33m${s}\x1b[39m`;
+const red = (s: string) => `\x1b[31m${s}\x1b[39m`;
+const strikethrough = (s: string) => `\x1b[9m${s}\x1b[29m`;
+
+interface TodoTaskLike {
+  id: string;
+  subject: string;
+  status: string;
+  blockedBy: string[];
+  skills?: Array<{ name: string; role?: string }>;
+  createdBy?: { id: string; label: string };
+  assignee?: { id: string; label: string };
+  updatedAt?: number;
+}
+
+const WICON: Record<string, string> = {
+  completed: "✓",
+  in_progress: "■",
+  blocked: "!",
+  pending: "□",
+};
+
+const WCOLOR: Record<string, (s: string) => string> = {
+  completed: green,
+  in_progress: yellow,
+  blocked: red,
+  pending: dim,
+};
+
+interface WidgetRunLike {
+  id: string;
+  sequence?: number;
+  command: string;
+  status: string;
+  attempt?: number;
+  gate?: string;
+  verdict?: string;
+  artifactsCount?: number;
+}
+
+export function renderTodoWidget(
+  tasks: TodoTaskLike[],
+  expanded = false,
+  width = 120,
+  runs?: readonly WidgetRunLike[] | null,
+): string[] {
+  const safeWidth = Math.max(1, width);
+  const hasTasks = tasks.length > 0;
+  const lines: string[] = [];
+  if (hasTasks) lines.push(renderTodoSummary(tasks, expanded, safeWidth));
+  if (runs && runs.length > 0) lines.push(truncateToWidth(widgetRunsCountLine(runs, lines.length === 0), safeWidth, "…"));
+  if (!expanded) return lines;
+  if (runs && runs.length > 0) {
+    for (const line of widgetRunsFocusLines(runs, safeWidth)) lines.push(line);
+  }
+  if (!hasTasks) return lines;
+
+  const ordered = [...tasks].sort((left, right) =>
+    todoStatusRank(left.status) - todoStatusRank(right.status)
+    || todoIdOrder(left.id) - todoIdOrder(right.id)
+    || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+  );
+  const visible = ordered.slice(0, 8);
+  for (const task of visible) {
+    lines.push(truncateToWidth(widgetTaskLine(task, tasks), safeWidth, "…"));
+  }
+  const hidden = ordered.length - visible.length;
+  if (hidden > 0) lines.push(truncateToWidth(dim(`  … ${hidden} more · ${TODO_TOGGLE_LABEL} collapse`), safeWidth, "…"));
+
+  return lines;
+}
+
+const TODO_STATUS_RANK: Record<string, number> = { in_progress: 0, blocked: 1, pending: 2, completed: 3 };
+
+function todoStatusRank(status: string): number {
+  return TODO_STATUS_RANK[status] ?? 4;
+}
+
+// Tasks keep their creation order (the numeric id assigned at allocation).
+// Non-numeric ids (workflow mirrors) sort after numeric ones, then lexicographically.
+function todoIdOrder(id: string): number {
+  const n = Number(id);
+  return Number.isInteger(n) ? n : Number.POSITIVE_INFINITY;
+}
+
+function renderTodoSummary(tasks: TodoTaskLike[], expanded: boolean, width: number): string {
+  const done = tasks.filter((t) => t.status === "completed").length;
+  const running = tasks.filter((t) => t.status === "in_progress").length;
+  const blocked = tasks.filter((t) => t.status === "blocked").length;
+  const memberCount = new Set(tasks.flatMap((task) => [task.createdBy?.id, task.assignee?.id]).filter(Boolean)).size;
+  const memberMeta = memberCount > 0 ? ` · ${memberCount} member${memberCount === 1 ? "" : "s"}` : "";
+  const toggleHint = expanded ? "collapse" : "expand";
+  const fullMeta = `${bold(String(tasks.length))} tasks · ${bold(String(done))} done · ${bold(String(running))} running${blocked ? ` · ${bold(String(blocked))} blocked` : ""}${memberMeta}  (${TODO_TOGGLE_LABEL} ${toggleHint})`;
+  const compactMeta = `${bold(String(done))}/${bold(String(tasks.length))} · ${bold(String(running))} running  (${TODO_TOGGLE_LABEL} ${toggleHint})`;
+  const minimalMeta = `${done}/${tasks.length}`;
+
+  const candidates = [fullMeta, compactMeta, minimalMeta];
+  let meta = minimalMeta;
+  for (const candidate of candidates) {
+    const prefix = `${bold("Todo")}  ${dim(candidate)}`;
+    if (visibleWidth(prefix) <= width) {
+      meta = candidate;
+      break;
+    }
+  }
+
+  return truncateToWidth(`${bold("Todo")}  ${dim(meta)}`, width, "…");
+}
+
+function workflowStatusColor(status: string): (s: string) => string {
+  if (status === "running" || status === "retrying") return yellow;
+  if (status === "failed") return red;
+  if (status === "sealed" || status === "completed" || status === "ready") return green;
+  return dim;
+}
+
+function widgetRunsCountLine(runs: readonly WidgetRunLike[], topLevel: boolean): string {
+  const total = runs.length;
+  const done = runs.filter((run) => run.status === "sealed" || run.status === "completed").length;
+  const running = runs.filter((run) => run.status === "running" || run.status === "retrying").length;
+  const failed = runs.filter((run) => run.status === "failed").length;
+  const failedPart = failed > 0 ? ` · ${red(bold(String(failed)))} failed` : "";
+  const prefix = topLevel ? "" : "  ";
+  return `${prefix}${dim("Runs")}  ${bold(String(total))} · ${bold(String(done))} done · ${bold(String(running))} running${failedPart}`;
+}
+
+function widgetRunsFocusLines(runs: readonly WidgetRunLike[], width: number): string[] {
+  const focus = [...runs]
+    .sort((left, right) => widgetRunRank(left.status) - widgetRunRank(right.status))
+    .filter((run) => widgetRunRank(run.status) < 5)
+    .slice(0, 3);
+  return focus.map((run) => truncateToWidth(widgetRunLine(run), width, "…"));
+}
+
+function widgetRunLine(run: WidgetRunLike): string {
+  const seq = run.sequence != null ? String(run.sequence).padStart(3, "0") : run.id.slice(0, 6);
+  const details = [run.gate, run.verdict, run.artifactsCount ? `${run.artifactsCount} art` : ""]
+    .filter(Boolean)
+    .join(" · ");
+  const tail = details ? dim(` · ${details}`) : "";
+  return `    ${workflowStatusColor(run.status)(workflowStatusLabel(run.status as never, run.attempt))} ${dim(`${seq}/`)}${run.command}${tail}`;
+}
+
+function widgetRunRank(status: string): number {
+  return ({ failed: 0, blocked: 1, waiting_user: 2, retrying: 3, running: 4 } as Record<string, number>)[status] ?? 5;
+}
+
+function formatWidgetTokens(value: number): string {
+  return value < 1_000 ? String(value) : `${Math.round(value / 1_000)}k`;
+}
+
+function widgetTaskLine(task: TodoTaskLike, allTasks: TodoTaskLike[]): string {
+  const colorFn = WCOLOR[task.status] ?? dim;
+  const icon = colorFn(WICON[task.status] ?? "?");
+  const subject = task.status === "completed"
+    ? strikethrough(colorFn(task.subject))
+    : task.status === "in_progress"
+      ? bold(colorFn(task.subject))
+      : colorFn(task.subject);
+  const actor = task.assignee
+    ? task.createdBy && task.createdBy.id !== task.assignee.id
+      ? `@${widgetActorLabel(task.createdBy, allTasks)}→@${widgetActorLabel(task.assignee, allTasks)}`
+      : `@${widgetActorLabel(task.assignee, allTasks)}`
+    : "";
+  let line = `  ${icon}${actor ? ` ${actor}` : ""} ${subject}`;
+  if (task.skills && task.skills.length > 0) {
+    const primary = task.skills.find((skill) => skill.role === "primary") ?? task.skills[0];
+    line += dim(`  /${primary.name}${task.skills.length > 1 ? ` +${task.skills.length - 1}` : ""}`);
+  }
+
+  // blocked: always show dependency arrows
+  if (task.status === "blocked" && task.blockedBy.length > 0) {
+    const arrows = task.blockedBy.map((depId) => {
+      const dep = allTasks.find((t) => t.id === depId);
+      if (!dep) return dim("← ?");
+      const depColorFn = WCOLOR[dep.status] ?? dim;
+      return `${dim("←")} ${depColorFn(WICON[dep.status] ?? "?")} ${dim(dep.subject)}`;
+    });
+    line += `  ${arrows.join("  ")}`;
+  }
+
+  return line;
+}
+
+function widgetActorLabel(
+  actor: { id: string; label: string },
+  tasks: readonly TodoTaskLike[],
+): string {
+  const actors = tasks.flatMap((task) => [task.createdBy, task.assignee])
+    .filter((candidate): candidate is { id: string; label: string } => Boolean(candidate));
+  return formatTodoActorSelector(actor, actors);
+}
+
+interface ParsedKnowledgeStageArgs {
+  target: "spec" | "knowhow";
+  title: string;
+  content: string;
+  action?: "propose" | "reaffirm" | "supersede" | "contest";
+  category?: string;
+  signal?: "consumed" | "cited" | "validated" | "contradicted";
+  signalIds?: string[];
+  evidence?: string[];
+}
+
+const KNOWLEDGE_STAGE_SIGNALS = new Set(["consumed", "cited", "validated", "contradicted"]);
+const KNOWLEDGE_STAGE_ACTIONS = new Set(["propose", "reaffirm", "supersede", "contest"]);
+
+function parseKnowledgeStageArgs(args: string): ParsedKnowledgeStageArgs | Error {
+  const tokens = tokenizeQuoted(args);
+  const positionals: string[] = [];
+  const flags = new Map<string, string[]>();
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.startsWith("--")) {
+      const name = token.slice(2);
+      const values: string[] = [];
+      while (index + 1 < tokens.length && !tokens[index + 1]!.startsWith("--")) {
+        values.push(tokens[++index]!);
+      }
+      if (values.length === 0) return new Error(`--${name} requires a value`);
+      flags.set(name, values);
+    } else {
+      positionals.push(token);
+    }
+  }
+  const [target, ...rest] = positionals;
+  if (!target || !["spec", "knowhow"].includes(target)) {
+    return new Error('target must be "spec" or "knowhow"');
+  }
+  const title = rest.shift();
+  if (!title) return new Error("title is required");
+  const content = rest.length > 0 ? rest.join(" ") : "";
+  if (!content.trim()) return new Error("content is required");
+
+  const category = firstFlag(flags, "category");
+  const action = firstFlag(flags, "action");
+  if (action !== undefined && !KNOWLEDGE_STAGE_ACTIONS.has(action)) {
+    return new Error(`--action must be one of ${[...KNOWLEDGE_STAGE_ACTIONS].join("|")}`);
+  }
+  const signal = firstFlag(flags, "signal");
+  if (signal !== undefined && !KNOWLEDGE_STAGE_SIGNALS.has(signal)) {
+    return new Error(`--signal must be one of ${[...KNOWLEDGE_STAGE_SIGNALS].join("|")}`);
+  }
+  const signalIds = splitFlag(flags, "signal-ids");
+  const evidence = splitFlag(flags, "evidence");
+  if (signal && !signalIds) return new Error("--signal requires --signal-ids");
+  if (signalIds && !signal) return new Error("--signal-ids requires --signal");
+
+  return {
+    target: target as "spec" | "knowhow",
+    title,
+    content,
+    action: action as ParsedKnowledgeStageArgs["action"],
+    category,
+    signal: signal as ParsedKnowledgeStageArgs["signal"],
+    signalIds,
+    evidence,
+  };
+}
+
+interface ParsedKnowledgeRecordArgs {
+  knowledgeIds: string[];
+  signal?: "consumed" | "cited" | "validated" | "contradicted";
+  source?: "search" | "load" | "manual";
+}
+
+const KNOWLEDGE_RECORD_SOURCES = new Set(["search", "load", "manual"]);
+
+function parseKnowledgeRecordArgs(args: string): ParsedKnowledgeRecordArgs | Error {
+  const tokens = tokenizeQuoted(args);
+  const positionals: string[] = [];
+  const flags = new Map<string, string[]>();
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.startsWith("--")) {
+      const name = token.slice(2);
+      const values: string[] = [];
+      while (index + 1 < tokens.length && !tokens[index + 1]!.startsWith("--")) {
+        values.push(tokens[++index]!);
+      }
+      if (values.length === 0) return new Error(`--${name} requires a value`);
+      flags.set(name, values);
+    } else {
+      positionals.push(token);
+    }
+  }
+  const knowledgeIds = positionals.flatMap((id) => id.split(",")).map((id) => id.trim()).filter(Boolean);
+  if (knowledgeIds.length === 0) return new Error("at least one knowledge id is required");
+  const signal = firstFlag(flags, "signal");
+  if (signal !== undefined && !KNOWLEDGE_STAGE_SIGNALS.has(signal)) {
+    return new Error(`--signal must be one of ${[...KNOWLEDGE_STAGE_SIGNALS].join("|")}`);
+  }
+  const source = firstFlag(flags, "source");
+  if (source !== undefined && !KNOWLEDGE_RECORD_SOURCES.has(source)) {
+    return new Error(`--source must be one of ${[...KNOWLEDGE_RECORD_SOURCES].join("|")}`);
+  }
+  return {
+    knowledgeIds,
+    signal: signal as ParsedKnowledgeRecordArgs["signal"],
+    source: source as ParsedKnowledgeRecordArgs["source"],
+  };
+}
+
+function tokenizeQuoted(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (const character of input.trim()) {
+    if (character === '"') {
+      quoted = !quoted;
+    } else if (character === " " && !quoted) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+    } else {
+      current += character;
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function firstFlag(flags: Map<string, string[]>, name: string): string | undefined {
+  return flags.get(name)?.[0];
+}
+
+function splitFlag(flags: Map<string, string[]>, name: string): string[] | undefined {
+  const values = flags.get(name);
+  if (!values) return undefined;
+  return values.flatMap((value) => value.split(",")).map((item) => item.trim()).filter(Boolean);
+}

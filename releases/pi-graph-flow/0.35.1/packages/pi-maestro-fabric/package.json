@@ -1,0 +1,49 @@
+{
+  "name": "pi-maestro-fabric",
+  "version": "0.1.0",
+  "description": "Host-independent connection kernel for the Pi Maestro multi-device Fabric.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepack": "node ../../scripts/bundle-settings-core.mjs",
+    "postpack": "node ../../scripts/bundle-settings-core.mjs --clean"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./directory": "./src/directory.ts",
+    "./transport-registry": "./src/transport-registry.ts",
+    "./connection-manager": "./src/connection-manager.ts",
+    "./admission-manager": "./src/admission-manager.ts",
+    "./store-coordinator": "./src/store-coordinator.ts",
+    "./presence-manager": "./src/presence-manager.ts",
+    "./invocation-manager": "./src/invocation-manager.ts",
+    "./fixed-ssh-channel": "./src/fixed-ssh-channel.ts",
+    "./stream-channel": "./src/stream-channel.ts",
+    "./channel-router": "./src/channel-router.ts",
+    "./mcp-mount-provider": "./src/mcp-mount-provider.ts",
+    "./outbound-wss-transport": "./src/outbound-wss-transport.ts",
+    "./edge-relay-transport": "./src/edge-relay-transport.ts",
+    "./artifact-transfer": "./src/artifact-transfer.ts"
+  },
+  "files": [
+    "src/**/*.ts"
+  ],
+  "keywords": [
+    "pi",
+    "maestro",
+    "fabric",
+    "multi-device"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "pi-graph-collaboration": "0.1.0"
+  },
+  "bundledDependencies": [
+    "pi-graph-collaboration"
+  ]
+}

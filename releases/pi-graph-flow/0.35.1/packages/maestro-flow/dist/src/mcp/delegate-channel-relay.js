@@ -1,0 +1,381 @@
+import { randomUUID } from 'node:crypto';
+import { writeFileSync, unlinkSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { DelegateBrokerClient, } from '../async/index.js';
+import { truncateRaw } from '../utils/cli-format.js';
+const DEFAULT_POLL_INTERVAL_MS = 1_500;
+const DEFAULT_POLL_LIMIT = 25;
+const DEFAULT_STATUS_THROTTLE_MS = 10_000;
+const DEFAULT_SNAPSHOT_THROTTLE_MS = 15_000;
+const MAX_CHANNEL_TEXT_LENGTH = 240;
+const SUPPORTED_EVENT_TYPES = new Set([
+    'queued',
+    'snapshot',
+    'status_update',
+    'input_required',
+    'completed',
+    'failed',
+    'cancelled',
+    'cancel_requested',
+]);
+function asOneLine(value) {
+    return value.replace(/\s+/g, ' ').trim();
+}
+function readString(value) {
+    return typeof value === 'string' ? value : undefined;
+}
+function readNumber(value) {
+    return typeof value === 'number' ? value : undefined;
+}
+function formatProgress(snapshot) {
+    if (!snapshot) {
+        return undefined;
+    }
+    const phase = readString(snapshot.phase);
+    const progress = readNumber(snapshot.progress);
+    const parts = [
+        phase ? `phase=${phase}` : undefined,
+        progress !== undefined ? `progress=${progress}%` : undefined,
+    ].filter((part) => Boolean(part));
+    return parts.length > 0 ? parts.join(' ') : undefined;
+}
+function extractSummary(event) {
+    const payload = event.payload;
+    const directSummary = readString(payload.summary)
+        ?? readString(payload.message)
+        ?? readString(payload.status)
+        ?? readString(payload.preview);
+    if (directSummary) {
+        return asOneLine(directSummary);
+    }
+    return formatProgress(event.snapshot);
+}
+function buildStatusLabel(event) {
+    if (event.type === 'completed') {
+        return 'DONE';
+    }
+    if (event.type === 'failed') {
+        return 'FAILED';
+    }
+    if (event.type === 'cancelled') {
+        return 'CANCELLED';
+    }
+    if (event.type === 'cancel_requested') {
+        return 'CANCELLING';
+    }
+    if (event.type === 'input_required') {
+        return 'INPUT REQUIRED';
+    }
+    if (event.type === 'queued') {
+        return 'QUEUED';
+    }
+    return String(event.status ?? 'RUNNING').toUpperCase();
+}
+function buildSignature(event) {
+    return JSON.stringify({
+        type: event.type,
+        status: event.status ?? null,
+        summary: extractSummary(event) ?? null,
+        snapshot: event.snapshot ?? null,
+    });
+}
+function buildNotificationContent(event) {
+    const status = buildStatusLabel(event);
+    const summary = extractSummary(event);
+    const headlineParts = [`[DELEGATE ${status}]`, event.jobId];
+    if (summary) {
+        headlineParts.push(truncateRaw(summary, 120));
+    }
+    return truncateRaw(headlineParts.join(' '), MAX_CHANNEL_TEXT_LENGTH);
+}
+export class DelegateChannelRelay {
+    server;
+    broker;
+    sessionId;
+    channelId;
+    pollIntervalMs;
+    pollLimit;
+    statusThrottleMs;
+    snapshotThrottleMs;
+    now;
+    jobState = new Map();
+    pollTimer = null;
+    running = false;
+    polling = false;
+    consecutiveFailures = 0;
+    constructor(options) {
+        this.server = options.server;
+        this.broker = options.broker ?? new DelegateBrokerClient();
+        // Derive session ID from SSE port when available, so relay restarts within
+        // the same Claude Code session reuse the same session ID. This prevents
+        // delegate completion events from being silently dropped by session isolation
+        // when the relay restarts. Falls back to random UUID for non-CC contexts.
+        const ssePort = process.env.CLAUDE_CODE_SSE_PORT;
+        this.sessionId = options.sessionId
+            ?? (ssePort ? `maestro-mcp-relay-port-${ssePort}` : `maestro-mcp-relay-${randomUUID()}`);
+        this.channelId = options.channelId ?? 'claude/channel';
+        this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+        this.pollLimit = options.pollLimit ?? DEFAULT_POLL_LIMIT;
+        this.statusThrottleMs = options.statusThrottleMs ?? DEFAULT_STATUS_THROTTLE_MS;
+        this.snapshotThrottleMs = options.snapshotThrottleMs ?? DEFAULT_SNAPSHOT_THROTTLE_MS;
+        this.now = options.now ?? (() => new Date().toISOString());
+    }
+    get id() {
+        return this.sessionId;
+    }
+    get sessionFilePath() {
+        const maestroHome = process.env.MAESTRO_HOME ?? join(homedir(), '.maestro');
+        return join(maestroHome, 'data', 'async', `relay-session-${process.pid}.id`);
+    }
+    writeSessionFile() {
+        try {
+            mkdirSync(dirname(this.sessionFilePath), { recursive: true });
+            const data = {
+                sessionId: this.sessionId,
+                pid: process.pid,
+                startedAt: this.now(),
+            };
+            // Record SSE port so delegate CLI can match relay to current Claude Code session
+            if (process.env.CLAUDE_CODE_SSE_PORT) {
+                data.ssePort = process.env.CLAUDE_CODE_SSE_PORT;
+            }
+            // Record parent PID (= Claude Code process that spawned this MCP).
+            // Lets the delegate CLI discard zombie relays whose parent has already died,
+            // even when the ephemeral SSE port has been reused by a new CC session.
+            if (typeof process.ppid === 'number' && process.ppid > 0) {
+                data.ownerPid = process.ppid;
+            }
+            writeFileSync(this.sessionFilePath, JSON.stringify(data), 'utf-8');
+        }
+        catch {
+            // Best-effort — file write failure shouldn't block relay
+        }
+    }
+    cleanupSessionFile() {
+        try {
+            unlinkSync(this.sessionFilePath);
+        }
+        catch { /* file may not exist */ }
+    }
+    /** Remove stale relay session files from previous relay processes sharing the
+     *  same SSE port. Without this, PID reuse on Windows can make dead relay PIDs
+     *  appear alive, causing resolveRelaySessionId() to return the wrong session. */
+    cleanupStaleRelayFiles() {
+        const ssePort = process.env.CLAUDE_CODE_SSE_PORT;
+        if (!ssePort)
+            return;
+        const dir = dirname(this.sessionFilePath);
+        try {
+            for (const f of readdirSync(dir)) {
+                if (!f.startsWith('relay-session-') || !f.endsWith('.id'))
+                    continue;
+                const filePath = join(dir, f);
+                // Skip our own session file
+                if (filePath === this.sessionFilePath)
+                    continue;
+                try {
+                    const data = JSON.parse(readFileSync(filePath, 'utf-8'));
+                    // Remove files that share our SSE port but belong to dead PIDs
+                    if (data.ssePort === ssePort && data.pid !== process.pid) {
+                        let pidAlive = true;
+                        try {
+                            process.kill(data.pid, 0);
+                        }
+                        catch {
+                            pidAlive = false;
+                        }
+                        if (!pidAlive) {
+                            unlinkSync(filePath);
+                        }
+                    }
+                }
+                catch { /* ignore unreadable files */ }
+            }
+        }
+        catch { /* best-effort */ }
+    }
+    async start() {
+        if (this.running) {
+            return;
+        }
+        this.running = true;
+        // Clean up stale relay files from previous sessions with the same SSE port.
+        // Must happen before writeSessionFile to prevent resolveRelaySessionId from
+        // returning a stale session ID from a dead relay process.
+        this.cleanupStaleRelayFiles();
+        // Purge expired events/jobs/sessions before registering, so stale history
+        // from previous sessions doesn't replay into the new channel.
+        this.broker.purgeExpiredEvents({ now: this.now() });
+        this.broker.registerSession({
+            sessionId: this.sessionId,
+            channelId: this.channelId,
+            metadata: { source: 'maestro-mcp-relay' },
+            now: this.now(),
+        });
+        this.writeSessionFile();
+        // Drain all pre-existing events so only events published after startup
+        // are emitted to the channel. Prevents historical replay on new sessions.
+        this.drainExistingEvents();
+        await this.pollOnce();
+        this.pollTimer = setInterval(() => {
+            this.pollOnce().catch(() => {
+                // Best-effort relay; the next interval will retry.
+            });
+        }, this.pollIntervalMs);
+        this.pollTimer.unref?.();
+    }
+    stop() {
+        this.cleanupSessionFile();
+        this.running = false;
+        if (this.pollTimer) {
+            clearInterval(this.pollTimer);
+            this.pollTimer = null;
+        }
+    }
+    async pollOnce() {
+        if (!this.running || this.polling) {
+            return;
+        }
+        this.polling = true;
+        const ackIds = [];
+        try {
+            this.broker.heartbeat({
+                sessionId: this.sessionId,
+                now: this.now(),
+            });
+            const events = this.broker.pollEvents({
+                sessionId: this.sessionId,
+                limit: this.pollLimit,
+                now: this.now(),
+            });
+            for (const event of events) {
+                const shouldAck = await this.handleEvent(event);
+                if (!shouldAck) {
+                    break;
+                }
+                ackIds.push(event.eventId);
+            }
+            if (ackIds.length > 0) {
+                this.broker.ack({
+                    sessionId: this.sessionId,
+                    eventIds: ackIds,
+                    now: this.now(),
+                });
+            }
+            this.consecutiveFailures = 0;
+        }
+        catch (error) {
+            this.consecutiveFailures += 1;
+            if (this.consecutiveFailures >= 3) {
+                // Pause polling with backoff instead of permanent stop.
+                // After 3 consecutive failures, back off for 30s then retry.
+                if (this.pollTimer) {
+                    clearInterval(this.pollTimer);
+                    this.pollTimer = null;
+                }
+                const backoffMs = Math.min(30_000, 5_000 * Math.pow(2, this.consecutiveFailures - 3));
+                console.warn(`[DelegateChannelRelay] Backing off poll for ${backoffMs}ms after ${this.consecutiveFailures} consecutive failures`);
+                setTimeout(() => {
+                    if (this.running) {
+                        this.consecutiveFailures = 0;
+                        this.pollTimer = setInterval(() => {
+                            this.pollOnce().catch(() => { });
+                        }, this.pollIntervalMs);
+                        this.pollTimer.unref?.();
+                    }
+                }, backoffMs).unref?.();
+            }
+            throw error;
+        }
+        finally {
+            this.polling = false;
+        }
+    }
+    drainExistingEvents() {
+        let drainedCount = 0;
+        for (;;) {
+            const events = this.broker.pollEvents({
+                sessionId: this.sessionId,
+                limit: this.pollLimit,
+                now: this.now(),
+            });
+            if (events.length === 0) {
+                break;
+            }
+            drainedCount += events.length;
+            this.broker.ack({
+                sessionId: this.sessionId,
+                eventIds: events.map((e) => e.eventId),
+                now: this.now(),
+            });
+        }
+        if (drainedCount > 0) {
+            // This is expected on a fresh relay — events from previous sessions are
+            // drained silently to prevent replay.
+        }
+    }
+    async handleEvent(event) {
+        if (!SUPPORTED_EVENT_TYPES.has(event.type)) {
+            return true;
+        }
+        // Session isolation: only emit events from jobs originated by this relay session.
+        // Jobs without sessionId in metadata are still emitted (backward compatibility).
+        const originSession = event.metadata?.sessionId;
+        if (typeof originSession === 'string' && originSession !== this.sessionId) {
+            console.warn(`[DelegateChannelRelay] Dropping event for job ${event.jobId}: session mismatch (origin=${originSession}, self=${this.sessionId})`);
+            return true; // Belongs to another session — ack but don't push
+        }
+        if (!this.shouldEmit(event)) {
+            return true;
+        }
+        await this.server.notification({
+            method: 'notifications/claude/channel',
+            params: {
+                content: buildNotificationContent(event),
+                meta: {
+                    job_id: event.jobId,
+                    exec_id: event.jobId,
+                    event_id: String(event.eventId),
+                    event_type: event.type,
+                    status: String(event.status ?? ''),
+                },
+            },
+        });
+        return true;
+    }
+    shouldEmit(event) {
+        if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+            return true;
+        }
+        const currentTime = Date.now();
+        const state = this.jobState.get(event.jobId) ?? {};
+        const signature = buildSignature(event);
+        if (event.type === 'status_update') {
+            if (state.lastStatusKey === signature) {
+                return false;
+            }
+            if (state.lastStatusAt && currentTime - state.lastStatusAt < this.statusThrottleMs) {
+                return false;
+            }
+            state.lastStatusKey = signature;
+            state.lastStatusAt = currentTime;
+            this.jobState.set(event.jobId, state);
+            return true;
+        }
+        if (event.type === 'snapshot') {
+            if (state.lastSnapshotKey === signature) {
+                return false;
+            }
+            if (state.lastSnapshotAt && currentTime - state.lastSnapshotAt < this.snapshotThrottleMs) {
+                return false;
+            }
+            state.lastSnapshotKey = signature;
+            state.lastSnapshotAt = currentTime;
+            this.jobState.set(event.jobId, state);
+            return true;
+        }
+        return true;
+    }
+}
+//# sourceMappingURL=delegate-channel-relay.js.map

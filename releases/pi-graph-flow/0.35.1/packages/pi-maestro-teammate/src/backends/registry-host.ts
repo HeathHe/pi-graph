@@ -1,0 +1,569 @@
+/**
+ * Host-side backend registry construction.
+ *
+ * Decides whether a dispatch consults the registry at all, and supplies the
+ * loader that resolves `pi-subprocess` to the in-process implementation instead
+ * of importing it by module specifier.
+ */
+
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import type {
+  BackendRegistryConfig,
+  TeammateExecutionMode,
+} from "pi-maestro-backend-core/v1/registry";
+
+import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
+import { TeammateBackendRegistry } from "pi-maestro-backends";
+import {
+  createFabricBackend,
+  type FabricBackendRouteResolver,
+  type FabricBackendRouteResolverAcquirer,
+} from "pi-maestro-backends/fabric";
+import { createRemoteBackend } from "pi-maestro-backends/remote";
+import type { RemoteWorkerManagerLike as RemoteManagerPort } from "pi-maestro-backends/remote";
+import { loadCliToolsConfigProjection, type CliToolsConfig } from "../cli-tools/cli-tools-config.ts";
+import type { AvailableModelEntry } from "../models/model-catalog.ts";
+import { resolvePiAgentDirectory } from "../shared/agent-directory.ts";
+import {
+  compileModelRegistryManifest,
+  parseModelRegistryManifest,
+  type CompiledModelRegistryPair,
+  type ProjectionIdentity,
+} from "../models/model-registry.ts";
+import { createPiSubprocessBackend, type PiSubprocessRunExtras } from "./pi-subprocess.ts";
+import type { BackendRunOptions } from "pi-maestro-backend-core/v1/backend";
+
+/** Legacy resolver factories and generation-tracked dispatch acquirers are both accepted. */
+export type FabricRouteResolverDispatchWiring =
+  | (() => FabricBackendRouteResolver)
+  | FabricBackendRouteResolverAcquirer;
+
+/** Registration document name shared by global and project configuration. */
+const REGISTRY_FILE = "teammate-backends.json";
+
+/** Global registration document under Pi's configured agent directory. */
+export function getGlobalBackendRegistryPath(): string {
+  return join(resolvePiAgentDirectory(), REGISTRY_FILE);
+}
+
+/** Project registration document relative to the workspace root. */
+export function getProjectBackendRegistryPath(workspaceRoot: string): string {
+  return join(workspaceRoot, ".pi", REGISTRY_FILE);
+}
+
+/** Name under which Pi registers itself; it holds no privilege beyond the name. */
+export const PI_SUBPROCESS = "pi-subprocess";
+
+/**
+ * Module name a remote-target registration names.
+ *
+ * One registration per target, conventionally named `remote:<targetId>`, all
+ * resolving to this one module: the target is a config field, not a module.
+ */
+export const REMOTE_WORKERS = "remote-workers";
+
+/**
+ * Module name a Fabric placement resolves to.
+ *
+ * The route resolver is host wiring, not a module: a deployment that ships the
+ * Fabric adapter registers this module name and supplies the resolver at
+ * dispatch. A dispatch without the wiring refuses the registration by name
+ * rather than running the placed task on this machine.
+ */
+export const FABRIC_BACKEND = "fabric";
+
+/**
+ * The registration used when the project ships no document.
+ *
+ * Pi alone, under its ordinary name. A deployment that opts into the registry
+ * without configuring anything therefore gets the same execution it had before,
+ * routed through the interface rather than around it.
+ */
+const BUILT_IN: BackendRegistryConfig = {
+  mode: "legacy",
+  default: PI_SUBPROCESS,
+  backends: { [PI_SUBPROCESS]: { module: PI_SUBPROCESS } },
+};
+
+/** The modes a document may name; anything else is a load-time error. */
+const MODES: readonly TeammateExecutionMode[] = ["legacy", "backend-registry", "model-registry"];
+
+/**
+ * Validate one registration document.
+ *
+ * Shared by the async and synchronous readers so a rule can never hold on one
+ * path and not the other.
+ *
+ * @param raw - the document text.
+ * @param path - the document path, for diagnostics that must name it.
+ * @returns the validated document with the built-in registration merged in.
+ */
+function parseBackendRegistryDocument(raw: string, path: string): BackendRegistryConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    throw new Error(`teammate backend registry at ${path} is not valid JSON`, { cause });
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`teammate backend registry at ${path} must contain a JSON object`);
+  }
+
+  const rawDocument = parsed as Record<string, unknown>;
+  if (rawDocument.mode === "model-registry") {
+    const manifest = parseModelRegistryManifest(raw, path);
+    return {
+      mode: manifest.mode,
+      default: manifest.default,
+      backends: manifest.backends,
+    };
+  }
+
+  const document = parsed as Partial<BackendRegistryConfig>;
+  if (document.mode !== undefined && !MODES.includes(document.mode)) {
+    throw new Error(
+      `teammate backend registry at ${path} names mode "${String(document.mode)}"; `
+      + `expected one of ${MODES.join(" | ")}`,
+    );
+  }
+  if (typeof document.default !== "string") {
+    throw new Error(`teammate backend registry at ${path} must name a "default" backend`);
+  }
+  if (typeof document.backends !== "object" || document.backends === null || Array.isArray(document.backends)) {
+    throw new Error(`teammate backend registry at ${path} must map "backends" to registrations`);
+  }
+  // Each entry must name a loadable module; an entry without one reaches the
+  // loader as import(undefined) and fails with a message about "undefined"
+  // rather than about the entry the operator wrote.
+  for (const [name, registration] of Object.entries(document.backends)) {
+    if (typeof registration !== "object" || registration === null || Array.isArray(registration)) {
+      throw new Error(`teammate backend registry at ${path}: registration "${name}" must be an object`);
+    }
+    if (typeof (registration as { module?: unknown }).module !== "string") {
+      throw new Error(`teammate backend registry at ${path}: registration "${name}" must name a "module"`);
+    }
+  }
+  // The built-in stays registered unless the document redefines it, so a
+  // document that only adds a remote backend does not lose Pi.
+  return {
+    mode: document.mode ?? "legacy",
+    default: document.default,
+    backends: { ...BUILT_IN.backends, ...document.backends },
+  };
+}
+
+/** Synchronously resolved documents, keyed by workspace and global document path. */
+const syncDocuments = new Map<string, BackendRegistryConfig>();
+
+/** Atomically published v2 projection pairs, keyed by workspace root. */
+const modelRegistryPairs = new Map<string, CompiledModelRegistryPair>();
+/** Last successfully published identity survives invalidation to keep revisions monotonic. */
+const modelRegistryGenerations = new Map<string, ProjectionIdentity>();
+
+/**
+ * Drop every cached registration document for one workspace.
+ *
+ * `syncDocuments` keys entries by workspace and global document path, so no
+ * single delete covers it. The model-registry reader calls this whenever its
+ * authority moves — invalid input, or an observed switch away from v2 — so the
+ * read-once 2.0 reader can never serve a document that no longer exists on
+ * disk. Published pairs and generations are handled separately per call site.
+ */
+function forgetSyncDocumentsForWorkspace(workspaceRoot: string): void {
+  for (const key of syncDocuments.keys()) {
+    if (key === workspaceRoot || key.startsWith(`${workspaceRoot}\0`)) syncDocuments.delete(key);
+  }
+}
+
+function modeGenerationHash(mode: string): string {
+  return createHash("sha256").update(`<mode:${mode}>`, "utf8").digest("hex");
+}
+
+export interface ModelRegistryProjectionInputs {
+  /** Authenticated models currently visible to the host Pi registry. */
+  hostModels?: readonly AvailableModelEntry[];
+  /** Effective CLI overlay; null explicitly means no overlay. */
+  cliToolsConfig?: CliToolsConfig | null;
+  /** Test/embedding override for the global CLI overlay path. */
+  cliToolsGlobalFilePath?: string;
+}
+
+/** Read and validate one document, returning undefined only when it is absent. */
+function readBackendRegistryDocument(path: string): BackendRegistryConfig | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`teammate backend registry at ${path} could not be read`, { cause });
+  }
+  return parseBackendRegistryDocument(raw, path);
+}
+
+/**
+ * Read the effective registration document synchronously, reusing an earlier read.
+ *
+ * A project document is an explicit per-workspace decision and therefore wins
+ * as a whole. When it is absent, the global document under Pi's agent directory
+ * applies. Mixing their `mode` or `default` fields would create a registry that
+ * appears in neither file, so this is precedence rather than field merging.
+ *
+ * Synchronous on purpose. Dispatch resolves the registry immediately before
+ * spawning, and inserting an awaited read there delays the child by an I/O tick
+ * — enough to break callers that address its stdin as soon as dispatch returns.
+ *
+ * @param workspaceRoot - directory holding the project's `.pi/`.
+ * @param globalFilePath - global document path; injectable for isolated tests.
+ * @returns the project document, global fallback, or built-in legacy config.
+ */
+export function backendRegistryConfigSync(
+  workspaceRoot: string,
+  globalFilePath: string = getGlobalBackendRegistryPath(),
+): BackendRegistryConfig {
+  const cacheKey = `${workspaceRoot}\0${globalFilePath}`;
+  const hit = syncDocuments.get(cacheKey);
+  if (hit !== undefined) return hit;
+
+  const config = readBackendRegistryDocument(getProjectBackendRegistryPath(workspaceRoot))
+    ?? readBackendRegistryDocument(globalFilePath)
+    ?? BUILT_IN;
+  syncDocuments.set(cacheKey, config);
+  return config;
+}
+
+/**
+ * Read and atomically publish an opted-in model-registry projection pair.
+ *
+ * Unlike the frozen 2.0 backend reader, this path fingerprints its semantic
+ * inputs on every call. A hand edit therefore takes effect before the next
+ * prompt or dispatch without changing legacy cache behavior. Compilation is
+ * completed into a local pair first; only then is the workspace publication
+ * swapped. Any changed invalid input removes the publication, so callers can
+ * never fall back to a prior valid discovery or dispatch projection.
+ */
+export function modelRegistryPairSync(
+  workspaceRoot: string,
+  inputs: ModelRegistryProjectionInputs = {},
+): CompiledModelRegistryPair | undefined {
+  // The 2.0 reader is deliberately read-once per workspace. A catalog refresh
+  // must not bypass that boundary and activate an edit from legacy or
+  // backend-registry into model-registry. Explicit invalidation removes this
+  // cached authority; once model-registry is authoritative, the reads below
+  // remain revision-aware until they observe a rollback to an older mode.
+  const cachedConfig = syncDocuments.get(workspaceRoot);
+  if (cachedConfig !== undefined && cachedConfig.mode !== "model-registry") {
+    return undefined;
+  }
+  if (cachedConfig === undefined
+    && backendRegistryConfigSync(workspaceRoot).mode !== "model-registry") {
+    return undefined;
+  }
+
+  const path = getProjectBackendRegistryPath(workspaceRoot);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (cause) {
+    modelRegistryPairs.delete(workspaceRoot);
+    forgetSyncDocumentsForWorkspace(workspaceRoot);
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") {
+      const previous = modelRegistryGenerations.get(workspaceRoot);
+      if (previous !== undefined) {
+        modelRegistryGenerations.set(workspaceRoot, {
+          revision: previous.revision,
+          hash: modeGenerationHash("missing"),
+        });
+      }
+      return undefined;
+    }
+    throw new Error(`teammate backend registry at ${path} could not be read`, { cause });
+  }
+
+  try {
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(raw);
+    } catch {
+      // Use the shared parser for the canonical path-bearing diagnostic.
+      parseBackendRegistryDocument(raw, path);
+    }
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+      parseBackendRegistryDocument(raw, path);
+    }
+    if ((envelope as { mode?: unknown }).mode !== "model-registry") {
+      // Preserve the exact legacy/backend-registry parser and validation path.
+      const legacyConfig = parseBackendRegistryDocument(raw, path);
+      modelRegistryPairs.delete(workspaceRoot);
+      // The keyed entries go so the 2.0 reader re-reads the rolled-back
+      // document instead of serving its cached model-registry view; the bare
+      // entry is then (re)set as the frozen-mode marker for catalog refreshes.
+      forgetSyncDocumentsForWorkspace(workspaceRoot);
+      syncDocuments.set(workspaceRoot, legacyConfig);
+      const previous = modelRegistryGenerations.get(workspaceRoot);
+      const modeHash = modeGenerationHash(legacyConfig.mode ?? "legacy");
+      if (previous !== undefined && previous.hash !== modeHash) {
+        modelRegistryGenerations.set(workspaceRoot, {
+          revision: previous.revision,
+          hash: modeHash,
+        });
+      }
+      return undefined;
+    }
+
+    const manifest = parseModelRegistryManifest(raw, path);
+    let cliToolsConfig: CliToolsConfig | null = null;
+    const projectionDiagnostics: string[] = [];
+    if (Object.hasOwn(inputs, "cliToolsConfig")) {
+      cliToolsConfig = inputs.cliToolsConfig ?? null;
+    } else if (manifest.compatibility?.teammateCliToolsProjection?.enabled === true) {
+      try {
+        cliToolsConfig = loadCliToolsConfigProjection(workspaceRoot, inputs.cliToolsGlobalFilePath);
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        projectionDiagnostics.push(`CLI compatibility projection is unavailable: ${message}`);
+      }
+    }
+    const compiled = compileModelRegistryManifest(manifest, {
+      hostModels: inputs.hostModels ?? [],
+      cliToolsConfig,
+      diagnostics: projectionDiagnostics,
+      previousIdentity: modelRegistryGenerations.get(workspaceRoot),
+    });
+    const published = modelRegistryPairs.get(workspaceRoot);
+    const backendConfig: BackendRegistryConfig = {
+      mode: manifest.mode,
+      default: manifest.default,
+      backends: manifest.backends,
+    };
+    if (published?.dispatch.hash === compiled.dispatch.hash) {
+      syncDocuments.set(workspaceRoot, backendConfig);
+      return published;
+    }
+
+    // These synchronous assignments form one publication boundary: no caller
+    // can observe the pair between them, and both are ready before this returns.
+    syncDocuments.set(workspaceRoot, backendConfig);
+    modelRegistryPairs.set(workspaceRoot, compiled);
+    modelRegistryGenerations.set(workspaceRoot, {
+      revision: compiled.dispatch.revision,
+      hash: compiled.dispatch.hash,
+    });
+    return compiled;
+  } catch (cause) {
+    modelRegistryPairs.delete(workspaceRoot);
+    forgetSyncDocumentsForWorkspace(workspaceRoot);
+    throw cause;
+  }
+}
+
+/** Return the currently published pair without reading or compiling sources. */
+export function publishedModelRegistryPairSync(workspaceRoot: string): CompiledModelRegistryPair | undefined {
+  return modelRegistryPairs.get(workspaceRoot);
+}
+
+/**
+ * Build a backend registry from one already-captured dispatch authority.
+ * Callers use this for the whole dispatch so a registry edit cannot split a
+ * candidate sweep across two model/deployment projections.
+ */
+export function dispatchRegistryForProjectionSync(
+  projection: CompiledModelRegistryPair["dispatch"],
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  remoteManagerOf?: () => RemoteManagerPort,
+  fabricRouteResolverOf?: FabricRouteResolverDispatchWiring,
+): TeammateBackendRegistry {
+  const backends = Object.create(null) as BackendRegistryConfig["backends"];
+  for (const [deploymentId, deployment] of projection.deploymentsById) {
+    backends[deploymentId] = deployment.registration;
+  }
+  return new TeammateBackendRegistry({
+    mode: "model-registry",
+    default: projection.defaultDeployment,
+    backends,
+  }, backendLoader(extrasOf, remoteManagerOf, fabricRouteResolverOf));
+}
+
+/**
+ * Resolve the registry a dispatch should use, without an awaited read.
+ *
+ * @param workspaceRoot - directory holding `.pi/`.
+ * @param extrasOf - per-run host wiring handed to the Pi backend.
+ * @param remoteManagerOf - the host's remote Monitor wiring; omitted by a
+ * dispatch that has none, which makes a remote registration unloadable rather
+ * than silently local.
+ * @param fabricRouteResolverOf - the host's Fabric route resolver; omitted by a
+ * dispatch that has none, which makes a Fabric registration unloadable rather
+ * than silently local.
+ * @returns the registry, or undefined when the document keeps the legacy path.
+ */
+export function dispatchRegistrySync(
+  workspaceRoot: string,
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  remoteManagerOf?: () => RemoteManagerPort,
+  globalFilePath: string = getGlobalBackendRegistryPath(),
+  fabricRouteResolverOf?: FabricRouteResolverDispatchWiring,
+): TeammateBackendRegistry | undefined {
+  let config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+  if (config.mode === "model-registry") {
+    const pair = modelRegistryPairSync(workspaceRoot);
+    if (pair === undefined) {
+      // The revision-aware read may have observed a rollback to a 2.0 mode.
+      config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+    } else {
+      return dispatchRegistryForProjectionSync(pair.dispatch, extrasOf, remoteManagerOf, fabricRouteResolverOf);
+    }
+  }
+  if ((config.mode ?? "legacy") === "legacy") return undefined;
+  return new TeammateBackendRegistry(config, backendLoader(extrasOf, remoteManagerOf, fabricRouteResolverOf));
+}
+
+/**
+ * Build the registry used by an already-admitted source-local Fabric attempt.
+ *
+ * Source execution still honours the operator's selected default deployment,
+ * but it must traverse the backend seam even when the project retains legacy
+ * mode. This does not change ordinary dispatch mode: only the explicit source
+ * runtime calls this helper.
+ */
+export function dispatchSourceAttemptRegistrySync(
+  workspaceRoot: string,
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  globalFilePath: string = getGlobalBackendRegistryPath(),
+): TeammateBackendRegistry {
+  const config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+  return new TeammateBackendRegistry(
+    { ...config, mode: "backend-registry" },
+    backendLoader(extrasOf),
+  );
+}
+
+/**
+ * Add the reserved Fabric deployment for one placed origin dispatch only.
+ *
+ * The overlay is never persisted and is never used for a placementless task.
+ * An operator may explicitly register the reserved name to the same module,
+ * but may not redirect it to a different implementation.
+ */
+export function dispatchFabricPlacementRegistrySync(
+  workspaceRoot: string,
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  fabricRouteResolverOf: FabricRouteResolverDispatchWiring,
+  remoteManagerOf?: () => RemoteManagerPort,
+  globalFilePath: string = getGlobalBackendRegistryPath(),
+): TeammateBackendRegistry {
+  let config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+  if (config.mode === "model-registry") {
+    const pair = modelRegistryPairSync(workspaceRoot);
+    if (pair === undefined) {
+      config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+    } else {
+      const backends = Object.create(null) as BackendRegistryConfig["backends"];
+      for (const [deploymentId, deployment] of pair.dispatch.deploymentsById) {
+        backends[deploymentId] = deployment.registration;
+      }
+      config = {
+        mode: "backend-registry",
+        default: pair.dispatch.defaultDeployment,
+        backends,
+      };
+    }
+  }
+  const registered = config.backends[FABRIC_BACKEND];
+  if (registered !== undefined && registered.module !== FABRIC_BACKEND) {
+    throw new Error(
+      `teammate backend registration ${JSON.stringify(FABRIC_BACKEND)} is reserved for placed Fabric dispatches; `
+      + `operator configuration maps it to conflicting module ${JSON.stringify(registered.module)}`,
+    );
+  }
+  const overlay: BackendRegistryConfig = {
+    mode: "backend-registry",
+    default: config.default,
+    backends: {
+      ...config.backends,
+      [FABRIC_BACKEND]: registered ?? { module: FABRIC_BACKEND },
+    },
+  };
+  return new TeammateBackendRegistry(
+    overlay,
+    backendLoader(extrasOf, remoteManagerOf, fabricRouteResolverOf),
+  );
+}
+
+/**
+ * Resolve a registration's module to something the registry can narrow.
+ *
+ * The return type is `unknown` rather than `TeammateBackend`: a module
+ * namespace is not a backend, and asserting that it is defeats the registry's
+ * own check — which is exactly how a backend with no default export came to be
+ * unregisterable while the loader compiled cleanly.
+ *
+ * @param extrasOf - per-run host wiring handed to the Pi backend.
+ * @param remoteManagerOf - the host's remote Monitor wiring, when it has any.
+ * @param fabricRouteResolverOf - the host's Fabric route resolver, when it has any.
+ * @returns the loader.
+ */
+function backendLoader(
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  remoteManagerOf?: () => RemoteManagerPort,
+  fabricRouteResolverOf?: FabricRouteResolverDispatchWiring,
+): (module: string) => Promise<unknown> {
+  // Pi is in this process already; importing it by specifier would load a
+  // second copy with its own module state.
+  const pi = createPiSubprocessBackend(extrasOf);
+  return async (module) => {
+    if (module === PI_SUBPROCESS) return pi;
+    if (module === REMOTE_WORKERS) {
+      // Same reason Pi resolves in-process, one step stronger: a second
+      // `RemoteWorkerManager` would open a second SSH connection under a second
+      // ownership nonce, and every run dispatched through it would be invisible
+      // to `observe kind=remote` and `teammate-list view=remote`. A dispatch
+      // without the wiring is refused by name rather than served by a stand-in.
+      if (remoteManagerOf === undefined) {
+        throw new Error(
+          `teammate backend module "${REMOTE_WORKERS}" needs the host's remote Monitor wiring, `
+          + "but this dispatch supplied no remote Monitor wiring; "
+          + "remote locations are dispatchable only from a root session running Monitor mode",
+        );
+      }
+      return createRemoteBackend(remoteManagerOf);
+    }
+    if (module === FABRIC_BACKEND) {
+      // Same reason as remote, one step stronger: the resolver owns the route
+      // admission and the paired transport for this host, so a second instance
+      // would address a Fabric Endpoint the host's own surfaces cannot see. A
+      // dispatch without the wiring is refused by name rather than served by a
+      // stand-in, because the alternative is running a placed task locally.
+      if (fabricRouteResolverOf === undefined) {
+        throw new Error(
+          `teammate backend module "${FABRIC_BACKEND}" needs the host's Fabric route resolver, `
+          + "but this dispatch supplied no Fabric wiring; a placed task cannot run on this machine",
+        );
+      }
+      return createFabricBackend(
+        typeof fabricRouteResolverOf === "function"
+          ? fabricRouteResolverOf()
+          : fabricRouteResolverOf,
+      );
+    }
+    return await import(module);
+  };
+}
+
+/**
+ * Forget cached documents and published pairs so an operator edit takes effect.
+ *
+ * Generations intentionally survive: they carry the last published identity,
+ * and dropping them would restart revisions at 1 across an invalidation
+ * boundary instead of advancing monotonically.
+ */
+export function forgetBackendRegistryConfigSync(workspaceRoot?: string): void {
+  if (workspaceRoot === undefined) {
+    syncDocuments.clear();
+    modelRegistryPairs.clear();
+    return;
+  }
+  forgetSyncDocumentsForWorkspace(workspaceRoot);
+  modelRegistryPairs.delete(workspaceRoot);
+}

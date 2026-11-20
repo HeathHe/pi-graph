@@ -1,0 +1,537 @@
+{
+  "upstreamCommit": "7a0daa75cf137c6907b037b5f38fc2496497f591",
+  "licenseSource": "artifacts/pi-maestro-comparison-20261103/upstream/LICENSE",
+  "licenseSha256": "4604892b826ecf82c56cccf1bb33a976236065c9411f6da70fc1b8898b1315e8",
+  "sourceBasis": "Observed rebuild plus fixed archive; this is a module migration, not a raw-copy completion claim",
+  "sources": [
+    {
+      "target": "src/protocol/spec.ts",
+      "source": "rebuild/packages/pi-maestro-backend-core/src/public/v1/spec.ts",
+      "sourceSha256": "b48be56e1bfc6c4c6ab752ed8504b21003cec3625f4de3d68abfe6ce90436901",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backend-core/src/public/v1/spec.ts",
+      "archiveSha256": "b48be56e1bfc6c4c6ab752ed8504b21003cec3625f4de3d68abfe6ce90436901",
+      "modification": "placement generics only; existing protocol fields preserved"
+    },
+    {
+      "target": "src/protocol/backend.ts",
+      "source": "rebuild/packages/pi-maestro-backend-core/src/public/v1/backend.ts",
+      "sourceSha256": "7df49cf145cd68d8f2154e33768217cd8f20f64716e5fdb627ecec596b42bcd0",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backend-core/src/public/v1/backend.ts",
+      "archiveSha256": "7df49cf145cd68d8f2154e33768217cd8f20f64716e5fdb627ecec596b42bcd0",
+      "modification": "placement generics only; existing protocol fields preserved"
+    },
+    {
+      "target": "src/protocol/registry.ts",
+      "source": "rebuild/packages/pi-maestro-backend-core/src/public/v1/registry.ts",
+      "sourceSha256": "d73483453e9d00adfbf020ac2dfb000ebc6f958da836ae68654e916383e562ab",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backend-core/src/public/v1/registry.ts",
+      "archiveSha256": "d73483453e9d00adfbf020ac2dfb000ebc6f958da836ae68654e916383e562ab",
+      "modification": "placement generics only; existing protocol fields preserved"
+    },
+    {
+      "target": "src/protocol/ssh.ts",
+      "source": "rebuild/packages/pi-maestro-backend-core/src/public/v1/ssh.ts",
+      "sourceSha256": "712f16c9a1d9eed2a014df003baae3a6a4cf35598a40a1eea8c73570b840ae6e",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backend-core/src/public/v1/ssh.ts",
+      "archiveSha256": "712f16c9a1d9eed2a014df003baae3a6a4cf35598a40a1eea8c73570b840ae6e",
+      "modification": "placement generics only; existing protocol fields preserved"
+    },
+    {
+      "target": "src/config.ts",
+      "source": "rebuild/packages/pi-maestro-backends/src/config.ts",
+      "sourceSha256": "91534963d75b1511402deb5980ecf1f0669cf6e15eb33d036260683ee06aa27e",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/config.ts",
+      "archiveSha256": "91534963d75b1511402deb5980ecf1f0669cf6e15eb33d036260683ee06aa27e",
+      "modification": "algorithm migration with approved isolation/validation hardening"
+    },
+    {
+      "target": "src/registry.ts",
+      "source": "rebuild/packages/pi-maestro-backends/src/registry.ts",
+      "sourceSha256": "9ef5f2d8aae9599648bf81808ae84c7bc16ee4d363d528243bc9102778b303ef",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/registry.ts",
+      "archiveSha256": "9ef5f2d8aae9599648bf81808ae84c7bc16ee4d363d528243bc9102778b303ef",
+      "modification": "algorithm migration with approved isolation/validation hardening"
+    },
+    {
+      "target": "src/capabilities.ts",
+      "source": "rebuild/packages/pi-maestro-backends/src/capabilities.ts",
+      "sourceSha256": "ab3b22f53edcea2169bef6afb151c264dc0f69fb2c93571990e4618b19ab7e83",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/capabilities.ts",
+      "archiveSha256": "ab3b22f53edcea2169bef6afb151c264dc0f69fb2c93571990e4618b19ab7e83",
+      "modification": "algorithm migration with approved isolation/validation hardening"
+    },
+    {
+      "target": "src/child-env.ts",
+      "source": "rebuild/packages/pi-maestro-backends/src/child-env.ts",
+      "sourceSha256": "a33b47bf1945437f6ba71be1925cc836ca13cc5c5f6ea3b2944f9a0c7316140a",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/child-env.ts",
+      "archiveSha256": "a33b47bf1945437f6ba71be1925cc836ca13cc5c5f6ea3b2944f9a0c7316140a",
+      "modification": "algorithm migration with approved isolation/validation hardening"
+    },
+    {
+      "target": "src/auth/contracts.ts",
+      "targetSha256": "4656137b0e87a89c4b632e10885fb4fd5f685c186bcf3103873be78f10d9f630",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "sourceSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "archiveSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/devin-auth.ts",
+          "sha256": "7235addf5497171bd67b7ecf6eade6e24d95a341a937f6b24ea2b075bf7dfc9d"
+        },
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/mcp/mcp-auth-flow.ts",
+          "sha256": "3192f2a06da92677a74b310bdc7bf7edb7a103f723e68c5197c344d4deeacc1e"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored structural Host ports/lifetime/safe error view; original authority separation; approved already-aborted Promise rejection observer fix",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/auth/devin-flow.ts",
+      "targetSha256": "738b877fc84c2f313d8b79ba82fd4b94de59885de97f8d57fc381859c9147ca9",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/devin-auth.ts",
+      "sourceSha256": "7235addf5497171bd67b7ecf6eade6e24d95a341a937f6b24ea2b075bf7dfc9d",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/devin-auth.ts",
+      "archiveSha256": "7235addf5497171bd67b7ecf6eade6e24d95a341a937f6b24ea2b075bf7dfc9d",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "complete original choreography/PKCE/expiry adapted to original Host random/hash/HTTP/callback ports; safe error view, no actual login claim",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/auth/mcp-flow.ts",
+      "targetSha256": "3671742538ab9c9c888b86bb64238e39c3805813c8025a13cabacb32037be265",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/mcp/mcp-auth-flow.ts",
+      "sourceSha256": "3192f2a06da92677a74b310bdc7bf7edb7a103f723e68c5197c344d4deeacc1e",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/mcp/mcp-auth-flow.ts",
+      "archiveSha256": "3192f2a06da92677a74b310bdc7bf7edb7a103f723e68c5197c344d4deeacc1e",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "complete original pending/dedup/start/finish/refresh/revoke/initialize/shutdown via original Host legacy store/transport; no new credential store",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/auth/provider-owner.ts",
+      "targetSha256": "30015ee74524d4c121bfbd5581abb2a8f04424c9da13ba895eea6459055723dc",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "sourceSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "archiveSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-ops.ts",
+          "sha256": "8b1b4141bb1f9fb94ba8f3ce0f85ca3dd37de24c9fc370465da8ad724d9c0ffb"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "complete provider lifecycle ordering migration; original Host writers/SDK credential authority retained",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/auth.ts",
+      "targetSha256": "16c8671b0aba5703cc500472b5d3351a1c4aee0e435c13091065cf80dd643966",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "sourceSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "archiveSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/devin-auth.ts",
+          "sha256": "7235addf5497171bd67b7ecf6eade6e24d95a341a937f6b24ea2b075bf7dfc9d"
+        },
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/mcp/mcp-auth-flow.ts",
+          "sha256": "3192f2a06da92677a74b310bdc7bf7edb7a103f723e68c5197c344d4deeacc1e"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored public aggregate for moved C02 contracts/provider/Devin/MCP owners; no claim raw-copy or actual callback/login passed",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/engine/adapter.ts",
+      "targetSha256": "08b8e32b6c249335163e77d5a664e680639ac74a0bf07be64607e7cee090324e",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/cli-adapter.ts",
+      "sourceSha256": "69aefcfbcd640028abfc69e5881b9dfffb482151370bfdab235fb0989929aab7",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/cli-adapter.ts",
+      "archiveSha256": "69aefcfbcd640028abfc69e5881b9dfffb482151370bfdab235fb0989929aab7",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "complete original capability/cache/protocol/catalog/argv/response/error/redaction methods and pure helpers, exactly original bodies; constructor requires Host runner; no default physical IO",
+      "phase": "C04-engine-contract",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/engine/classification.ts",
+      "targetSha256": "6bed666581feb759cc94304d6c7ffc91b841f0874f3ed451c31b349fdb69cd48",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/tools/run-control.ts",
+      "sourceSha256": "a71995265462b27e3c7b30e8f8c3eca2f3fbc96277a4eac466a78ffc85333ae1",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/tools/run-control.ts",
+      "archiveSha256": "a71995265462b27e3c7b30e8f8c3eca2f3fbc96277a4eac466a78ffc85333ae1",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "whole original read/write/mutation/lease classification bytes unchanged; no business permission or Coordinator move",
+      "phase": "C04-engine-contract",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/engine/contracts.ts",
+      "targetSha256": "9bd789b3e74e122d3e7d1e0223f3b7c7408ee22bf02b62f5e81a5c026f08ae91",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/cli-adapter.ts",
+      "sourceSha256": "69aefcfbcd640028abfc69e5881b9dfffb482151370bfdab235fb0989929aab7",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/cli-adapter.ts",
+      "archiveSha256": "69aefcfbcd640028abfc69e5881b9dfffb482151370bfdab235fb0989929aab7",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "original CLI public protocol/types extracted whole; Host process implementation excluded",
+      "phase": "C04-engine-contract",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/engine/response.ts",
+      "targetSha256": "be97d1084cc0498de71d4201eb2d6e2e1c0ff367c9768a428751077983248b67",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/run-response.ts",
+      "sourceSha256": "be97d1084cc0498de71d4201eb2d6e2e1c0ff367c9768a428751077983248b67",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/run-response.ts",
+      "archiveSha256": "be97d1084cc0498de71d4201eb2d6e2e1c0ff367c9768a428751077983248b67",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "whole original strict run-response schemas/parser/private/public projection bytes unchanged; actual Zod3.25.76 preserved",
+      "phase": "C04-engine-contract",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/engine.ts",
+      "targetSha256": "368adebb7c25675405664c570f0a732158bda375bd8f165169975cd7e11c04bb",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/cli-adapter.ts",
+      "sourceSha256": "69aefcfbcd640028abfc69e5881b9dfffb482151370bfdab235fb0989929aab7",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/cli-adapter.ts",
+      "archiveSha256": "69aefcfbcd640028abfc69e5881b9dfffb482151370bfdab235fb0989929aab7",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/session/run-response.ts",
+          "sha256": "be97d1084cc0498de71d4201eb2d6e2e1c0ff367c9768a428751077983248b67"
+        },
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/tools/run-control.ts",
+          "sha256": "a71995265462b27e3c7b30e8f8c3eca2f3fbc96277a4eac466a78ffc85333ae1"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored engine public aggregate of same canonical moved contracts/adapter/response/classification; Flow default constructor and Host runner remain original facade",
+      "phase": "C04-engine-contract",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/index.ts",
+      "targetSha256": "98d7981482cd7a0adf0d0a9014df5da9a1399eb70ee31766724193515b67a14f",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/index.ts",
+      "sourceSha256": "1418cb20cdb0013946a71438b386f25e15c2b0beb0196b6cb8e08bf1bd645893",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/index.ts",
+      "archiveSha256": "1418cb20cdb0013946a71438b386f25e15c2b0beb0196b6cb8e08bf1bd645893",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backend-core/src/public/v1/index.ts",
+          "sha256": "95b44b38caa3f75972b22f5beafd4c1b0e80b337abe99f78a2a11f23f5a62aa1"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored C01 selective aggregate; existing source directives remain canonical and separate /auth,/remote,/engine exports use original wildcard export",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/protocol/failure.ts",
+      "targetSha256": "01d7d189c8e5b6899a2844af268fd7adcf2dcab5d3c8c0a9337d4a198535c1ee",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/runs/retry.ts",
+      "sourceSha256": "75505aea255cff869ff3ed1bff6b3c0e34e132b6f81cc2d0119676eab2e0c126",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/runs/retry.ts",
+      "archiveSha256": "75505aea255cff869ff3ed1bff6b3c0e34e132b6f81cc2d0119676eab2e0c126",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/runs/recovery-protocol.ts",
+          "sha256": "d3522a75dffb115d8fae30b19785626c5cddeb8bf960f787ae31bf4ef1527bf3"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored approved M08 structured private failure/recovery facts contract; not present as a raw upstream file; preserves explicit source/code and unknown classification",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/protocol/remote-failure.ts",
+      "targetSha256": "fe0a517b02442d9249910d995ef45f5ee8cea7c8c751ee326cc48707c43d64d3",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/pi-rpc-driver.ts",
+      "sourceSha256": "a5e8cfd3dd6f4c1fbf75b608ba68c51f841f78497c2468b4357ea92421402d6e",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/pi-rpc-driver.ts",
+      "archiveSha256": "a5e8cfd3dd6f4c1fbf75b608ba68c51f841f78497c2468b4357ea92421402d6e",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/runs/recovery-protocol.ts",
+          "sha256": "d3522a75dffb115d8fae30b19785626c5cddeb8bf960f787ae31bf4ef1527bf3"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored bounded remote structured failure wire validation; explicit configured-worker boundary, no cause inference from text",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/protocol/remote-run.ts",
+      "targetSha256": "db1ffa6aa3a93fe02e981b9ac05d141c7089a8be12ca3cb7616126c6d6e9a66f",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/types.ts",
+      "sourceSha256": "5cd3f97580ca7d82cd14cf2e5985c5bbdbfb21cefcd51e8bc36a7e0de7d0c91b",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/types.ts",
+      "archiveSha256": "5cd3f97580ca7d82cd14cf2e5985c5bbdbfb21cefcd51e8bc36a7e0de7d0c91b",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/protocol.ts",
+          "sha256": "577270eb1b9d3c1beb4eaa1463b3e3d712413bf8c2385f94eab8bd2f2c113a6c"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "canonical remote DTO/protocol relocation; original identity/capture/request/public shapes preserved; Host-only config not copied into core",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/backend.ts",
+      "targetSha256": "4d182822342ee4469a8be7aeafaa030dfb253cda6f4bcfb1fc8e1fa19c4a0bfe",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/remote/backend.ts",
+      "sourceSha256": "22526c658ba25d518d90fb24b1ef4c9f2d800404f7a66dd5103656eff99e40d4",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/remote/backend.ts",
+      "archiveSha256": "22526c658ba25d518d90fb24b1ef4c9f2d800404f7a66dd5103656eff99e40d4",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "complete remote backend run/fold/manager-port adapter relocation; capabilities/unsupported policy unchanged, no second connection manager",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/daemon.ts",
+      "targetSha256": "eee22330a73a08b8ab5f8dd45bb667585976e60f9ab13b25e7c5601a92c0e9c0",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/server.ts",
+      "sourceSha256": "ae4b2209ad38394de7ce5f07c9aaa29939b2564732683d94b0abf488416f3308",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/server.ts",
+      "archiveSha256": "ae4b2209ad38394de7ce5f07c9aaa29939b2564732683d94b0abf488416f3308",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "run/controller/concurrency/pump owner extracted from Host server; same original M13 command gate/journal port remains authoritative; approved late-start/close ownership/fact-vs-publish lifecycle fixes",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/manager-port.ts",
+      "targetSha256": "c19c30cd6546f11e80c4dc0050145be9881c18f9ef113acc9ecce6eec35e121c",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/backends/remote-workers.ts",
+      "sourceSha256": "5abe199efdfee623a769882fb472b319e431c433c167c968554e0a5d9e41a52b",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/backends/remote-workers.ts",
+      "archiveSha256": "5abe199efdfee623a769882fb472b319e431c433c167c968554e0a5d9e41a52b",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "per-capture subscription binding moved with manager; listener-before-start and captured buffer/replay semantics retained",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/manager.ts",
+      "targetSha256": "670a58a55403a5b9536e6cad28e66dca2fa58bd018b8cc9887195f9a7df44bc5",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/worker-manager.ts",
+      "sourceSha256": "58be6cb10dae87e97c55022df53d4867df20b7a23f4a01e7b002de665c956f2c",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/worker-manager.ts",
+      "archiveSha256": "58be6cb10dae87e97c55022df53d4867df20b7a23f4a01e7b002de665c956f2c",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "complete run/handle/event manager algorithm through original connection/target/timer ports; attach/replay late binding/closed/signal checks; no second Host Monitor or transport",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/outcome.ts",
+      "targetSha256": "bb28dbd468d17ac7d92892424bc3688d92e4bbffe728be887f2a8c9847b242d5",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/remote/outcome.ts",
+      "sourceSha256": "9616fe2005df42c07a6f47a1ea086ad64a4478c513b5120226a0aef3301034b0",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/remote/outcome.ts",
+      "archiveSha256": "9616fe2005df42c07a6f47a1ea086ad64a4478c513b5120226a0aef3301034b0",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "original foldRemoteOutcome algorithm relocation; all remote physical release remains unreaped/unknown unless original proof, no optimistic reclamation",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/ports.ts",
+      "targetSha256": "c7d4b4d18f0b1c9a5fc452e419af45c3c7023a5800475fe6b74e3f0a8ed4b780",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/driver.ts",
+      "sourceSha256": "f56b8262cfda42f713c4f4933d1cb68b6726fe27f1ef8d99f0e186be9cf7a1cd",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/driver.ts",
+      "archiveSha256": "f56b8262cfda42f713c4f4933d1cb68b6726fe27f1ef8d99f0e186be9cf7a1cd",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/ssh.ts",
+          "sha256": "b108db9a08ed16f5032c4ca3383f3fbaa884f0e9843e98891d86ab1a7a4c9ac2"
+        },
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/worker-manager.ts",
+          "sha256": "58be6cb10dae87e97c55022df53d4867df20b7a23f4a01e7b002de665c956f2c"
+        },
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/remote/types.ts",
+          "sha256": "9b26ef2301499f101c6e872414179278a2a4045e6f43cb92cee5c3e5252f85e4"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored structural IO/clock/target/connection/journal/manager ports from original Host interfaces; private resources remain Host",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/rpc-connection.ts",
+      "targetSha256": "8a4a689cd148d5212c6b674b74fc2b29ef0a7290de7a5e051355f6cb2559e65e",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/ssh.ts",
+      "sourceSha256": "b108db9a08ed16f5032c4ca3383f3fbaa884f0e9843e98891d86ab1a7a4c9ac2",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/ssh.ts",
+      "archiveSha256": "b108db9a08ed16f5032c4ca3383f3fbaa884f0e9843e98891d86ab1a7a4c9ac2",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "original JSON-RPC transport algorithm extracted via byte-stream ports; immediate response observation, close/finalize consistency, bounded drain/deadline cleanup and queued recovery fixes",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/ssh-pool.ts",
+      "targetSha256": "6ab4d88acdec1991bca5980563325014c901ae22a969cc67d6e9f014f6cb9c95",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/ssh.ts",
+      "sourceSha256": "b108db9a08ed16f5032c4ca3383f3fbaa884f0e9843e98891d86ab1a7a4c9ac2",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/ssh.ts",
+      "archiveSha256": "b108db9a08ed16f5032c4ca3383f3fbaa884f0e9843e98891d86ab1a7a4c9ac2",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "original connection/reference pooling extracted via factory/timer ports; approved exact-instance generation removal fix; SSH process/credentials remain Host",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote/state.ts",
+      "targetSha256": "41b990cec05e54b8a65e7c5daa3ae132bf3d423334d51f51a8f304734a5b6aab",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/state.ts",
+      "sourceSha256": "3c0f3dd2dc6049ac36ab1308ec6830565b28e892ec6db19adbc4a2ad9779831e",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/state.ts",
+      "archiveSha256": "3c0f3dd2dc6049ac36ab1308ec6830565b28e892ec6db19adbc4a2ad9779831e",
+      "additionalArchiveSources": [],
+      "originKind": "algorithm-migration",
+      "modification": "canonical capture/status folding relocation, original semantics retained",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/remote.ts",
+      "targetSha256": "248c5a99f55c412f4e86823a9537d696427972b946a897d409fa2869a9b439df",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/worker-manager.ts",
+      "sourceSha256": "58be6cb10dae87e97c55022df53d4867df20b7a23f4a01e7b002de665c956f2c",
+      "archive": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/worker-manager.ts",
+      "archiveSha256": "58be6cb10dae87e97c55022df53d4867df20b7a23f4a01e7b002de665c956f2c",
+      "additionalArchiveSources": [
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/remote/server.ts",
+          "sha256": "ae4b2209ad38394de7ce5f07c9aaa29939b2564732683d94b0abf488416f3308"
+        },
+        {
+          "path": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-backends/src/remote/backend.ts",
+          "sha256": "22526c658ba25d518d90fb24b1ef4c9f2d800404f7a66dd5103656eff99e40d4"
+        }
+      ],
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "authored aggregate of relocated C03 protocol/state/manager/ports/backend/daemon/RPC/pool; not physical SSH or socket proof",
+      "phase": "previously-root-landed-C02-C03-or-structured-facts",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/health/circuit.ts",
+      "targetSha256": "a38b50b65e3e95d06794a04d5ec5df2f25d9b7061141962d717101173e30476b",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/models/model-circuit-breaker.ts",
+      "sourceSha256": "fe864901502b1de3c4bd2820502a3cc6f343378c40fa0f6868175e52040fc97f",
+      "archive": "artifacts/pi-graph-full-parity-architecture-20261103/install-readiness-20261110/coverage-current/m08-cli-health/c05-execution/before/rebuild/packages/pi-maestro-teammate/src/models/model-circuit-breaker.ts",
+      "archiveSha256": "fe864901502b1de3c4bd2820502a3cc6f343378c40fa0f6868175e52040fc97f",
+      "originKind": "algorithm-migration",
+      "modification": "Full circuit algorithm relocated; non-reused monotonic generation allocation fences removed/readded and manually reset circuit epochs.",
+      "phase": "C05-health-owner",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/health/coordinator.ts",
+      "targetSha256": "d1b5c78e346dcc8498b077188da30f655df5ca782d6a79962f75d07654ce5acc",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/models/model-circuit-breaker.ts",
+      "sourceSha256": "fe864901502b1de3c4bd2820502a3cc6f343378c40fa0f6868175e52040fc97f",
+      "archive": "artifacts/pi-graph-full-parity-architecture-20261103/install-readiness-20261110/coverage-current/m08-cli-health/c05-execution/before/rebuild/packages/pi-maestro-teammate/src/models/model-circuit-breaker.ts",
+      "archiveSha256": "fe864901502b1de3c4bd2820502a3cc6f343378c40fa0f6868175e52040fc97f",
+      "originKind": "algorithm-migration",
+      "modification": "Original canonical deployment/route coordinator, paired permits, projection reconciliation and ranking relocated.",
+      "phase": "C05-health-owner",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/health/attempt.ts",
+      "targetSha256": "0b73ff97138db58ac2fcac687dfd84867bc0b5239e6df116929e922465f5a769",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/runs/retry.ts",
+      "sourceSha256": "75505aea255cff869ff3ed1bff6b3c0e34e132b6f81cc2d0119676eab2e0c126",
+      "archive": "artifacts/pi-graph-full-parity-architecture-20261103/install-readiness-20261110/coverage-current/m08-cli-health/c05-execution/before/rebuild/packages/pi-maestro-teammate/src/runs/retry.ts",
+      "archiveSha256": "75505aea255cff869ff3ed1bff6b3c0e34e132b6f81cc2d0119676eab2e0c126",
+      "originKind": "algorithm-migration",
+      "modification": "Attempt quarantine/auth-suppression and retry-kind health projection relocated; text classification/backoff remain with Teammate Host.",
+      "phase": "C05-health-owner",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/health/key-policy.ts",
+      "targetSha256": "62147419d981a1c6adeefec8aae29c7c3e095ec094c9fd43c9d7932f02a010eb",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-ops.ts",
+      "sourceSha256": "8b1b4141bb1f9fb94ba8f3ce0f85ca3dd37de24c9fc370465da8ad724d9c0ffb",
+      "archive": "artifacts/pi-graph-full-parity-architecture-20261103/install-readiness-20261110/coverage-current/m08-cli-health/c05-execution/before/rebuild/packages/pi-maestro-flow/src/providers/api-provider-ops.ts",
+      "archiveSha256": "820fac1bbc85d9716c35bbcb37853829f40c78c1d9aa2fea0a48fbd7f6fb074d",
+      "originKind": "algorithm-migration",
+      "modification": "Key policy decisions relocated using metadata only; secrets, durable models IO, locking and credential hydration remain with Flow Host.",
+      "phase": "C05-health-owner",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/health/key-owner.ts",
+      "targetSha256": "115695d631461224ddcf1b956da7af4eed90dd0d0af99146d2134448abd3d9c5",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "sourceSha256": "4582f74dd16c81691c3affddbbd6adb58394b3af5f03e78293dbc0751b2fb61a",
+      "archive": "artifacts/pi-graph-full-parity-architecture-20261103/install-readiness-20261110/coverage-current/m08-cli-health/c05-execution/before/rebuild/packages/pi-maestro-flow/src/providers/api-provider-config.ts",
+      "archiveSha256": "711b89b4b6fe8c6ddc7fa73e93cbe1ecdc582ae7880d845430fdc2ba73e632ec",
+      "originKind": "algorithm-migration",
+      "modification": "Original response status-to-key-health orchestration relocated through original Host mutation/registration/refresh/notification ports.",
+      "phase": "C05-health-owner",
+      "noWholeFeatureAcceptanceClaim": true
+    },
+    {
+      "target": "src/health.ts",
+      "targetSha256": "6fe14b3253ae06a4c6ee893160cf4acf92b8ebcd89f4872562f6d4d89fe87c63",
+      "source": "artifacts/pi-maestro-comparison-20261103/upstream/packages/pi-maestro-teammate/src/models/model-circuit-breaker.ts",
+      "sourceSha256": "fe864901502b1de3c4bd2820502a3cc6f343378c40fa0f6868175e52040fc97f",
+      "archive": "artifacts/pi-graph-full-parity-architecture-20261103/install-readiness-20261110/coverage-current/m08-cli-health/c05-execution/before/rebuild/packages/pi-maestro-teammate/src/models/model-circuit-breaker.ts",
+      "archiveSha256": "fe864901502b1de3c4bd2820502a3cc6f343378c40fa0f6868175e52040fc97f",
+      "originKind": "authored-adaptation-or-composition",
+      "modification": "Authored public aggregate; same-install shared composition remains with original Teammate Host.",
+      "phase": "C05-health-owner",
+      "noWholeFeatureAcceptanceClaim": true
+    }
+  ],
+  "scopeNotes": [
+    "original first8 C01 records unchanged",
+    "C02 authority/Host boundaries and callback/platform limitations remain original receipts",
+    "C03 inprocess/Root SDK proof is not physical SSH/server socket proof",
+    "C04 engine protocol/response/classification relocated; physical CLI/process behavior remains with the Flow Host; upstream engine integration is a separate platform capability.",
+    "C05 health/circuit/key-metadata orchestration relocated; physical retries, credential authority and durable Host writes remain with their original owners."
+  ]
+}

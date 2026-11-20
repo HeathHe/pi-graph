@@ -1,0 +1,567 @@
+/**
+ * Load Command — Unified knowledge loading (specs, wiki, sessions).
+ *
+ *   maestro load <id>                              — load by canonical ID (type inferred)
+ *   maestro load --type session --list             — list recent sessions
+ *   maestro load --type session --id <id>          — load specific session
+ *   maestro load --type spec --category coding     — load coding specs
+ *   maestro load --type knowhow --list             — browse knowhow entries
+ *   maestro load --type knowhow --id <id>          — load specific knowhow
+ */
+import { readFileSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { requireArchKbIndex, resolveArchKbContentPath, } from '../arch-kb/index.js';
+import { truncate } from '../utils/cli-format.js';
+import { AsyncResourceSlot } from '../utils/async-resource-slot.js';
+import { isDeprecatedKnowledgeEntry } from '../utils/knowledge-lifecycle.js';
+import { isRepositoryApplicable } from '../repository/applicability.js';
+import { loadWorkspaceConfig, resolveWorkspaceLinks } from '../config/index.js';
+import { resolveRepositoryContext } from '../repository/context.js';
+import { spawnDaemon, tryDaemonLoad } from '../search/daemon-client.js';
+import { loadSpecWikiEntries } from '../tools/spec-wiki-loader.js';
+const VALID_TYPES = ['spec', 'knowhow', 'note', 'domain', 'issue', 'project', 'roadmap', 'session', 'scratch', 'template'];
+const indexerSlot = new AsyncResourceSlot();
+function resolveWikiAuthority(current) {
+    const linkedWorkspaces = resolveWorkspaceLinks(current.projectRoot, loadWorkspaceConfig(current.projectRoot))
+        .filter(lw => lw.valid)
+        .map(lw => ({
+        name: lw.name,
+        workflowRoot: lw.workflowRoot,
+        shareTypes: lw.share,
+        repoId: lw.repoId,
+        repoName: lw.repoName,
+        workspaceFence: lw.repoId ? `repo:${lw.repoId}` : `linked:${lw.name}`,
+    }));
+    const repository = {
+        repoId: current.repoId,
+        repoName: current.repoName,
+        alias: current.alias,
+        workspaceFence: current.repoId ? `repo:${current.repoId}` : undefined,
+    };
+    return {
+        linkedWorkspaces,
+        repository,
+        authorityKey: JSON.stringify({ linkedWorkspaces, repository }),
+    };
+}
+/** Run one operation while holding the cached reader's lifecycle lease. */
+export async function withWikiIndexer(projectRoot, operation) {
+    const root = resolve(projectRoot ?? '.');
+    const current = resolveRepositoryContext('current', { projectRoot: root });
+    const { linkedWorkspaces, repository, authorityKey } = resolveWikiAuthority(current);
+    const key = JSON.stringify({ workflowRoot: current.workflowRoot, authorityKey });
+    return indexerSlot.run(key, async () => {
+        const { WikiIndexer: Cls } = await import('#maestro-dashboard/wiki/wiki-indexer.js');
+        return new Cls({
+            workflowRoot: current.workflowRoot,
+            linkedWorkspaces,
+            repository,
+            role: 'reader',
+        });
+    }, operation);
+}
+function matchesType(entry, type) {
+    if (type === 'session')
+        return entry.category === 'session';
+    if (type === 'scratch')
+        return entry.category === 'scratch';
+    return entry.type === type;
+}
+function displayType(e) {
+    if (e.category === 'session')
+        return 'session';
+    if (e.category === 'scratch')
+        return 'scratch';
+    return e.type;
+}
+function formatEntry(e) {
+    const badge = displayType(e);
+    const catTag = e.category && e.category !== 'session' && e.category !== 'scratch'
+        ? ` [${e.category}]` : '';
+    const codePaths = Array.isArray(e.ext?.codePaths)
+        ? `\n\n[codePaths: ${e.ext.codePaths.join(', ')}]` : '';
+    const editedFiles = Array.isArray(e.ext?.editedFiles) && e.ext.editedFiles.length > 0
+        ? `\n\n[editedFiles: ${e.ext.editedFiles.join(', ')}]` : '';
+    const related = e.related.length > 0
+        ? `\n[related: ${e.related.join(', ')}]` : '';
+    // KG codegraph stubs carry no body in the wiki index — point at the source
+    // file so the caller can still reach the full text.
+    const body = e.body || e.summary;
+    const filePath = typeof e.ext?.filePath === 'string' && e.ext.filePath.length > 0
+        && !e.body
+        ? `\n\n→ 全文: ${e.ext.filePath}` : '';
+    return `## [${badge}]${catTag} ${e.title}\n\n${body}${codePaths}${editedFiles}${filePath}${related}`;
+}
+const TYPE_PREFIXES = ['spec', 'knowhow', 'note', 'domain', 'issue', 'project', 'roadmap', 'session', 'scratch'];
+/**
+ * Resolve an entry ID with tolerance: exact match first, then
+ * case-insensitive, then with the `--type` prefix applied (e.g. `--id dcs-…`
+ * matches `knowhow-dcs-…`). When no type is given (wiki load/get), all known
+ * type prefixes are tried. Mirrors the lowercase canonical IDs produced by
+ * knowhowFileToWikiId() so hand-typed IDs don't miss.
+ */
+export function findEntry(index, rawId, type) {
+    const exact = index.byId[rawId];
+    if (exact)
+        return exact;
+    const lower = rawId.toLowerCase();
+    const candidates = [lower];
+    if (type) {
+        if (type !== 'session' && type !== 'scratch' && !lower.startsWith(`${type}-`)) {
+            candidates.push(`${type}-${lower}`);
+        }
+    }
+    else {
+        for (const t of TYPE_PREFIXES) {
+            if (!lower.startsWith(`${t}-`))
+                candidates.push(`${t}-${lower}`);
+        }
+    }
+    for (const candidate of candidates) {
+        for (const e of index.entries) {
+            if (e.id.toLowerCase() === candidate)
+                return e;
+        }
+    }
+    return null;
+}
+function formatListLine(e) {
+    const badge = displayType(e);
+    const catTag = e.category && e.category !== 'session' && e.category !== 'scratch'
+        ? `  ${e.category}` : '';
+    const date = e.updated.slice(0, 10);
+    const title = truncate(e.title, 50);
+    return `  [${badge}]${catTag}  ${e.id}  ${title}  (${date})`;
+}
+function entryToJson(e, brief) {
+    const base = {
+        id: e.id, type: e.type, title: e.title,
+        category: e.category, updated: e.updated,
+        repoId: e.repoId ?? e.source.repoId ?? null,
+        repoName: e.repoName ?? e.source.repoName ?? null,
+        alias: e.alias ?? e.source.alias ?? null,
+        workspaceFence: e.workspaceFence ?? e.source.workspaceFence ?? null,
+        appliesToRepoIds: e.appliesToRepoIds ?? null,
+    };
+    if (brief) {
+        base.summary = e.summary;
+        return base;
+    }
+    return {
+        ...base,
+        summary: e.summary, body: e.body,
+        related: e.related,
+        codePaths: e.ext?.codePaths ?? null,
+        editedFiles: e.ext?.editedFiles ?? null,
+    };
+}
+function templateEntryToJson(entry, body) {
+    return {
+        id: entry.id,
+        type: entry.type,
+        title: entry.title,
+        category: 'arch-kb',
+        summary: entry.summary,
+        slug: entry.slug,
+        keywords: entry.keywords,
+        sections: entry.sections,
+        path: entry.path,
+        referenceOnly: true,
+        ...(body === undefined ? {} : { body }),
+    };
+}
+function loadArchitectureTemplates(opts, ids) {
+    const index = requireArchKbIndex();
+    const templates = index.entries.filter(entry => entry.type === 'template');
+    const byId = (id) => templates.find(entry => entry.id === id || entry.slug === id);
+    const isList = opts.list === true;
+    let entries;
+    if (ids.length > 0) {
+        entries = ids.map(byId).filter((entry) => entry !== undefined);
+        const missing = ids.filter(id => !byId(id));
+        if (missing.length > 0) {
+            console.error(`Not found: ${missing.join(', ')}`);
+            process.exitCode = 1;
+        }
+    }
+    else {
+        entries = [...templates];
+        if (opts.category && opts.category !== 'arch-kb')
+            entries = [];
+        if (opts.keyword) {
+            const keyword = opts.keyword.toLowerCase();
+            entries = entries.filter(entry => entry.title.toLowerCase().includes(keyword)
+                || entry.summary.toLowerCase().includes(keyword)
+                || entry.slug.toLowerCase().includes(keyword)
+                || entry.keywords.some(value => value.toLowerCase().includes(keyword)));
+        }
+        if (opts.tag) {
+            const tag = opts.tag.toLowerCase();
+            entries = entries.filter(entry => entry.keywords.some(value => value.toLowerCase() === tag));
+        }
+        entries.sort((left, right) => left.title.localeCompare(right.title));
+        const defaultLimit = isList ? 20 : 10;
+        const parsedLimit = opts.limit ? Number.parseInt(opts.limit, 10) : defaultLimit;
+        const limit = Math.max(1, Math.min(Number.isFinite(parsedLimit) ? parsedLimit : defaultLimit, 500));
+        entries = entries.slice(0, limit);
+    }
+    if (entries.length === 0) {
+        console.error('No entries found.');
+        if (ids.length > 0)
+            process.exitCode = 1;
+        return;
+    }
+    if (isList) {
+        if (opts.json) {
+            console.log(JSON.stringify({
+                totalLoaded: entries.length,
+                entries: entries.map(entry => templateEntryToJson(entry)),
+            }, null, 2));
+            return;
+        }
+        console.log(`template: ${entries.length} entries`);
+        for (const entry of entries) {
+            console.log(`  [template]  ${entry.id}  ${truncate(entry.title, 50)}`);
+        }
+        return;
+    }
+    const loaded = entries.flatMap(entry => {
+        const contentPath = resolveArchKbContentPath(entry.path);
+        if (!contentPath) {
+            console.error(`Source file not found: ${entry.id} (${entry.path})`);
+            process.exitCode = 1;
+            return [];
+        }
+        return [{ entry, body: readFileSync(contentPath, 'utf-8') }];
+    });
+    if (loaded.length === 0)
+        return;
+    if (opts.json) {
+        console.log(JSON.stringify({
+            totalLoaded: loaded.length,
+            entries: loaded.map(({ entry, body }) => templateEntryToJson(entry, body)),
+        }, null, 2));
+        return;
+    }
+    const sections = loaded.map(({ entry, body }) => `## [template] [arch-kb] ${entry.title}\n\n${body}\n\n[source: ${entry.path}]`);
+    console.log(`# Loaded ${loaded.length} entries\n\n---\n\n${sections.join('\n\n---\n\n')}`);
+}
+export async function recordLoadedKnowledge(entries) {
+    try {
+        const { recordKnowledgeConsumptionsDetailed } = await import('../graph/kg/knowledge-usage.js');
+        const result = recordKnowledgeConsumptionsDetailed(process.cwd(), entries.map(entry => ({ id: entry.id, sourceRef: entry.sourceRef })));
+        if (result.nodeIds.length === 0)
+            return;
+        // Resolve exact read-only authority before writing attribution. A live Run
+        // channel must not be collapsed to its Session when several Runs are active.
+        try {
+            const { SessionStore } = await import('../run/store.js');
+            const { findKnowledgeAttributionAuthority } = await import('../run/knowledge-identity.js');
+            const store = new SessionStore(process.cwd());
+            const authority = findKnowledgeAttributionAuthority(process.cwd(), store);
+            if (authority?.kind === 'run') {
+                const { recordRunKnowledgeInputs } = await import('../run/knowledge.js');
+                recordRunKnowledgeInputs(process.cwd(), authority.runId, result.nodeIds, 'consumed', 'load', authority.sessionId);
+                return;
+            }
+            if (authority?.kind === 'session') {
+                const { recordSessionKnowledgeInputs } = await import('../run/session-knowledge.js');
+                recordSessionKnowledgeInputs(process.cwd(), authority.sessionId, result.nodeIds, 'consumed', 'load');
+                return;
+            }
+        }
+        catch {
+            // Attribution is best-effort; fall through to the ambiguity warning.
+        }
+        console.error('Warning: knowledge consumption recorded in the global ledger, but run/session '
+            + 'attribution was skipped (write authority is absent or ambiguous).');
+    }
+    catch {
+        // Usage analytics must never block knowledge loading.
+    }
+}
+const DAEMON_LOAD_BUDGET_MS = 1_500;
+function wikiIndexFromDaemon(entries, generatedAt) {
+    const byId = Object.create(null);
+    const byType = Object.create(null);
+    for (const entry of entries) {
+        byId[entry.id] = entry;
+        (byType[entry.type] ??= []).push(entry);
+    }
+    return {
+        entries,
+        byId,
+        byType,
+        backlinks: Object.create(null),
+        generatedAt: Number.isFinite(generatedAt) ? generatedAt : Date.now(),
+    };
+}
+export function registerLoadCommand(program) {
+    program
+        .command('load [ids...]')
+        .description('Unified knowledge loading — specs, wiki, sessions')
+        .option('--type <type>', `Entry type: ${VALID_TYPES.join(', ')} (inferred from ID when omitted)`)
+        .option('--id <ids>', 'Load specific entries by ID (comma-separated)')
+        .option('--category <cat>', 'Filter by category (e.g. coding, arch, debug, recipe)')
+        .option('--keyword <word>', 'Filter entries by keyword in title/body')
+        .option('--tag <tag>', 'Filter entries by exact tag match')
+        .option('--list', 'List matching entries (compact, no body)')
+        .option('--scope <scope>', 'Spec scope: project|global|team|personal (default: project)')
+        .option('--repo <selector>', 'Target repository (current, ID, linked alias, or unique name)')
+        .option('--limit <n>', 'Max entries (default: 20 for --list, 10 for load)', '')
+        .option('--include-deprecated', 'Include deprecated/superseded entries')
+        .option('--json', 'Output as JSON')
+        .action(async (positionalIds, opts) => {
+        const positional = (positionalIds ?? [])
+            .flatMap((value) => value.split(','))
+            .map((value) => value.trim())
+            .filter(Boolean);
+        const declaredType = opts.type;
+        if (declaredType !== undefined && !VALID_TYPES.includes(declaredType)) {
+            console.error(`Error: --type must be one of ${VALID_TYPES.join(', ')}`);
+            process.exit(1);
+        }
+        const isList = opts.list === true;
+        const includeDeprecated = opts.includeDeprecated === true;
+        const ids = [
+            ...(opts.id ? opts.id.split(',').map((s) => s.trim()).filter(Boolean) : []),
+            ...positional,
+        ];
+        // Canonical IDs carry their own type prefix (knowhow-…, spec:…,
+        // issue-…, session-…), so a bare `maestro load <id>` must not force the
+        // caller to restate --type. --type is only mandatory for browsing.
+        let type = declaredType;
+        if (type === undefined) {
+            if (ids.length === 0) {
+                console.error(`Error: --type is required when browsing (one of ${VALID_TYPES.join(', ')}). `
+                    + 'To load by ID: maestro load <id>');
+                process.exit(1);
+            }
+            // Spec IDs keep the file-backed fast path; every other ID resolves
+            // against the full Wiki index without a declared type. `kg-spec-*`
+            // (dash form) is a KG-projection wiki ID, not a spec file reference.
+            if (ids.every(id => /^(?:spec[:-]|kg-spec:)/i.test(id)))
+                type = 'spec';
+        }
+        import('../hooks/spec-analytics.js').then(({ logCliEndpoint }) => {
+            logCliEndpoint(process.cwd(), 'load', { type: type ?? 'auto', category: opts.category, id: opts.id, list: opts.list });
+        }).catch(() => { });
+        // Architecture templates are global read-only references, not Wiki entries.
+        // Keep this path independent from repository resolution, the daemon, and
+        // project knowledge-consumption attribution.
+        if (type === 'template') {
+            loadArchitectureTemplates(opts, ids);
+            return;
+        }
+        let currentRepository;
+        let targetRepository;
+        try {
+            currentRepository = resolveRepositoryContext('current', { projectRoot: process.cwd() });
+            targetRepository = opts.repo
+                ? resolveRepositoryContext(opts.repo, { projectRoot: currentRepository.projectRoot })
+                : currentRepository;
+        }
+        catch (error) {
+            console.error(`Error: ${error.message}`);
+            process.exitCode = 1;
+            return;
+        }
+        // --type spec (non-list, no specific IDs): delegate to spec-loader
+        if (type === 'spec' && !isList && ids.length === 0) {
+            await loadBySpecCategory(opts, targetRepository);
+            return;
+        }
+        const defaultLimit = isList ? 20 : 10;
+        const parsedLimit = opts.limit ? Number.parseInt(opts.limit, 10) : defaultLimit;
+        const limit = Math.max(1, Math.min(Number.isFinite(parsedLimit) ? parsedLimit : defaultLimit, 500));
+        let index;
+        if (type === 'spec' && ids.length > 0) {
+            // Canonical spec IDs are file-backed. Scan only the bounded spec scopes
+            // instead of asking the daemon for the full Wiki index (which can turn
+            // a telemetry-only KG update into a whole-corpus rebuild).
+            index = wikiIndexFromDaemon(await loadSpecWikiEntries(targetRepository));
+        }
+        else if (type === undefined) {
+            // Untyped ID lookups always need the whole index: the daemon
+            // selection contract requires a declared type, and positional IDs
+            // may span entry types.
+            spawnDaemon(currentRepository.workflowRoot).catch(() => { });
+            index = await withWikiIndexer(undefined, indexer => indexer.get());
+        }
+        else {
+            const { authorityKey } = resolveWikiAuthority(currentRepository);
+            const selection = {
+                type,
+                ...(ids.length > 0 ? { ids } : {}),
+                ...(opts.category ? { category: opts.category } : {}),
+                ...(opts.keyword ? { keyword: opts.keyword } : {}),
+                ...(opts.tag ? { tag: opts.tag } : {}),
+                includeDeprecated,
+                limit,
+                projection: isList ? 'metadata' : 'full',
+                ...(targetRepository.repoId ? { applicableRepoId: targetRepository.repoId } : {}),
+                ...(opts.repo && targetRepository.repoId ? { targetRepoId: targetRepository.repoId } : {}),
+                ...(opts.repo && !targetRepository.repoId ? { targetAlias: targetRepository.alias } : {}),
+                originExplicit: Boolean(opts.repo),
+            };
+            const daemonResult = await tryDaemonLoad(currentRepository.workflowRoot, { timeoutMs: DAEMON_LOAD_BUDGET_MS, authorityKey, selection });
+            if (daemonResult?.ok && Array.isArray(daemonResult.entries)) {
+                index = wikiIndexFromDaemon(daemonResult.entries, daemonResult.generatedAt);
+            }
+            else {
+                // Start recovery before local work: a caller timeout must not prevent
+                // the daemon from warming. Spawn arbitration keeps callers single.
+                spawnDaemon(currentRepository.workflowRoot).catch(() => { });
+                index = await withWikiIndexer(undefined, indexer => indexer.get());
+            }
+        }
+        let entries;
+        if (ids.length > 0) {
+            entries = ids
+                .map(id => findEntryForRepository(index, id, type, targetRepository, Boolean(opts.repo)))
+                .filter((e) => e !== null
+                && (includeDeprecated || !isDeprecatedKnowledgeEntry(e))
+                && entryMatchesRepository(e, targetRepository, Boolean(opts.repo)));
+            const missing = ids.filter(id => {
+                const entry = findEntryForRepository(index, id, type, targetRepository, Boolean(opts.repo));
+                return !entry
+                    || (!includeDeprecated && isDeprecatedKnowledgeEntry(entry))
+                    || !entryMatchesRepository(entry, targetRepository, Boolean(opts.repo));
+            });
+            if (missing.length > 0) {
+                const suffix = includeDeprecated ? '' : ' (use --include-deprecated to load retired entries)';
+                console.error(`Not found or deprecated: ${missing.join(', ')}${suffix}`);
+            }
+        }
+        else {
+            // Browsing (no IDs) always has a declared type — the early exit above
+            // guarantees it. Narrow once for the filters and labels below.
+            const browseType = type;
+            let pool = index.entries.filter(e => matchesType(e, browseType)
+                && (includeDeprecated || !isDeprecatedKnowledgeEntry(e))
+                && entryMatchesRepository(e, targetRepository, Boolean(opts.repo)));
+            if (opts.category) {
+                pool = pool.filter(e => e.category === opts.category);
+            }
+            if (opts.keyword) {
+                const kw = opts.keyword.toLowerCase();
+                pool = pool.filter(e => e.title.toLowerCase().includes(kw) ||
+                    // A selected metadata projection intentionally omits bodies. An
+                    // absent body may have been the server-side keyword match.
+                    typeof e.body !== 'string' || e.body.toLowerCase().includes(kw));
+            }
+            if (opts.tag) {
+                const tag = opts.tag.toLowerCase();
+                pool = pool.filter(e => e.tags.includes(tag));
+            }
+            if (browseType === 'session' || browseType === 'scratch') {
+                pool.sort((a, b) => new Date(b.updated).getTime() - new Date(a.updated).getTime());
+            }
+            else {
+                // Content-bearing entries (file-backed or kg nodes with body) sort
+                // before empty stub projections so discovery views aren't flooded
+                // by codegraph stubs; title order stays deterministic within groups.
+                pool.sort((a, b) => {
+                    // Codegraph stubs carry no body — keep them after entries that
+                    // surface full text so discovery views aren't flooded by stubs.
+                    const aStub = !a.body;
+                    const bStub = !b.body;
+                    if (aStub !== bStub)
+                        return aStub ? 1 : -1;
+                    return a.title.localeCompare(b.title);
+                });
+            }
+            entries = pool.slice(0, limit);
+        }
+        if (entries.length === 0) {
+            console.error('No entries found.');
+            return;
+        }
+        // Listing is discovery only. Returning full content is an explicit
+        // consumption signal, regardless of whether output is text or JSON.
+        if (!isList)
+            await recordLoadedKnowledge(entries);
+        if (opts.json) {
+            console.log(JSON.stringify({
+                totalLoaded: entries.length,
+                entries: entries.map(e => entryToJson(e, isList)),
+            }, null, 2));
+            return;
+        }
+        if (isList) {
+            console.log(`${type ?? 'knowledge'}: ${entries.length} entries`);
+            for (const e of entries)
+                console.log(formatListLine(e));
+            return;
+        }
+        const sections = entries.map(formatEntry);
+        console.log(`# Loaded ${entries.length} entries\n\n---\n\n${sections.join('\n\n---\n\n')}`);
+    });
+}
+function findEntryForRepository(index, id, type, target, originExplicit) {
+    const direct = findEntry(index, id, type);
+    if (direct && entryMatchesRepository(direct, target, originExplicit))
+        return direct;
+    if (!originExplicit)
+        return direct;
+    const lower = id.toLowerCase();
+    return index.entries.find(entry => {
+        if (!entryMatchesRepository(entry, target, true))
+            return false;
+        if (type !== undefined && !matchesType(entry, type))
+            return false;
+        const entryId = entry.id.toLowerCase();
+        return entryId === lower || entryId.endsWith(`:${lower}`);
+    }) ?? null;
+}
+function entryMatchesRepository(entry, target, originExplicit) {
+    if (!isRepositoryApplicable(entry, target.repoId))
+        return false;
+    if (!originExplicit)
+        return true;
+    if (target.repoId)
+        return (entry.repoId ?? entry.source.repoId) === target.repoId;
+    return (entry.alias ?? entry.source.alias) === target.alias;
+}
+async function loadBySpecCategory(opts, targetRepository) {
+    const { loadSpecs } = await import('../tools/spec-loader.js');
+    const projectPath = process.cwd();
+    const wsConfig = loadWorkspaceConfig(projectPath);
+    const resolved = resolveWorkspaceLinks(projectPath, wsConfig);
+    const explicitRepo = typeof opts.repo === 'string';
+    const linkedSpecs = resolved
+        .filter(lw => lw.valid && (lw.share.includes('spec') || lw.share.includes('knowhow')))
+        .filter(lw => !explicitRepo
+        || (targetRepository.repoId ? lw.repoId === targetRepository.repoId : lw.name === targetRepository.alias))
+        .map(lw => ({
+        name: lw.name,
+        specsDir: join(lw.workflowRoot, 'specs'),
+        includeSpecs: lw.share.includes('spec'),
+        knowhowDir: lw.share.includes('knowhow') ? join(lw.workflowRoot, 'knowhow') : undefined,
+        repoId: lw.repoId,
+        repoName: lw.repoName,
+        workspaceFence: lw.repoId ? `repo:${lw.repoId}` : `linked:${lw.name}`,
+    }));
+    const loaderOpts = {
+        ...(linkedSpecs.length > 0 ? { linkedWorkspaces: linkedSpecs } : {}),
+        includeDeprecated: opts.includeDeprecated === true,
+        applicableRepoId: targetRepository.repoId,
+        includeProject: !explicitRepo || targetRepository.relation === 'current',
+        includeGlobal: !explicitRepo || targetRepository.relation === 'current',
+    };
+    const scope = opts.scope ?? 'project';
+    const keyword = opts.keyword;
+    const category = opts.category;
+    const result = loadSpecs(projectPath, category, undefined, keyword, scope, loaderOpts);
+    if (opts.json) {
+        console.log(JSON.stringify({
+            totalLoaded: result.totalLoaded,
+            specs: result.matchedSpecs,
+            content: result.content,
+        }, null, 2));
+    }
+    else {
+        console.log(result.content || '(No specs found)');
+    }
+}
+//# sourceMappingURL=load.js.map

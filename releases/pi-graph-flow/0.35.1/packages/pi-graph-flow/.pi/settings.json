@@ -1,0 +1,10 @@
+{
+  "skills": [
+    "skills"
+  ],
+  "compaction": {
+    "newContext": {
+      "enabled": true
+    }
+  }
+}

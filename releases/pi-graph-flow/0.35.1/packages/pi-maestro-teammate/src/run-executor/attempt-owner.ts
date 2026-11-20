@@ -1,0 +1,3418 @@
+import { createChildModelBudgetPort, type ChildModelBudgetPort } from "./budget-port.ts";
+import type { isUtf8 } from "node:buffer";
+import type { preserveStructuredOutputFailure } from "./structured-output-failure-evidence.ts";
+import type { parseDeclaredJsonResult } from "pi-graph-verification";
+import type { createChildTodoParentContext, readChildTodoParentContext, ChildTodoParentContext } from "../runs/child-parent-context.ts";
+import type { assertTaskDispatch, TaskDispatchRequest } from "../public/v1/task-dispatch-binding.ts";
+import type { createNativeObservation } from "./native-observation.ts";
+import type {
+
+  spawn,
+  ChildProcess,
+} from "node:child_process";
+import type { logDiagnosticError, logDiagnosticWarn } from "../shared/diagnostic-log.ts";
+import type { nextTeammateHostSequence, publishTeammateHostBoundary } from "../runs/host-observers.ts";
+import type {
+  randomUUID,
+  createHash,
+} from "node:crypto";
+import type * as fs from "node:fs";
+import type * as path from "node:path";
+import type {
+  Writable,
+} from "node:stream";
+import type {
+  StringDecoder,
+} from "node:string_decoder";
+import type crossSpawn from "cross-spawn";
+import type { beginNativeTaskRecovery, beforeNativeTaskWrite, consumeNativeTaskWrite, markNativeTaskWriteUnknown, markNativeTaskCleanup, observeNativeTaskRecovery } from "../public/v1/task-dispatch-binding.ts";
+import type { getPiHostMode } from "pi-maestro-settings-core/v1";
+import type { assertVirtualChildRouter, nativeChildBuiltinArgs, probePiChildVersion } from "../runs/native-child.ts";
+import type {
+  AgentConfig,
+} from "../agents/agents.ts";
+import type {
+  ReplyTarget,
+} from "../shared/routing.ts";
+import type {
+  previewToolCallArgs,
+} from "../runs/shared/tool-preview.ts";
+import type {
+  SingleResult,
+  AgentTerminalStatus,
+  AgentTurnEvent,
+  AgentTurnMessageMetadataV1,
+  AgentTurnTriggerContextV1,
+  MessageProvenanceV1,
+} from "../shared/types.ts";
+import type {
+  AGENT_TURN_VERSION,
+  normalizeMessageProvenanceV1,
+} from "../shared/types.ts";
+import type {
+  wrapLeasedMessage,
+  LeaseToken,
+} from "../runs/session-handoff.ts";
+import type { classifyRetryError, classifyRetryErrorDetailed } from "../runs/retry.ts";
+import type {
+  RECOVERY_WAKE_RECEIPT_VERSION,
+  ReplayEvidenceCollector,
+  hasExternalReplayRisk,
+  RecoveryFailureChainV1,
+  RecoveryFailureRecordV1,
+  RecoveryWakeReceiptV1,
+} from "../runs/recovery-protocol.ts";
+import type {
+  EXECUTION_BUFFER_LIMITS,
+  FIRST_ACTIVITY_TIMEOUT_MS,
+  MODEL_FALLBACK_RESUME_PROMPT,
+  OUTPUT_LIMIT_RECOVERY_TIMEOUT_MS,
+  resultReadyGraceMsFor,
+  STRUCTURED_OUTPUT_SETTLEMENT_DIAGNOSTICS,
+  addUsageSnapshot,
+  appendBoundedTranscriptMessage,
+  appendDistinctAssistantMessage,
+  appendUtf8Tail,
+  bindChildTerminationSignal,
+  buildPiArgs,
+  cleanupFile,
+  correlationSessionDirectoryName,
+  createChildTerminationController,
+  createProgress,
+  createUtf8LineDecoder,
+  describeStructuredOutputValidationFailure,
+  emptyUsage,
+  ensurePrivateDirectory,
+  extractPiEventError,
+  extractStructuredOutputCandidate,
+  extractTextContent,
+  formatPiLaunchDiagnostic,
+  getPiSpawnCommand,
+  getTeammateDepth,
+  getTeammateSessionRoot,
+  isPiResultReadyTurn,
+  piLaunchDiagnostic,
+  releasePublishedTurnHistory,
+  resetUsage,
+  setUsageSnapshot,
+  truncateUtf8Head,
+  truncateUtf8Tail,
+  writeSchemaFile,
+  writeSystemPromptFile,
+} from "../runs/execution-infra.ts";
+import type {
+  JsonLineEvent,
+  RunSingleTeammateParams,
+  RunTeammateOptions,
+  StructuredOutputCandidate,
+} from "../runs/execution-infra.ts";
+import type {AttemptPorts,AttemptAssets} from "./lifecycle-contracts.ts";
+import {createControlOwner} from "./control-owner.ts";
+import type { TransportSidecarLease, TransportSidecar, RpcMessageMode, RpcInputDisposition, RpcReceipt, InterruptHandler } from "./control-owner.ts";
+export interface AttemptRecoveryFacts {
+  settlementCapability: AttemptSettlementCapability;
+  completedToolCount: number;
+  inFlightToolCount: number;
+  /** A non-zero close before any child event, stderr, or possible side effect. */
+  preActivityInfrastructureExit: boolean;
+  /** Exact compatibility projection of replayEvidence. */
+  externalReplayRisk: boolean;
+  replayEvidence?: ReturnType<ReplayEvidenceCollector["snapshot"]>;
+  /** Non-JSON stdout was attributed as assistant content (protocol violation). Optional: not all settlement paths populate it. */
+  stdoutProtocolViolation?: boolean;
+}
+export interface AttemptSessionContext {
+  /** Private per-correlation session directory, when the parent exposes one. */
+  sessionDir?: string;
+  /** Existing child session loaded after a cold runtime restart. */
+  resumeSessionFile?: string;
+  /** Parent session file the child forks from. */
+  forkSessionFile?: string;
+  /** Transcript note emitted when an explicit fork could not be honoured. */
+  forkWarning?: string;
+}
+export interface AttemptState {
+  nativeRecoveryFailure?: string;
+  // --- Turn-scoped: cleared by completeTurn() once a result is published. ---
+  lastContent: string;
+  streamingText: string;
+  stderrBuffer: string;
+  pendingStructuredOutput?: StructuredOutputCandidate;
+  capturedStructuredOutput: unknown;
+  structuredOutputValidationFailure?: string;
+  /** Set when the child's structured_output tool execution itself failed. */
+  structuredOutputAttemptFailed: boolean;
+  structuredOutputSubmissionConfirmed: boolean;
+  reportedRuntimeErrors: Set<string>;
+  runtimeFailure?: string;
+  modelSwitchFailure?: { diagnostic: string; source: "provider" | "transport" };
+  /**
+   * progress.toolCount stays cumulative for the lifetime of a wakeable agent so
+   * it reads on the same scale as the cumulative token counters. This per-turn
+   * count only feeds diagnostics.
+   */
+  turnToolCount: number;
+  /**
+   * Re-opened at every turn boundary, set by completeTurn(). Guards against a
+   * second settlement for the same turn.
+   */
+  turnLifecycleSettled: boolean;
+  /** Last assistant stop reason observed for this turn. */
+  lastAssistantStopReason?: string;
+  /** A length-truncated turn is waiting for child-local compaction and continuation. */
+  outputLimitRecoveryPending: boolean;
+  /** A Flow synthetic compaction interruption must continue before this turn can settle. */
+  compactionWakeProtocolCapable: boolean;
+  latestWakeReceipt?: RecoveryWakeReceiptV1;
+  compactionRecovery?: {
+    recoveryId: string;
+    producer: string;
+    generation: number;
+    phase: "pending" | "continuation" | "completed";
+    wakeProtocolVersion?: 1;
+    wakeId?: string;
+    wakeReceipt?: RecoveryWakeReceiptV1;
+    absoluteDeadlineAt?: number;
+  };
+
+  // --- Attempt-scoped: survive turns for the lifetime of a wakeable child. ---
+  resolvedModel: string;
+  /**
+   * Result usage remains turn-scoped, while status usage stays cumulative for
+   * the lifetime of a wakeable agent.
+   */
+  completedInputTokens: number;
+  completedOutputTokens: number;
+  completedCacheReadTokens: number;
+  completedCacheWriteTokens: number;
+  /** One-way latches; never reset. */
+  receivedFirstActivity: boolean;
+  /** True only for a silent non-zero close before any child event or possible effect. */
+  preActivityInfrastructureExit: boolean;
+  /** Bounded monotonic provenance; the public boolean is its exact projection. */
+  replayEvidence: ReplayEvidenceCollector;
+  /** Non-JSON stdout was attributed as assistant content (protocol violation). */
+  stdoutProtocolViolation: boolean;
+  initialResultPublished: boolean;
+  /** Recovery evidence used to fence any fresh-process model fallback. */
+  settlementCapability: AttemptSettlementCapability;
+  completedToolCount: number;
+  inFlightToolCount: number;
+  failureSequence: number;
+  failureChain: RecoveryFailureChainV1;
+  /** Absorbing state: once terminal, queued child lines must not reopen a turn. */
+  terminal: boolean;
+  /** Unique owner of an asynchronous model-selection decision. */
+  modelSwitchDecisionId?: string;
+  /** In-process model switch transaction, when one is awaiting Pi's ack. */
+  modelSwitch?: {
+    requestId: string;
+    targetModel: string;
+    /** False until Pi confirms the `set_model` command. */
+    acknowledged: boolean;
+  };
+  /**
+   * Model currently active after an in-process switch (undefined until the
+   * first switch is acknowledged). Passed back to `onModelFailover` so the
+   * decision hook can settle the previous trial and avoid re-selecting it.
+   */
+  switchedModel?: string;
+  /**
+   * Request id of the resume prompt issued after a successful in-process
+   * model switch. A rejected response for this id must settle the turn (the
+   * child is alive but refuses to continue, so no other settlement path
+   * exists).
+   */
+  modelSwitchResumeRequestId?: string;
+}
+export interface AttemptTimers {
+  firstActivity?: ReturnType<typeof setTimeout>;
+  compactionIpcDrain?: ReturnType<typeof setImmediate>;
+  resultReadyGrace?: ReturnType<typeof setTimeout>;
+  outputLimitRecovery?: ReturnType<typeof setTimeout>;
+  compactionRecovery?: ReturnType<typeof setTimeout>;
+  interruptingSteer?: ReturnType<typeof setTimeout>;
+  toolHeartbeat?: ReturnType<typeof setInterval>;
+  modelSwitch?: ReturnType<typeof setTimeout>;
+}
+export interface PendingInterrupt {
+  abortRequestId: string;
+  promptRequestId: string;
+  message: string;
+  token?: LeaseToken;
+  provenance?: MessageProvenanceV1;
+  phase: "aborting" | "prompting";
+  /** Set when the interrupted turn settles; a later turn_start means the steer missed its window. */
+  turnSettledDuringAbort?: boolean;
+}
+export interface PendingModelInput {
+  requestId: string;
+  /** Exact leased string written on the Pi transport. */
+  transportMessage: string;
+  /** Exact user text after the child input hook validates and unwraps the lease. */
+  acceptedMessage: string;
+  context: AgentTurnTriggerContextV1;
+  loopSeq: number;
+  eventsEmitted: boolean;
+  initial: boolean;
+  committed: boolean;
+  nativeInputGeneration?: number;
+  nativeTurnEpoch?: number;
+  lastMessage?: AgentTurnMessageMetadataV1;
+}
+export interface ChildCompactionCapability {
+  type: "teammate_compaction_capability";
+  runtimeGeneration: number;
+}
+export interface ChildCompactionStateEvent {
+  type: "teammate_compaction_state";
+  recoveryId: string;
+  /** Producer-local generations are comparable only within this namespace. */
+  producer: string;
+  generation: number;
+  phase: "pending" | "continuation" | "completed" | "failed" | "cancelled";
+  /** Capability advertisement is carried on the ordered IPC state channel. */
+  wakeProtocolVersion?: 1;
+  wakeId?: string;
+  wakeDeadlineAt?: number;
+  reason?: string;
+}
+export type AttemptSettlementCapability = "agent_settled" | "legacy" | "unknown";
+export function createAttemptOwner(ports:AttemptPorts,assets:AttemptAssets) {
+ const { isUtf8,
+  preserveStructuredOutputFailure,
+  parseDeclaredJsonResult,
+  createChildTodoParentContext,
+  readChildTodoParentContext,
+  assertTaskDispatch,
+  createNativeObservation,
+  spawn,
+  logDiagnosticError,
+  logDiagnosticWarn,
+  nextTeammateHostSequence,
+  publishTeammateHostBoundary,
+  randomUUID,
+  createHash,
+  fs,
+  path,
+  StringDecoder,
+  crossSpawn,
+  beginNativeTaskRecovery,
+  beforeNativeTaskWrite,
+  consumeNativeTaskWrite,
+  markNativeTaskWriteUnknown,
+  markNativeTaskCleanup,
+  observeNativeTaskRecovery,
+  getPiHostMode,
+  assertVirtualChildRouter,
+  nativeChildBuiltinArgs,
+  probePiChildVersion,
+  previewToolCallArgs,
+  AGENT_TURN_VERSION,
+  normalizeMessageProvenanceV1,
+  wrapLeasedMessage,
+  classifyRetryError,
+  classifyRetryErrorDetailed,
+  RECOVERY_WAKE_RECEIPT_VERSION,
+  ReplayEvidenceCollector,
+  hasExternalReplayRisk,
+  EXECUTION_BUFFER_LIMITS,
+  FIRST_ACTIVITY_TIMEOUT_MS,
+  MODEL_FALLBACK_RESUME_PROMPT,
+  OUTPUT_LIMIT_RECOVERY_TIMEOUT_MS,
+  resultReadyGraceMsFor,
+  STRUCTURED_OUTPUT_SETTLEMENT_DIAGNOSTICS,
+  addUsageSnapshot,
+  appendBoundedTranscriptMessage,
+  appendDistinctAssistantMessage,
+  appendUtf8Tail,
+  bindChildTerminationSignal,
+  buildPiArgs,
+  cleanupFile,
+  correlationSessionDirectoryName,
+  createChildTerminationController,
+  createProgress,
+  createUtf8LineDecoder,
+  describeStructuredOutputValidationFailure,
+  emptyUsage,
+  ensurePrivateDirectory,
+  extractPiEventError,
+  extractStructuredOutputCandidate,
+  extractTextContent,
+  formatPiLaunchDiagnostic,
+  getPiSpawnCommand,
+  getTeammateDepth,
+  getTeammateSessionRoot,
+  isPiResultReadyTurn,
+  piLaunchDiagnostic,
+  releasePublishedTurnHistory,
+  resetUsage,
+  setUsageSnapshot,
+  truncateUtf8Head,
+  truncateUtf8Tail,
+  writeSchemaFile,
+  writeSystemPromptFile,
+  process,
+  Buffer,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  setImmediate,
+  clearImmediate } = ports;
+ const control=createControlOwner(ports);
+ const { guardedChildStdinStreams,
+  nativeWriteGates,
+  nativeWriteFailures,
+  interruptHandlers,
+  transportSidecars,
+  nativeRpcStreams,
+  rpcResponses,
+  acceptRpcResponse,
+  rejectRpcResponses,
+  sendRpcMessageWithReceipt,
+  guardChildStdin,
+  writeChildStdinLine,
+  writeTransportModelInput,
+  hasRpcTurnSidecar,
+  sendRpcMessage,
+  sendChildIpcMessage,
+  dispatchChildIpcMessage,
+  replyFailedChildRequest } = control;
+// Failed candidate processes must be physically reclaimed before a fallback
+// reuses their correlation identity for a replacement child.
+const attemptReclamations = new WeakMap<SingleResult, Promise<unknown>>();
+
+
+
+
+
+const attemptRecoveryFacts = new WeakMap<SingleResult, AttemptRecoveryFacts>();
+const INTERRUPTING_STEER_TIMEOUT_MS = 10_000;
+// Keep in sync with STRUCTURED_OUTPUT_MAX_BYTES in extension/structured-output.ts.
+const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
+
+class StructuredOutputTooLargeError extends Error {
+  constructor(readonly bytes: number) { super("Structured output exceeds byte limit"); }
+}
+
+/** Check the opened file before reading, and cap the read if it grows after fstat. */
+function readBoundedStructuredOutputFile(filePath: string): Buffer {
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`Structured output path is not a regular file: ${filePath}`);
+    if (stat.size > STRUCTURED_OUTPUT_MAX_BYTES) throw new StructuredOutputTooLargeError(stat.size);
+    const bytes = Buffer.allocUnsafe(STRUCTURED_OUTPUT_MAX_BYTES + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = fs.readSync(fd, bytes, length, bytes.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > STRUCTURED_OUTPUT_MAX_BYTES) throw new StructuredOutputTooLargeError(length);
+    return bytes.subarray(0, length);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Deadline for Pi to acknowledge an in-process model switch (`set_model`).
+ * Independent of the steer timeout: a slow provider handshake on a cold
+ * account can legitimately exceed a steer's interactive budget, while a
+ * stalled switch must still settle the turn instead of hanging.
+ */
+const MODEL_SWITCH_ACK_TIMEOUT_MS = 15_000;
+
+
+
+/** AC5: session directory + fork context resolved once per attempt. */
+
+
+function resolveAttemptSessionContext(
+  params: RunSingleTeammateParams,
+  agentConfig: AgentConfig,
+  correlationId: string,
+  options: RunTeammateOptions,
+): AttemptSessionContext {
+  const effectiveContext = params.context ?? agentConfig.defaultContext;
+  const parentSession = options.parentSessionFile ?? process.env.PI_TEAMMATE_PARENT_SESSION ?? null;
+  const hasParentSession = Boolean(parentSession) && fs.existsSync(parentSession as string);
+  const context: AttemptSessionContext = {};
+  if (options.resumeSessionFile && fs.existsSync(options.resumeSessionFile)) {
+    context.resumeSessionFile = options.resumeSessionFile;
+    context.sessionDir = path.dirname(options.resumeSessionFile);
+  }
+  if (!context.sessionDir && options.sessionDir) {
+    ensurePrivateDirectory(options.sessionDir);
+    context.sessionDir = path.resolve(options.sessionDir);
+  }
+  if (hasParentSession && !context.sessionDir) {
+    const sessionRoot = getTeammateSessionRoot(parentSession as string);
+    if (sessionRoot) {
+      context.sessionDir = path.join(sessionRoot, correlationSessionDirectoryName(correlationId));
+      ensurePrivateDirectory(context.sessionDir);
+    }
+  }
+  if (effectiveContext === "fork" && !context.resumeSessionFile) {
+    if (hasParentSession) {
+      context.forkSessionFile = parentSession as string;
+    } else if (params.context === "fork") {
+      context.forkWarning = "Fork requested but parent session file not available. Starting with fresh context.";
+    }
+  }
+  return context;
+}
+
+/**
+ * Every value a running attempt mutates after setup. Collecting them here keeps
+ * the settlement invariants readable as one state machine instead of a dozen
+ * independent closure flags, and lets the per-event handlers below be named,
+ * self-contained functions.
+ */
+
+
+/**
+ * While a tool is in flight (e.g. a long bash script), the pi child emits no
+ * further events until the tool completes. Without a heartbeat the parent's
+ * 30s stall clock (`TEAMMATE_STALL_TIMEOUT_MS`) would mark a busy agent as
+ * stalled. This interval refreshes progress activity until the tool ends; it
+ * stays well under the stall threshold so dropped ticks cannot false-flag.
+ */
+const TOOL_EXECUTION_HEARTBEAT_MS = 10_000;
+
+/**
+ * The lifecycle deadlines an attempt can arm. Every settlement path clears
+ * both; cleared handles are deliberately left in place so
+ * `armResultReadyGrace` still recognises a grace window that was already used.
+ */
+
+
+
+
+
+
+/**
+ * Cache tier for agent subprocesses.
+ *
+ * Agents stay on the short tier (5m on Anthropic, implicit 30m on OpenAI) even
+ * when the main process runs with PI_CACHE_RETENTION=long, so a long-lived main
+ * session does not leak its expensive 1h/24h cache tier into short-lived agents.
+ * PI_TEAMMATE_CACHE_RETENTION overrides the pin (valid values: short | long | none).
+ */
+function resolveAgentCacheRetention(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.PI_TEAMMATE_CACHE_RETENTION;
+  return override === "long" || override === "none" || override === "short" ? override : "short";
+}
+
+/** Environment handed to the pi child: identity, depth diagnostics and file seams. */
+function buildChildSpawnEnv(
+  correlationId: string,
+  replyTo: ReplyTarget,
+  options: RunTeammateOptions,
+  schemaFile: string | undefined,
+  outputFile: string | undefined,
+  forkSessionFile: string | undefined,
+  fast: boolean | undefined,
+): Record<string, string | undefined> {
+  const spawnEnv: Record<string, string | undefined> = {
+    ...process.env,
+    PI_TEAMMATE_CHILD: "1",
+    // Diagnostic only. The child never spawns grandchildren itself — it
+    // proxies nested dispatches back to this process — so the guard reads
+    // RunTeammateOptions.depth rather than this variable.
+    PI_TEAMMATE_DEPTH: String((options.depth ?? getTeammateDepth()) + 1),
+    PI_TEAMMATE_CORRELATION_ID: correlationId,
+    PI_TEAMMATE_REPLY_TO: replyTo,
+    PI_TEAMMATE_RUNTIME_GENERATION: String(options.runtimeGeneration ?? 0),
+    // Cache-tier pin (see resolveAgentCacheRetention): the child inherits the
+    // parent env via the spread above, so an explicit short-tier override keeps
+    // agents from inheriting the main process's long retention.
+    PI_CACHE_RETENTION: resolveAgentCacheRetention(process.env),
+    ...options.childEnvironment,
+    PI_TEAMMATE_CONTEXT_MODE: forkSessionFile ? "fork" : undefined,
+    // Clear any inherited child override; false must survive without a CLI flag.
+    PI_TEAMMATE_CODEX_FAST: fast === undefined ? undefined : String(fast),
+  };
+  if (options.maxDispatchDepth !== undefined) {
+    spawnEnv.PI_TEAMMATE_MAX_DISPATCH_DEPTH = String(options.maxDispatchDepth);
+  }
+  if (outputFile) {
+    spawnEnv.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH = outputFile;
+    spawnEnv.PI_TEAMMATE_STRUCTURED_SCHEMA_PATH = schemaFile;
+  }
+  if (options.parentSessionFile) {
+    spawnEnv.PI_TEAMMATE_PARENT_SESSION = options.parentSessionFile;
+  }
+  return spawnEnv;
+}
+
+
+
+function childCompactionCapability(message: Record<string, unknown>): ChildCompactionCapability | undefined {
+  if (message.type !== "teammate_compaction_capability"
+    || message.version !== 1
+    || message.wakeProtocolVersion !== 1
+    || !Number.isSafeInteger(message.runtimeGeneration)) return undefined;
+  return { type: "teammate_compaction_capability", runtimeGeneration: message.runtimeGeneration as number };
+}
+
+/** Child IPC events that only publish identity or validated in-process recovery state. */
+function isReplayNeutralChildIpcMessage(message: Record<string, unknown>): boolean {
+  return message.type === "teammate_session_ready"
+    || childCompactionCapability(message) !== undefined
+    || childCompactionStateEvent(message) !== undefined
+    || childWakeReceipt(message) !== undefined;
+}
+
+function childWakeReceipt(message: Record<string, unknown>): RecoveryWakeReceiptV1 | undefined {
+  if (message.type !== "teammate_compaction_wake_receipt"
+    || message.version !== RECOVERY_WAKE_RECEIPT_VERSION
+    || typeof message.recoveryId !== "string"
+    || typeof message.producer !== "string"
+    || !Number.isSafeInteger(message.generation)
+    || typeof message.wakeId !== "string"
+    || !["prepared", "queued", "consumed", "turn-started", "cancelled", "failed"].includes(String(message.state))
+    || !Number.isSafeInteger(message.sequence)
+    || !Number.isSafeInteger(message.deadlineAt)
+    || !Number.isSafeInteger(message.runtimeGeneration)) return undefined;
+  const optionalStrings = ["sessionId", "branchCheckpointId", "messageId", "turnId", "reason"] as const;
+  if (optionalStrings.some((key) => message[key] !== undefined && typeof message[key] !== "string")) return undefined;
+  return {
+    version: RECOVERY_WAKE_RECEIPT_VERSION,
+    recoveryId: message.recoveryId,
+    producer: message.producer,
+    generation: message.generation as number,
+    wakeId: message.wakeId,
+    state: message.state as RecoveryWakeReceiptV1["state"],
+    sequence: message.sequence as number,
+    deadlineAt: message.deadlineAt as number,
+    runtimeGeneration: message.runtimeGeneration as number,
+    ...Object.fromEntries(optionalStrings.flatMap((key) => typeof message[key] === "string" ? [[key, message[key]]] : [])),
+  } as RecoveryWakeReceiptV1;
+}
+
+
+
+function childCompactionStateEvent(message: Record<string, unknown>): ChildCompactionStateEvent | undefined {
+  if (message.type !== "teammate_compaction_state"
+    || typeof message.recoveryId !== "string"
+    || !Number.isSafeInteger(message.generation)
+    || (message.phase !== "pending"
+      && message.phase !== "continuation"
+      && message.phase !== "completed"
+      && message.phase !== "failed"
+      && message.phase !== "cancelled")
+    || (message.wakeProtocolVersion !== undefined && message.wakeProtocolVersion !== 1)
+    || (message.wakeProtocolVersion === 1
+      && (typeof message.wakeId !== "string" || !Number.isSafeInteger(message.wakeDeadlineAt)))
+    || ((message.wakeId !== undefined || message.wakeDeadlineAt !== undefined)
+      && message.wakeProtocolVersion !== 1)) return undefined;
+  return {
+    type: "teammate_compaction_state",
+    recoveryId: message.recoveryId,
+    // Legacy children emitted one global-looking generation. Keep them in a
+    // separate namespace so mixed-version sessions remain backward compatible.
+    producer: typeof message.producer === "string" && message.producer.length > 0
+      ? message.producer
+      : "legacy",
+    generation: message.generation as number,
+    phase: message.phase,
+    ...(message.wakeProtocolVersion === 1
+      ? {
+          wakeProtocolVersion: 1 as const,
+          wakeId: message.wakeId as string,
+          wakeDeadlineAt: message.wakeDeadlineAt as number,
+        }
+      : {}),
+    ...(typeof message.reason === "string" ? { reason: message.reason } : {}),
+  };
+}
+
+/** Proxy requests and lifecycle events raised by extensions inside the child. */
+function bindChildIpcRelay(
+  child: ChildProcess,
+  correlationId: string,
+  options: RunTeammateOptions,
+  onActivity?: (message: Record<string, unknown>) => void,
+  onReply?: (request: Record<string, unknown>) => void,
+  parentContext?: ChildTodoParentContext,
+  modelBudget?: ChildModelBudgetPort,
+): void {
+  child.on("message", (msg: unknown) => {
+    // PERFSEC-001: process.send(null) or malformed envelopes must not crash
+    // the parent — an unguarded property access in an EventEmitter callback is
+    // an uncaught exception.
+    if (msg === null || msg === undefined || typeof msg !== "object") return;
+    const m = msg as Record<string, unknown>;
+    // Only an already-marked exact budget claim may deliver physical facts after
+    // ordinary tool/send authority has ended. The generic relay below is unchanged.
+    if (modelBudget?.interceptFact(m, reply => {
+      if (!sendChildIpcMessage(child, reply)) logDiagnosticWarn("[pi-maestro-teammate] child budget fact reply channel closed");
+    })) return;
+    // GEN-001: After teardown aborts the signal, a dying child's in-flight
+    // IPC messages must not re-enter the parent and spawn new nested agents.
+    if (options.signal?.aborted) return;
+    if (m.type === "teammate_session_ready") {
+      try { modelBudget?.observeSession(m); }
+      catch (error) { logDiagnosticWarn("[pi-maestro-teammate] child budget session identity rejected", error); }
+    }
+    onActivity?.(m);
+    dispatchChildIpcMessage(
+      m,
+      options.onChildRequest
+        ? (request, reply) => {
+          readChildTodoParentContext(parentContext);
+          return options.onChildRequest?.({
+            ...request,
+            // The parent process owns this identity; never trust a child-supplied actor id.
+            correlationId,
+          }, reply, parentContext);
+        }
+        : undefined,
+      options.onChildEvent
+        ? (event) => options.onChildEvent?.({
+            ...event,
+            // Lifecycle ownership is assigned by the spawning parent.
+            correlationId,
+          })
+        : undefined,
+      (reply) => {
+        if (!sendChildIpcMessage(child, reply as Record<string, unknown>)) {
+          throw new Error("Child IPC channel rejected the reply envelope.");
+        }
+        onReply?.(m);
+      },
+    );
+  });
+}
+
+async function runSingleAttempt(
+  params: RunSingleTeammateParams,
+  agentConfig: AgentConfig,
+  cwd: string,
+  correlationId: string,
+  replyTo: ReplyTarget,
+  startTime: number,
+  modelOverride: string | undefined,
+  options: RunTeammateOptions,
+  originalDispatch?: { readonly origin: object | undefined; readonly request: TaskDispatchRequest },
+): Promise<SingleResult> {
+  const effectiveContext = params.context ?? agentConfig.defaultContext;
+  const wakeable = effectiveContext !== "fork";
+  const systemPromptFile = writeSystemPromptFile(agentConfig, correlationId, params.outputSchema, params.todos);
+  const { sessionDir, resumeSessionFile, forkSessionFile, forkWarning } =
+    resolveAttemptSessionContext(params, agentConfig, correlationId, options);
+
+  // AC6: Structured output
+  const { schemaFile, outputFile } = params.outputSchema
+    ? writeSchemaFile(params.outputSchema, correlationId)
+    : { schemaFile: undefined, outputFile: undefined };
+
+  const piArgs = buildPiArgs(
+    agentConfig,
+    params,
+    systemPromptFile,
+    modelOverride,
+    sessionDir,
+    forkSessionFile,
+    schemaFile,
+    options.virtualModelIds?.length
+      ? [...(options.modelCapabilities ?? []), ...options.virtualModelIds.map((id) => ({ id }))]
+      : options.modelCapabilities,
+    resumeSessionFile,
+  );
+
+  const usage = emptyUsage();
+  const pendingMessageUsage = emptyUsage();
+  const messages: Array<{ role: string; content: string }> = [];
+  if (forkWarning) {
+    appendBoundedTranscriptMessage(messages, { role: "system", content: forkWarning });
+  }
+  const state: AttemptState = {
+    lastContent: "",
+    streamingText: "",
+    stderrBuffer: "",
+    pendingStructuredOutput: undefined,
+    capturedStructuredOutput: undefined,
+    structuredOutputValidationFailure: undefined,
+    reportedRuntimeErrors: new Set(),
+    runtimeFailure: undefined,
+    turnToolCount: 0,
+    turnLifecycleSettled: false,
+    lastAssistantStopReason: undefined,
+    outputLimitRecoveryPending: false,
+    compactionWakeProtocolCapable: false,
+    compactionRecovery: undefined,
+    structuredOutputAttemptFailed: false,
+    structuredOutputSubmissionConfirmed: false,
+    resolvedModel: modelOverride ?? params.model ?? agentConfig.model ?? "unknown",
+    completedInputTokens: 0,
+    completedOutputTokens: 0,
+    completedCacheReadTokens: 0,
+    completedCacheWriteTokens: 0,
+    receivedFirstActivity: false,
+    preActivityInfrastructureExit: false,
+    replayEvidence: new ReplayEvidenceCollector(),
+    stdoutProtocolViolation: false,
+    initialResultPublished: false,
+    settlementCapability: "unknown",
+    completedToolCount: 0,
+    inFlightToolCount: 0,
+    latestWakeReceipt: undefined,
+    failureSequence: 0,
+    failureChain: { version: 1, decisions: Object.freeze([]) },
+    terminal: false,
+    modelSwitchDecisionId: undefined,
+  };
+
+  // AC8: Rich progress tracking
+  const progress = createProgress(params.agent, startTime);
+  progress.requestedModel = modelOverride ?? params.model ?? agentConfig.model;
+
+  const initialTurnContext: AgentTurnTriggerContextV1 = options.initialTurnContext ?? {
+    version: AGENT_TURN_VERSION,
+    turnId: randomUUID(),
+    correlationId,
+    runtimeGeneration: options.runtimeGeneration ?? 0,
+    promptSeq: 1,
+    trigger: normalizeMessageProvenanceV1(options.initialMessageProvenance),
+  };
+  const turnLoopSeqOffset = Number.isSafeInteger(options.turnLoopSeqOffset)
+    ? Math.max(0, options.turnLoopSeqOffset ?? 0)
+    : 0;
+  const pendingModelInputs: PendingModelInput[] = [];
+  let currentModelInput: PendingModelInput | undefined;
+  let initialModelInputRegistered = false;
+  let nextExternalPromptSeq = initialTurnContext.promptSeq + 1;
+  let lastTurnEventTimestamp = typeof options.turnEventTimestampFloor === "number"
+    && Number.isFinite(options.turnEventTimestampFloor)
+    && options.turnEventTimestampFloor >= 0
+    ? options.turnEventTimestampFloor
+    : 0;
+  let lastProgressFingerprint: string | undefined;
+
+  const turnEventTimestamp = (): number => {
+    lastTurnEventTimestamp = Math.max(Date.now(), lastTurnEventTimestamp + 1);
+    return lastTurnEventTimestamp;
+  };
+
+  const recordCanonicalTurnEvent = (event: AgentTurnEvent): void => {
+    if (event.type === "progress") {
+      const fingerprint = JSON.stringify([
+        event.turnId,
+        event.correlationId,
+        event.runtimeGeneration,
+        event.promptSeq,
+        event.loopSeq,
+        event.phase ?? null,
+        event.toolActivity ?? null,
+        event.lastMessage ?? null,
+      ]);
+      if (fingerprint === lastProgressFingerprint) return;
+      lastProgressFingerprint = fingerprint;
+    }
+    try {
+      options.recordTurnEvent?.(event);
+    } catch {
+      // Observational sidecar failures cannot change transport or settlement.
+    }
+  };
+
+  const turnEventBase = (input: PendingModelInput, timestamp: number) => ({
+    ...input.context,
+    loopSeq: input.loopSeq,
+    timestamp,
+  });
+
+  const assistantMessageMetadata = (
+    input: PendingModelInput,
+    timestamp: number,
+  ): AgentTurnMessageMetadataV1 => ({
+    role: "assistant",
+    timestamp,
+    provenance: {
+      version: 1,
+      messageId: randomUUID(),
+      source: "agent-runtime",
+      messageKind: "message",
+      deliveryMode: "notify",
+      confidence: "verified",
+      sender: { kind: "teammate-agent", correlationId: input.context.correlationId },
+    },
+  });
+
+  const enqueueTransportInput = (
+    transportMessage: string,
+    acceptedMessage: string,
+    mode: "prompt" | "steer" | "follow_up",
+    provenance?: MessageProvenanceV1,
+    requestId = randomUUID(),
+  ): TransportSidecarLease => {
+    successfulWorkSettlement=false;
+    const initial = !initialModelInputRegistered;
+    initialModelInputRegistered = true;
+    const context = initial
+      ? initialTurnContext
+      : {
+          version: AGENT_TURN_VERSION,
+          turnId: randomUUID(),
+          correlationId: initialTurnContext.correlationId,
+          runtimeGeneration: initialTurnContext.runtimeGeneration,
+          promptSeq: nextExternalPromptSeq++,
+          trigger: normalizeMessageProvenanceV1(provenance, {
+            deliveryMode: mode,
+            messageKind: "message",
+          }),
+        };
+    const pending: PendingModelInput = {
+      requestId,
+      transportMessage,
+      acceptedMessage,
+      context,
+      loopSeq: initial ? turnLoopSeqOffset : 0,
+      eventsEmitted: false,
+      initial,
+      committed: false,
+    };
+    pendingModelInputs.push(pending);
+    pending.nativeInputGeneration = nativeObservation?.enqueueInput(requestId, pending.loopSeq);
+    return {
+      commit(): void {
+        if (pending.committed) return;
+        pending.committed = true;
+        if (pending.nativeInputGeneration !== undefined) nativeObservation?.commitInput(pending.nativeInputGeneration);
+        if (!pending.initial || options.emitInitialTurnTrigger !== false) {
+          const timestamp = turnEventTimestamp();
+          recordCanonicalTurnEvent({
+            ...turnEventBase(pending, timestamp),
+            type: "trigger-enqueued",
+          });
+        }
+      },
+      cancel(): void {
+        const index = pendingModelInputs.indexOf(pending);
+        if (index >= 0) pendingModelInputs.splice(index, 1);
+        if (pending.nativeInputGeneration !== undefined) nativeObservation?.cancelInput(pending.nativeInputGeneration);
+      },
+    };
+  };
+
+  const hostOnProgress = options.onProgress;
+  const reportProgress = (): void => {
+    hostOnProgress?.(progress);
+    const input = currentModelInput;
+    if (!input) return;
+    const timestamp = turnEventTimestamp();
+    recordCanonicalTurnEvent({
+      ...turnEventBase(input, timestamp),
+      type: "progress",
+      ...(progress.phase === undefined ? {} : { phase: progress.phase }),
+      toolActivity: state.inFlightToolCount > 0 ? "active" : "idle",
+      ...(input.lastMessage === undefined ? {} : { lastMessage: input.lastMessage }),
+    });
+  };
+  options = { ...options, onProgress: reportProgress };
+
+  const recordTerminalTurnEvent = (
+    status: AgentTerminalStatus,
+    message?: string,
+  ): void => {
+    const input = currentModelInput;
+    if (!input) return;
+    const timestamp = turnEventTimestamp();
+    const base = turnEventBase(input, timestamp);
+    if (status === "completed") {
+      recordCanonicalTurnEvent({
+        ...base,
+        type: "turn-settled",
+        outcome: "completed",
+        ...(input.lastMessage === undefined ? {} : { lastMessage: input.lastMessage }),
+      });
+    } else if (status === "terminated") {
+      recordCanonicalTurnEvent({
+        ...base,
+        type: "terminated",
+        outcome: "terminated",
+        reason: message?.trim() || "Teammate turn terminated.",
+        ...(input.lastMessage === undefined ? {} : { lastMessage: input.lastMessage }),
+      });
+    } else {
+      recordCanonicalTurnEvent({
+        ...base,
+        type: "failed",
+        outcome: "failed",
+        error: message?.trim() || "Teammate turn failed.",
+        ...(input.lastMessage === undefined ? {} : { lastMessage: input.lastMessage }),
+      });
+    }
+  };
+
+  const recordedRecoveryResults = new Set<SingleResult>();
+  const refreshReplayEvidence = (finalized = false): ReturnType<ReplayEvidenceCollector["snapshot"]> => {
+    const evidence = state.replayEvidence.snapshot(finalized);
+    for (const result of recordedRecoveryResults) {
+      result.replayEvidence = evidence;
+      const facts = attemptRecoveryFacts.get(result);
+      if (facts) attemptRecoveryFacts.set(result, {
+        ...facts,
+        externalReplayRisk: hasExternalReplayRisk(evidence),
+        replayEvidence: evidence,
+      });
+    }
+    return evidence;
+  };
+  const addReplayEvidence = (source: Parameters<ReplayEvidenceCollector["add"]>[0], reasonCode: string): void => {
+    state.replayEvidence.add(source, reasonCode);
+    refreshReplayEvidence();
+  };
+  let nativeObservation: ReturnType<typeof createNativeObservation> | undefined;
+  let nativeRecoveryGate: object | undefined;
+  let modelBudgetInvocation: string | undefined;
+  let successfulWorkSettlement=false;
+  const nativeInputReference = (input: PendingModelInput | undefined) => input?.nativeInputGeneration === undefined
+    ? undefined : { inputGeneration: input.nativeInputGeneration, requestId: input.requestId, loopSeq: input.loopSeq };
+  const recordAttemptRecovery = (result: SingleResult): SingleResult => {
+    successfulWorkSettlement=result.exitCode===0&&result.terminalStatus==="completed"&&result.lifecyclePending!==true;
+    nativeObservation?.result(result, nativeInputReference(currentModelInput), currentModelInput?.nativeTurnEpoch);
+    recordedRecoveryResults.add(result);
+    const replayEvidence = refreshReplayEvidence();
+    result.replayEvidence = replayEvidence;
+    if (state.latestWakeReceipt) result.recoveryWakeReceipt = state.latestWakeReceipt;
+    if (state.failureChain.initiating || state.failureChain.terminal || state.failureChain.decisions.length > 0) {
+      result.recoveryFailureChain = state.failureChain;
+    }
+    attemptRecoveryFacts.set(result, {
+      settlementCapability: state.settlementCapability,
+      completedToolCount: state.completedToolCount,
+      inFlightToolCount: state.inFlightToolCount,
+      preActivityInfrastructureExit: state.preActivityInfrastructureExit,
+      externalReplayRisk: hasExternalReplayRisk(replayEvidence),
+      replayEvidence,
+    });
+    return result;
+  };
+
+  const updateProgressUsage = (): void => {
+    const inputTokens = state.completedInputTokens + usage.inputTokens + pendingMessageUsage.inputTokens;
+    const outputTokens = state.completedOutputTokens + usage.outputTokens + pendingMessageUsage.outputTokens;
+    const cacheReadTokens = state.completedCacheReadTokens + usage.cacheReadTokens + pendingMessageUsage.cacheReadTokens;
+    const cacheWriteTokens = state.completedCacheWriteTokens + usage.cacheWriteTokens + pendingMessageUsage.cacheWriteTokens;
+    progress.inputTokens = Math.max(progress.inputTokens ?? 0, inputTokens);
+    progress.outputTokens = Math.max(progress.outputTokens ?? 0, outputTokens);
+    progress.cacheReadTokens = Math.max(progress.cacheReadTokens ?? 0, cacheReadTokens);
+    progress.cacheWriteTokens = Math.max(progress.cacheWriteTokens ?? 0, cacheWriteTokens);
+    progress.tokens = progress.inputTokens + progress.outputTokens;
+  };
+
+  const spawnEnv = buildChildSpawnEnv(
+    correlationId,
+    replyTo,
+    options,
+    schemaFile,
+    outputFile,
+    forkSessionFile,
+    params.fast ?? agentConfig.fast,
+  );
+  const projectionImport = assets.stdoutProjectionImport;
+  if (!spawnEnv.NODE_OPTIONS?.split(/\s+/).includes(projectionImport)) {
+    spawnEnv.NODE_OPTIONS = [spawnEnv.NODE_OPTIONS, projectionImport].filter(Boolean).join(" ");
+  }
+  const spawnSpec = getPiSpawnCommand(piArgs);
+  const probedChildVersion = options.spawnChildProcess
+    ? options.childPiVersion
+    : await probePiChildVersion(spawnSpec.command, spawnSpec.argsPrefix, cwd, spawnEnv);
+
+  return new Promise<SingleResult>((resolve) => {
+    let child: ChildProcess;
+    let releaseRetryPersistenceGuard = () => {};
+    let pendingInterrupt: PendingInterrupt | undefined;
+    /**
+     * True when a settlement boundary (agent_settled, legacy agent_end) was
+     * swallowed while the interrupt transaction owned settlement. A degraded
+     * steer must converge the turn the swallowed boundary would have, or the
+     * turn strands with no deadline armed.
+     */
+    let steerSettlementSwallowed = false;
+    let compactionSettlementSwallowed = false;
+    let turnBoundaryEpoch = 0;
+    let autoRetryProgressMessage: string | undefined;
+    const clearAutoRetryProgressMessage = (): void => {
+      if (progress.lastMessage === autoRetryProgressMessage) progress.lastMessage = undefined;
+      autoRetryProgressMessage = undefined;
+    };
+    let modelFailoverProgressMessage: string | undefined;
+    const setModelFailoverProgressMessage = (message: string): void => {
+      modelFailoverProgressMessage = message;
+      progress.lastMessage = message;
+    };
+    const clearModelFailoverProgressMessage = (): void => {
+      if (progress.lastMessage === modelFailoverProgressMessage) progress.lastMessage = undefined;
+      modelFailoverProgressMessage = undefined;
+    };
+    const latestCompactionGenerationByProducer = new Map<string, number>();
+    const closedCompactionRecoveries = new Set<string>();
+    const compactionRecoveryKey = (recovery: { recoveryId: string; producer: string; generation: number }): string =>
+      `${recovery.producer}:${recovery.generation}:${recovery.recoveryId}`;
+    const closeActiveCompactionRecovery = (): void => {
+      if (state.compactionRecovery) {
+        closedCompactionRecoveries.add(compactionRecoveryKey(state.compactionRecovery));
+      }
+    };
+    const interruptingSteerTimeoutMs = options.interruptingSteerTimeoutMs ?? INTERRUPTING_STEER_TIMEOUT_MS;
+    const modelSwitchAckTimeoutMs = options.modelSwitchAckTimeoutMs ?? MODEL_SWITCH_ACK_TIMEOUT_MS;
+
+    let useIpc = false;
+    let confirmedChildVersion: string | undefined;
+    let nativeAdmissionFailed = false;
+    try {
+      const childVersion = confirmedChildVersion = probedChildVersion;
+      const selection = modelOverride ?? params.model ?? agentConfig.model;
+      assertVirtualChildRouter(selection, options.virtualModelIds, childVersion);
+      const builtinArgs = nativeChildBuiltinArgs({ version: childVersion, cwd, env: spawnEnv, tools: agentConfig.tools, model: selection });
+      spawnSpec.args.push(...builtinArgs);
+      useIpc = !spawnSpec.shell;
+      const spawnOpts: Parameters<typeof crossSpawn>[2] = {
+        cwd,
+        stdio: useIpc ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
+        env: spawnEnv,
+        shell: spawnSpec.shell,
+        windowsHide: true,
+      };
+      assertTaskDispatch(options.preparedTaskDispatch,{correlationId,runtimeGeneration:options.runtimeGeneration??null,
+        agent:params.agent,name:params.name,cwd,todoIds:params.todos??[]});
+      try{nativeRecoveryGate=beginNativeTaskRecovery(options.preparedTaskDispatch,{correlationId,runtimeGeneration:options.runtimeGeneration??null,agent:params.agent,name:params.name,cwd,todoIds:params.todos??[]});}
+      catch(error){nativeAdmissionFailed=true;throw error;}
+      nativeObservation = createNativeObservation({correlationId, runtimeGeneration: options.runtimeGeneration ?? null,
+        requestedTodoIds: params.todos, isCurrent: () => options.isNativeInvocationCurrent?.(correlationId, options.runtimeGeneration ?? null) !== false}, snapshot=>{
+          modelBudgetInvocation ??= snapshot.nativeInvocationId;
+          try{observeNativeTaskRecovery(nativeRecoveryGate,snapshot);}finally{options.onNativeExecutionObservation?.(snapshot);}
+        });
+      // The observer above is advisory and may synchronously change host state.
+      // Recheck after it, with no await or callback between this check and spawn.
+      options.signal?.throwIfAborted();
+      assertTaskDispatch(options.preparedTaskDispatch,{correlationId,runtimeGeneration:options.runtimeGeneration??null,
+        agent:params.agent,name:params.name,cwd,todoIds:params.todos??[]});
+      child = (options.spawnChildProcess ?? crossSpawn)(spawnSpec.command, spawnSpec.args, spawnOpts);
+      nativeObservation.observeChild(child);
+
+    } catch (error) {
+      nativeObservation?.spawnThrew();
+      cleanupFile(systemPromptFile);
+      if (schemaFile) cleanupFile(schemaFile);
+      if (outputFile) cleanupFile(outputFile);
+
+      const spawnDiagnostic = { ...piLaunchDiagnostic(spawnSpec, "spawn", null, null, ""),
+        childVersion: confirmedChildVersion, hostMode: getPiHostMode(confirmedChildVersion),
+      };
+      options.onChildEvent?.({ ...spawnDiagnostic, correlationId });
+      const result: SingleResult = {
+        agent: params.agent,
+        name: params.name,
+        task: params.task ?? "",
+        exitCode: 1,
+        messages: [{
+          role: "system",
+          content:
+            nativeAdmissionFailed
+            ? `Native recovery durability failure before attempt; no child/input retry: ${error instanceof Error ? error.message : String(error)}`
+            : `Failed to spawn pi subprocess (agent=${params.agent}, model=${state.resolvedModel || "unknown"}, `
+            + `correlationId=${correlationId}, ${formatPiLaunchDiagnostic(spawnDiagnostic)}): `
+            + `${error instanceof Error ? error.message : String(error)}`,
+        }],
+        usage: emptyUsage(),
+        model: state.resolvedModel,
+        correlationId,
+        durationMs: Date.now() - startTime,
+      };
+      if(nativeAdmissionFailed)nativeDurabilityFailureResults.add(result);
+      recordAttemptRecovery(result);
+      state.initialResultPublished = true;
+      state.turnLifecycleSettled = true;
+      resolve(result);
+      try {
+        options.onTurnComplete?.(result);
+      } catch {
+        // Completion observers cannot prevent a terminal spawn failure from settling.
+      }
+      return;
+    }
+
+    try {
+      options.onChildEvent?.({ ...piLaunchDiagnostic(spawnSpec, "spawn", null, null, ""),
+        correlationId, childVersion: confirmedChildVersion, hostMode: getPiHostMode(confirmedChildVersion),
+      });
+    } catch (error) {
+      logDiagnosticWarn("[pi-maestro-teammate] child capability diagnostic observer failed:", error);
+    }
+    if (child.stdin) {
+      guardChildStdin(child.stdin);
+      nativeWriteGates.set(child.stdin,{handle:nativeRecoveryGate,control:()=>nativeObservation?.executionControl()});
+      transportSidecars.set(child.stdin, { enqueue: enqueueTransportInput });
+      if (getPiHostMode(confirmedChildVersion) === "native") nativeRpcStreams.add(child.stdin);
+    }
+
+    // Pi core keeps its in-process provider retry enabled. It handles
+    // transient network/provider errors without restarting the child, so
+    // tool calls already executed are never repeated. Teammate owns model
+    // fallback across candidates at the process level.
+
+    // RPC mode: stdin stays open for bidirectional messaging.
+    // Configure the Pi steer-queue drain mode before the first prompt so queued
+    // steers are co-injected per the dispatch's steeringMode. "all" drains the
+    // whole steerQueue into one assistant turn; "one-at-a-time" (Pi default) is
+    // left implicit. The response carries an id that no pending transaction
+    // matches, so onResponse ignores it.
+    if (child.stdin && options.steeringMode === "all") {
+      writeChildStdinLine(child.stdin, JSON.stringify({
+        id: `teammate-steering-mode-${randomUUID()}`,
+        type: "set_steering_mode",
+        mode: "all",
+      }));
+    }
+    // Send initial prompt via RPC command. A resumed child already carries the
+    // original task inside its loaded session history, so the initial prompt
+    // becomes the resume directive instead of a re-send of the task text.
+    const sendInitialPrompt=():void=>{if (child.stdin && params.task) {
+      const initialLeaseToken = typeof options.initialLeaseToken === "function"
+        ? options.initialLeaseToken(correlationId)
+        : options.initialLeaseToken;
+      const sent=sendRpcMessage(
+        child.stdin,
+        options.resumePrompt ?? params.task,
+        "prompt",
+        initialLeaseToken,
+      );
+      if(!sent)failNativeInput(nativeWriteFailures.get(child.stdin)??new Error("Native recovery durability/input transport refused the initial prompt"));
+    }};
+
+    let lastCompactionReason: string | undefined;
+    let nativeProcessStopped = false;
+    child.once("exit", () => { nativeProcessStopped = true; });
+    child.once("close", () => { nativeProcessStopped = true; });
+    const modelBudget = createChildModelBudgetPort({ child, sourceScope: options.todoSourceScope, nativeGate: nativeRecoveryGate, originalDispatch,
+      correlationId, runtimeGeneration: options.runtimeGeneration ?? null, nativeInvocationId: () => modelBudgetInvocation,
+      launch: { cwd, sessionDir, resumeSessionFile, forkSessionFile },
+      onFactError: error => logDiagnosticWarn("[pi-maestro-teammate] child budget fact remains unknown", error),
+      assertCurrent: () => {
+        if (nativeProcessStopped || state.terminal || options.signal?.aborted
+          || options.isNativeInvocationCurrent?.(correlationId, options.runtimeGeneration ?? null) === false) throw new Error("Child model attempt is no longer current");
+      } });
+    child.once("close", () => modelBudget?.close());
+    const parentContext = createChildTodoParentContext({sourceScope:options.todoSourceScope,correlationId, modelBudget,
+      runtimeGeneration:options.runtimeGeneration ?? null,signal:options.signal,
+      isCurrent:()=>!nativeProcessStopped && !state.terminal && !options.signal?.aborted
+        && options.isNativeInvocationCurrent?.(correlationId,options.runtimeGeneration ?? null) !== false});
+    let lastChildProxy: { requestId: string; tool: string; phase: "received" | "reply-enqueued" } | undefined;
+    const observerIncarnation = randomUUID();
+    const observerSequence = nextTeammateHostSequence();
+    const observeBoundary = (event: Record<string, unknown>): void => {
+      publishTeammateHostBoundary({
+        correlationId, incarnation: observerIncarnation, sequence: observerSequence,
+        parentSessionFile: options.parentSessionFile,
+        runtimeGeneration: options.runtimeGeneration ?? 0, event,
+        steer: (message) => !state.terminal && !options.signal?.aborted && !!child.stdin
+          && sendRpcMessage(child.stdin, message, "steer"),
+      });
+    };
+
+    const observerAborted = (): void => observeBoundary({ type: "host_offline" });
+    options.signal?.addEventListener("abort", observerAborted, { once: true });
+
+    // Identity publication is observational only. Request/control envelopes
+    // and unknown lifecycle events remain replay-risking until explicitly
+    // proven side-effect free.
+    if (useIpc) {
+      bindChildIpcRelay(child, correlationId, options, (message) => {
+        state.receivedFirstActivity = true;
+        if (message.type === "teammate_proxy_request") {
+          lastChildProxy = {
+            requestId: typeof message.requestId === "string" ? message.requestId : "unknown",
+            tool: typeof message.tool === "string" ? message.tool.slice(0, 128) : "unknown",
+            phase: "received",
+          };
+        }
+        const compactionCapability = childCompactionCapability(message);
+        if (compactionCapability) {
+          if (compactionCapability.runtimeGeneration === (options.runtimeGeneration ?? 0)) {
+            state.compactionWakeProtocolCapable = true;
+          }
+          return;
+        }
+        const compactionEvent = childCompactionStateEvent(message);
+        if (compactionEvent) {
+          lastCompactionReason = compactionEvent.reason?.slice(0, 128);
+          handleChildCompactionState(compactionEvent);
+          observeBoundary({ type: "host_compaction", phase: compactionEvent.phase });
+          return;
+        }
+        const wakeReceipt = childWakeReceipt(message);
+        if (wakeReceipt) {
+          handleChildWakeReceipt(wakeReceipt);
+          return;
+        }
+        if (message.type === "proxy_request") addReplayEvidence("proxy-request", "child-proxy-request");
+        else if (!isReplayNeutralChildIpcMessage(message) && !modelBudget?.isReplayNeutralControl(message)) {
+          addReplayEvidence("unknown-ipc", "unrecognized-child-ipc");
+        }
+      }, (request) => {
+        if (lastChildProxy && lastChildProxy.requestId === request.requestId) lastChildProxy.phase = "reply-enqueued";
+      }, parentContext, modelBudget);
+    }
+
+    // Report initial progress
+    options.onProgress?.(progress);
+
+    const physicalTermination = createChildTerminationController(child);
+    const termination:typeof physicalTermination={outcome:physicalTermination.outcome,cleanup:()=>physicalTermination.cleanup(),terminate(){if(successfulWorkSettlement)markNativeTaskCleanup(nativeRecoveryGate);physicalTermination.terminate();}};
+    void termination.outcome.then((outcome) => {
+      options.onReclamationOutcome?.(correlationId, outcome);
+    });
+
+    // Handle abort signal
+    const unbindTerminationSignal = bindChildTerminationSignal(termination, options.signal);
+
+    // Timeout handling
+    const timers: AttemptTimers = {};
+    // Cleared handles are deliberately left assigned: armResultReadyGrace()
+    // treats a non-empty handle as "this window was already used".
+    const clearAllTimers = (): void => {
+      if (timers.firstActivity) clearTimeout(timers.firstActivity);
+      if (timers.compactionIpcDrain) clearImmediate(timers.compactionIpcDrain);
+      if (timers.resultReadyGrace) clearTimeout(timers.resultReadyGrace);
+      if (timers.outputLimitRecovery) clearTimeout(timers.outputLimitRecovery);
+      if (timers.compactionRecovery) clearTimeout(timers.compactionRecovery);
+      if (timers.interruptingSteer) clearTimeout(timers.interruptingSteer);
+      if (timers.modelSwitch) clearTimeout(timers.modelSwitch);
+      if (timers.toolHeartbeat) clearInterval(timers.toolHeartbeat);
+    };
+
+    /**
+     * Start or stop the in-flight tool heartbeat. A long-running tool call
+     * (bash script, observe wait, …) emits no further child events until it
+     * completes; the heartbeat republishes progress so the parent's stall
+     * clock keeps seeing activity. Idempotent — call after every tool
+     * start/completion event and on any boundary that ends tool execution.
+     */
+    const syncToolHeartbeat = (): void => {
+      const inFlight = !state.terminal && !state.turnLifecycleSettled && state.inFlightToolCount > 0;
+      if (inFlight) {
+        if (!timers.toolHeartbeat) {
+          timers.toolHeartbeat = setInterval(() => {
+            if (state.terminal || state.turnLifecycleSettled || state.inFlightToolCount === 0) {
+              syncToolHeartbeat();
+              return;
+            }
+            progress.lastActivityAt = Date.now();
+            options.onProgress?.(progress);
+          }, options.toolExecutionHeartbeatMs ?? TOOL_EXECUTION_HEARTBEAT_MS);
+          timers.toolHeartbeat.unref?.();
+        }
+        return;
+      }
+      if (timers.toolHeartbeat) {
+        clearInterval(timers.toolHeartbeat);
+        timers.toolHeartbeat = undefined;
+      }
+    };
+    timers.firstActivity = setTimeout(() => {
+      if (state.initialResultPublished || state.receivedFirstActivity) return;
+      const stderrTail = state.stderrBuffer.trim();
+      const message =
+        `Timed out waiting for the first child agent event `
+        + `(agent=${params.agent}, model=${state.resolvedModel || "unknown"}, correlationId=${correlationId}, `
+        + `phase=first-activity); the child process started but did not report model activity.`
+        + (stderrTail ? ` stderr: ${truncateUtf8Tail(stderrTail, 1_000)}` : "");
+      state.lastContent = message;
+      state.runtimeFailure = message;
+      appendBoundedTranscriptMessage(messages, { role: "system", content: message });
+      progress.status = "failed";
+      progress.durationMs = Date.now() - startTime;
+      progress.lastMessage = message;
+      options.onProgress?.(progress);
+      termination.terminate();
+    }, options.firstActivityTimeoutMs ?? FIRST_ACTIVITY_TIMEOUT_MS);
+
+    // Parse JSON lines from stdout. Pi's agent_end event can repeat the full
+    // message history even without structured output, so framing must allow the
+    // bounded transcript plus JSON escaping and event metadata in every lane.
+    const failStdoutProtocol = (reason: string): void => {
+      if (state.terminal) return;
+      state.receivedFirstActivity = true;
+      state.stdoutProtocolViolation = true;
+      addReplayEvidence("stdout-protocol", reason);
+      state.runtimeFailure = `Teammate stdout JSONL protocol violation (agent=${params.agent}, correlationId=${correlationId}): ${reason}`;
+      appendBoundedTranscriptMessage(messages, { role: "system", content: state.runtimeFailure });
+      completeTurn(undefined, true, 1, "failed");
+    };
+    const processStdoutLine = (line: string) => {
+      if (state.terminal) return;
+      const trimmed = line.trim();
+      if (!trimmed) {
+        state.receivedFirstActivity = true;
+        addReplayEvidence("stdout-protocol", "blank-stdout-line");
+        if (timers.firstActivity) clearTimeout(timers.firstActivity);
+        return;
+      }
+      let event: JsonLineEvent;
+      try {
+        event = JSON.parse(trimmed) as JsonLineEvent;
+      } catch (error) {
+        failStdoutProtocol(`malformed JSON, receivedBytes=${Buffer.byteLength(line)}: ${error instanceof Error ? truncateUtf8Head(error.message, 256) : String(error)}`);
+        return;
+      }
+      if (!event || typeof event !== "object" || typeof event.type !== "string") {
+        failStdoutProtocol(`invalid event envelope, receivedBytes=${Buffer.byteLength(line)}`);
+        return;
+      }
+      try {
+        processEvent(event);
+      } catch (error) {
+        failStdoutProtocol(`event processing failed, event=${truncateUtf8Head(event.type, 64)}: ${error instanceof Error ? truncateUtf8Head(error.message, 256) : String(error)}`);
+      }
+    };
+    const stdoutLines = createUtf8LineDecoder(
+      EXECUTION_BUFFER_LIMITS.transcriptBytes * 4,
+      ({ receivedBytes, maxBytes, prefix }) => {
+        const eventType = /"type"\s*:\s*"([\w-]{1,64})"/.exec(prefix)?.[1] ?? "unknown";
+        failStdoutProtocol(`oversized event=${eventType}, receivedBytes=${receivedBytes}, limitBytes=${maxBytes}`);
+      },
+      processStdoutLine,
+    );
+    child.stdout?.on("data", (chunk: Buffer) => {
+      pokeLifecycleDeadline();
+      stdoutLines.write(chunk);
+    });
+
+    const clearInterrupt = (): PendingInterrupt | undefined => {
+      const pending = pendingInterrupt;
+      pendingInterrupt = undefined;
+      if (timers.interruptingSteer) {
+        clearTimeout(timers.interruptingSteer);
+        timers.interruptingSteer = undefined;
+      }
+      return pending;
+    };
+
+    const markSteerTurnSettledDuringAbort = (): void => {
+      if (pendingInterrupt?.phase === "aborting") {
+        pendingInterrupt.turnSettledDuringAbort = true;
+      }
+    };
+
+    /**
+     * Settle the steer transaction as a task failure. Reserved for outcomes
+     * where the turn was already interrupted (acknowledged abort) or the
+     * child is gone, so the original work cannot continue either way.
+     */
+    const failInterrupt = (reason: string): void => {
+      if (!pendingInterrupt || state.terminal || state.turnLifecycleSettled) return;
+      clearInterrupt();
+      const diagnostic =
+        `Failed to interrupt and steer teammate (agent=${params.agent}, correlationId=${correlationId}): ${reason}`;
+      state.runtimeFailure = diagnostic;
+      appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+      completeTurn(readStructuredOutput(true), true, 1);
+    };
+
+    /**
+     * A control-plane failure must not masquerade as a task failure. When the
+     * abort was never acknowledged (timeout) or Pi rejected it, the running
+     * turn is untouched: killing the child and settling exitCode=1 turned one
+     * undelivered interruption into a failed task and — through graph
+     * dependencies — into a cascading failure of every downstream dependent.
+     * Requeue the correction as a non-interrupting follow_up, surface the
+     * control error in the transcript and progress, and let the task run on.
+     */
+    const degradeInterruptToFollowUp = (reason: string): void => {
+      if (!pendingInterrupt || state.terminal || state.turnLifecycleSettled) return;
+      const pending = clearInterrupt();
+      if (!pending) return;
+      const diagnostic =
+        `Interrupt degraded to follow_up (agent=${params.agent}, correlationId=${correlationId}): ${reason}. `
+        + "The turn was not interrupted; the correction message was queued and the task continues.";
+      appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+      progress.lastMessage = diagnostic;
+      options.onProgress?.(progress);
+      const leasedMessage = wrapLeasedMessage(pending.message, pending.token);
+      if (!child.stdin || !writeTransportModelInput(
+        child.stdin,
+        { type: "follow_up", message: leasedMessage },
+        leasedMessage,
+        pending.message,
+        "follow_up",
+        pending.provenance,
+      )) {
+        const undelivered =
+          `Interrupt follow_up could not be delivered (agent=${params.agent}, correlationId=${correlationId}): `
+          + "the correction message was dropped; the task continues.";
+        appendBoundedTranscriptMessage(messages, { role: "system", content: undelivered });
+        progress.lastMessage = undelivered;
+        options.onProgress?.(progress);
+      }
+      // A settlement boundary swallowed while the interrupt owned settlement
+      // would strand the turn now that the pending state is gone; converge it
+      // the way the swallowed boundary would have.
+      if (steerSettlementSwallowed) settleAgentSession();
+    };
+
+    const armInterruptTimeout = (): void => {
+      if (timers.interruptingSteer) clearTimeout(timers.interruptingSteer);
+      if (!pendingInterrupt) {
+        timers.interruptingSteer = undefined;
+        return;
+      }
+      timers.interruptingSteer = setTimeout(() => {
+        const phase = pendingInterrupt?.phase;
+        if (phase === "prompting") {
+          failInterrupt(
+            `Pi did not start the correction prompt within ${interruptingSteerTimeoutMs}ms`,
+          );
+        } else {
+          degradeInterruptToFollowUp(
+            `Pi did not acknowledge the turn abort within ${interruptingSteerTimeoutMs}ms`,
+          );
+        }
+      }, interruptingSteerTimeoutMs);
+      timers.interruptingSteer.unref?.();
+    };
+
+    const requestInterrupt = (
+      message: string,
+      token?: LeaseToken,
+      provenance?: MessageProvenanceV1,
+    ): boolean => {
+      if (
+        !child.stdin
+        || pendingInterrupt
+        || state.modelSwitchDecisionId
+        || state.modelSwitch
+        || state.modelSwitchResumeRequestId
+        || state.terminal
+        || state.turnLifecycleSettled
+      ) return false;
+      const nonce = randomUUID();
+      steerSettlementSwallowed = false;
+      pendingInterrupt = {
+        abortRequestId: `teammate-steer-abort-${nonce}`,
+        promptRequestId: `teammate-steer-prompt-${nonce}`,
+        message,
+        token,
+        provenance,
+        phase: "aborting",
+      };
+      const sent = writeChildStdinLine(child.stdin, JSON.stringify({
+        id: pendingInterrupt.abortRequestId,
+        type: "abort",
+      }));
+      if (!sent) {
+        pendingInterrupt = undefined;
+        return false;
+      }
+      progress.phase = "continuing";
+      progress.resultReadyAt = undefined;
+      options.onProgress?.(progress);
+      armInterruptTimeout();
+      return true;
+    };
+
+    if (child.stdin) {
+      interruptHandlers.set(child.stdin, requestInterrupt);
+      options.onChildSpawned?.(child.stdin, (message) => {
+        return sendChildIpcMessage(child, message);
+      }, sessionDir, correlationId, options.runtimeGeneration);
+    }
+
+    let rawStructuredOutput: Buffer | undefined;
+    let rawStructuredOutputRejected = false;
+    let validatedFileOutput: unknown;
+    let outputFileCleanedByParent = false;
+    let incompleteStructuredOutput: { bytes: number | "unknown"; reason: "limit-exceeded" | "read-failed" } | undefined;
+    function recordStructuredOutputFailure(diagnostic: string): void {
+      if (state.structuredOutputValidationFailure !== diagnostic) appendStructuredOutputFailure();
+      state.structuredOutputValidationFailure = diagnostic;
+    }
+    function readStructuredOutput(cleanup: boolean): unknown | undefined {
+      // File bytes are evidence, never proof of an authorized successful tool.
+      let rejected = state.structuredOutputAttemptFailed
+        || (getPiHostMode(confirmedChildVersion) === "native" && !state.structuredOutputSubmissionConfirmed);
+      let structuredOutput: unknown;
+      if (outputFile) {
+        try {
+          if (outputFileCleanedByParent) {
+            structuredOutput = validatedFileOutput;
+          } else {
+            rawStructuredOutput = readBoundedStructuredOutputFile(outputFile);
+            incompleteStructuredOutput = undefined;
+            if (!isUtf8(rawStructuredOutput)) {
+              rejected = true;
+              rawStructuredOutputRejected = true;
+              validatedFileOutput = undefined;
+              recordStructuredOutputFailure("structured_output validation failed: output file is not valid UTF-8.");
+            } else {
+              const report = parseDeclaredJsonResult(rawStructuredOutput.toString("utf8"), params.outputSchema ?? {});
+              rawStructuredOutputRejected = report.status === "format_failed";
+              if (report.status === "format_failed") {
+                rejected = true;
+                validatedFileOutput = undefined;
+                recordStructuredOutputFailure(report.failure);
+              } else {
+                structuredOutput = validatedFileOutput = report.value;
+              }
+            }
+          }
+        } catch (error) {
+          if (error instanceof StructuredOutputTooLargeError) {
+            rejected = true;
+            rawStructuredOutput = undefined;
+            rawStructuredOutputRejected = true;
+            validatedFileOutput = undefined;
+            incompleteStructuredOutput = { bytes: error.bytes, reason: "limit-exceeded" };
+            recordStructuredOutputFailure(
+              `structured_output validation failed: output file exceeds ${STRUCTURED_OUTPUT_MAX_BYTES}-byte limit.`,
+            );
+            state.capturedStructuredOutput = undefined;
+            state.pendingStructuredOutput = undefined;
+          }
+          // A cleaned file is unavailable on later lifecycle reads. Retain the
+          // original bounded bytes already observed instead of replacing them.
+        }
+        if (cleanup) { cleanupFile(outputFile); outputFileCleanedByParent = true; }
+      }
+      return rejected || rawStructuredOutputRejected ? undefined : structuredOutput ?? state.capturedStructuredOutput;
+    }
+
+    function completeTurn(
+      structuredOutput: unknown,
+      terminateChild: boolean,
+      exitCode = 0,
+      terminalStatus: AgentTerminalStatus = exitCode === 0 ? "completed" : "failed",
+    ): void {
+      if (state.terminal) return;
+      // A settled result stays published, but a later corrupt RPC line must
+      // retire the still-live runtime and report a failed lifecycle.
+      if (state.turnLifecycleSettled && !(state.stdoutProtocolViolation && terminalStatus === "failed")) return;
+      if (state.stdoutProtocolViolation && exitCode === 0) {
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content:
+            `Teammate stdout JSONL protocol violation (agent=${params.agent}, `
+            + `correlationId=${correlationId}); a malformed or oversized event was rejected.`,
+        });
+        exitCode = 1;
+        terminalStatus = "failed";
+        terminateChild = true;
+      }
+      releaseRetryPersistenceGuard();
+      state.turnLifecycleSettled = true;
+      progress.status = terminalStatus;
+      progress.phase = undefined;
+      progress.resultReadyAt = params.outputSchema && exitCode === 0 ? Date.now() : undefined;
+      progress.durationMs = Date.now() - startTime;
+      if (messages.length === 0 && state.lastContent) {
+        appendBoundedTranscriptMessage(messages, { role: "assistant", content: state.lastContent });
+      }
+      if (exitCode !== 0 || terminalStatus !== "completed") {
+        const terminalMessage = messages.at(-1)?.content;
+        if (terminalMessage) progress.lastMessage = terminalMessage;
+      }
+      options.onProgress?.(progress);
+      clearAllTimers();
+      cleanupFile(systemPromptFile);
+      if (schemaFile) cleanupFile(schemaFile);
+      if (outputFile) cleanupFile(outputFile);
+
+      const turnResult: SingleResult = {
+        agent: params.agent,
+        name: params.name,
+        task: params.task ?? "",
+        exitCode,
+        messages: [...messages],
+        usage: { ...usage },
+        model: state.resolvedModel,
+        correlationId,
+        durationMs: Date.now() - startTime,
+        toolCount: progress.toolCount,
+        wakeable: !terminateChild,
+        structuredOutput,
+        ...(params.outputSchema && structuredOutput === undefined && terminalStatus === "failed" ? {
+          structuredOutputFailureEvidence: preserveStructuredOutputFailure(correlationId, rawStructuredOutput, incompleteStructuredOutput),
+        } : {}),
+        attemptedModels: undefined,
+        terminalStatus,
+      };
+      if(state.nativeRecoveryFailure)nativeDurabilityFailureResults.add(turnResult);
+      recordAttemptRecovery(turnResult);
+      if (terminateChild) attemptReclamations.set(turnResult, termination.outcome);
+      recordTerminalTurnEvent(
+        terminalStatus,
+        state.runtimeFailure ?? turnResult.messages.at(-1)?.content,
+      );
+      if (!state.initialResultPublished) {
+        state.initialResultPublished = true;
+        resolve(turnResult);
+      }
+      try {
+        options.onTurnComplete?.(turnResult, terminalStatus);
+      } catch {
+        // Completion observers must not strand a child after the result has
+        // already been published to the caller.
+      } finally {
+        state.completedInputTokens = Math.max(state.completedInputTokens, progress.inputTokens ?? 0);
+        state.completedOutputTokens = Math.max(state.completedOutputTokens, progress.outputTokens ?? 0);
+        state.completedCacheReadTokens = Math.max(state.completedCacheReadTokens, progress.cacheReadTokens ?? 0);
+        state.completedCacheWriteTokens = Math.max(state.completedCacheWriteTokens, progress.cacheWriteTokens ?? 0);
+        releasePublishedTurnHistory(messages, progress, usage);
+        state.lastContent = "";
+        state.streamingText = "";
+        state.stderrBuffer = "";
+        state.pendingStructuredOutput = undefined;
+        state.capturedStructuredOutput = undefined;
+        rawStructuredOutput = undefined;
+        rawStructuredOutputRejected = false;
+        validatedFileOutput = undefined;
+        outputFileCleanedByParent = false;
+        incompleteStructuredOutput = undefined;
+        state.structuredOutputValidationFailure = undefined;
+        state.structuredOutputAttemptFailed = false;
+        state.structuredOutputSubmissionConfirmed = false;
+        state.reportedRuntimeErrors.clear();
+        state.runtimeFailure = undefined;
+        state.lastAssistantStopReason = undefined;
+        state.outputLimitRecoveryPending = false;
+        closeActiveCompactionRecovery();
+        state.compactionRecovery = undefined;
+        compactionSettlementSwallowed = false;
+        state.modelSwitchDecisionId = undefined;
+        state.modelSwitchResumeRequestId = undefined;
+        autoRetryProgressMessage = undefined;
+        modelFailoverProgressMessage = undefined;
+        resetUsage(pendingMessageUsage);
+        if (terminateChild) {
+          state.terminal = true;
+          if(exitCode===0&&terminalStatus==="completed")markNativeTaskCleanup(nativeRecoveryGate);
+          termination.terminate();
+        }
+      }
+    }
+
+    function publishResultReady(): void {
+      if (state.initialResultPublished) return;
+      if (messages.length === 0 && state.lastContent) {
+        appendBoundedTranscriptMessage(messages, { role: "assistant", content: state.lastContent });
+      }
+      clearAllTimers();
+      progress.phase = "result-ready";
+      if (currentModelInput?.lastMessage) {
+        const timestamp = turnEventTimestamp();
+        recordCanonicalTurnEvent({
+          ...turnEventBase(currentModelInput, timestamp),
+          type: "result-ready",
+          lastMessage: currentModelInput.lastMessage,
+        });
+      }
+      state.initialResultPublished = true;
+      const result = recordAttemptRecovery({
+        agent: params.agent,
+        name: params.name,
+        task: params.task ?? "",
+        exitCode: 0,
+        messages: [...messages],
+        usage: { ...usage },
+        model: state.resolvedModel,
+        correlationId,
+        durationMs: Date.now() - startTime,
+        toolCount: progress.toolCount,
+        wakeable,
+        lifecyclePending: true,
+      });
+      resolve(result);
+    }
+
+    /**
+     * A published result never confirms its own lifecycle. Without this
+     * deadline, a child that goes silent after its final tool-free turn keeps
+     * the agent `running` forever: publishResultReady() has already cleared the
+     * absolute run ceiling, and no later event can settle the turn.
+     *
+     * Publication semantics stay untouched — the result was already handed to
+     * the caller; this only bounds how long we wait for agent_settled/close.
+     *
+     * LC-001: The deadline is activity-aware — stdout/stderr activity resets
+     * the window so a child in a legitimate continuation (retry, compaction,
+     * streaming) is not killed while still producing output.
+     */
+    let lifecycleDeadlineActive = false;
+    const lifecycleDeadlineMs = (): number =>
+      resultReadyGraceMsFor(state.completedToolCount, options.resultReadyGraceMs);
+    const lifecycleDeadlineCallback = (): void => {
+      timers.resultReadyGrace = undefined;
+      lifecycleDeadlineActive = false;
+      if (state.terminal || state.turnLifecycleSettled || pendingInterrupt) return;
+      appendBoundedTranscriptMessage(messages, {
+        role: "system",
+        content:
+          `Teammate published a result but never confirmed its lifecycle within ${lifecycleDeadlineMs()}ms `
+          + `(agent=${params.agent}, correlationId=${correlationId}, expected=agent_settled, `
+          + `tools=${progress.toolCount}, turnTools=${state.turnToolCount}, `
+          + `inFlightTools=${state.inFlightToolCount}, completedTools=${state.completedToolCount}, `
+          + `lastStopReason=${state.lastAssistantStopReason ?? "unknown"}, `
+          + `compaction=${state.compactionRecovery ? `${state.compactionRecovery.producer}/${state.compactionRecovery.phase}` : "none"}, `
+          + `compactionReason=${lastCompactionReason ?? "none"}, `
+          + `lastProxy=${lastChildProxy ? `${lastChildProxy.tool}/${lastChildProxy.phase}/${lastChildProxy.requestId.slice(0, 128)}` : "none"}); `
+          + "the child process was terminated.",
+      });
+      completeTurn(readStructuredOutput(true), true, 0, "terminated");
+    };
+    function armLifecycleConfirmationDeadline(): void {
+      if (state.terminal || state.turnLifecycleSettled || pendingInterrupt || timers.resultReadyGrace) return;
+      lifecycleDeadlineActive = true;
+      timers.resultReadyGrace = setTimeout(lifecycleDeadlineCallback, lifecycleDeadlineMs());
+      timers.resultReadyGrace.unref?.();
+    }
+    /** Reset the lifecycle deadline window on observed child activity. */
+    function pokeLifecycleDeadline(): void {
+      if (!lifecycleDeadlineActive || state.terminal || state.turnLifecycleSettled || pendingInterrupt) return;
+      if (timers.resultReadyGrace) clearTimeout(timers.resultReadyGrace);
+      timers.resultReadyGrace = setTimeout(lifecycleDeadlineCallback, lifecycleDeadlineMs());
+      timers.resultReadyGrace.unref?.();
+    }
+
+    function armResultReadyGrace(): void {
+      if (pendingInterrupt || timers.resultReadyGrace) return;
+      timers.resultReadyGrace = setTimeout(() => {
+        timers.resultReadyGrace = undefined;
+        if (state.terminal || state.turnLifecycleSettled || pendingInterrupt) return;
+        // The result is already consumable; settle with whatever structured
+        // output was captured instead of blocking on a missing agent_settled/close.
+        const structuredOutput = readStructuredOutput(true);
+        if (state.runtimeFailure) {
+          if (params.outputSchema && structuredOutput === undefined) {
+            appendStructuredOutputFailure();
+            appendBoundedTranscriptMessage(messages, {
+              role: "system",
+              content: STRUCTURED_OUTPUT_SETTLEMENT_DIAGNOSTICS.resultReadyGrace,
+            });
+          }
+          completeTurn(structuredOutput, true, 1);
+          return;
+        }
+        if (structuredOutput === undefined) {
+          appendStructuredOutputFailure();
+          appendBoundedTranscriptMessage(messages, {
+            role: "system",
+            content: STRUCTURED_OUTPUT_SETTLEMENT_DIAGNOSTICS.resultReadyGrace,
+          });
+        }
+        completeTurn(structuredOutput, true, structuredOutput === undefined ? 1 : 0);
+      }, lifecycleDeadlineMs());
+      timers.resultReadyGrace.unref?.();
+    }
+
+    function armCompactionRecoveryDeadline(): void {
+      if (state.terminal || state.turnLifecycleSettled || timers.compactionRecovery || !state.compactionRecovery) return;
+      const configuredMs = options.outputLimitRecoveryTimeoutMs ?? OUTPUT_LIMIT_RECOVERY_TIMEOUT_MS;
+      const deadlineMs = state.compactionRecovery.absoluteDeadlineAt === undefined
+        ? configuredMs
+        : Math.max(0, state.compactionRecovery.absoluteDeadlineAt - Date.now());
+      timers.compactionRecovery = setTimeout(() => {
+        timers.compactionRecovery = undefined;
+        const recovery = state.compactionRecovery;
+        if (!recovery || state.terminal || state.turnLifecycleSettled) return;
+        closedCompactionRecoveries.add(compactionRecoveryKey(recovery));
+        state.compactionRecovery = undefined;
+        compactionSettlementSwallowed = false;
+        const diagnostic =
+          `Teammate compaction recovery did not continue within ${deadlineMs}ms `
+          + `(agent=${params.agent}, correlationId=${correlationId}, recoveryId=${recovery.recoveryId}, phase=${recovery.phase}); `
+          + "the stalled recovery was aborted.";
+        state.runtimeFailure = diagnostic;
+        state.failureChain = Object.freeze({
+          ...state.failureChain,
+          terminal: recoveryFailureRecord("wake-not-started", "recovery", "compaction-wake-timeout", diagnostic),
+        });
+        appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+        completeTurn(readStructuredOutput(true), true, 1);
+      }, deadlineMs);
+    }
+
+    function handleChildWakeReceipt(receipt: RecoveryWakeReceiptV1): void {
+      if (state.terminal || state.turnLifecycleSettled) return;
+      const active = state.compactionRecovery;
+      if (!active
+        || active.recoveryId !== receipt.recoveryId
+        || active.producer !== receipt.producer
+        || active.generation !== receipt.generation
+        || active.wakeId !== receipt.wakeId
+        || receipt.runtimeGeneration !== (options.runtimeGeneration ?? 0)) return;
+      const previous = active.wakeReceipt;
+      if (previous && (previous.wakeId !== receipt.wakeId || receipt.sequence <= previous.sequence)) return;
+      const absoluteDeadlineAt = Math.min(active.absoluteDeadlineAt ?? receipt.deadlineAt, receipt.deadlineAt);
+      if (Date.now() >= absoluteDeadlineAt && receipt.state !== "cancelled" && receipt.state !== "failed") return;
+      const transitionAllowed = previous === undefined
+        ? receipt.state === "prepared"
+        : previous.state === "prepared"
+          ? receipt.state === "prepared" || receipt.state === "queued" || receipt.state === "consumed"
+            || receipt.state === "cancelled" || receipt.state === "failed"
+          : previous.state === "queued"
+            ? receipt.state === "queued" || receipt.state === "consumed"
+              || receipt.state === "cancelled" || receipt.state === "failed"
+            : previous.state === "consumed"
+              ? receipt.state === "consumed" || receipt.state === "turn-started"
+                || receipt.state === "cancelled" || receipt.state === "failed"
+              : false;
+      if (!transitionAllowed) return;
+      // A producer chooses the absolute deadline once. Later receipts may make
+      // it earlier, but duplicates/retries can never extend it.
+      active.absoluteDeadlineAt = absoluteDeadlineAt;
+      active.wakeReceipt = Object.freeze({ ...receipt, deadlineAt: active.absoluteDeadlineAt });
+      state.latestWakeReceipt = active.wakeReceipt;
+      for (const result of recordedRecoveryResults) result.recoveryWakeReceipt = active.wakeReceipt;
+      if (receipt.state === "turn-started") {
+        closeActiveCompactionRecovery();
+        state.compactionRecovery = undefined;
+        compactionSettlementSwallowed = false;
+        if (timers.compactionRecovery) clearTimeout(timers.compactionRecovery);
+        timers.compactionRecovery = undefined;
+        return;
+      }
+      if (receipt.state === "cancelled" || receipt.state === "failed") {
+        handleChildCompactionState({
+          type: "teammate_compaction_state",
+          recoveryId: receipt.recoveryId,
+          producer: receipt.producer,
+          generation: receipt.generation,
+          phase: receipt.state,
+          wakeProtocolVersion: 1,
+          wakeId: receipt.wakeId,
+          ...(receipt.reason === undefined ? {} : { reason: receipt.reason }),
+        });
+        return;
+      }
+      if (timers.compactionRecovery) {
+        clearTimeout(timers.compactionRecovery);
+        timers.compactionRecovery = undefined;
+      }
+      if (compactionSettlementSwallowed) armCompactionRecoveryDeadline();
+    }
+
+    function handleChildCompactionState(event: ChildCompactionStateEvent): void {
+      if (state.terminal || state.turnLifecycleSettled) return;
+      const activeBeforeGenerationCheck = state.compactionRecovery;
+      if (activeBeforeGenerationCheck?.producer === event.producer) {
+        const sameCoreIdentity = activeBeforeGenerationCheck.generation === event.generation
+          && activeBeforeGenerationCheck.recoveryId === event.recoveryId;
+        const sameWakeIdentity = activeBeforeGenerationCheck.wakeProtocolVersion === 1
+          ? event.wakeProtocolVersion === 1 && event.wakeId === activeBeforeGenerationCheck.wakeId
+          : event.wakeProtocolVersion === undefined || event.wakeProtocolVersion === 1;
+        if (!sameCoreIdentity || !sameWakeIdentity) return;
+      }
+      const latestGeneration = latestCompactionGenerationByProducer.get(event.producer) ?? -1;
+      if (event.generation < latestGeneration) return;
+      if (event.generation > latestGeneration) {
+        latestCompactionGenerationByProducer.set(event.producer, event.generation);
+      }
+
+      const eventKey = compactionRecoveryKey(event);
+      if (closedCompactionRecoveries.has(eventKey)) return;
+      const active = state.compactionRecovery;
+      const matchesActive = active === undefined
+        || (active.producer === event.producer
+          && active.generation === event.generation
+          && active.recoveryId === event.recoveryId
+          && (active.wakeProtocolVersion === 1
+            ? event.wakeProtocolVersion === 1 && event.wakeId === active.wakeId
+            : event.wakeProtocolVersion === undefined || event.wakeProtocolVersion === 1));
+      // Another producer may announce a deferred request while the current
+      // recovery owns settlement. It must re-announce pending when it actually
+      // acquires the compaction lease; never let incomparable counters replace
+      // the current owner.
+      if (!matchesActive) return;
+      if (event.phase === "cancelled") {
+        const settlementWasSwallowed = compactionSettlementSwallowed;
+        closedCompactionRecoveries.add(eventKey);
+        state.compactionRecovery = undefined;
+        compactionSettlementSwallowed = false;
+        if (timers.compactionRecovery) {
+          clearTimeout(timers.compactionRecovery);
+          timers.compactionRecovery = undefined;
+        }
+        if (settlementWasSwallowed) {
+          const cancelledAtTurnBoundary = turnBoundaryEpoch;
+          // The child may have already queued the continuation turn directly
+          // behind the cancellation IPC event. Yield through the I/O phase and
+          // settle only if no new turn boundary arrived.
+          const settleCancelledRecovery = setImmediate(() => {
+            if (state.terminal || state.turnLifecycleSettled
+              || turnBoundaryEpoch !== cancelledAtTurnBoundary
+              || state.compactionRecovery) return;
+            settleAgentSession();
+          });
+          settleCancelledRecovery.unref?.();
+        }
+        return;
+      }
+      const phaseRank = { pending: 0, completed: 1, continuation: 2 } as const;
+      let phaseAdvanced = false;
+      if (active) {
+        if (event.phase !== "failed" && phaseRank[event.phase] < phaseRank[active.phase]) return;
+        phaseAdvanced = event.phase !== "failed" && phaseRank[event.phase] > phaseRank[active.phase];
+      }
+      if (event.phase === "failed") {
+        closedCompactionRecoveries.add(eventKey);
+        state.compactionRecovery = undefined;
+        if (timers.compactionRecovery) {
+          clearTimeout(timers.compactionRecovery);
+          timers.compactionRecovery = undefined;
+        }
+        const diagnostic =
+          `Teammate compaction recovery failed (agent=${params.agent}, correlationId=${correlationId}, `
+          + `recoveryId=${event.recoveryId}): ${event.reason ?? "unknown recovery failure"}`;
+        state.runtimeFailure = diagnostic;
+        state.failureChain = Object.freeze({
+          ...state.failureChain,
+          terminal: recoveryFailureRecord("compaction-recovery-failed", "recovery", "compaction", diagnostic),
+        });
+        appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+        progress.lastMessage = diagnostic;
+        progress.status = "failed";
+        progress.phase = "settling";
+        options.onProgress?.(progress);
+        compactionSettlementSwallowed = false;
+        completeTurn(readStructuredOutput(true), true, 1);
+        return;
+      }
+      state.compactionRecovery = {
+        recoveryId: event.recoveryId,
+        producer: event.producer,
+        generation: event.generation,
+        phase: event.phase,
+        ...(event.wakeProtocolVersion === 1 || active?.wakeProtocolVersion === 1
+          ? {
+              wakeProtocolVersion: 1 as const,
+              wakeId: event.wakeId ?? active?.wakeId,
+            }
+          : {}),
+        ...(active?.wakeReceipt === undefined ? {} : { wakeReceipt: active.wakeReceipt }),
+        ...(event.wakeDeadlineAt === undefined && active?.absoluteDeadlineAt === undefined
+          ? {}
+          : {
+              absoluteDeadlineAt: Math.min(
+                event.wakeDeadlineAt ?? Number.POSITIVE_INFINITY,
+                active?.absoluteDeadlineAt ?? Number.POSITIVE_INFINITY,
+              ),
+            }),
+      };
+      // Legacy producers retain their prior per-phase conservative deadline.
+      // Receipt-capable producers keep one absolute deadline for the wake.
+      if (phaseAdvanced && active?.wakeProtocolVersion === undefined
+        && active?.wakeReceipt === undefined && timers.compactionRecovery) {
+        clearTimeout(timers.compactionRecovery);
+        timers.compactionRecovery = undefined;
+      }
+      progress.status = "running";
+      progress.phase = event.phase === "pending" ? "compacting" : "continuing";
+      progress.resultReadyAt = undefined;
+      options.onProgress?.(progress);
+      // Scheduling a future reset must not consume its entire watchdog while
+      // the current agent turn is still running. The deadline starts only once
+      // an authoritative settlement has actually been swallowed.
+      if (compactionSettlementSwallowed) armCompactionRecoveryDeadline();
+    }
+
+    function armOutputLimitRecoveryDeadline(): void {
+      if (state.terminal || state.turnLifecycleSettled || pendingInterrupt || timers.outputLimitRecovery) return;
+      const deadlineMs = options.outputLimitRecoveryTimeoutMs ?? OUTPUT_LIMIT_RECOVERY_TIMEOUT_MS;
+      timers.outputLimitRecovery = setTimeout(() => {
+        timers.outputLimitRecovery = undefined;
+        if (
+          state.terminal
+          || state.turnLifecycleSettled
+          || pendingInterrupt
+          || !state.outputLimitRecoveryPending
+        ) return;
+        state.outputLimitRecoveryPending = false;
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content:
+            `Teammate output-limit recovery did not continue within ${deadlineMs}ms `
+            + `(agent=${params.agent}, correlationId=${correlationId}); the partial response was not accepted as success.`,
+        });
+        completeTurn(readStructuredOutput(true), true, 1);
+      }, deadlineMs);
+    }
+
+    function appendStructuredOutputFailure(): void {
+      if (!state.structuredOutputValidationFailure) return;
+      if (!messages.some((message) => message.content === state.structuredOutputValidationFailure)) {
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content: state.structuredOutputValidationFailure,
+        });
+      }
+    }
+
+    function recoveryFailureRecord(
+      code: string,
+      layer: RecoveryFailureRecordV1["layer"],
+      phase: string,
+      message: string,
+      model?: string,
+    ): RecoveryFailureRecordV1 {
+      return Object.freeze({
+        code,
+        layer,
+        phase,
+        sequence: ++state.failureSequence,
+        sanitizedMessage: message,
+        ...(model === undefined ? {} : { model }),
+      });
+    }
+
+    function recordRuntimeEventError(event: JsonLineEvent, phase: string): void {
+      const error = extractPiEventError(event);
+      if (!error) return;
+      if (pendingInterrupt && /\babort(?:ed)?\b/i.test(error)) return;
+      // A recurring runtime error that survived a turn boundary (runtimeFailure
+      // was cleared by onTurnBoundary but the error text persists in
+      // reportedRuntimeErrors across the settled turn) must re-set the failure —
+      // otherwise the turn settles as a false success. completeTurn clears the
+      // dedup set on settlement, so a surviving entry means the boundary was
+      // crossed without a settlement that consumed the prior failure.
+      if (state.reportedRuntimeErrors.has(error) && state.runtimeFailure === undefined) {
+        const model = typeof (event.message as Record<string, unknown> | undefined)?.model === "string"
+          ? (event.message as Record<string, unknown>).model as string
+          : typeof event.model === "string"
+            ? event.model
+            : state.resolvedModel;
+        const recurring =
+          `Teammate runtime error (phase=${phase}, agent=${params.agent}, model=${model || "unknown"}, `
+          + `correlationId=${correlationId}): ${error} [recurred across turn boundary]`;
+        appendBoundedTranscriptMessage(messages, { role: "system", content: recurring });
+        state.runtimeFailure = recurring;
+        progress.lastMessage = recurring;
+        options.onProgress?.(progress);
+        return;
+      }
+      if (state.reportedRuntimeErrors.has(error)) return;
+      state.reportedRuntimeErrors.add(error);
+      const message = event.message as Record<string, unknown> | undefined;
+      const model = typeof message?.model === "string"
+        ? message.model
+        : typeof event.model === "string"
+          ? event.model
+          : state.resolvedModel;
+      const diagnostic =
+        `Teammate runtime error (phase=${phase}, agent=${params.agent}, model=${model || "unknown"}, `
+        + `correlationId=${correlationId}): ${error}`;
+      // Only a model assistant error frame with an explicit classified failure
+      // can authorize a model switch. Generic runtime/tool text is not provider evidence.
+      const classified = classifyRetryErrorDetailed(error);
+      const modelFailure = message?.role === "assistant" && message.stopReason === "error"
+        && (phase === "message_end" || phase === "turn_end" || phase === "agent_end")
+        && !classified.defaulted && classified.kind !== "non-retryable";
+      const failureSource = modelFailure ? (classified.kind === "network" ? "transport" : "provider") : undefined;
+      state.modelSwitchFailure = failureSource ? {diagnostic, source: failureSource} : undefined;
+      if (state.failureChain.initiating === undefined) {
+        const retryKind = classified.kind;
+        state.failureChain = Object.freeze({
+          ...state.failureChain,
+          initiating: recoveryFailureRecord(
+            retryKind,
+            failureSource ?? "recovery",
+            phase,
+            error,
+            model,
+          ),
+        });
+      }
+      appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+      state.runtimeFailure = diagnostic;
+      progress.lastMessage = diagnostic;
+      options.onProgress?.(progress);
+    }
+
+    // --- Per-event handlers -------------------------------------------------
+    // Each handler owns exactly one event family and only mutates `state`,
+    // `progress`, `messages` and `usage`. processEvent() below routes to them
+    // through EVENT_HANDLERS after applying the shared pre-dispatch bookkeeping.
+
+    /** A new agent loop starts: the previous turn's settlement no longer applies. */
+    function onTurnBoundary(event: JsonLineEvent): void {
+      turnBoundaryEpoch += 1;
+      if (pendingInterrupt?.phase === "aborting" && pendingInterrupt.turnSettledDuringAbort) {
+        degradeInterruptToFollowUp("turn advanced before abort was acknowledged");
+      }
+      if (pendingInterrupt?.phase === "prompting") {
+        pendingInterrupt = undefined;
+        if (timers.interruptingSteer) {
+          clearTimeout(timers.interruptingSteer);
+          timers.interruptingSteer = undefined;
+        }
+      }
+      if (state.outputLimitRecoveryPending) {
+        state.outputLimitRecoveryPending = false;
+        if (timers.outputLimitRecovery) {
+          clearTimeout(timers.outputLimitRecovery);
+          timers.outputLimitRecovery = undefined;
+        }
+      }
+      if (state.compactionRecovery
+        && state.compactionRecovery.wakeProtocolVersion === undefined
+        && state.compactionRecovery.wakeReceipt === undefined
+        && (state.compactionRecovery.producer !== "new-context"
+          || state.compactionRecovery.phase === "continuation")) {
+        // An explicit reset is scheduled by a tool before the final assistant
+        // turn. That turn is not its continuation: keep the obligation until
+        // the checkpoint callback announces continuation (or cancellation).
+        // Other legacy producers retain their prior boundary-based behavior.
+        closeActiveCompactionRecovery();
+        state.compactionRecovery = undefined;
+        compactionSettlementSwallowed = false;
+        if (timers.compactionRecovery) {
+          clearTimeout(timers.compactionRecovery);
+          timers.compactionRecovery = undefined;
+        }
+      }
+      if (timers.resultReadyGrace) {
+        clearTimeout(timers.resultReadyGrace);
+        timers.resultReadyGrace = undefined;
+      }
+      if (timers.outputLimitRecovery) {
+        clearTimeout(timers.outputLimitRecovery);
+        timers.outputLimitRecovery = undefined;
+      }
+      state.turnLifecycleSettled = false;
+      const pendingSwitch = state.modelSwitch;
+      if (pendingSwitch && !pendingSwitch.acknowledged) {
+        options.onChildEvent?.({
+          type: "teammate_model_switch_abandoned",
+          correlationId,
+          model: pendingSwitch.targetModel,
+        });
+      }
+      state.modelSwitchDecisionId = undefined;
+      state.modelSwitch = undefined;
+      state.modelSwitchResumeRequestId = undefined;
+      if (timers.modelSwitch) clearTimeout(timers.modelSwitch);
+      timers.modelSwitch = undefined;
+      clearAutoRetryProgressMessage();
+      clearModelFailoverProgressMessage();
+      state.lastAssistantStopReason = undefined;
+      state.runtimeFailure = undefined;
+      progress.status = "running";
+      progress.phase = "prompting";
+      progress.resultReadyAt = undefined;
+      progress.recentTools = [];
+      state.turnToolCount = 0;
+      // A new turn means the previous turn's tools all completed; drop any
+      // stale counter so the in-flight heartbeat cannot leak across turns.
+      state.inFlightToolCount = 0;
+      inFlightCallIds.clear();
+      completedCallIds.clear();
+      state.pendingStructuredOutput = undefined;
+      state.capturedStructuredOutput = undefined;
+      rawStructuredOutput = undefined;
+      rawStructuredOutputRejected = false;
+      validatedFileOutput = undefined;
+      outputFileCleanedByParent = false;
+      incompleteStructuredOutput = undefined;
+      state.structuredOutputValidationFailure = undefined;
+      state.structuredOutputAttemptFailed = false;
+      state.structuredOutputSubmissionConfirmed = false;
+      if (event.type === "agent_start" && currentModelInput?.eventsEmitted) {
+        currentModelInput.loopSeq += 1;
+        currentModelInput.eventsEmitted = false;
+      }
+      if ((event.type === "agent_start" || event.type === "turn_start")
+        && currentModelInput
+        && !currentModelInput.eventsEmitted) {
+        const timestamp = turnEventTimestamp();
+        recordCanonicalTurnEvent({
+          ...turnEventBase(currentModelInput, timestamp),
+          type: "turn-started",
+          phase: "prompting",
+        });
+        currentModelInput.eventsEmitted = true;
+      }
+      const nativeEpoch = nativeObservation?.beginTurn(nativeInputReference(currentModelInput));
+      if (currentModelInput) currentModelInput.nativeTurnEpoch = nativeEpoch;
+      options.onProgress?.(progress);
+    }
+
+    /** Relay a child extension's UI request, or decline it when nobody listens. */
+    function onExtensionUiRequest(event: JsonLineEvent): void {
+      // Caller cancellation can precede the last buffered UI request and child exit.
+      if (options.signal?.aborted) return;
+      const request = {
+        ...event,
+        type: "teammate_rpc_ui_request",
+        correlationId,
+      };
+      const respond = (response: unknown) => {
+        if (options.signal?.aborted || !child.stdin) return;
+        writeChildStdinLine(child.stdin, JSON.stringify(response));
+      };
+      if (options.onChildRequest) { readChildTodoParentContext(parentContext); options.onChildRequest(request, respond, parentContext); }
+      else if (typeof event.id === "string") {
+        respond({ type: "extension_ui_response", id: event.id, cancelled: true });
+      }
+    }
+
+    function recordResolvedModel(event: JsonLineEvent, msg: Record<string, unknown> | undefined): void {
+      const modelId = typeof msg?.model === "string" ? msg.model : event.model;
+      const provider = typeof msg?.provider === "string" ? msg.provider : event.provider;
+      const capabilities = options.modelCapabilities ?? [];
+      let reference = modelId;
+      if (typeof modelId === "string" && typeof provider === "string") {
+        const qualified = `${provider}/${modelId}`;
+        reference = capabilities.some((candidate) => candidate.id === qualified)
+          || !capabilities.some((candidate) => candidate.id === modelId)
+          ? qualified
+          : modelId;
+      }
+      // Runtime events usually report a bare model id without a provider. Upgrade
+      // it to the canonical provider/model id when exactly one capability matches,
+      // so status comparisons are not fooled by id formatting. Ambiguous or
+      // unknown ids are left untouched (this never throws).
+      if (typeof reference === "string" && !reference.includes("/")) {
+        const matches = capabilities
+          .map((candidate) => candidate.id)
+          .filter((candidate) => candidate.endsWith(`/${reference}`));
+        if (matches.length === 1) reference = matches[0];
+      }
+      if (!reference) return;
+      state.resolvedModel = reference;
+      progress.resolvedModel = reference;
+    }
+
+    function onMessageEnd(event: JsonLineEvent): void {
+      const msg = event.message as Record<string, unknown> | undefined;
+      if (msg?.role !== "user") {
+        onAssistantMessage(event);
+        return;
+      }
+      const text = extractTextContent(event);
+      const pendingIndex = text === undefined
+        ? -1
+        : pendingModelInputs.findIndex((input) =>
+            input.committed && input.acceptedMessage === text
+          );
+      if (pendingIndex >= 0) {
+        const input = pendingModelInputs.splice(pendingIndex, 1)[0]!;
+        currentModelInput = input;
+        const reference = nativeInputReference(input);
+        input.nativeTurnEpoch = reference ? nativeObservation?.acceptInput(reference) : undefined;
+        const timestamp = turnEventTimestamp();
+        input.lastMessage = {
+          role: "user",
+          timestamp,
+          provenance: input.context.trigger,
+        };
+        if (!input.initial || options.emitInitialTurnTrigger !== false) {
+          recordCanonicalTurnEvent({
+            ...turnEventBase(input, timestamp),
+            type: "trigger-accepted",
+          });
+        }
+        recordCanonicalTurnEvent({
+          ...turnEventBase(input, timestamp),
+          type: "turn-started",
+          phase: "prompting",
+        });
+        input.eventsEmitted = true;
+        options.onProgress?.(progress);
+        return;
+      }
+
+      // Pi-created inputs continue the accepted logical turn without acquiring
+      // sender identity. They can advance only its low-level loop sequence.
+      if (currentModelInput) {
+        currentModelInput.loopSeq += 1;
+        currentModelInput.eventsEmitted = false;
+        currentModelInput.nativeTurnEpoch = nativeObservation?.advanceLoop(nativeInputReference(currentModelInput));
+      } else {
+        for (const pending of pendingModelInputs) pending.loopSeq += 1;
+      }
+    }
+
+    /** A completed assistant message: transcript, usage and resolved model. */
+    function onAssistantMessage(event: JsonLineEvent): void {
+      const msg = event.message as Record<string, unknown> | undefined;
+      if (event.type === "message_end" && msg?.role !== "assistant") return;
+      if (currentModelInput) {
+        const timestamp = turnEventTimestamp();
+        currentModelInput.lastMessage = assistantMessageMetadata(currentModelInput, timestamp);
+      }
+      const text = extractTextContent(event) || state.streamingText || undefined;
+      if (text) {
+        state.lastContent = text;
+        state.streamingText = "";
+        appendDistinctAssistantMessage(messages, text);
+        progress.lastMessage = text;
+      }
+      const messageUsage = (msg?.usage as Record<string, unknown> | undefined)
+        ?? (event.usage as Record<string, unknown> | undefined);
+      if (messageUsage) {
+        addUsageSnapshot(usage, messageUsage);
+        resetUsage(pendingMessageUsage);
+        usage.turns += 1;
+        updateProgressUsage();
+      }
+      recordResolvedModel(event, msg);
+      recordRuntimeEventError(event, event.type);
+      options.onProgress?.(progress);
+    }
+
+    /** Streaming deltas and in-flight usage snapshots. */
+    function onMessageUpdate(event: JsonLineEvent): void {
+      const ame = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      const deltaType = ame?.type as string | undefined;
+      let progressChanged = false;
+
+      if (deltaType === "text_delta") {
+        const delta = ame?.delta as string | undefined;
+        if (delta) {
+          state.streamingText = appendUtf8Tail(
+            state.streamingText,
+            delta,
+            EXECUTION_BUFFER_LIMITS.streamBytes,
+          );
+          progress.lastMessage = state.streamingText;
+          progressChanged = true;
+        }
+      } else if (deltaType === "text_start") {
+        state.streamingText = "";
+      }
+      // Ignore thinking_delta, thinking_start, etc.
+
+      // Pi 0.84 dropped the cumulative `message` (and `assistantMessageEvent.partial`)
+      // fields from JSON/RPC message_update events — only assistantMessageEvent
+      // deltas remain. Reading `event.message.usage` is kept defensively for 0.83
+      // hosts (it is undefined on 0.84); in-flight usage on 0.84 arrives via the
+      // dedicated `usage` event (onUsageSnapshot) and settles at `message_end`
+      // (onAssistantMessage), so usage totals are unaffected.
+      const msg = event.message as Record<string, unknown> | undefined;
+      const msgUsage = msg?.usage as Record<string, unknown> | undefined;
+      if (msgUsage) {
+        setUsageSnapshot(pendingMessageUsage, msgUsage);
+        updateProgressUsage();
+        progressChanged = true;
+      }
+      if (progressChanged) options.onProgress?.(progress);
+    }
+
+    const inFlightCallIds = new Set<string>();
+    const completedCallIds = new Set<string>();
+
+    function onToolStart(event: JsonLineEvent): void {
+      if (typeof event.toolCallId === "string") {
+        if (inFlightCallIds.has(event.toolCallId)) return;
+        inFlightCallIds.add(event.toolCallId);
+      }
+      const toolName = truncateUtf8Tail(
+        (event.toolName as string) ?? (event.name as string) ?? "unknown",
+        EXECUTION_BUFFER_LIMITS.toolNameBytes,
+      );
+      const argsPreview = previewToolCallArgs(event.args, toolName);
+      const identity = {
+        ...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}),
+        ...(typeof event.parentToolCallId === "string" ? { parentToolCallId: event.parentToolCallId } : {}),
+      };
+      progress.recentTools.push({ ...identity, name: toolName, status: "running", ...(argsPreview === undefined ? {} : { argsPreview }) });
+      state.inFlightToolCount += 1;
+      progress.phase = "tool-execution";
+      if (progress.recentTools.length > EXECUTION_BUFFER_LIMITS.toolItems) {
+        progress.recentTools.splice(
+          0,
+          progress.recentTools.length - EXECUTION_BUFFER_LIMITS.toolItems,
+        );
+      }
+      options.onProgress?.(progress);
+      syncToolHeartbeat();
+    }
+
+    /**
+     * Track a finished execution by its exact identity. A model-issued final
+     * submission is captured here; only the outer lifecycle can settle it.
+     */
+    function onToolCompleted(event: JsonLineEvent): void {
+      if (typeof event.toolCallId === "string") {
+        if (completedCallIds.has(event.toolCallId)) return;
+        completedCallIds.add(event.toolCallId);
+        // Bound duplicate telemetry retention independently of active calls.
+        if (completedCallIds.size > EXECUTION_BUFFER_LIMITS.toolItems * 4) completedCallIds.delete(completedCallIds.values().next().value!);
+      }
+      if (event.content) {
+        appendBoundedTranscriptMessage(messages, { role: "tool", content: event.content });
+      }
+      // Public/replay completion counts include nested executions (their
+      // effects fence replay too). The per-turn diagnostic counts model calls.
+      progress.toolCount += 1;
+      state.completedToolCount += 1;
+      if (event.parentToolCallId === undefined) state.turnToolCount += 1;
+      if (typeof event.toolCallId !== "string" || inFlightCallIds.delete(event.toolCallId)) {
+        state.inFlightToolCount = Math.max(0, state.inFlightToolCount - 1);
+      }
+      if (state.inFlightToolCount === 0 && progress.phase === "tool-execution") {
+        // The next silent interval belongs to model continuation, not to the
+        // completed tool. This selects the model-phase stall window while the
+        // child waits for its next provider event.
+        progress.phase = "continuing";
+      }
+      const lastTool = typeof event.toolCallId === "string"
+        ? progress.recentTools.find((tool) => tool.toolCallId === event.toolCallId)
+        : [...progress.recentTools].reverse().find((tool) => tool.status === "running" && tool.name === (event.toolName ?? event.name));
+      if (lastTool && lastTool.status === "running") {
+        lastTool.status = event.isError === true ? "failed" : "completed";
+      }
+      syncToolHeartbeat();
+      if (pendingInterrupt) {
+        state.pendingStructuredOutput = undefined;
+        progress.phase = "continuing";
+        progress.resultReadyAt = undefined;
+        options.onProgress?.(progress);
+        return;
+      }
+      options.onProgress?.(progress);
+      const completedTool = (event.toolName as string | undefined)
+        ?? (event.name as string | undefined)
+        ?? lastTool?.name;
+      if (
+        event.type === "tool_execution_end"
+        && event.parentToolCallId === undefined
+        && completedTool === "structured_output"
+      ) {
+        const pending = state.pendingStructuredOutput;
+        const completedToolCallId = typeof event.toolCallId === "string"
+          ? event.toolCallId
+          : typeof event.id === "string"
+            ? event.id
+            : undefined;
+        const idsMatch = pending?.toolCallId === undefined
+          ? completedToolCallId === undefined
+          : pending.toolCallId === completedToolCallId;
+        if (event.isError !== true && pending && idsMatch) {
+          state.capturedStructuredOutput = pending.value;
+          state.structuredOutputSubmissionConfirmed = true;
+        } else if (event.isError === true && idsMatch) {
+          state.pendingStructuredOutput = undefined;
+          state.structuredOutputAttemptFailed = true;
+          state.structuredOutputSubmissionConfirmed = false;
+        }
+        const structuredOutput = readStructuredOutput(false);
+        if (event.isError !== true && idsMatch && structuredOutput !== undefined && !state.runtimeFailure) {
+          // A final tool submission is not the outer AgentSession settlement.
+          // In particular a sibling/nested call may still be executing.
+          armLifecycleConfirmationDeadline();
+        }
+      }
+    }
+
+    function onUsageSnapshot(event: JsonLineEvent): void {
+      if (event.usage) {
+        setUsageSnapshot(pendingMessageUsage, event.usage as Record<string, unknown>);
+        updateProgressUsage();
+        options.onProgress?.(progress);
+      }
+    }
+
+    /**
+     * A result-ready turn publishes a consumable result but never settles the
+     * lifecycle here: the child is neither killed nor parked. Only agent_end,
+     * close, error or the armed deadline may converge the lifecycle.
+     */
+    function onTurnEnd(event: JsonLineEvent): void {
+      if (pendingInterrupt) {
+        progress.phase = "continuing";
+        progress.resultReadyAt = undefined;
+        options.onProgress?.(progress);
+        return;
+      }
+      const msg = event.message as Record<string, unknown> | undefined;
+      if (msg?.role === "assistant") {
+        if (typeof msg.stopReason === "string") state.lastAssistantStopReason = msg.stopReason;
+        const text = extractTextContent({ type: "turn_end", message: msg });
+        if (text && appendDistinctAssistantMessage(messages, text)) {
+          state.lastContent = text;
+          progress.lastMessage = text;
+        }
+      }
+      recordResolvedModel(event, msg);
+      recordRuntimeEventError(event, "turn_end");
+      if (currentModelInput) {
+        if (msg?.role === "assistant"
+          && (!currentModelInput.lastMessage || currentModelInput.lastMessage.role !== "assistant")) {
+          const timestamp = turnEventTimestamp();
+          currentModelInput.lastMessage = assistantMessageMetadata(currentModelInput, timestamp);
+        }
+        const lastMessage = currentModelInput.lastMessage;
+        if (lastMessage) {
+          const timestamp = turnEventTimestamp();
+          recordCanonicalTurnEvent({
+            ...turnEventBase(currentModelInput, timestamp),
+            type: "turn-ended",
+            lastMessage,
+          });
+        }
+      }
+      if (isPiResultReadyTurn(event, {
+        inFlightToolCount: state.inFlightToolCount,
+        completedToolCount: state.completedToolCount,
+      })) {
+        options.onProgress?.(progress);
+        if (!params.outputSchema) {
+          progress.resultReadyAt = Date.now();
+          options.onProgress?.(progress);
+          publishResultReady();
+          // Symmetric with the schema lane: the result is consumable, but
+          // the lifecycle still needs a bounded confirmation window.
+          armLifecycleConfirmationDeadline();
+        } else {
+          // Text alone is not consumable for schema runs. Keep resultReadyAt
+          // hidden until structured_output is captured and bound recovery with
+          // the same completed-tool-aware lifecycle grace as the text lane.
+          progress.resultReadyAt = undefined;
+          armResultReadyGrace();
+        }
+      }
+    }
+
+    /**
+     * Start an in-process model switch transaction. Asks the decision hook for
+     * the next model, then sends the child's `set_model` RPC command and waits
+     * for Pi's acknowledgement. On success the model is swapped in place and
+     * the same session continues; the ack response also carries the switch
+     * outcome so a rejected command settles the original failure.
+     */
+    function startModelSwitch(failure: string, previousModel?: string): void {
+      if (state.modelSwitchDecisionId || state.modelSwitch || state.modelSwitchResumeRequestId) return;
+      const stdin = child.stdin;
+      const decisionId = randomUUID();
+      state.modelSwitchDecisionId = decisionId;
+      timers.modelSwitch = setTimeout(() => {
+        timers.modelSwitch = undefined;
+        if (state.modelSwitchDecisionId !== decisionId || state.terminal || state.turnLifecycleSettled) return;
+        state.modelSwitchDecisionId = undefined;
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content: "Model failover selection did not finish within the failover deadline; settling the original failure.",
+        });
+        settleAsFailed();
+      }, modelSwitchAckTimeoutMs);
+      timers.modelSwitch.unref?.();
+      void Promise.resolve()
+        .then(() => options.onModelFailover!(failure, previousModel, state.modelSwitchFailure?.diagnostic === failure ? state.modelSwitchFailure.source : undefined))
+        .then((targetModel) => {
+          if (state.modelSwitchDecisionId !== decisionId || state.terminal || state.turnLifecycleSettled) {
+            if (targetModel !== undefined) {
+              options.onChildEvent?.({
+                type: "teammate_model_switch_abandoned",
+                correlationId,
+                model: targetModel,
+              });
+            }
+            return;
+          }
+          state.modelSwitchDecisionId = undefined;
+          if (timers.modelSwitch) clearTimeout(timers.modelSwitch);
+          timers.modelSwitch = undefined;
+          if (targetModel === undefined) {
+            settleAsFailed();
+            return;
+          }
+          const slash = targetModel.indexOf("/");
+          if (slash <= 0) {
+            appendBoundedTranscriptMessage(messages, {
+              role: "system",
+              content:
+                `Model failover hook returned an invalid model id "${targetModel}"; `
+                + "settling the original failure instead of hot-swapping.",
+            });
+            settleAsFailed();
+            return;
+          }
+          const requestId = `teammate-model-switch-${randomUUID()}`;
+          state.modelSwitch = { requestId, targetModel, acknowledged: false };
+          progress.phase = "continuing";
+          setModelFailoverProgressMessage(`Model failover: switching ${state.resolvedModel} -> ${targetModel}`);
+          options.onProgress?.(progress);
+          const sent = stdin !== null
+            && writeChildStdinLine(stdin, JSON.stringify({
+              id: requestId,
+              type: "set_model",
+              provider: targetModel.slice(0, slash),
+              modelId: targetModel.slice(slash + 1),
+            }));
+          if (!sent) {
+            settleAsFailed();
+            return;
+          }
+          timers.modelSwitch = setTimeout(() => {
+            timers.modelSwitch = undefined;
+            const pending = state.modelSwitch;
+            if (!pending || pending.requestId !== requestId || state.terminal) return;
+            appendBoundedTranscriptMessage(messages, {
+              role: "system",
+              content:
+                `Pi did not acknowledge the in-process model switch to ${targetModel} `
+                + "within the failover deadline; settling the original failure.",
+            });
+            settleAsFailed();
+          }, modelSwitchAckTimeoutMs);
+          timers.modelSwitch.unref?.();
+        })
+        .catch((error) => {
+          if (state.modelSwitchDecisionId !== decisionId || state.terminal || state.turnLifecycleSettled) return;
+          state.modelSwitchDecisionId = undefined;
+          if (timers.modelSwitch) clearTimeout(timers.modelSwitch);
+          timers.modelSwitch = undefined;
+          appendBoundedTranscriptMessage(messages, {
+            role: "system",
+            content:
+              `Model failover hook failed: ${error instanceof Error ? error.message : String(error)}; `
+              + "settling the original failure.",
+          });
+          settleAsFailed();
+        });
+    }
+
+    /** Settle the turn as a failure after an aborted or rejected model switch. */
+    function settleAsFailed(): void {
+      if (state.turnLifecycleSettled || state.terminal) return;
+      state.modelSwitchDecisionId = undefined;
+      state.modelSwitchResumeRequestId = undefined;
+      if (timers.modelSwitch) clearTimeout(timers.modelSwitch);
+      timers.modelSwitch = undefined;
+      // A switch that never reached its ack (rejected set_model, timeout,
+      // dead stdin) never ran under the target model. Tell the host so it can
+      // release the trial acquisition instead of charging a phantom failure.
+      const pendingSwitch = state.modelSwitch;
+      state.modelSwitch = undefined;
+      if (pendingSwitch !== undefined && !pendingSwitch.acknowledged) {
+        options.onChildEvent?.({
+          type: "teammate_model_switch_abandoned",
+          correlationId,
+          model: pendingSwitch.targetModel,
+        });
+      }
+      const structuredOutput = readStructuredOutput(true);
+      completeTurn(structuredOutput, true, 1);
+    }
+
+    /** Finalize the current run after Pi confirms no retry, compaction, or queued continuation remains. */
+    function settleAgentSession(): void {
+      if (state.compactionRecovery) {
+        if (state.compactionRecovery.phase === "continuation" && state.runtimeFailure) {
+          closeActiveCompactionRecovery();
+          state.compactionRecovery = undefined;
+          compactionSettlementSwallowed = false;
+          if (timers.compactionRecovery) {
+            clearTimeout(timers.compactionRecovery);
+            timers.compactionRecovery = undefined;
+          }
+        } else {
+          compactionSettlementSwallowed = true;
+          progress.status = "running";
+          progress.phase = state.compactionRecovery.phase === "pending" ? "compacting" : "continuing";
+          progress.resultReadyAt = undefined;
+          options.onProgress?.(progress);
+          armCompactionRecoveryDeadline();
+          return;
+        }
+      }
+      if (state.modelSwitchDecisionId || state.modelSwitch || state.modelSwitchResumeRequestId) return;
+      const structuredOutput = readStructuredOutput(false);
+      const exitCode = state.runtimeFailure ? 1 : 0;
+      // In-process model failover: when the turn failed with a retryable
+      // provider error, the child runtime is still alive (wakeable), and a
+      // model-switch decision is available, hot-swap the model over the live
+      // RPC channel instead of settling the failure. The same session
+      // continues under the new model, so completed tools are never replayed.
+      if (
+        exitCode !== 0
+        && wakeable
+        && state.runtimeFailure !== undefined
+        && !state.terminal
+        && !state.modelSwitch
+        && !pendingInterrupt
+        && child.stdin !== null
+        && child.stdin.writable
+        && options.onModelFailover !== undefined
+        && state.modelSwitchFailure?.diagnostic === state.runtimeFailure
+      ) {
+        void startModelSwitch(state.runtimeFailure, state.switchedModel);
+        return;
+      }
+      if (params.outputSchema && structuredOutput === undefined) {
+        appendStructuredOutputFailure();
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content: STRUCTURED_OUTPUT_SETTLEMENT_DIAGNOSTICS.agentEnd,
+        });
+        completeTurn(undefined, true, 1);
+        return;
+      }
+      completeTurn(structuredOutput, !wakeable || exitCode !== 0, exitCode);
+      // Process stays alive. Idle agents must be resumed with an RPC prompt;
+      // steer/follow_up only queue while an agent loop is already running.
+    }
+
+    /**
+     * `agent_end` closes one low-level loop. AgentSession may still retry,
+     * compact, or drain a queued continuation, so current RPC streams settle
+     * only on `agent_settled`. Streams without `willRetry` are legacy Pi
+     * versions and retain the former agent_end settlement behavior.
+     */
+    function onAgentEnd(event: JsonLineEvent): void {
+      recordRuntimeEventError(event, "agent_end");
+      if (pendingInterrupt) {
+        // Legacy streams without willRetry settle here; remember the boundary
+        // so a degraded steer can converge the turn it would have settled.
+        if (typeof event.willRetry !== "boolean") steerSettlementSwallowed = true;
+        progress.status = "running";
+        progress.phase = "continuing";
+        progress.resultReadyAt = undefined;
+        options.onProgress?.(progress);
+        return;
+      }
+      const eventMessages = Array.isArray(event.messages) ? event.messages : [];
+      let stopReason = state.lastAssistantStopReason;
+      for (let index = eventMessages.length - 1; index >= 0; index -= 1) {
+        const message = eventMessages[index];
+        if (!message || typeof message !== "object" || (message as Record<string, unknown>).role !== "assistant") continue;
+        const candidate = (message as Record<string, unknown>).stopReason;
+        if (typeof candidate === "string") stopReason = candidate;
+        break;
+      }
+      state.lastAssistantStopReason = stopReason;
+      if (currentModelInput) {
+        const timestamp = turnEventTimestamp();
+        recordCanonicalTurnEvent({
+          ...turnEventBase(currentModelInput, timestamp),
+          type: "agent-ended",
+          ...(currentModelInput.lastMessage === undefined ? {} : { lastMessage: currentModelInput.lastMessage }),
+        });
+      }
+      if (stopReason === "length") {
+        state.outputLimitRecoveryPending = true;
+        progress.status = "running";
+        progress.phase = "continuing";
+        progress.resultReadyAt = undefined;
+        options.onProgress?.(progress);
+        armOutputLimitRecoveryDeadline();
+        return;
+      }
+      progress.phase = "settling";
+      options.onProgress?.(progress);
+      if (getPiHostMode(confirmedChildVersion) !== "native" && typeof event.willRetry !== "boolean") {
+        state.settlementCapability = "legacy";
+        settleAgentSession();
+      }
+    }
+
+    function settleAfterCompactionIpcDrain(): void {
+      if (timers.compactionIpcDrain) return;
+      const boundaryEpoch = turnBoundaryEpoch;
+      let remainingPasses = 2;
+      const drain = () => {
+        timers.compactionIpcDrain = setImmediate(() => {
+          timers.compactionIpcDrain = undefined;
+          if (state.terminal || state.turnLifecycleSettled || turnBoundaryEpoch !== boundaryEpoch) return;
+          remainingPasses -= 1;
+          if (state.compactionRecovery || remainingPasses === 0) {
+            settleAgentSession();
+            return;
+          }
+          drain();
+        });
+      };
+      drain();
+    }
+
+    /** Pi's authoritative AgentSession idle boundary. */
+    function onAgentSettled(): void {
+      state.settlementCapability = "agent_settled";
+      if (pendingInterrupt) {
+        markSteerTurnSettledDuringAbort();
+        steerSettlementSwallowed = true;
+        progress.status = "running";
+        progress.phase = "continuing";
+        progress.resultReadyAt = undefined;
+        options.onProgress?.(progress);
+        return;
+      }
+      nativeObservation?.agentSettled(nativeInputReference(currentModelInput), currentModelInput?.nativeTurnEpoch);
+      if (state.outputLimitRecoveryPending) {
+        state.outputLimitRecoveryPending = false;
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content:
+            `Teammate output-limit recovery settled without a continuation `
+            + `(agent=${params.agent}, correlationId=${correlationId}); the partial response was not accepted as success.`,
+        });
+        state.runtimeFailure = "output-limit recovery settled without continuation";
+        completeTurn(readStructuredOutput(true), true, 1);
+        return;
+      }
+      if (state.compactionWakeProtocolCapable && !state.compactionRecovery) {
+        settleAfterCompactionIpcDrain();
+        return;
+      }
+      settleAgentSession();
+    }
+
+    function onAutoRetryStart(event: JsonLineEvent): void {
+      progress.status = "retrying";
+      progress.phase = "retrying";
+      const attempt = typeof event.attempt === "number" ? event.attempt : undefined;
+      const maxAttempts = typeof event.maxAttempts === "number" ? event.maxAttempts : undefined;
+      const errorMessage = typeof event.errorMessage === "string" ? event.errorMessage : undefined;
+      autoRetryProgressMessage = [
+        attempt === undefined ? "Pi is retrying the provider request" : `Pi retry ${attempt}${maxAttempts ? `/${maxAttempts}` : ""}`,
+        errorMessage,
+      ].filter(Boolean).join(": ");
+      progress.lastMessage = autoRetryProgressMessage;
+      options.onProgress?.(progress);
+    }
+
+    function onAutoRetryEnd(event: JsonLineEvent): void {
+      clearAutoRetryProgressMessage();
+      progress.status = "running";
+      progress.phase = event.success === true ? "continuing" : "settling";
+      options.onProgress?.(progress);
+    }
+
+    function onCompactionStart(): void {
+      progress.status = "running";
+      progress.phase = "compacting";
+      options.onProgress?.(progress);
+    }
+
+    function onCompactionEnd(event: JsonLineEvent): void {
+      progress.status = "running";
+      progress.phase = event.willRetry === true ? "continuing" : "settling";
+      options.onProgress?.(progress);
+    }
+
+    function onErrorEvent(event: JsonLineEvent): void {
+      recordRuntimeEventError(event, "error");
+    }
+
+    function onResponse(event: JsonLineEvent): void {
+      if (child.stdin) acceptRpcResponse(child.stdin, event);
+      const inputIndex = pendingModelInputs.findIndex((input) => input.requestId === event.id);
+      const responseData = event.data as Record<string, unknown> | undefined;
+      if (inputIndex >= 0 && (event.success !== true || responseData?.disposition === "handled")) {
+        const input = pendingModelInputs.splice(inputIndex, 1)[0]!;
+        if (input.nativeInputGeneration !== undefined) nativeObservation?.cancelInput(input.nativeInputGeneration);
+        options.onChildEvent?.({ type: "teammate_rpc_input_disposition", correlationId, requestId: input.requestId, disposition: event.success === true ? "handled" : "rejected" });
+        if (input.initial) {
+          appendBoundedTranscriptMessage(messages, { role: "system", content: event.success === true ? "Pi handled the input without starting an agent run." : "Pi rejected the initial prompt." });
+          // Acceptance/handling alone does not satisfy a teammate task. There
+          // is no AgentSession run to await and no model result to publish.
+          completeTurn(undefined, true, 1);
+          return;
+        }
+      }
+      const modelSwitch = state.modelSwitch;
+      if (modelSwitch && typeof event.id === "string" && event.id === modelSwitch.requestId) {
+        if (timers.modelSwitch) {
+          clearTimeout(timers.modelSwitch);
+          timers.modelSwitch = undefined;
+        }
+        if (event.success !== true || event.command !== "set_model") {
+          appendBoundedTranscriptMessage(messages, {
+            role: "system",
+            content:
+              `Pi rejected the in-process model switch to ${modelSwitch.targetModel}; `
+              + "settling the original failure.",
+          });
+          settleAsFailed();
+          return;
+        }
+        // Model swapped in place. Resume the same session: send the resume
+        // directive over the live channel so Pi starts a fresh turn under the
+        // new model, then re-arm settlement for that turn.
+        modelSwitch.acknowledged = true;
+        state.modelSwitch = undefined;
+        state.switchedModel = modelSwitch.targetModel;
+        state.resolvedModel = modelSwitch.targetModel;
+        progress.requestedModel = modelSwitch.targetModel;
+        state.turnLifecycleSettled = false;
+        state.runtimeFailure = undefined;
+        // The deduplication set is turn-scoped in normal flow (cleared by
+        // completeTurn's finally) but this failover path never calls
+        // completeTurn before resuming. Without clearing it here, the new
+        // model reporting the same provider error text (a fleet-wide outage
+        // is the common case) would be deduplicated away and the turn would
+        // settle as a false success.
+        state.reportedRuntimeErrors.clear();
+        state.lastAssistantStopReason = undefined;
+        state.lastContent = "";
+        state.streamingText = "";
+        state.outputLimitRecoveryPending = false;
+        state.structuredOutputAttemptFailed = false;
+        state.structuredOutputSubmissionConfirmed = false;
+        progress.status = "running";
+        progress.phase = "continuing";
+        progress.resultReadyAt = undefined;
+        setModelFailoverProgressMessage(`Model failover: switched to ${modelSwitch.targetModel}`);
+        options.onProgress?.(progress);
+        const prompt = options.resumePrompt ?? MODEL_FALLBACK_RESUME_PROMPT;
+        const resumeRequestId = `teammate-model-switch-resume-${randomUUID()}`;
+        state.modelSwitchResumeRequestId = resumeRequestId;
+        const sent = child.stdin !== null && child.stdin.writable
+          && writeTransportModelInput(child.stdin, {
+            id: resumeRequestId,
+            type: "prompt",
+            message: wrapLeasedMessage(prompt, typeof options.initialLeaseToken === "function"
+              ? options.initialLeaseToken(correlationId)
+              : options.initialLeaseToken),
+          },prompt,prompt,"prompt");
+        if (!sent) {
+          settleAsFailed();
+          return;
+        }
+        timers.modelSwitch = setTimeout(() => {
+          timers.modelSwitch = undefined;
+          if (state.modelSwitchResumeRequestId !== resumeRequestId || state.terminal || state.turnLifecycleSettled) return;
+          state.modelSwitchResumeRequestId = undefined;
+          appendBoundedTranscriptMessage(messages, {
+            role: "system",
+            content:
+              `Pi did not start the resumed turn under ${modelSwitch.targetModel} `
+              + "within the failover deadline; settling the failed turn.",
+          });
+          settleAsFailed();
+        }, modelSwitchAckTimeoutMs);
+        timers.modelSwitch.unref?.();
+        return;
+      }
+      // The resume prompt after a successful in-process switch was rejected:
+      // the child is alive but refuses the continuation, and no other
+      // settlement path exists (modelSwitch was cleared, no steer pending).
+      // Settle the turn as a failure instead of stranding it.
+      if (
+        state.modelSwitchResumeRequestId !== undefined
+        && typeof event.id === "string"
+        && event.id === state.modelSwitchResumeRequestId
+        && (event.success !== true || responseData?.disposition === "handled")
+      ) {
+        state.modelSwitchResumeRequestId = undefined;
+        if (timers.modelSwitch) clearTimeout(timers.modelSwitch);
+        timers.modelSwitch = undefined;
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content:
+            "Pi rejected or handled the resume prompt without starting a run after the in-process model switch; "
+            + "settling the failed turn.",
+        });
+        settleAsFailed();
+        return;
+      }
+      const pending = pendingInterrupt;
+      if (!pending || typeof event.id !== "string") return;
+      if (pending.phase === "aborting" && event.id === pending.abortRequestId) {
+        if (event.success !== true || event.command !== "abort") {
+          // A rejected abort leaves the turn intact; never fail the task for
+          // an interruption Pi declined to perform.
+          degradeInterruptToFollowUp("Pi rejected the turn abort command");
+          return;
+        }
+        pending.phase = "prompting";
+        armInterruptTimeout();
+        const leasedMessage = wrapLeasedMessage(pending.message, pending.token);
+        if (!child.stdin || !writeTransportModelInput(
+          child.stdin,
+          {
+            id: pending.promptRequestId,
+            type: "prompt",
+            message: leasedMessage,
+          },
+          leasedMessage,
+          pending.message,
+          "steer",
+          pending.provenance,
+        )) {
+          failInterrupt("the correction prompt could not be written");
+        }
+        return;
+      }
+      if (pending.phase === "prompting" && event.id === pending.promptRequestId && (event.success !== true || responseData?.disposition === "handled")) {
+        failInterrupt("Pi rejected or handled the correction prompt without starting a run");
+      }
+    }
+
+    /**
+     * Event type -> handler. Unlisted types are intentionally inert; keeping the
+     * mapping as data makes the full set of recognised events readable at once.
+     *
+     * A Map, not an object literal: `event.type` is child-supplied, and a plain
+     * object would resolve `"toString"` or `"__proto__"` through the prototype
+     * chain instead of staying inert.
+     */
+    const eventHandlers = new Map<string, (event: JsonLineEvent) => void>([
+      ["agent_start", onTurnBoundary],
+      ["turn_start", onTurnBoundary],
+      ["extension_ui_request", onExtensionUiRequest],
+      ["message_end", onMessageEnd],
+      ["assistant", onAssistantMessage],
+      ["message_update", onMessageUpdate],
+      ["response", onResponse],
+      ["auto_retry_start", onAutoRetryStart],
+      ["auto_retry_end", onAutoRetryEnd],
+      ["compaction_start", onCompactionStart],
+      ["compaction_end", onCompactionEnd],
+      ["tool_execution_start", onToolStart],
+      ["tool_execution_end", onToolCompleted],
+      ["tool_result_end", onToolCompleted],
+      ["tool_result", onToolCompleted],
+      ["usage", onUsageSnapshot],
+      ["turn_end", onTurnEnd],
+      ["agent_end", onAgentEnd],
+      ["agent_settled", onAgentSettled],
+      ["error", onErrorEvent],
+    ]);
+
+    function processEvent(event: JsonLineEvent): void {
+      if (!state.receivedFirstActivity) {
+        state.receivedFirstActivity = true;
+        if (timers.firstActivity) clearTimeout(timers.firstActivity);
+      }
+      // completeTurn() is the authoritative settlement boundary. A child may
+      // already have queued tool_result, turn_start, or agent_end lines when
+      // termination begins; treating the terminal state as absorbing prevents
+      // those buffered lines from reawakening the published agent loop.
+      if (state.terminal) return;
+      if (state.capturedStructuredOutput === undefined && params.outputSchema && event.parentToolCallId === undefined) {
+        const candidate = extractStructuredOutputCandidate(event, params.outputSchema)
+          ?? (event.type === "tool_execution_start" && event.toolName === "structured_output"
+            ? extractStructuredOutputCandidate({ message: { content: [{ name: "structured_output", toolCallId: event.toolCallId, arguments: event.args }] } }, params.outputSchema)
+            : undefined);
+        if (candidate) state.pendingStructuredOutput = candidate;
+        const validationFailure = describeStructuredOutputValidationFailure(event, params.outputSchema);
+        if (validationFailure) recordStructuredOutputFailure(validationFailure);
+      }
+      // AC8: Update lastActivityAt on every event
+      progress.lastActivityAt = Date.now();
+      progress.durationMs = Date.now() - startTime;
+
+      // Full live execution events, including nested results and complete:false,
+      // go to observers. nestedCalls is only bounded transcript telemetry.
+      if (event.type.startsWith("tool_execution_")) {
+        options.onChildEvent?.({ ...event, correlationId });
+      }
+      eventHandlers.get(event.type)?.(event);
+      observeBoundary(event);
+    }
+
+    const stderrDecoder = new StringDecoder("utf8");
+    child.stderr?.on("data", (chunk: Buffer) => {
+      pokeLifecycleDeadline();
+      if (chunk.length > 0) addReplayEvidence("stderr", "raw-stderr");
+      state.stderrBuffer = appendUtf8Tail(
+        state.stderrBuffer,
+        stderrDecoder.write(chunk),
+        EXECUTION_BUFFER_LIMITS.stderrBytes,
+      );
+    });
+
+    const notifyChildClosed = (code: number | null, signal: NodeJS.Signals | null): void => {
+      options.signal?.removeEventListener("abort", observerAborted);
+      observeBoundary({ type: "host_offline" });
+      if (child.stdin) rejectRpcResponses(child.stdin);
+      options.onChildClosed?.(correlationId, options.runtimeGeneration, {
+        code,
+        signal,
+        settled: state.turnLifecycleSettled,
+      });
+    };
+
+    child.on("close", (code, signal) => {
+      releaseRetryPersistenceGuard();
+      if (child.stdin) {
+        transportSidecars.delete(child.stdin);
+        interruptHandlers.delete(child.stdin);
+      }
+      clearAllTimers();
+      const closingSwitch = state.modelSwitch;
+      state.modelSwitchDecisionId = undefined;
+      state.modelSwitch = undefined;
+      state.modelSwitchResumeRequestId = undefined;
+      if (closingSwitch && !closingSwitch.acknowledged) {
+        options.onChildEvent?.({
+          type: "teammate_model_switch_abandoned",
+          correlationId,
+          model: closingSwitch.targetModel,
+        });
+      }
+      termination.cleanup();
+      unbindTerminationSignal();
+
+      cleanupFile(systemPromptFile);
+
+      for (const line of stdoutLines.end()) processStdoutLine(line);
+      state.stderrBuffer = appendUtf8Tail(
+        state.stderrBuffer,
+        stderrDecoder.end(),
+        EXECUTION_BUFFER_LIMITS.stderrBytes,
+      );
+
+      // A lifecycle event may have been present in the final decoded stdout
+      // chunk, or terminal structured output may have initiated this close.
+      if (state.turnLifecycleSettled) {
+        notifyChildClosed(code, signal);
+        return;
+      }
+
+      if (pendingInterrupt) {
+        const phase = pendingInterrupt.phase;
+        pendingInterrupt = undefined;
+        const diagnostic =
+          `Failed to interrupt and steer teammate (agent=${params.agent}, correlationId=${correlationId}): `
+          + (phase === "prompting"
+            ? "the child exited before the correction prompt started"
+            : "the child exited before acknowledging the turn abort");
+        state.runtimeFailure = diagnostic;
+        appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+      }
+
+      // A length-truncated turn is waiting for child-local continuation; if
+      // the child exits instead, the partial response must not settle as
+      // success. This also covers a child that closes before the recovery
+      // deadline could fire — close already cleared that timer above.
+      if (state.outputLimitRecoveryPending) {
+        state.outputLimitRecoveryPending = false;
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content:
+            `Teammate child exited before output-limit recovery could continue `
+            + `(agent=${params.agent}, correlationId=${correlationId}); the partial response was not accepted as success.`,
+        });
+        state.runtimeFailure = "output-limit recovery interrupted by child exit";
+      }
+
+      const stderrTail = state.stderrBuffer.trim();
+      state.preActivityInfrastructureExit = code !== null
+        && code !== 0
+        && signal === null
+        && !state.receivedFirstActivity
+        && !state.runtimeFailure
+        && stderrTail.length === 0
+        && state.lastContent.trim().length === 0;
+      const finalContent = state.lastContent.trim();
+      if (finalContent && !messages.some((message) => message.content === finalContent)) {
+        appendDistinctAssistantMessage(messages, finalContent);
+      }
+      if (messages.length === 0) {
+        const content = state.lastContent.trim() || stderrTail || "(no output)";
+        appendBoundedTranscriptMessage(messages, { role: "assistant", content });
+      }
+
+      // Gateway results and Monitor observers consume the same bounded,
+      // provenance-bearing diagnostic projection.
+      if ((code ?? 1) !== 0) {
+        const closeDiagnostic = piLaunchDiagnostic(
+          spawnSpec,
+          "close",
+          code,
+          signal,
+          stderrTail,
+        );
+        options.onChildEvent?.({ ...closeDiagnostic, correlationId });
+        const transcriptDiagnostic = stderrTail && messages.some((message) => message.content === stderrTail)
+          ? { ...closeDiagnostic, stderrTail: "" }
+          : closeDiagnostic;
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content:
+            `Teammate child process exited abnormally (agent=${params.agent}, `
+            + `correlationId=${correlationId}, ${formatPiLaunchDiagnostic(transcriptDiagnostic)}, `
+            + `elapsed=${Date.now() - startTime}ms, tools=${progress.toolCount}).`,
+        });
+      }
+
+      const status = code === 0 && !state.runtimeFailure ? "completed" : "failed";
+      progress.status = status;
+      progress.durationMs = Date.now() - startTime;
+      const lastMsg = messages[messages.length - 1]?.content;
+      if (lastMsg) progress.lastMessage = lastMsg;
+      options.onProgress?.(progress);
+
+      // AC6: Read structured output if available
+      const structuredOutput = readStructuredOutput(true);
+      if (schemaFile) cleanupFile(schemaFile);
+
+      if (state.compactionRecovery && !state.runtimeFailure) {
+        const recovery = state.compactionRecovery;
+        const diagnostic =
+          `Teammate runtime closed before compaction recovery continued `
+          + `(agent=${params.agent}, correlationId=${correlationId}, recoveryId=${recovery.recoveryId}, phase=${recovery.phase}).`;
+        state.runtimeFailure = diagnostic;
+        appendBoundedTranscriptMessage(messages, { role: "system", content: diagnostic });
+      }
+      const processExitCode = state.runtimeFailure ? 1 : code ?? 1;
+      // Non-JSON stdout attributed as assistant content is a protocol violation;
+      // a child that emits it must not settle as a clean success (exitCode 0)
+      // even if it exits 0 with no runtimeFailure. Otherwise malformed output is
+      // attributed as the valid answer (DEF-002 false-success). The violation
+      // flag is the authoritative signal — by this point the malformed text has
+      // already been appended to messages as assistant content, so checking
+      // messages.length would miss the case.
+      const protocolViolationExit = state.stdoutProtocolViolation
+        && state.runtimeFailure === undefined
+        ? 1
+        : 0;
+      const exitCode = (processExitCode === 0 && params.outputSchema && structuredOutput === undefined)
+        || protocolViolationExit === 1
+        ? 1
+        : processExitCode;
+      if (exitCode !== 0 && params.outputSchema && structuredOutput === undefined) {
+        appendStructuredOutputFailure();
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content: STRUCTURED_OUTPUT_SETTLEMENT_DIAGNOSTICS.close,
+        });
+      }
+
+      if (state.initialResultPublished) {
+        completeTurn(structuredOutput, true, exitCode);
+        notifyChildClosed(code, signal);
+        return;
+      }
+
+      if (!state.initialResultPublished) {
+        const result: SingleResult = {
+          agent: params.agent,
+          name: params.name,
+          task: params.task ?? "",
+          exitCode,
+          messages,
+          usage,
+          model: state.resolvedModel,
+          correlationId,
+          durationMs: Date.now() - startTime,
+          toolCount: progress.toolCount,
+          wakeable: false,
+          structuredOutput,
+        };
+        recordAttemptRecovery(result);
+        state.initialResultPublished = true;
+        state.turnLifecycleSettled = true;
+        state.terminal = true;
+        recordTerminalTurnEvent(
+          exitCode === 0 ? "completed" : "failed",
+          result.messages.at(-1)?.content,
+        );
+        resolve(result);
+        try {
+          options.onTurnComplete?.(result);
+        } catch {
+          // Completion observers cannot prevent process-close settlement.
+        }
+      }
+      notifyChildClosed(code, signal);
+    });
+
+    child.on("error", (error) => {
+      releaseRetryPersistenceGuard();
+      if (child.stdin) {
+        transportSidecars.delete(child.stdin);
+        interruptHandlers.delete(child.stdin);
+      }
+      clearAllTimers();
+      unbindTerminationSignal();
+
+      cleanupFile(systemPromptFile);
+      if (schemaFile) cleanupFile(schemaFile);
+      if (outputFile) cleanupFile(outputFile);
+
+      progress.status = "failed";
+      progress.durationMs = Date.now() - startTime;
+      options.onProgress?.(progress);
+
+      const childErrorDiagnostic = piLaunchDiagnostic(
+        spawnSpec,
+        "child-error",
+        null,
+        child.signalCode,
+        state.stderrBuffer,
+      );
+      options.onChildEvent?.({ ...childErrorDiagnostic, correlationId });
+      const processError =
+        `Teammate child process error (agent=${params.agent}, model=${state.resolvedModel || "unknown"}, `
+        + `correlationId=${correlationId}, ${formatPiLaunchDiagnostic(childErrorDiagnostic)}): ${error.message}`;
+      if (state.initialResultPublished) {
+        appendBoundedTranscriptMessage(messages, {
+          role: "system",
+          content: processError,
+        });
+        completeTurn(undefined, true, 1);
+        return;
+      }
+
+      if (!state.initialResultPublished) {
+        const result: SingleResult = {
+          agent: params.agent,
+          name: params.name,
+          task: params.task ?? "",
+          exitCode: 1,
+          messages: [{
+            role: "system",
+            content: processError,
+          }],
+          usage: emptyUsage(),
+          model: state.resolvedModel,
+          correlationId,
+          durationMs: Date.now() - startTime,
+          toolCount: progress.toolCount,
+          wakeable: false,
+        };
+        recordAttemptRecovery(result);
+        state.initialResultPublished = true;
+        state.turnLifecycleSettled = true;
+        state.terminal = true;
+        recordTerminalTurnEvent("failed", processError);
+        resolve(result);
+        try {
+          options.onTurnComplete?.(result);
+        } catch {
+          // Completion observers cannot prevent child-error settlement.
+        } finally {
+          // A logical child-process error is not proof that the OS process has
+          // exited. Retain reclamation ownership through the termination
+          // controller and publish its bounded outcome separately.
+          termination.terminate();
+        }
+      }
+    });
+    /** Called only after controllers, timers and lifecycle handlers are initialized. */
+    function failNativeInput(error:unknown):void {
+      if(state.terminal)return;
+      const diagnostic=`Native recovery durability failure; input was not retried: ${error instanceof Error?error.message:String(error)}`;
+      state.nativeRecoveryFailure=diagnostic;state.runtimeFailure=diagnostic;
+      appendBoundedTranscriptMessage(messages,{role:"system",content:diagnostic});
+      // A refused new input retires an old warm turn as well; it cannot retain a
+      // misleading result-ready child waiting for a generic startup timeout.
+      state.turnLifecycleSettled=false;
+      completeTurn(undefined,true,1,"failed");
+    }
+    if(child.stdin){const gate=nativeWriteGates.get(child.stdin);if(gate)gate.failed=failNativeInput;
+      const prior=nativeWriteFailures.get(child.stdin);if(prior)failNativeInput(prior);else sendInitialPrompt();}
+    else if(params.task)failNativeInput(new Error("Native recovery durability/input transport unavailable: child stdin missing"));
+  });
+}
+
+const nativeDurabilityFailureResults=new WeakSet<SingleResult>();
+function isNativeDurabilityFailure(result:SingleResult):boolean{return nativeDurabilityFailureResults.has(result);}
+
+
+ return { attemptReclamations,
+  attemptRecoveryFacts,
+  TOOL_EXECUTION_HEARTBEAT_MS,
+  resolveAgentCacheRetention,
+  runSingleAttempt,
+  isNativeDurabilityFailure,...control };
+}

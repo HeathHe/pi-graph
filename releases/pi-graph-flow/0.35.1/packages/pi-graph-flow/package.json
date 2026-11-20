@@ -1,0 +1,217 @@
+{
+  "name": "pi-graph-flow",
+  "version": "0.35.1",
+  "description": "All-in-one multi-agent orchestration for the Pi coding agent — parallel teammate dispatch, goals, plans, knowledge system, MCP/LSP/browser, and cockpit visualization in a single install",
+  "type": "module",
+  "bin": {
+    "pi-maestro-gateway": "bin/pi-maestro-gateway.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/configure-keybindings.mjs && node scripts/install-workflows.mjs && node scripts/register-companion-packages.mjs",
+    "prepack": "node scripts/prepare-package-skills.mjs && node ../../scripts/bundle-settings-core.mjs",
+    "postpack": "node ../../scripts/bundle-settings-core.mjs --clean && node scripts/prepare-package-skills.mjs --clean",
+    "test:install": "node --test test/configure-keybindings.test.mjs test/install-workflows.test.mjs test/register-companion-packages.test.mjs",
+    "test:package": "node scripts/verify-maestro-run-capabilities.mjs && node --experimental-transform-types --test test/prepare-package-skills.test.mjs test/package-resources.test.mjs test/package-resources-runtime.test.ts && node --test test/sdk-resolution-contract.test.mjs",
+    "test:conversion": "node --experimental-transform-types --test test/convert-pi.test.mjs test/maestro-run-capabilities.test.mjs test/skill-contract-lint.test.ts",
+    "check:maestro-run-cli": "node scripts/verify-maestro-run-capabilities.mjs",
+    "test:todo": "node --experimental-transform-types --test test/skill-loader.test.ts test/skill-manager.test.ts test/todo.test.ts test/todo-prompt-context.test.ts test/cockpit-ownership.test.ts",
+    "test:compaction": "node --experimental-transform-types --test test/pi-internals.test.mjs test/compaction.test.ts test/summary-optimization.test.ts test/compaction-image.test.ts test/compaction-settings.test.ts test/compaction-tui.test.ts test/tool-result-spill.test.ts test/lossless.test.ts test/cache-gate.test.ts test/relevance.test.ts test/dedup.test.ts test/content-detector.test.ts test/evidence-index.test.ts test/new-context.test.ts test/recovery-focus.test.ts",
+    "test:settings": "node --experimental-transform-types --test test/settings-provider.test.ts test/api-manager-settings-provider.test.ts test/mcp-settings-provider.test.ts test/skills-settings-provider.test.ts test/smart-search-settings-provider.test.ts test/teammate-backends-settings-provider.test.ts test/settings-provider-wiring.test.ts test/settings-catalogs.test.ts test/tui-locale.test.ts test/resource-lock.test.ts",
+    "test:gui": "node --experimental-transform-types --test test/gui-server.test.ts test/gui-state.test.ts test/gui-events.test.ts test/gui-tools.test.ts test/gui-invoke.test.ts test/gui-e2e.test.ts",
+    "test:hooks": "node --experimental-transform-types --test test/hooks.test.ts",
+    "test:permissions": "node --experimental-transform-types --test test/permissions.test.ts test/ask.test.ts test/ask-transport.test.ts test/ask-sessionbar-integration.test.ts test/approval-mode.test.ts test/notify-mode.test.ts test/teammate-relay-ipc.test.ts test/direct-teammate-runtime.test.ts test/permission-core-host.test.ts test/permission-core-controller.test.ts",
+    "test:providers": "node --experimental-transform-types --test test/api-provider-config.test.ts test/api-model-editor.test.ts test/devin-auth.test.ts test/devin-transport.test.ts test/explore-config-manager.test.ts test/cost-backfill.test.ts test/model-discovery.test.ts test/before-agent-start.test.ts test/model-failover.test.ts",
+    "test:next-suggest": "node --experimental-transform-types --test test/next-suggest.test.ts",
+    "test:mcp": "node --experimental-transform-types --test test/mcp-config.test.ts test/mcp-manager.test.ts test/mcp-server-manager.test.ts test/mcp-lifecycle-leases.test.ts test/mcp-ui-server.test.ts test/fabric-mcp-mount.test.ts test/mcp-oauth-fence.test.ts",
+    "test:goal": "node --experimental-transform-types --import ./test/goal-offline-preload.mjs --test --test-concurrency=2 test/goal.test.ts test/goal-verification-timeout.test.ts test/goal-owner-lifecycle.test.ts test/business-registered.test.ts test/business-delivery.test.ts test/business-closure.test.ts test/task-workflow/source-owner.test.ts test/goal-evidence.test.ts test/goal-verifier-loader.test.ts test/task-workflow/goal-detach-journal-reconciliation.test.ts test/task-workflow/storage-persist-compat.test.ts",
+    "test:bash-bg": "node --experimental-transform-types --test test/bash-bg.test.ts",
+    "test:plan": "vitest run --config ./vitest.plan.config.ts test/plan-store.test.ts test/plan-editor.test.ts test/plan-transport.test.ts test/plan-decompose.test.ts test/plan-refine.test.ts test/refine-transport.test.ts test/plan-lifecycle.test.ts test/plan-model.test.ts test/plan-todo-integration.test.ts test/session-artifact.test.ts test/statusline.test.ts test/plan-auto.test.ts test/plan-review.test.ts test/plan-sources.test.ts test/plan-coordinator-lifecycle.test.ts test/plan-registered-flow.test.ts test/plan-node-shim-contract.test.ts test/plan-replan-supersession.test.ts test/task-workflow/plan-replacement-recovery.test.ts test/task-clear-history.test.ts test/task-workflow/task-clear-recovery.test.ts",
+    "test:flow-schedule": "node --experimental-transform-types --test --test-concurrency=2 test/flow-schedule-schema.test.ts test/flow-schedule-store.test.ts test/flow-schedule-machine.test.ts test/flow-schedule-actor.test.ts test/flow-schedule-runtime.test.ts test/flow-schedule-tool.test.ts test/flow-schedule-legacy.test.ts test/flow-schedule-e2e.test.ts",
+    "test:session": "node --experimental-transform-types --test test/session-bridge.test.ts test/session-export.test.ts test/todo-projection.test.ts test/workflow-coordinator.test.ts test/run-recovery.test.ts test/session-tui.test.ts test/ui-projection.test.ts test/skill-contract-lint.test.ts",
+    "test:swarm": "node --experimental-transform-types --test test/swarm-projection.test.ts test/swarm-tui.test.ts",
+    "test:packed": "node --test test/packed-consumer-e2e.test.mjs",
+    "test:packed-todo": "node --test test/packed-todo-consumer.test.mjs",
+    "test:packed-flow-schedule": "node --test test/packed-flow-schedule-consumer.test.mjs",
+    "test:intelligence": "node --experimental-transform-types --test test/search-tool-bm25.test.ts test/smart-search.test.ts test/smart-search-config.test.ts test/web-storage.test.ts test/lsp-client.test.ts test/lsp-manager.test.ts test/lsp-lifecycle.test.ts test/lsp-tool.test.ts test/lsp-output.test.ts test/lsp-auto-diagnostics.test.ts test/workspace-edit.test.ts test/browser-tool.test.ts test/extension-tools.test.ts test/fff.test.ts test/quiet-render.test.ts test/tool-renderer-lifecycle.test.ts",
+    "check:mcp": "tsc -p tsconfig.mcp.json",
+    "check:types": "tsc -p tsconfig.intelligence.json",
+    "typecheck": "tsc -p tsconfig.build.json"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "maestro",
+    "agents",
+    "explore",
+    "delegate",
+    "moa",
+    "workflow",
+    "orchestration",
+    "swarm",
+    "aco",
+    "visualization",
+    "skills",
+    "all-in-one",
+    "multi-agent",
+    "goal",
+    "plan"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "src/mcp/app-bridge.bundle.js",
+    "src/mcp/LICENSE.pi-mcp-adapter",
+    "src/providers/devin/LICENSE.oh-my-pi",
+    "bin/",
+    "scripts/",
+    "schemas/",
+    "templates/",
+    "tsconfig.intelligence.json",
+    ".pi/",
+    "!.pi/**/__pycache__/**",
+    "!.pi/**/*.pyc",
+    "!.pi/settings.local.json",
+    "!.pi/model-failover.json",
+    "!.pi/scratch/**",
+    "README.md",
+    "optional/"
+  ],
+  "exports": {
+    "./ask-transport": "./src/ask-transport.ts",
+    "./plan-transport": "./src/plan-transport.ts",
+    "./refine-transport": "./src/refine-transport.ts",
+    "./gui": "./src/gui/index.ts",
+    "./gui/client": "./src/gui/client.ts",
+    "./compaction/settings": "./src/compaction/compaction-settings.ts",
+    "./compaction/arbiter": "./src/compaction/compaction-arbiter.ts",
+    "./gateway/v1": "./src/gateway/public/v1/index.ts",
+    "./src/*": "./src/*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension/index.ts",
+      "./src/advisor/extension.ts",
+      "./src/self-evolve/extension.ts",
+      "./src/submit-gate/extension.ts",
+      "./src/classifier/extension.ts",
+      "./src/decision-policy/extension.ts",
+      "./src/providers/codex-fast.ts"
+    ],
+    "skills": [
+      "./.pi/skills"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-mcp": "1.5.2",
+    "pi-graph-permission-core": "0.1.0",
+    "@ff-labs/fff-node": "0.10.1",
+    "@modelcontextprotocol/ext-apps": "1.7.4",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@mozilla/readability": "^0.6.0",
+    "@types/turndown": "^5.0.6",
+    "cross-spawn": "7.0.6",
+    "jiti": "2.7.0",
+    "linkedom": "^0.18.13",
+    "maestro-flow": ">=0.5.91",
+    "open": "10.2.0",
+    "p-limit": "^7.3.1",
+    "pi-cockpit": "0.24.5",
+    "pi-maestro-backend-core": "0.1.5",
+    "pi-maestro-backends": "0.1.7",
+    "pi-maestro-fabric": "0.1.0",
+    "pi-maestro-fabric-core": "0.1.0",
+    "pi-maestro-settings-core": "0.2.3",
+    "pi-maestro-teammate": "2.10.2",
+    "promise.try": "^2.0.1",
+    "proper-lockfile": "4.1.2",
+    "puppeteer-core": "25.12.0",
+    "recheck": "4.5.0",
+    "ssh2": "1.17.0",
+    "turndown": "^7.2.4",
+    "unpdf": "^1.8.0",
+    "ws": "^8.18.0",
+    "yaml": "^2.9.0",
+    "zod": "3.25.76",
+    "pi-graph-model-role": "0.1.0",
+    "pi-graph-resources": "0.1.0",
+    "pi-graph-observability": "0.1.0",
+    "pi-graph-context-runtime": "0.1.0",
+    "pi-graph-mcp-core": "0.1.0",
+    "pi-graph-host-compat": "0.1.0",
+    "pi-graph-provider-backend": "0.1.0"
+  },
+  "bundledDependencies": [
+    "pi-cockpit",
+    "pi-graph-context-runtime",
+    "pi-graph-host-compat",
+    "pi-graph-mcp-core",
+    "pi-graph-model-role",
+    "pi-graph-observability",
+    "pi-graph-permission-core",
+    "pi-graph-resources",
+    "pi-maestro-backend-core",
+    "pi-maestro-backends",
+    "pi-maestro-fabric",
+    "pi-maestro-fabric-core",
+    "pi-maestro-settings-core",
+    "pi-maestro-teammate",
+    "pi-graph-provider-backend",
+    "maestro-flow"
+  ],
+  "optionalDependencies": {
+    "@konbakuyomu/smart-search": "https://github.com/konbakuyomu/smartsearch/archive/667c465d0f6ea16a423f03c434f94e21505d3595.tar.gz",
+    "@nut-tree-fork/nut-js": "npm:@dyw1234/nut-js@4.2.7",
+    "active-win": "npm:@dyw1234/active-win@9.0.1",
+    "node-window-manager": "2.2.4",
+    "onnxruntime-node": "1.30.0",
+    "screenshot-desktop": "1.15.6"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.99.0",
+    "@earendil-works/pi-ai": "0.99.0",
+    "@earendil-works/pi-coding-agent": "0.99.0",
+    "@earendil-works/pi-tui": "0.99.0",
+    "@types/cross-spawn": "6.0.6",
+    "@types/ssh2": "1.15.5",
+    "@types/ws": "^8.5.13",
+    "typebox": "1.3.27",
+    "typescript": "5.7.3",
+    "vitest": "^4.1.10"
+  },
+  "maestro": {
+    "required": true,
+    "minVersion": "1.0.0",
+    "features": [
+      "search",
+      "load"
+    ],
+    "installUrl": "https://github.com/catlog22/maestro2"
+  }
+}

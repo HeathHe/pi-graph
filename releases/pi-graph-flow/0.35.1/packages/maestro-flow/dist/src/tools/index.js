@@ -1,0 +1,44 @@
+import { ccwResultToMcp } from '../types/tool-schema.js';
+// CCW-style tool modules (schema + handler exports)
+import * as editFileTool from './edit-file.js';
+import * as writeFileTool from './write-file.js';
+import * as readFileTool from './read-file.js';
+import * as readManyFilesTool from './read-many-files.js';
+import * as teamMsgTool from './team-msg.js';
+import * as teamMailboxTool from './team-mailbox.js';
+import * as storeKnowhowTool from './store-knowhow.js';
+import * as teamTasksMcpTool from './team-tasks-mcp.js';
+import * as teamAgentsTool from './team-agents.js';
+import * as wikiSearchTool from './wiki-search.js';
+import * as codeSemanticSearchTool from './code-semantic-search.js';
+import * as delegateMcpTool from './delegate-mcp.js';
+/**
+ * Register a CCW-style tool (with schema + handler exports) into the maestro registry.
+ * Adapts CCW's { success, result, error } format to maestro's { content, isError } format.
+ */
+function registerCcwTool(registry, mod) {
+    registry.register({
+        name: mod.schema.name,
+        description: mod.schema.description,
+        inputSchema: mod.schema.inputSchema,
+        async handler(input) {
+            const ccwResult = await mod.handler(input);
+            return ccwResultToMcp(ccwResult);
+        },
+    });
+}
+export function registerBuiltinTools(registry) {
+    registerCcwTool(registry, editFileTool);
+    registerCcwTool(registry, writeFileTool);
+    registerCcwTool(registry, readFileTool);
+    registerCcwTool(registry, readManyFilesTool);
+    registerCcwTool(registry, teamMsgTool);
+    registerCcwTool(registry, teamMailboxTool);
+    registerCcwTool(registry, storeKnowhowTool);
+    registerCcwTool(registry, teamTasksMcpTool);
+    registerCcwTool(registry, teamAgentsTool);
+    registerCcwTool(registry, wikiSearchTool);
+    registerCcwTool(registry, codeSemanticSearchTool);
+    registerCcwTool(registry, delegateMcpTool);
+}
+//# sourceMappingURL=index.js.map
