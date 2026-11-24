@@ -136,21 +136,3 @@ Pi Graph 自动分类意图并路由：**简单任务**直接执行 · **多步�
 | **[更新说明](docs/UPDATES.md)** | 历史提交变更记录 |
 | **[新特性使用说明](docs/new-features-usage.md)** | Vision 委托 · 终端标题 · Mailbox · observe watch · self-evolve 快速上手 |
 | 各插件 README | [flow](packages/pi-graph/README.md) · [teammate](packages/pi-graph-agent-runtime/README.md) · [cockpit](packages/pi-graph-dashboard/README.md) |
-
----
-
-## 致谢
-
-- **[Maestro-Flow](https://github.com/catlog22/maestro-flow)** — 意图驱动工作流编排框架 by [@catlog22](https://github.com/catlog22)
-- **[Pi Coding Agent](https://github.com/earendil-works/pi)** — 终端编码智能体（宿主运行时）by [@earendil-works](https://github.com/earendil-works)
-- 驱动内置工具的上游库：[@modelcontextprotocol/sdk](https://modelcontextprotocol.io)（`mcp`，SDK `1.32.1`）· [Puppeteer](https://github.com/puppeteer/puppeteer)（`browser`，`puppeteer-core 25.12.0`）· [@ff-labs/fff-node](https://github.com/dmtrKovalenko/fff)（`search`/`fffind`）· [@konbakuyomu/smart-search](https://github.com/konbakuyomu/smartsearch)（`smart_search`）· [pi-web-access](https://github.com/nicobailon/pi-web-access)（原生网络搜索/提取/curator）
-
-## 许可证
-
-[MIT](LICENSE) © 2026 HeathHe
-
----
-
-## 友情链接
-
-- **[Linux DO](https://linux.do/)** — Linux DO：学AI，上L站！
