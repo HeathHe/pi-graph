@@ -1,0 +1,482 @@
+/**
+ * TypeBox schemas for all maestro tools.
+ *
+ * Main tool: maestro (action: explore | delegate | moa)
+ * Auxiliary tools: goal, ask-user-question, todo
+ */
+
+import { Type, type Static } from "typebox";
+import { Errors } from "typebox/value";
+import { MAX_ACCEPTANCE_COMMAND_CHARS } from "../tools/goal-verification.ts";
+import {
+  TODO_ADVANCE_TRANSITIONS,
+  TODO_GET_FIELDS,
+  TODO_GET_DEFAULT_LIMIT,
+  TODO_GET_MAX_LIMIT,
+  TODO_LIST_DEFAULT_LIMIT,
+  TODO_LIST_MAX_LIMIT,
+  TODO_HANDOFF_FILE_VALUES,
+  TODO_MAX_HANDOFF_FILES,
+  TODO_MAX_HANDOFF_NEXT_STEPS,
+  TODO_MAX_HANDOFF_PATH_BYTES,
+  TODO_MAX_HANDOFF_TEXT_BYTES,
+  TODO_MAX_RESOURCE_URI_BYTES,
+  TODO_MAX_RESOURCE_URIS,
+  TODO_RESOURCE_URI_GUIDANCE,
+  TODO_RESOURCE_URI_SCHEMA_PATTERN,
+  TODO_UPDATE_FIELDS,
+} from "../tools/todo-contract.ts";
+
+function StringEnum<T extends string[]>(values: [...T], description?: string) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: values,
+    ...(description ? { description } : {}),
+  });
+}
+
+export const MaestroParams = Type.Object({
+  // === Action Dispatch ===
+  action: StringEnum(["explore", "delegate", "moa"]),
+
+  // === Explore Action Fields ===
+  prompts: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Search prompts for explore action (each prompt = one parallel agent)",
+    }),
+  ),
+  endpoint: Type.Optional(
+    Type.String({
+      description: "Specific model/endpoint for explore agents",
+    }),
+  ),
+  all: Type.Optional(
+    Type.Boolean({
+      description: "Fan out each prompt to all registered endpoints",
+    }),
+  ),
+  maxTurns: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Maximum agent turns per exploration job",
+    }),
+  ),
+  concurrency: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Maximum concurrent explore agents (default: 4)",
+    }),
+  ),
+
+  // === Delegate Action Fields ===
+  prompt: Type.Optional(
+    Type.String({
+      description: "Task prompt for delegate action",
+    }),
+  ),
+  tool: Type.Optional(
+    Type.String({
+      description:
+        "Target tool/provider for delegate (e.g., 'gemini', 'claude', 'codex')",
+    }),
+  ),
+  mode: Type.Optional(
+    Type.Unsafe<"analysis" | "write">({
+      type: "string",
+      enum: ["analysis", "write"],
+      description: "analysis: read-only investigation; write: allow file modifications",
+    }),
+  ),
+  name: Type.Optional(
+    Type.String({
+      description: "Stable delegate task name for nested tracing and follow-up",
+    }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description: "Model override for delegate or explore",
+    }),
+  ),
+  rule: Type.Optional(
+    Type.String({
+      description: "Protocol + prompt template for delegate",
+    }),
+  ),
+
+  // === MOA Action Fields ===
+  preset: Type.Optional(
+    Type.String({
+      description: "MOA preset configuration name",
+    }),
+  ),
+
+  // === Common Fields ===
+  cwd: Type.Optional(
+    Type.String({
+      description: "Working directory for the operation",
+    }),
+  ),
+  timeoutMs: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Timeout in milliseconds",
+    }),
+  ),
+});
+
+// === Goal Tool Schema ===
+
+// Keep the function schema rooted at an object. Some OpenAI-compatible
+// providers reject a root-level anyOf even when every union variant is an
+// object. Action-specific requirements are enforced by executeGoal().
+export const GoalToolParams = Type.Object({
+  action: StringEnum(["get", "create", "update", "complete"]),
+  objective: Type.Optional(
+    Type.String({ description: "Goal objective; required when action is 'create' or 'update'" }),
+  ),
+  summary: Type.Optional(Type.String({ maxLength: 4000, description: "Completion claim (max 4000 characters); required on complete. Put original evidence in evidenceRefs." })),
+  evidenceRefs: Type.Optional(Type.Array(Type.Object({
+    requirement: Type.String({ minLength: 1, maxLength: 256 }),
+    uri: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+    path: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+    offset: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_000 })),
+    charOffset: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000_000, description: "URI only: UTF-16 character offset within the selected lines." })),
+  }, { additionalProperties: false, oneOf: [{ required: ["uri"], not: { required: ["path"] } }, { required: ["path"], not: { required: ["uri"] } }] }), {
+    maxItems: 16,
+    uniqueItems: true,
+    description: "Complete only: requirement-labelled original evidence. Exactly one exact session://id/entry/id or agent://exact-id[/subpath] URI, or local path; optional 1-based line offset/limit. Correlations are pinned to their current publication; task names are not evidence.",
+  })),
+  tokenBudget: Type.Optional(
+    Type.String({ description: "Optional explicit Token budget; omit for no budget. Accepts plain, k, or m values, e.g. '100000', '100k', or '1.5m'; create only" }),
+  ),
+  planHandoffKey: Type.Optional(
+    Type.String({ description: "Handoff key of the approved Plan this item implements. There is no injector: pass the key that the Plan approval message gave you, or omit it" }),
+  ),
+  acceptance: Type.Optional(
+    Type.Array(Type.String({ maxLength: MAX_ACCEPTANCE_COMMAND_CHARS }), {
+      maxItems: 5,
+      description: `Acceptance commands (max 5, ${MAX_ACCEPTANCE_COMMAND_CHARS} characters each), configurable on create or update. During completion the extension reruns them from the workspace with the platform system shell, so commands must be focused and cross-platform; exit status directly determines verification; without commands, completion uses the agent verifier.`,
+    }),
+  ),
+}, { additionalProperties: false });
+
+// === OpenCodeReview Schema ===
+
+export const OcrReviewParams = Type.Object({
+  action: StringEnum(
+    ["review", "preview", "rules", "health"],
+    "review = full OpenCodeReview-managed review (current API manager gateway model injected via env); preview/rules = delegate mode, deterministic, no LLM; health = version + LLM connectivity check",
+  ),
+  commit: Type.Optional(Type.String({ description: "Review one commit against its parent" })),
+  from: Type.Optional(Type.String({ description: "Base ref for a range review; must be paired with 'to'" })),
+  to: Type.Optional(Type.String({ description: "Target ref for a range review; must be paired with 'from'" })),
+  resume: Type.Optional(Type.String({ description: "Resume an interrupted review session by id (review only)" })),
+  paths: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "File paths to resolve review rules for (action=rules only; pass the reviewable_files list from preview)",
+    }),
+  ),
+  background: Type.Optional(Type.String({ description: "Business/requirement context to focus the review" })),
+  exclude: Type.Optional(Type.String({ description: "Comma-separated gitignore-style exclusion patterns" })),
+  repo: Type.Optional(Type.String({ description: "Repository root; defaults to the workspace cwd" })),
+  timeoutMinutes: Type.Optional(Type.Integer({ minimum: 1, description: "Per-file-group OCR timeout in minutes (review)" })),
+  overallTimeoutMinutes: Type.Optional(Type.Integer({ minimum: 1, maximum: 35791, description: "Wall-clock cap per OCR process for all actions (defaults: preview/rules 2, health 1.5, review 45 minutes). Preview builds full diffs; use an explicit larger cap for large repositories." })),
+  model: Type.Optional(
+    Type.String({
+      description: "Review model override: 'provider/modelId' pins a registered model, 'session' follows the current session model and its runtime-resolved gateway auth (default). Falls back to the api-manager.json ocr.modelRef pin.",
+    }),
+  ),
+}, { additionalProperties: false });
+
+// === Ask User Question Schema ===
+
+const QuestionOptionSchema = Type.Object({
+  label: Type.String({ description: "Option display text" }),
+  recommended: Type.Optional(Type.Boolean({ description: "Explicit recommended option for host Ask-auto timeout fallback; never an approval. Single-select requires one recommended option; multi-select adopts all marked options." })),
+  description: Type.Optional(
+    Type.String({ description: "Explanation of this option" }),
+  ),
+});
+
+const QuestionSchema = Type.Object({
+  question: Type.String({ description: "The question text" }),
+  header: Type.Optional(
+    Type.String({ description: "Short chip/tag label (max 16 chars)" }),
+  ),
+  options: Type.Optional(
+    Type.Array(QuestionOptionSchema, {
+      minItems: 2,
+      maxItems: 4,
+      description: "Multiple-choice options (2-4)",
+    }),
+  ),
+  multiSelect: Type.Optional(
+    Type.Boolean({ description: "Allow multiple selections (default: false); every option question also accepts additional details" }),
+  ),
+});
+
+export const AskUserQuestionParams = Type.Object({
+  questions: Type.Array(QuestionSchema, {
+    minItems: 1,
+    maxItems: 4,
+    description: "1-4 questions collected through the keyboard-first TUI wizard",
+  }),
+});
+
+// === Todo Tool Schema ===
+
+const TodoSkillBindingSchema = Type.Object({
+  name: Type.String({
+    minLength: 1,
+    description: "Pi skill name resolved by the native skill loader during next",
+  }),
+  role: StringEnum(["primary", "guard", "support"]),
+  args: Type.Optional(
+    Type.String({ description: "Task-level skill arguments; override matching skill-config defaults" }),
+  ),
+}, { additionalProperties: false });
+
+const TodoResourceUrisSchema = Type.Array(
+  Type.String({
+    minLength: 1,
+    maxLength: TODO_MAX_RESOURCE_URI_BYTES,
+    pattern: TODO_RESOURCE_URI_SCHEMA_PATTERN,
+    description: `Trimmed resource URI; runtime enforces the UTF-8 byte limit. ${TODO_RESOURCE_URI_GUIDANCE}`,
+  }),
+  {
+    maxItems: TODO_MAX_RESOURCE_URIS,
+    description: `Durable resource references (max ${TODO_MAX_RESOURCE_URIS}; ${TODO_MAX_RESOURCE_URI_BYTES} UTF-8 bytes each)`,
+  },
+);
+
+export function createTodoHandoffSchema(
+  description = "Durable next-step and task-relative file loading annotations; omitted children preserve existing values on update and empty arrays clear them",
+) {
+  return Type.Object({
+    nextSteps: Type.Optional(Type.Array(Type.String({
+      minLength: 1,
+      maxLength: TODO_MAX_HANDOFF_TEXT_BYTES,
+      description: "Ordered recommendations for the next phase; runtime enforces UTF-8 byte limits",
+    }), {
+      maxItems: TODO_MAX_HANDOFF_NEXT_STEPS,
+    })),
+    files: Type.Optional(Type.Array(Type.Object({
+      path: Type.String({
+        minLength: 1,
+        maxLength: TODO_MAX_HANDOFF_PATH_BYTES,
+        description: "Exact local file path or supported durable resource URI",
+      }),
+      value: StringEnum(
+        [...TODO_HANDOFF_FILE_VALUES],
+        "Loading value: required=needed for the next action; conditional=load only when 'when' applies; skip=no incremental value by default; unknown=relevance is not established",
+      ),
+      reason: Type.String({
+        minLength: 1,
+        maxLength: TODO_MAX_HANDOFF_TEXT_BYTES,
+        description: "Task-relative reason for the loading value",
+      }),
+      when: Type.Optional(Type.String({
+        minLength: 1,
+        maxLength: TODO_MAX_HANDOFF_TEXT_BYTES,
+        description: "Reload condition or smallest useful symbol/line range; required for conditional",
+      })),
+    }, { additionalProperties: false }), {
+      maxItems: TODO_MAX_HANDOFF_FILES,
+    })),
+  }, {
+    additionalProperties: false,
+    description,
+  });
+}
+
+export const TodoHandoffSchema = createTodoHandoffSchema();
+
+const TodoFilterSchema = Type.Object({
+  status: Type.Optional(
+    StringEnum(["pending", "in_progress", "completed", "blocked"]),
+  ),
+  memberId: Type.Optional(
+    Type.String({ description: "Return tasks created by or assigned to self, root, a teammate id or unique id prefix, label, @label, or label#id-prefix" }),
+  ),
+}, { additionalProperties: false });
+
+const TodoBatchTaskSchema = Type.Object({
+  subject: Type.String({
+    minLength: 1,
+    description: "Task title",
+  }),
+  description: Type.Optional(
+    Type.String({ description: "Long-form task detail" }),
+  ),
+  context: Type.Optional(
+    Type.String({ description: "Plain-text execution context for this step" }),
+  ),
+  skills: Type.Optional(
+    Type.Array(TodoSkillBindingSchema, { description: "Ordered Pi skill bindings; exactly one primary when present" }),
+  ),
+  resourceUris: Type.Optional(TodoResourceUrisSchema),
+  handoff: Type.Optional(TodoHandoffSchema),
+  assignee: Type.Optional(
+    Type.String({ description: "Assignee selector; defaults to the calling actor" }),
+  ),
+  blockedBy: Type.Optional(
+    Type.Array(Type.Integer({
+      minimum: 0,
+      description: "Zero-based index of an earlier dependency in this exact tasks array. For tasks[i], the index must be less than i; for example, tasks[1] may depend on 0.",
+    }), {
+      description: "Batch indexes this task depends on. Example: tasks[1].blockedBy = [0] makes the second item depend on the first.",
+    }),
+  ),
+  goalId: Type.Optional(
+    Type.String({ description: "Id of the Goal acting as this task's quality gate. Bind only key tasks with verifiable acceptance criteria — do not create a Goal for every task; the task completes only after this Goal verifies" }),
+  ),
+}, { additionalProperties: false });
+
+const TodoBatchUpdateSchema = Type.Object({
+  id: Type.String({ minLength: 1, description: "Task ID to update" }),
+  subject: Type.Optional(Type.String({ minLength: 1, description: "Replacement task title" })),
+  description: Type.Optional(Type.String({ description: "Replacement description; empty clears it" })),
+  status: Type.Optional(StringEnum(["pending", "in_progress", "completed", "blocked"])),
+  blockedBy: Type.Optional(Type.Array(Type.String(), { description: "Replacement dependency task IDs" })),
+  context: Type.Optional(Type.String({ description: "Replacement context; empty clears it" })),
+  skills: Type.Optional(Type.Array(TodoSkillBindingSchema, { description: "Replacement ordered skill bindings; empty clears them" })),
+  summary: Type.Optional(Type.String({ description: "Replacement completion summary; empty clears it" })),
+  resourceUris: Type.Optional(TodoResourceUrisSchema),
+  handoff: Type.Optional(TodoHandoffSchema),
+  updateFields: Type.Optional(Type.Array(StringEnum([...TODO_UPDATE_FIELDS]), {
+    description: "Fields changed by this update; listed values must be present",
+    uniqueItems: true,
+  })),
+  assignee: Type.Optional(Type.String({ description: "Replacement assignee selector" })),
+  goalId: Type.Optional(Type.String({ description: "Replacement Goal quality gate; empty clears it" })),
+}, { additionalProperties: false });
+
+// The top level remains permissive for the legacy `skill` input normalized by todo.ts.
+export const TodoToolParams = Type.Object({
+  action: StringEnum([
+    "create",
+    "update",
+    "list",
+    "get",
+    "delete",
+    "clear",
+    "next",
+    "advance",
+  ]),
+
+  subject: Type.Optional(
+    Type.String({ minLength: 1, description: "Task title (required for single create)" }),
+  ),
+  description: Type.Optional(
+    Type.String({ description: "Long-form task detail" }),
+  ),
+  status: Type.Optional(
+    StringEnum(["pending", "in_progress", "completed", "blocked"], "Target status for update only; create derives status from dependencies and rejects an explicit status"),
+  ),
+  blockedBy: Type.Optional(
+    Type.Array(Type.String(), { description: "Task IDs this depends on" }),
+  ),
+  context: Type.Optional(
+    Type.String({ description: "Plain-text execution context. On update, an empty string clears the stored context" }),
+  ),
+  skills: Type.Optional(
+    Type.Array(TodoSkillBindingSchema, {
+      description: "Ordered Pi skill bindings. Omit when no skill is needed; on update, an empty array clears the stored skills",
+    }),
+  ),
+  resourceUris: Type.Optional(TodoResourceUrisSchema),
+  handoff: Type.Optional(TodoHandoffSchema),
+  summary: Type.Optional(
+    Type.String({ description: "Short completion summary carried into later todo steps" }),
+  ),
+  updateFields: Type.Optional(
+    Type.Array(
+      StringEnum([...TODO_UPDATE_FIELDS]),
+      { description: "Fields to modify during update. When present, other top-level values are ignored; omit for legacy presence-based updates", uniqueItems: true },
+    ),
+  ),
+  assignee: Type.Optional(
+    Type.String({ description: "Assignee selector: self, root, a known teammate id or unique id prefix, label, @label, or label#id-prefix" }),
+  ),
+
+  tasks: Type.Optional(
+    Type.Array(TodoBatchTaskSchema, {
+      minItems: 1,
+      description: "Non-empty batch for create. Inside tasks[i].blockedBy, each integer N means tasks[N] in this same array and must satisfy 0 <= N < i. Cannot be combined with single-task fields (subject, description, blockedBy, assignee, context, skills, resourceUris, handoff, goalId)",
+    }),
+  ),
+
+  field: Type.Optional(StringEnum([...TODO_GET_FIELDS], "Get only: field to page; omit all read options for a bounded overview. Structured fields/all are JSON; text fields are raw text")),
+  offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Get/list only: 0-based offset (get: Unicode code points; list: filtered task entries in creation order). Defaults to 0; get without field pages all" })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TODO_GET_MAX_LIMIT, description: `Get/list only: page size. Get: Unicode code points (default ${TODO_GET_DEFAULT_LIMIT}, max ${TODO_GET_MAX_LIMIT}); list: tasks (default ${TODO_LIST_DEFAULT_LIMIT}, max ${TODO_LIST_MAX_LIMIT}). Follow Continue for the rest` })),
+  id: Type.Optional(
+    Type.String({ description: "Task ID (required for get and single update/delete)" }),
+  ),
+  ids: Type.Optional(
+    Type.Array(Type.String({ minLength: 1 }), {
+      minItems: 1,
+      uniqueItems: true,
+      description: "Task IDs for atomic batch delete; cannot be combined with id",
+    }),
+  ),
+  updates: Type.Optional(
+    Type.Array(TodoBatchUpdateSchema, {
+      minItems: 1,
+      description: "Atomic batch updates; cannot be combined with id or top-level update fields",
+    }),
+  ),
+  filter: Type.Optional(TodoFilterSchema),
+  planHandoffKey: Type.Optional(
+    Type.String({ description: "Handoff key of the approved Plan this item implements. There is no injector: pass the key that the Plan approval message gave you, or omit it" }),
+  ),
+  goalId: Type.Optional(
+    Type.String({ description: "Id of the Goal acting as this task's quality gate (bind sparingly, only for tasks with verifiable acceptance); empty string clears it on update" }),
+  ),
+  transition: Type.Optional(
+    StringEnum([...TODO_ADVANCE_TRANSITIONS], "Request-only context transition. Completion-form advance supports keep_context or new_context; a single active update supports only new_context. It is never persisted in Todo state"),
+  ),
+}, {
+  allOf: [{
+    if: { required: ["field"] },
+    then: { properties: { action: { const: "get" } }, required: ["action"] },
+  }, {
+    if: { anyOf: [{ required: ["offset"] }, { required: ["limit"] }] },
+    then: { properties: { action: { enum: ["get", "list"] } }, required: ["action"] },
+  }, {
+    if: { properties: { action: { const: "list" } }, required: ["action"] },
+    then: { properties: { limit: { maximum: TODO_LIST_MAX_LIMIT } } },
+  }, {
+    if: { required: ["transition"] },
+    then: { properties: { action: { enum: ["advance", "update"] } }, required: ["action"] },
+  }, {
+    if: { properties: { action: { const: "update" } }, required: ["action", "transition"] },
+    then: {
+      properties: { transition: { const: "new_context" } },
+      required: ["id"],
+      not: { required: ["updates"] },
+    },
+  }],
+});
+
+// The host validates against TodoToolParams; the model-facing declaration must
+// omit conditionals that Gemini function declarations do not support.
+const { allOf: _todoConditions, ...todoModelSchema } = TodoToolParams as typeof TodoToolParams & { allOf?: unknown };
+export const TodoModelParams = Type.Unsafe<Static<typeof TodoToolParams>>(todoModelSchema);
+
+export function formatTodoArgumentError(params: unknown): string {
+  const [error] = Errors(TodoToolParams, params);
+  if (!error) return "Invalid todo arguments.";
+  const path = error.instancePath || "$";
+  if (/\/resourceUris\/\d+$/.test(path)) {
+    let value: unknown = params;
+    for (const key of path.split("/").slice(1)) {
+      value = value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
+    }
+    const preview = JSON.stringify(value)?.slice(0, 160) ?? String(value);
+    const message = error.keyword === "pattern" ? "must be a structurally valid resource URI" : error.message;
+    return `Invalid todo arguments at ${path}: ${message}; received ${preview}. ${TODO_RESOURCE_URI_GUIDANCE}`;
+  }
+  return `Invalid todo arguments at ${path}: ${error.message}`;
+}

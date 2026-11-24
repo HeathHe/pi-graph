@@ -1,0 +1,1395 @@
+# pi-graph 功能使用说明
+
+<p align="center">
+  <strong>中文</strong> | <a href="USAGE_EN.md">English</a>
+</p>
+
+> 本文档详细介绍 pi-graph 插件为 Pi Coding Agent 注册的所有工具、能力和使用方法。
+> Skills 为简要索引，完整定义请参阅 [Maestro Flow](https://github.com/catlog22/maestro-flow) 项目。
+
+---
+
+## 目录
+
+1. [安装与配置](#1-安装与配置)
+2. [核心工具](#2-核心工具)
+   - [teammate — 多智能体调度](#21-teammate--多智能体调度)
+   - [maestro — 知识感知调度](#22-maestro--知识感知调度)
+   - [goal — 长时目标生命周期](#23-goal--长时目标生命周期)
+   - [todo — 任务管理](#24-todo--任务管理)
+     - [TODO 单步骤进展监护](#todo-单步骤进展监护)
+   - [run-control — 工作流运行控制](#25-run-control--工作流运行控制)
+3. [智能工具](#3-智能工具)
+   - [lsp — 语言服务器集成](#31-lsp--语言服务器集成)
+   - [browser — 浏览器控制](#32-browser--浏览器控制)
+   - [smart_search — 网络搜索与研究](#33-smart_search--网络搜索与研究)
+   - [search / fffind — 快速搜索](#34-search--fffind--快速搜索)
+   - [search_tool_bm25 — 工具发现](#35-search_tool_bm25--工具发现)
+4. [MCP 集成](#4-mcp-集成)
+5. [权限系统](#5-权限系统)
+6. [思考深度控制](#6-思考深度控制)
+7. [交互工具](#7-交互工具)
+   - [ask-user-question — 结构化用户输入](#71-ask-user-question--结构化用户输入)
+   - [plan-enter — 计划模式](#72-plan-enter--计划模式)
+8. [Agent 控制工具](#8-agent-控制工具)
+9. [运行时子系统](#9-运行时子系统)
+   - [自动压缩](#91-自动压缩)
+   - [GUI 子系统（UCL）](#92-gui-子系统ucl)
+   - [TUI 界面组件](#93-tui-界面组件)
+10. [Agent 角色（27 个）](#10-agent-角色27-个)
+11. [Prompt 输入](#11-prompt-输入)
+12. [Skills 索引（68 个）](#12-skills-索引68-个)
+13. [知识系统](#13-知识系统)
+14. [工作流模式](#14-工作流模式)
+15. [配置参考](#15-配置参考)
+16. [故障排除](#16-故障排除)
+
+---
+
+## 1. 安装与配置
+
+### 前置条件
+
+| 组件 | 版本要求 |
+|------|---------|
+| Node.js | ≥ 22.19.0 |
+| [Pi Coding Agent](https://github.com/earendil-works/pi) | 0.99.0 验证基线；0.87–0.98 版本门控 legacy 兼容 |
+
+> [Maestro Flow](https://github.com/catlog22/maestro-flow)（知识系统）作为依赖随插件自动安装，无需单独前置安装。
+
+### 安装
+
+> **源码版本：** Graph npm 安装示例仅适用于发布之后；源码安装与包名映射见 [Graph 打包指南](GRAPH-PACKAGING.md)。
+
+> **v0.34.0 基线：** Flow 0.34.0、Backends 0.1.7、Teammate 2.10.0、Cockpit 0.24.4，其余包不变；引擎仍为 `maestro-flow >=0.5.91`（上游最新/本地 0.5.92，非精确 pin）。fork 来源与验证范围见 [RELEASE.md](../RELEASE.md)；原生验证限 Windows x64 / Node 22.22，最低 Node 与 macOS/Linux 未验证。
+
+```bash
+# 安装或升级（pi-graph-agent-runtime 作为依赖自动安装）
+pi install npm:pi-graph@0.2.7
+
+# 验证 Flow、Teammate 和 Cockpit 均已列出，然后重启 Pi 或 reload extensions
+pi list
+```
+
+升级会迁移由 Flow 管理的 companion 注册；同名本地开发覆盖会被保留并在启动日志中提示，需显式升级或移除。
+
+### v0.34.0 使用提示
+
+- 浏览器新增 `start_video` / `stop_video` 与章节/动作演示：managed/profile/CDP 可跨 run/导航录制无声 WebM，需支持 VP8/WebM 的 FFmpeg；关闭 tab 后保留产物，extension 不支持。见[浏览器指南](../docs-site/src/content/docs/guides/lsp-browser.md)。
+- 压缩摘要新增 thinking/timeout 设置、实时进度与重试/用量指标，见[压缩配置](../docs-site/src/content/docs/guides/compaction-config.md)。
+- Teammate 统一路由说明，Monitor 新增精确 owner 生命周期 `subscribe` / `unsubscribe` / `subscriptions`；工作区 root 投递区分 queued 与实际消费，交互 worker 完成不自动关闭终端。见[调度指南](../docs-site/src/content/docs/guides/teammate-dispatch.md)。
+- Cockpit 改进视口与终端恢复稳定性；HTTP/2、unknown 与 stream-read 错误纳入重试分类，observation/RPC/search/error 预览有界，不能把截断预览当作完整完成证据。
+
+### Pi 0.99 原生宿主与新工具
+
+Pi 0.99+ 由宿主管理工具 loadout、`tool_search`、模型/classifier、MCP 与键盘能力；缺少原生 API 不会自动启动第二套 legacy runtime。Pi 核心 optional peer 的 `*` 范围不变。MCP 使用原生 `/mcp`；迁移旧配置前先禁用 `builtin:mcp`，再运行 `/maestro-mcp-migrate` 预览并批准，完成后恢复原生管理器。
+
+- `search` 替代 `ffgrep`：支持 literal/regex/fuzzy 与 lines/files/count；索引不可用及工作区根目录 plain/regex 搜索可走有界 `rg`，fuzzy 仍需索引。大项目应限定 path/glob。
+- `open-code-review` 需要单独安装 `ocr` CLI。`preview`/`rules` 只解析文件与规则，`review` 使用运行时模型执行 OCR 管理的评审；`health` 检查连通性。模型配置入口为 `/api-manager open-code-review`，安装说明见 `packages/pi-graph/optional/OCR-SETUP.md`。
+- 可选 Ask transport 与本地 TUI 竞速并取消另一端；Mobile 取消也会关闭本地向导。Plan confirm/review 暴露可选 transport seam 和 revision 检查，不代表所有客户端都已实现 Plan UI。v0.35.0 的 Refine transport 则只镜像本地面板并回传操作意图，不另开子代理；本地 TUI 保持权威，镜像失败不关闭本地界面。优化草稿须经 PlanStore 提交后才报告 `applied`，评审反馈仍进入讨论，不等于草稿已应用或 Plan 已批准。
+- 原生 Quiet 模式支持 live 切换且不额外激活工具；首次恢复历史渲染和第三方 execution-only override 仍有边界，详见文档站 [Cockpit](../docs-site/src/content/docs/guides/cockpit.md)。
+
+### 插件注册的工具总览
+
+安装后，插件向 Pi 注册以下工具：
+
+| 来源包 | 工具 | 用途 |
+|--------|------|------|
+| pi-graph-agent-runtime | `teammate` | 多智能体调度（单任务/并行/DAG） |
+| pi-graph-agent-runtime | `teammate-send` | 向运行中的 Agent 发送消息 |
+| pi-graph-agent-runtime | `teammate-list` | 列出活跃 Agent |
+| pi-graph-agent-runtime | `teammate-watch` | 查看 Agent 输出 |
+| pi-graph-agent-runtime | `teammate-wait` | 等待 Agent 完成 |
+| pi-graph | `maestro` | 知识感知调度（explore/delegate/moa） |
+| pi-graph | `goal` | 长时目标生命周期管理 |
+| pi-graph | `todo` | 任务分解与跟踪 |
+| pi-graph | `run-control` | 工作流 Run 生命周期 |
+| pi-graph | `ask-user-question` | 结构化用户输入收集 |
+| pi-graph | `lsp` | 语言服务器协议集成 |
+| pi-graph | `browser` | Chromium 浏览器控制 |
+| pi-graph | `smart_search` | 网络搜索/深度研究/URL 抓取 |
+| pi-graph | `search` | FFF 索引内容搜索（literal/regex/fuzzy，rg 兜底） |
+| pi-graph | `fffind` | FFF 快速模糊文件搜索 |
+| pi-graph | `search_tool_bm25` | BM25 工具发现 |
+| pi-graph | `model-availability` | 无密钥的模型注册与路由诊断 |
+| pi-graph | `plan-enter` | 进入计划模式 |
+
+---
+
+## 2. 核心工具
+
+### 2.1 teammate — 多智能体调度
+
+所有调用统一使用必需的非空 `tasks[]`。单 Agent 是一个 task，多 Agent 是多个 task。每项 `prompt` 都是字面任务文本，不加载 Prompt 模板。
+
+```javascript
+teammate({ tasks: [{
+  agent: "explorer",
+  taskType: "explore",
+  prompt: "FIND: 认证入口
+SCOPE: src/"
+}] })
+
+teammate({
+  agent: "explorer",
+  model: "provider/fast-model",
+  tasks: [
+    { name: "scan", prompt: "定位认证入口" },
+    { name: "calls", prompt: "定位调用点" },
+    { name: "review", agent: "analyst", taskType: "review",
+      model: "provider/deep-model", prompt: "审查 {scan} 与 {calls}" }
+  ],
+  concurrency: 2,
+  background: false
+})
+```
+
+顶层 `agent/taskType/model/thinking/context/cwd/outputSchema/timeoutMs` 是 task 默认值，task 同名字段覆盖。未指定角色时默认 `general`。`{name}`/`{name.field}` 注入上游输出，`dependsOn` 只声明顺序。`background` 默认 `false`。
+
+模型优先级：task model > 顶层 model > taskType 映射 > 角色 model > 父 Pi 模型。taskType 只影响路由，不改变角色行为。Control Center 会自动合并内置类型、当前发现的内置/项目/用户 Agent YAML 类型及已有映射类型；自定义 Agent 可声明新的小写类型标识。
+
+#### model-registry 模式
+
+`.pi/teammate-backends.json` 有三种需要区分的模式：缺省/`legacy` 保留原路径，`backend-registry` 使用旧式后端注册与附带模型目录，v2 `model-registry` 则要求显式的 `models`、`defaultModel` 与部署拓扑。此时 teammate 的 `model` 值是 canonical 模型注册 id，不是 backend id 或 adapter selector。
+
+DSH 部署使用 `pi-graph-executors/dsh`，对应模型注册使用 `adapter-model` selector，其 `value` 是 DSH 模型。Pi、本地 ACP、直连 SSH ACP 在 root 与 child session 中均可用；`remote-workers` 只能使用 `fixed`，并且仅在当前 root Monitor session 中 sessionAvailable。
+
+迁移后运行 `model-availability`。兼容字段 `teammate_models`、`delegate_tools`、`delegate_fallback`、`delegate_config_path` 保留；新增的 `model_registry.registrations` 仅显示注册/模型/部署身份、标准化 harness/transport、`registered`、`resolvable`、`sessionAvailable`、`healthy` 四道门和净化后的 `unavailableReason`。Monitor 外的远端路由仍保留在诊断矩阵中，并给出确定性原因。
+
+CLI 兼容投影必须显式设置 `compatibility: { "version": 1, "teammateCliToolsProjection": { "enabled": true } }`。只有恰好一个 ACP 部署拥有相同 `cli/<tool>` 路由时，启用的 `teammate-cli-tools.json` 名称才会被投影；该文件不会重新成为启动权威。
+
+**外部 CLI 适配器需要自行安装**：配置连接只是指向一个可执行文件，teammate 不会自动安装任何包。已知 ACP 适配器的安装命令（全局装一次即可，适配器会自带对应 agent 运行时）：`codex-acp` ← `npm i -g @agentclientprotocol/codex-acp`；`claude-agent-acp` ← `npm i -g @agentclientprotocol/claude-agent-acp`。命令未安装时，启动探测与模型目录刷新会直接给出这条安装命令。
+
+迁移步骤：先备份文件并保留部署 id/config，再加入 `version: 2`、显式模型注册以及默认部署上唯一的默认模型，可选开启 CLI 投影，然后 reload extension 并检查四道诊断门。回滚只需把 `mode` 改回 `backend-registry` 或 `legacy` 并 reload；保留 `models`、`defaultModel`、`compatibility` 只是 round-trip 保留，不保证能有效重进。Flow Settings 只编辑 backend 字段，保留 v2/未知区段、CAS 与凭据隔离，不提供模型注册编辑器。严格 v2 parser 仍可能拒绝不支持或未知的字段，重进 `model-registry` 前必须删除或更新这些字段。
+
+已知缺口：registry dispatch 仍会丢弃 task 级 `timeoutMs`；`backend-registry` 与 `model-registry` 都没有 host watchdog。需要超时时应配置部署自己的字段，例如 ACP `runTimeoutMs`。完整 manifest 与拓扑契约见 [Teammate Backend Adapter Contract](teammate-backend-adapter-contract.md)。
+
+#### 复用 `/ssh` 主机
+
+Remote Worker、ACP direct-SSH/`cli/<tool>` 和 DSH SSH 都可以用 `sshHostRef` 引用加密 SSH manager 中的主机。先通过 `/ssh` 解锁 manager，再在 Connections 中选择兼容主机；`#ssh` 当前选择只绑定独立 `ssh` 工具，不会改变 teammate 路由。
+
+SSH manager store v3 把 Gateway binding 与主机资料分开加密保存。对已经 Test 并固定 host key 的主机，可由用户运行 `/ssh pair <targetId>`；扩展只执行固定 bootstrap、内部消费 endpoint/token，并只显示无秘密 receipt。之后 Gateway 优先直连 Streamable HTTPS；`/ssh unpair <targetId>` 会先撤销远端 pairing，再删除本地 binding 并恢复固定 stdio relay。只有连接拒绝/超时或 404/405 协议不可用会降级；TLS/hostname/certificate、401/403、过期/撤销、server identity 与 host digest 错误全部 fail closed。endpoint、token 和 pairing id 不会进入 tool schema、target 列表、system prompt、日志或错误。
+
+Remote Worker 的 v4 配置把引用放在 host alias 上，target/workspace 仍保留自己的远端 `cwd`、driver 和 command：
+
+```json
+{
+  "version": 4,
+  "hosts": { "production": { "sshHostRef": "server-id-from-ssh-manager" } },
+  "targets": {
+    "production/pi": {
+      "host": "production",
+      "cwd": "/srv/project",
+      "driver": "pi-rpc",
+      "command": ["pi", "--mode", "rpc"]
+    }
+  },
+  "workspaces": {}
+}
+```
+
+ACP/DSH deployment 则在 `mode: "ssh"` 下直接设置 `sshHostRef`。引用与内嵌的 `host`、`user`、`port`、`hostKeySha256`、`identityFile` 互斥；旧内嵌配置继续兼容。teammate 引用仅接受 `bash` 主机以及 ssh-agent 或**无 passphrase**的 identity file。manager 中的 password、带 passphrase identity 和 PowerShell 主机仍可供独立 `ssh` 工具使用，但会被 teammate 引用明确拒绝。manager 锁定、引用删除或 provider 不可用时，新连接 fail closed；已认证且正在执行的 channel 可以完成。
+
+#### DSH 直连 SSH 模式
+
+DSH 部署设置 `"mode": "ssh"` 后会通过 OpenSSH 在远端主机上启动运行时。连接来源可以是一个 `sshHostRef`，也可以是原有的五个内嵌 SSH 字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `mode` | enum | `"ssh"` 选择远端启动；默认 `"local"` 时忽略下列所有字段 |
+| `sshHostRef` | text | `/ssh` manager 中的主机 id；使用时不能再设置任何内嵌 SSH 字段 |
+| `host` | text | 内嵌模式的远端主机名；未使用 `sshHostRef` 时**必填** |
+| `user` | text | 内嵌模式的远端登录名；未使用 `sshHostRef` 时**必填** |
+| `port` | integer | TCP 端口，默认 `22` |
+| `hostKeySha256` | text | 可选的 `SHA256:...` 指纹，启动前通过 `ssh-keyscan` 预检固定 |
+| `identityFile` | path | 可选私钥；ssh 随后只提供这把密钥（`IdentitiesOnly`） |
+
+`cordisConfig` 与 `cwd` 在 `ssh` 下是**远端路径**：它们进入远端 shell 命令（`cd <cwd> && exec <runtime> <cordisConfig>`），不由本机使用。校验在本机执行，因此只检查形态——控制字符会被拒绝（值要跨 ssh 命令行传递），但**不会验证存在性**：对远端路径做本机存在性检查本身就是错的，路径写错只会表现为启动失败，而不是注册被拒。
+
+认证为 BatchMode 且仅支持身份文件/agent：启动命令带 `-o BatchMode=yes -o StrictHostKeyChecking=yes`，任何情况下都不会出现提示符。配置了 `identityFile` 就只提供该密钥；未配置则由本机 ssh agent 完成认证。密码提示即失败，这是有意设计。
+
+`hostKeySha256` 是启动前预检固定，不等于握手时验证：`ssh-keyscan` 在启动前运行，指纹匹配在连接时对照固定的 known_hosts 文件强制执行。请通过可信渠道获取指纹；远端若在扫描与连接之间轮换主机密钥，启动会直接失败（符合预期）。
+
+`envPassthrough` 降级为尽力而为的 `SendEnv`：值只保留在已净化的 ssh 子进程环境中，不会进入 argv；只有本机实际解析到的名字才会转发，而远端 sshd 会丢弃其 `AcceptEnv` 不允许的名字——运行时真正需要的内容请放在 `cordis.yml` 旁的自身配置里。
+
+`mode: ssh` 下不支持 `todoBridge` 并会在加载时被拒绝：todo endpoint 监听本机 loopback，远端运行时无法到达。
+
+`requestTimeoutMs` 约束的是单个 JSON-RPC 请求而非整个回合；走 ssh 时每个请求都要过一次网络，因此应调大它（低于 `300000` 时 resolver 会警告），而不是让按 localhost 调好的超时在回合中途失败。
+
+#### pi-teammate-models CLI
+
+`pi-teammate-models` 是独立的命令行工具，用于在不打开 Control Center 的情况下读取和维护 `.pi/teammate-backends.json`：
+
+```bash
+pi-teammate-models list                     # 静态路由表（不加载任何 backend 模块）
+pi-teammate-models edit                     # 编辑某个部署的配置字段
+pi-teammate-models add                      # 引导式部署 + 模型注册向导
+pi-teammate-models path                     # 打印解析后的文档路径
+```
+
+- **`list`** 用与运行时完全相同的 parser 编译 manifest，输出注册、模型、部署、拓扑、selector 以及 `registered`/`resolvable`/`healthy` 各门。Session 可用性恒为 `n/a`——CLI 不持有 root-monitor 权威。legacy/backend-registry 文档会渲染计算出的 v2 升级骨架且**绝不写入**；唯一出口是 `[E] 显式写出升级副本`，它写到 `<file>.upgraded.json`（绝不是旧文档本身），默认为 `[A] 中止`。
+- **`edit`** 先列出部署，再对选定部署的声明字段逐项提示并显示当前值；空输入保留当前值。credential-ref 字段只接受变量**名**——粘贴机密值会被拒绝并给出明确警告，且该值不会被回显。
+- **`add`** 按 家族（`pi`/`dsh`/`acp`/第三方）→ 传输变体（适用时选 `local`/`ssh`，并强制补全 `host`/`user`）→ 唯一部署 id → 按类型校验的字段（空输入应用默认值）→ 模型注册（id、内在 modelId、selector、部署默认）逐步引导。写入前会对整份候选 manifest 重新编译；编号的编译错误（重复 selector、争夺部署默认、selector/拓扑不匹配）会全部列出并重新提示注册区块。
+
+选项：`--file <path>`（替代文档路径）、`--locale en|zh-CN`、`--yes`（预确认覆盖外部修改）。并发语义为文档化的**后写入者胜**：发布前会重新读取文件，外部修改以脱敏 diff 展示且必须显式确认（或用 `--yes` 预确认）。每次写入都会轮换备份——`<file>.bak` 保存上一版文档，`<file>.bak.1` 保存上上一版——因此撤销就是 `cp <file>.bak <file>`。
+
+#### Control Center 的连接 tab
+
+通过 `Alt+M` 或 `/teammate-models` 打开 Teammate Control Center 后，中文界面中的 **连接**（英文 **Connections**）tab 会在同一个可筛选列表中合并两类配置：v2 model-registry 部署，以及旧版 worker hosts/targets。v2 部署可直接查看，按 Enter 使用与 CLI 共用的字段表单编辑，或按 `a` 通过共用向导新增；字段校验失败会在原字段就地重新提示，整份候选 manifest 的编译错误也会回到相应注册区块。
+
+部署的新增与编辑写回同一份 `.pi/teammate-backends.json`，并调用 CLI 的同一 D12 写入管线：运行时 parser 校验、外部修改确认、`.bak`/`.bak.1` 备份轮换和原子发布均保持一致。legacy/backend-registry 文档只提供升级预览；显式确认后也只会创建 `<file>.upgraded.json`，绝不覆盖原文档。TUI 不提供部署删除；需要调整部署时使用 `pi-teammate-models edit`。
+
+原有 worker host/target 操作与快捷键保持不变：`n`/`N` 新建 host/target、Enter 编辑、`d` 删除、`t` 测试、`g`/`p` 切换全局/项目范围、Tab/Shift+Tab 或左右方向键切换 tab、Esc 关闭。部署行不会响应 `d`，因此不会误用旧版删除命令。
+
+### 2.2 maestro — 知识感知调度
+
+提供三个 action，连接外部 CLI 端点和知识系统：
+
+#### explore — 并行代码搜索
+
+```javascript
+maestro({
+  action: "explore",
+  prompts: [
+    "FIND: 所有 JWT 验证中间件\nSCOPE: src/middleware/\nEXPECTED: file:line + 控制流摘要",
+    "FIND: 所有 auth.login() 调用点\nSCOPE: src/**/*.ts\nEXPECTED: file:line 列表"
+  ],
+  concurrency: 3,
+  maxTurns: 6
+})
+```
+
+#### delegate — 任务委派到外部工具
+
+```javascript
+maestro({
+  action: "delegate",
+  prompt: "PURPOSE: 实现密码重置流程\nMODE: write\nCONTEXT: @src/auth/",
+  tool: "claude",       // gemini | claude | codex
+  mode: "write"
+})
+```
+
+#### moa — 混合智能体合成
+
+```javascript
+maestro({
+  action: "moa",
+  prompts: ["从安全和架构两个角度分析支付流程"],
+  preset: "deep"
+})
+// 跨多个模型并行分析，然后合成为统一报告
+```
+
+---
+
+### 2.3 goal — 长时目标生命周期
+
+为多轮自主工作提供持久化引擎：自动续行、Token 预算、压缩存活、独立验证。
+
+#### 模型侧操作
+
+```javascript
+goal({ action: "create", objective: "实现 JWT 认证模块" })
+goal({ action: "create", objective: "实现 JWT 认证模块", tokenBudget: "100k" })
+goal({ action: "get" })
+goal({ action: "update", objective: "实现 JWT 认证 + 刷新令牌" })
+goal({ action: "complete", summary: "所有模块已实现并通过测试" })
+```
+
+#### 用户侧命令
+
+| 命令 | 效果 |
+|------|------|
+| `/goal status` | 查看当前 Goal |
+| `/goal create [--tokens 100k] <目标>` | 创建 Goal 并启动代理循环 |
+| `/goal stop` | 暂停，保存状态 |
+| `/goal resume [--tokens 200k]` | 恢复；可提高预算 |
+| `/goal clear` | 放弃并删除 Goal |
+
+#### 验证机制
+
+- 正常 `agent_end` 后自动触发独立验证
+- `pass` → 标记完成，清除 Goal
+- `fail` → 保持活跃，携带未满足需求启动下一轮
+- `inconclusive` → 保持活跃，等待用户 `/goal resume`
+
+#### Goal 面板
+
+Goal 存在时，输入编辑器上方渲染 `goal-panel`，显示：
+- 状态（ACTIVE / WAITING / VERIFYING / VERIFIED / STOPPED / BUDGET / BLOCKED / ERROR）
+- 目标描述、已用时间、循环次数
+- 显式配置的 Token 预算（未配置时不显示）
+
+---
+
+### 2.4 todo — 任务管理
+
+8 个操作，支持纯文本上下文和可选的 Pi Skill 执行：
+
+```javascript
+// 创建任务
+todo({ action: "create", subject: "实现用户认证", description: "JWT + 刷新令牌" })
+
+// 带 Skill 绑定的任务
+todo({
+  action: "create",
+  subject: "代码审查",
+  skills: [{ name: "quality-review", role: "primary", args: "--level deep" }]
+})
+
+// 首次激活调用者自己的下一个可运行任务
+todo({ action: "advance" })
+
+// 当前任务完成后立即完成并推进调用者自己的下一任务
+todo({ action: "advance", id: "abc123", summary: "已完成认证模块" })
+
+// 只完成当前任务，不激活下一项
+todo({ action: "update", id: "abc123", status: "completed", summary: "已完成认证模块" })
+
+// 列出任务
+todo({ action: "list", filter: { status: "pending" } })
+
+// 兼容入口：仅激活下一个待办任务
+todo({ action: "next" })
+
+// 分配给 teammate
+todo({ action: "create", subject: "探索代码库", assignee: "explorer-1" })
+```
+
+| 操作 | 说明 |
+|------|------|
+| `create` | 创建任务（subject 必填） |
+| `update` | 更新状态/摘要/上下文/技能；可只完成而不继续 |
+| `advance` | 无活动任务时激活下一项；有活动任务时完成当前项并推进下一项 |
+| `list` | 按状态/成员过滤列出 |
+| `get` | 获取单个任务详情 |
+| `delete` | 删除任务 |
+| `clear` | 清除所有任务 |
+| `next` | 兼容操作：只激活下一个待办任务，返回解析后的上下文 |
+
+`advance` 按调用 actor 隔离：它只能完成或激活分配给调用者的任务，但任务完成仍会全局解除跨角色依赖。一个逻辑目标需要多个角色时，应创建一个父任务和多个分别分配的角色子任务，不让多个角色共同写同一 Todo 的终态。Canonical Workflow Session/Run 的镜像 Todo 仍由 Run lifecycle 驱动，不使用普通 `advance` 代替 Run 控制。
+
+---
+
+#### TODO 单步骤进展监护
+
+Advisor 可对当前普通 `in_progress` TODO 做任务级进展审查：步数或有效时长达到阈值后，先用 `todo-progress` 分类器判断，再选择继续、回溯提示或独立建议 agent。**达到阈值不等于卡住**；该功能默认关闭，不改变 Goal 续跑和 TODO 生命周期。
+
+```text
+/advisor on                    # Advisor 总开关
+/advisor mode automatic        # automatic 或 hybrid 才运行自动监护
+/advisor todo                  # 打开 TODO 监护 TUI；/advisor settings 同一入口
+/advisor todo on               # 单独开启 TODO 监护
+/advisor todo mode shadow      # 仅观察；改为 active 才允许提示/建议
+/advisor status                # 查看实际生效配置和运行状态
+```
+
+TUI 可编辑 Advisor 总开关、模式、建议模型，以及 TODO 监护开关、模式、全部阈值、冷却和预算。`↑↓` 选择、`Enter` 修改、`Ctrl+S` 后 `Enter` 确认保存、`Ctrl+R` 还原草稿、`Esc` 返回／取消；有未保存修改时再按一次 `Esc` 放弃。配置写入项目 `.pi/advisor.json`；取消不写入，不会隐式开启 Advisor 或分类器。面板区分已配置与实际生效值，并保留当前不可用的模型钉选。
+
+| `todoReview` 字段 | 默认值 | 含义 |
+|---|---:|---|
+| `enabled` | `false` | 独立监护开关；同时需要 Advisor 已开启 |
+| `mode` | `active` | `active` 允许干预；`shadow` 仅记录分类 |
+| `reviewSteps` / `reviewActiveMs` | `12` / `480000` | 12 个模型迭代或 8 分钟有效运行后轻审查 |
+| `sameFailureLimit` | `3` | 同类连续失败提前触发回溯 |
+| `reflectionSteps` | `6` | 回溯后追加 6 步仍无新证据时考虑建议 agent |
+| `unresolvedSteps` / `unresolvedActiveMs` | `24` / `900000` | 已回溯且仍未收敛时的升级阈值：24 步或 15 分钟 |
+| `cooldownMs` | `30000` | 同任务审查冷却，另受 Advisor 投递门控约束 |
+| `maxReviewsPerTask` / `maxEscalationsPerTask` | `3` / `1` | 每任务激活周期的审查／独立建议预算 |
+
+例如 `.pi/advisor.json`：
+
+```json
+{
+  "enabled": true,
+  "mode": "automatic",
+  "todoReview": {
+    "enabled": true,
+    "mode": "shadow",
+    "reviewSteps": 12,
+    "reviewActiveMs": 480000,
+    "sameFailureLimit": 3,
+    "reflectionSteps": 6,
+    "unresolvedSteps": 24,
+    "unresolvedActiveMs": 900000,
+    "cooldownMs": 30000,
+    "maxReviewsPerTask": 3,
+    "maxEscalationsPerTask": 1
+  }
+}
+```
+
+建议先 shadow 观察，再通过 TUI 切换 active。`/advisor status` 显示 shadow 观察次数，以及最近一次任务／actor、分类、置信度和来源；shadow 分类也通过 `supervision:event` 发布只读 verdict。观察数据是当前会话的有界状态，不是持久化审查报告。审查预算按任务激活累计，切换模式／模型或压缩不会补充预算；预算耗尽时可在 TUI 显式调整，或在下一任务激活后使用新预算。分类器仍使用独立开关和域模式：需要语义判断时显式运行 `/classifier on` 和 `/classifier mode todo-progress jev`；`off` 使用规则，`shadow` 的语义结果不成为执行依据。分类器不可用或证据／置信度不足时保守回溯，不把建议当成授权，也不自动启用分类器。
+
+- 一步是模型推理／行动迭代，不是工具结果数。有效时间只计在线运行，排除已知工具执行、人工／依赖／容量等待、压缩和离线；不会用 TODO 的状态挂起时长直接判断卡住。
+- `on-track` 不干预；`waiting` 等待；`looping` 先要求通过 `session_history` 回看假设、操作和结果，并与当前源码核对；回溯后仍不收敛才请求独立 Advisor。`blocked` 或 `uncertain` 不授予权限，缺凭证、资源或用户决策须明确报告。
+- 主会话与本地绑定 TODO 的子 agent 使用宿主权威的任务／actor 身份；完成、转交、重新激活或会话变更后的旧结果不投递。Canonical Workflow 镜像 TODO 不在普通任务监护范围；不要把该功能理解为远端 Fabric 监控。
+- 提示在安全模型边界消费，不中断正在执行的工具、不自动完成或转交 TODO、不因空闲计时启动新轮次。旧 Advisor 审查与 TODO 审查去重，仍保留手动咨询；建议不是审批，也不能替代真实完成证据。
+
+---
+
+### 2.5 run-control — Maestro CLI 透传壳
+
+通过 argv 透传调用 canonical Maestro CLI，是 **Session/Run 生命周期的唯一 LLM 工具面**（无需在 bash 手写 `maestro run/session`）：
+
+| 命令分类 | 说明 |
+|---------|------|
+| 读命令 | `status`/`brief`/`prepare`/`check`/`recall`/`evidence`/`list`/`show`/`graph`/`skills`/`search`/`load`/`review` —— 无需 mutation lease |
+| 写命令 | `next`/`done`/`decide`/`seal`/`edit`/`meta`/`recover`/`accept-reuse`/… —— 需当前 Pi session 持有 mutation lease；Plan 模式阻断 |
+| 入口命令 | `session/run create|start` —— 无 lease 时可建新 Session；已持 lease 且目标不一致则拒绝 |
+
+```javascript
+run-control({ argv: ["session", "status"] })
+run-control({ argv: ["session", "next"] })
+run-control({ argv: ["run", "done", "run-123", "--verdict", "done", "--summary", "完成"] })
+run-control({ argv: ["run", "edit", "quality-review", "--after", "current"] })
+```
+
+---
+
+## 3. 智能工具
+
+### 3.1 lsp — 语言服务器集成
+
+连接语言服务器，提供代码智能功能：
+
+| Action | 说明 |
+|--------|------|
+| `diagnostics` | 获取诊断信息（错误/警告） |
+| `definition` | 跳转到定义 |
+| `references` | 查找所有引用 |
+| `hover` | 悬停信息（类型/文档） |
+| `symbols` | 文件/工作区符号列表 |
+| `rename` | 重命名符号 |
+| `rename_file` | 重命名文件（更新引用） |
+| `code_actions` | 可用代码操作 |
+| `type_definition` | 跳转到类型定义 |
+| `implementation` | 查找实现 |
+| `status` | 语言服务器状态 |
+| `reload` | 重新加载 |
+| `capabilities` | 服务器能力 |
+| `request` | 原始 LSP 请求 |
+
+```javascript
+lsp({ action: "diagnostics", file: "src/auth/login.ts" })
+lsp({ action: "definition", file: "src/auth/login.ts", line: 42, symbol: "validateToken" })
+lsp({ action: "references", file: "src/auth/login.ts", line: 42, symbol: "validateToken" })
+lsp({ action: "rename", file: "src/auth/login.ts", line: 42, symbol: "validateToken", new_name: "verifyToken", apply: true })
+lsp({ action: "symbols", file: "*" })  // 工作区符号
+```
+
+插件还注册了 **LSP 自动诊断**：文件编辑后自动触发诊断检查。
+
+---
+
+### 3.2 browser — 浏览器控制
+
+通过显式 `app.channel: "managed" | "profile" | "cdp" | "extension"` 选择 Chromium 后端；未选通道时默认 managed headless，不自动接管日常 Chrome。操作前先调用 `browser({ action: "guide" })` 并加载相关 SOP。
+
+| Action | 说明 |
+|--------|------|
+| `open` | 打开/附加浏览器标签页 |
+| `close` | 关闭标签页（`all: true` 关闭全部） |
+| `run` | 在宿主执行 JS；页面 JS 用 `page.evaluate` |
+| `guide` | SOP 索引/主题 |
+| `status` | 启动并实时探测 bridge 与命名 tab |
+| `pair` | 仅 paired 模式批准 requestId/code |
+
+```javascript
+// 打开页面
+browser({ action: "open", url: "http://localhost:3000", name: "app" })
+
+// 执行 JS + 截图
+browser({
+  action: "run",
+  name: "app",
+  code: "await page.screenshot({ path: 'screenshot.png' }); return await page.title();"
+})
+
+// 设置视口
+browser({ action: "open", url: "...", viewport: { width: 1920, height: 1080 } })
+
+// 关闭
+browser({ action: "close", name: "app" })
+browser({ action: "close", all: true })
+```
+
+支持配置：
+- `app.path` — 自定义 Chromium/Chrome/Edge 路径
+- `app.cdp_url` — `channel:"cdp"` 附加已有端点（borrowed）
+- `app.user_profile_dir` — `channel:"profile"` 明确选择非默认 user-data-dir；旧 `attach_user_profile:true` 兼容
+- `visible:true` — 显示 Pi 启动的 managed/profile 进程；已有附加不受影响，extension 拒绝此参数
+- `wait_until` / `dialogs` — managed/profile/cdp 导航等待与对话框策略
+
+**扩展桥**：`/install browser-bridge` 后调用 `browser({action:"status"})`。扩展同时发现/连接默认 `19222..19231` 的多个 listener；每个 Pi 占一个可用端口。默认 `paired`：比对 popup 与 `pendingPairings` 的 requestId/code，调用 `browser pair`，等待独立认证重连后 `authenticatedConnected:true`。显式在启动 Pi 前设置 `PI_BROWSER_BRIDGE_AUTH_MODE=none`：不需要 token 或 pair，成功为 `transportReady:true`、`authenticatedConnected:false`、`pendingPairings:[]`；NONE 是无凭证授权模式，不是认证成功。自定义 `PI_BROWSER_BRIDGE_PORT` 改变十端口起点，必须把 status 的实际 listeningPort 加到 popup **Advanced**（NONE 留空 token）。
+
+```javascript
+browser({ action: "open", name: "daily", app: { channel: "extension", target: "example.com" } })
+```
+
+extension 仅支持 URL/title/goto/evaluate、`browser.pages`、raw CDP/batch、cookies、tabs 和 CDP screenshot，不承诺 Puppeteer/ElementHandle/DOM helper/OCR parity；未实现 API 或断连失败关闭、不回退。borrowed close 释放映射/租约，owned close 关闭真实 tab；物理 tab 租约跨 listener 独占，busy/draining 不代表页面工作停止，cookies/登录态仍共享而非隔离。
+
+**会话与 deadline（v0.33.0）**：命名 tab 按可信 host session 隔离，在同一会话的多个 turn 间稳定；`status.namedTabs` 与 `close all` 只操作本 scope。Bridge discovery 仍为进程共享，tab 归属不等于 cookies/登录隔离。
+
+managed/profile/CDP 的 `run.timeout`（秒，默认 30，最大 300）是 setup、执行与 postprocessing 共用的单一 deadline，不是每个 step 重置；Puppeteer/tab 的 wait 通常用毫秒，需留出预算余量，cleanup 可能增加返回延迟。Extension 的 command/execution 等待有界，但 setup/postprocessing 可另加延迟。失败附有界 passive 诊断，不重放脚本或自动交互；异常前动作可能已经发生。Managed 超时关闭 owned 资源；borrowed profile/CDP 仅断开，页面代码可能继续。
+
+Extension run 中断后，新的 `run` 被阻断，直到该 entry 所有 command terminal 与 host operation 都 drain；仅 bridge 总计 `drainingCommands: 0` 不足以证明可复用。之后显式 `open` 同名、不传 url，重验证现有 fixed tab/generation；draining 时 open 也拒绝，重开保留 tab，绝不重放中断动作。
+
+```javascript
+browser({ action: "status" }) // 先观察 named entry 与 bridge 的 drain 状态
+// 全部 drain 后才重验证；不是取消/重试此前动作
+browser({ action: "open", name: "daily", app: { channel: "extension" } })
+```
+
+SOP loader 支持 published knowledge hint，包括已晋升条目；仍先读 guide 索引与相关完整 topic，hint 不是完整 SOP。
+
+profile 自动启动使用 `--remote-debugging-port=0` 并读取 `DevToolsActivePort`，或复用已有 endpoint。Chrome 136+ 即使关闭窗口仍禁止调试默认 user-data-dir；明确选择非默认 profile，或用 extension 访问日常 Chrome。不会自动复制/切换 profile，真实登录环境也不保证 CAPTCHA 成功。安全风险及排障见[安装指南](../packages/pi-graph/optional/BROWSER-BRIDGE-SETUP.md)。
+
+---
+
+### 3.3 smart_search — 网络搜索与研究
+
+外部信息检索 — 网络搜索、深度研究、URL 内容提取：
+
+| 模式 | 用途 | 关键参数 |
+|------|------|---------|
+| `search` | 快速查询 | `platform`, `validation` |
+| `research` | 多源深度研究 | `budget`（quick/standard/deep）, `validation`（strict） |
+| `fetch` | 提取已知 URL 内容 | — |
+| `route` | 路由诊断 | `router_mode` |
+
+```javascript
+smart_search({ mode: "search", query: "Express.js 中间件错误处理最佳实践" })
+smart_search({ mode: "research", query: "JWT vs Session 认证对比", budget: "deep", validation: "strict" })
+smart_search({ mode: "fetch", query: "https://docs.example.com/api/auth" })
+```
+
+通过 `Alt+S` 或 `/smart-search-config` 打开配置界面。
+
+---
+
+### 3.4 search / fffind — 快速搜索
+
+基于 [FFF](https://github.com/fff-labs/fff) 的工作区级原生索引搜索。索引在会话启动时预热并驻留内存；teammate 子会话通过 broker 共享同一索引：
+
+```javascript
+// 字面内容搜索（默认 mode="plain"）
+search({ pattern: "validateToken", context: 3, limit: 20 })
+
+// 正则 / 模糊内容搜索
+search({ pattern: "fn\\s+validate\\w*", mode: "regex" })
+search({ pattern: "valdiate token", mode: "fuzzy" })
+
+// 输出形态：files = 仅文件路径；count = 每文件命中数
+search({ pattern: "TODO", output: "files" })
+search({ pattern: "deprecated", output: "count", glob: "*.ts" })
+
+// 模糊文件路径搜索
+fffind({ pattern: "auth middleware", limit: 10 })
+```
+
+索引不可用时 `search` 自动降级为 ripgrep（结果附 `[engine: rg]` 标注）；`mode="fuzzy"` 无降级等价物，索引不可用时返回明确错误。
+
+---
+
+### 3.5 search_tool_bm25 — 工具发现
+
+按名称、描述和参数名搜索所有已注册工具，使用 BM25 加权排序：
+
+```javascript
+search_tool_bm25({ query: "code search", limit: 10 })
+```
+
+匹配的未激活工具会被自动激活。
+
+---
+
+## 4. MCP 集成
+
+插件内置完整的 MCP（Model Context Protocol）客户端，通过统一的 `mcp` 代理工具连接外部 MCP 服务器。
+
+> 设计原则：不将 MCP 服务器的数百个工具逐一注册到 Pi，而是通过单一 `mcp` 代理工具统一访问，保持 LLM 上下文精简。
+
+### 基本操作
+
+```javascript
+// 查看服务器状态
+mcp({ })
+
+// 列出服务器的工具
+mcp({ server: "server-name" })
+
+// 搜索工具（按名称/描述）
+mcp({ search: "query" })
+mcp({ search: "pattern.*", regex: true })
+
+// 查看工具详情和参数
+mcp({ describe: "tool_name" })
+
+// 连接服务器并刷新元数据
+mcp({ connect: "server-name" })
+
+// 调用工具
+mcp({ tool: "tool_name", args: '{"key": "value"}' })
+mcp({ server: "server-name", tool: "tool_name", args: '{"key": "value"}' })
+```
+
+### OAuth 认证
+
+```javascript
+// 启动手动 OAuth 流程，获取浏览器 URL
+mcp({ action: "auth-start", server: "server-name" })
+
+// 完成手动 OAuth
+mcp({ action: "auth-complete", server: "server-name", args: '{"redirectUrl":"..."}' })
+
+// 获取已完成 UI 会话的消息
+mcp({ action: "ui-messages" })
+```
+
+### 传输协议
+
+支持三种传输方式：
+- **stdio** — 本地进程通信（最常用）
+- **SSE** — Server-Sent Events HTTP 流
+- **Streamable HTTP** — 可流式 HTTP 传输
+
+### 高级特性
+
+| 特性 | 说明 |
+|------|------|
+| **元数据缓存** | 持久化工具/资源元数据缓存（7 天 TTL），避免重复连接 |
+| **NPX 解析** | 自动解析 `npx`/`npm exec` 二进制路径，避免 npm 父进程开销 |
+| **输出守卫** | 大输出自动截断（默认 50KB / 2000 行），完整输出写入临时文件 |
+| **Sampling** | 支持 MCP Sampling 请求（服务器请求 LLM 生成），需用户确认 |
+| **UI 会话** | 支持 MCP UI 资源（`ui://` 协议），在浏览器中渲染交互式界面 |
+| **UI 流式** | 支持 `eager` / `stream-first` 两种 UI 流式模式 |
+| **OAuth 提供者** | 完整 OAuth 客户端实现（注册、令牌存储、授权重定向） |
+| **配置导入** | 支持从 Cursor / Claude Code / Claude Desktop / Codex / Windsurf / VSCode 导入配置 |
+| **MCP 管理器** | TUI 管理界面（`/mcp` 命令），支持启用/停用/删除服务器 |
+| **资源工具** | MCP 资源自动转换为 `get_<name>` 工具 |
+| **同意管理** | 工具调用同意管理，支持自动批准配置 |
+
+### 配置
+
+MCP 服务器在 Pi 配置文件中定义（用户级或项目级）：
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "npx",
+      "args": ["-y", "@my/mcp-server"],
+      "env": { "API_KEY": "..." },
+      "enabled": true,
+      "excludeTools": ["dangerous_tool"]
+    }
+  }
+}
+```
+
+### Gateway Tunnel 公网 MCP
+
+Gateway Tunnel 用于把 Gateway 的 MCP endpoint 安全地放到公网；它与 `/mcp` 管理普通外部 MCP server 是两条不同链路。完整的 Cloudflare Quick/Named、OpenAI Secure、Managed OpenSSH Reverse 配置见 [Gateway Tunnel 配置指南](gateway-tunnel-configuration.md)；实验性 OpenAI client 的安装交互见 [OpenAI Secure MCP Tunnel](../packages/pi-graph/optional/OPENAI-TUNNEL-SETUP.md)。
+
+Pi 内使用 `/gateway tunnel` 打开专用人工操作面，也可使用 CLI：
+
+```bash
+# Gateway 运行状态和无副作用检查
+pi-graph-gateway tunnel doctor --config ~/.pi/agent/gateway/config.yaml --json
+
+# 查看/启动一个已配置的 profile
+pi-graph-gateway tunnel profile list --config ~/.pi/agent/gateway/config.yaml --json
+pi-graph-gateway tunnel profile status PROFILE --config ~/.pi/agent/gateway/config.yaml --json
+pi-graph-gateway tunnel profile start PROFILE --config ~/.pi/agent/gateway/config.yaml --json
+```
+
+Persistent profile 的 `enable|disable` 修改持久启用意图；`start|stop|restart` 只操作当前实例。启用公网 MCP access 时使用精确的 `actions` allowlist；OpenAI Secure 才能使用 `auth.kind: managed-forward`，其他 provider 不接受由 profile 代发的窄权限 action。固定公网 URL 为 `public_url + transport.http.path`，Quick URL 则每次启动可能变化。Tunnel 内部的短期 `gateway.tunnel` credential 不等同于公网 MCP 客户端 token，不应复制到客户端配置。
+
+---
+
+## 5. 权限系统
+
+插件实现了完整的工具调用权限控制，支持多种权限模式和细粒度规则。
+
+### 权限模式
+
+| 模式 | 行为 |
+|------|------|
+| `default` | 默认模式，危险操作需用户确认 |
+| `acceptEdits` | 自动接受文件编辑，其他操作仍需确认 |
+| `plan` | 计划模式，仅允许只读操作 |
+| `dontAsk` | 不询问，自动允许所有操作 |
+| `bypassPermissions` | YOLO 模式，跳过所有权限检查（可被配置禁用） |
+
+### 权限规则
+
+三种行为级别：
+
+| 行为 | 说明 |
+|------|------|
+| `allow` | 自动允许，不询问 |
+| `ask` | 每次询问用户 |
+| `deny` | 拒绝执行 |
+
+规则可配置在会话级（临时）或本地设置文件（持久）：
+
+```json
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": ["Bash(npm test)", "Bash(npm run *)"],
+    "ask": ["Bash(rm *)"],
+    "deny": ["Bash(rm -rf /)"],
+    "disableBypassPermissionsMode": "disable"
+  }
+}
+```
+
+### 始终允许的工具
+
+以下工具在任何模式下都自动允许（只读或无副作用）：
+
+`Read`, `Grep`, `Glob`, `Ls`, `Find`, `search`, `fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
+
+### Teammate 子进程权限中继
+
+Teammate 子进程没有本地终端，权限请求通过 IPC 中继到父进程处理：
+- 父进程拥有实时模式、会话规则、钩子和持久化
+- 子进程的权限请求通过 `teammate_proxy_request` 转发
+- 父进程执行权限评估并返回 `allow_once` 或 `deny`
+
+---
+
+## 6. 思考深度控制
+
+Teammate 调度支持精细的思考深度控制，影响子进程 Agent 的推理深度。
+
+### 可用级别
+
+| 级别 | 说明 |
+|------|------|
+| `off` | 关闭扩展思考，最快响应 |
+| `minimal` | 最小思考开销 |
+| `low` | 低深度推理 |
+| `medium` | 中等深度（平衡速度和质量） |
+| `high` | 高深度推理 |
+| `xhigh` | 极高深度（最慢但最 thorough） |
+| `max` | `xhigh` 的别名 |
+
+### 使用方式
+
+```javascript
+// 顶层默认
+teammate({
+  thinking: "high",
+  tasks: [
+    { name: "quick-scan", agent: "explorer", prompt: "...", thinking: "off" },
+    { name: "deep-analysis", agent: "general", prompt: "...", thinking: "xhigh" }
+  ]
+})
+```
+
+### 优先级
+
+任务级 `thinking` → 顶层 `thinking` → `taskType` 映射 → Agent frontmatter → Pi 默认
+
+> 注意：teammate 层不限制思考深度——上表中的所有级别对任意路由模型均可选择。若 provider 无法兑现某级别，子进程 Pi host 会在自身能力边界内收敛。
+
+---
+
+## 7. 交互工具
+
+### 7.1 ask-user-question — 结构化用户输入
+
+通过键盘优先的 TUI 向导收集结构化用户答案：
+
+```javascript
+// 单选
+ask-user-question({
+  questions: [{
+    question: "选择哪种方案？",
+    header: "方案",
+    options: [
+      { label: "A: 微服务", description: "独立部署，松耦合" },
+      { label: "B: 单体", description: "简单直接，易调试" }
+    ]
+  }]
+})
+
+// 多选
+ask-user-question({
+  questions: [{
+    question: "需要哪些功能？",
+    multiSelect: true,
+    options: [
+      { label: "认证" }, { label: "授权" },
+      { label: "审计日志" }, { label: "速率限制" }
+    ]
+  }]
+})
+
+// 开放式
+ask-user-question({
+  questions: [{ question: "项目名称是什么？" }]
+})
+```
+
+- 单次最多 4 个问题
+- 每个问题 2-4 个选项
+- 支持单选、多选、开放式
+
+**Ask-auto（v0.33.0）**：真人可用 `/auto ask on [seconds]` 开启 grant（默认 60 秒）。超时后，剩余安全选项题可以采用 `recommended: true` 标记：单选必须恰好一个，多选采用所有标记项。机器结果进入 `recommendations`（`source: timeout`），不进入人工 `answers`，也不是批准；混合批次保留原 `questionIndex`。Policy classification 优先，外部/不确定/降级决策、human-only 问题、缺失或歧义推荐及敏感审批不自动确认；开放题仍须人工。建议不是 Plan/权限/支付/发布/知识晋升授权。
+
+---
+
+### 7.2 plan-enter — 计划模式
+
+进入持久化计划模式，加载当前会话的 `current.md` 草稿，激活计划专用工具：
+
+```javascript
+plan-enter()
+```
+
+**计划模式行为：**
+- 编辑/写入工具和文件变更命令被阻止
+- 读取/搜索/探索工具保持可用
+- 通过 `plan-update` 起草 Markdown 计划
+- 通过 `plan-status` 检查计划状态
+- `plan-confirm`（或 `/plan approve`）提交计划并恢复 Act 工具
+- `plan-exit` 放弃计划返回 Act 模式
+
+**切换方式：** `Alt+Shift+P` 或 `/plan` 切换 Plan/Act 模式。
+
+**会话级 Plan-auto（v0.33.0）**：默认关闭，只有父 TUI 的真人 `/plan-auto on` 或 `Alt+Shift+A` 可开启（Act/Plan 均可）；`off` 撤销，`status` 查看。模型注入、RPC、子代理和历史记录不能授权。每个 cycle 的 `plan-confirm` 仍经正常 archive/manifest 事务批准精确草稿，并执行 standalone/current；开启不立即批准，`plan-update` 只保存，`plan-review` 仍人工。
+
+开关跨 Plan cycle、exit/clear、修订、压缩与同会话 `new_context` 保留；每个新 cycle 绑定新任务授权，手动 exit/clear 使旧授权失效。Footer 分别为 `PLAN-AUTO on`、`confirm+ask` 或 `ask`。off、session/cwd 切换、fork、历史导航与 reload/restart/shutdown 撤销，绝不从磁盘恢复。关闭不终止已开始执行；已批准但尚未开始的自动 handoff 会停止。
+
+分类后的内部 Ask 建议仅在当前有界授权任务内有效，项目 policy 仍是额外限制；机器 `decisions` 与人工 `answers` 分开，不授予 Plan、权限或治理批准。Classifier 设置与诊断支持共享 `zh-CN` / `en` locale，语言切换不改变 domain/mode 协议键或授权边界。
+
+---
+
+## 8. Agent 控制工具
+
+管理运行中的 teammate Agent：
+
+```javascript
+// 列出所有活跃 Agent
+teammate-list({ view: "all" })     // all | active | named | roles
+
+// 查看 Agent 输出
+teammate-watch({ name: "my-agent", lines: 30 })
+
+// 等待 Agent 完成（事件驱动，避免轮询）
+teammate-wait({ name: "my-agent", timeoutMs: 60000 })
+teammate-wait({ waitMs: 5000 })  // 固定延迟
+
+// 向运行中的 Agent 发送消息
+teammate-send({ to: "my-agent", message: "请也检查边界情况", mode: "follow_up" })
+
+// 紧急修正（中断当前轮次）
+teammate-send({ to: "my-agent", message: "停止当前方案，改用替代方案", mode: "steer" })
+
+// 终止
+teammate-send({ to: "my-agent", mode: "abort" })
+```
+
+| 工具 | 用途 |
+|------|------|
+| `teammate-list` | 列出 Agent（active / named / all / roles） |
+| `teammate-watch` | 查看最近输出、工具活动、收件箱 |
+| `teammate-wait` | 事件驱动等待 Agent 完成或固定延迟 |
+| `teammate-send` | 发送消息（follow_up / steer / abort） |
+
+---
+
+## 9. 运行时子系统
+
+### 9.1 自动压缩
+
+插件实现了智能的上下文窗口管理，防止长会话溢出：
+
+| 特性 | 说明 |
+|------|------|
+| **自动修剪** | 上下文达到阈值（~70%）时自动修剪大型工具结果（≥4KB） |
+| **保留近期** | 始终保留最近 ~20K Token 的对话内容 |
+| **预留空间** | 预留 ~16K Token 给模型响应 |
+| **可重放工具** | `read`, `grep`, `glob`, `search`, `find` 的结果可安全修剪（需要时可重新执行） |
+| **压缩续行** | 压缩后自动注入续行提示，Agent 从中断点继续 |
+| **状态持久化** | 修剪状态持久化，跨会话保持 |
+
+### 9.2 GUI 子系统（UCL）
+
+统一通信层（Unified Communication Layer），通过 `PI_GUI=1` 环境变量启用：
+
+```bash
+PI_GUI=1 pi   # 启动带 GUI sidecar 的 Pi
+```
+
+| 特性 | 说明 |
+|------|------|
+| **工具发现** | `GET /tools` — 列出所有可用工具 |
+| **工具调用** | `POST /tools/:name` — 通过 HTTP 调用工具（带权限网关） |
+| **状态聚合** | `GET /state` / `GET /state/:sub` — 聚合会话状态 |
+| **变更事件** | SSE（Server-Sent Events）实时推送状态变更 |
+| **零侵入** | 未启用时无任何行为变化（无监听器、无发现文件） |
+
+### 9.3 TUI 界面组件
+
+插件注册了多个 TUI 覆盖层和面板：
+
+| 组件 | 触发方式 | 功能 |
+|------|---------|------|
+| **Goal 面板** | Goal 存在时自动显示 | 状态、目标、时间、循环次数、Token 预算 |
+| **Todo 覆盖层** | Todo 操作时 | 任务列表和状态 |
+| **Session 覆盖层** | `/maestro-session` | 工作流会话控制中心 |
+| **Maestro 面板** | Maestro 操作时 | 运行状态和进度 |
+| **Swarm 覆盖层** | `/swarm` | 蚁群优化状态、拓扑、指标 |
+| **模型映射覆盖层** | `Alt+M` / `/teammate-models` | 配置 taskType → 模型映射 |
+| **Smart Search 配置** | `Alt+S` / `/smart-search-config` | 搜索引擎和提供商配置 |
+| **MCP 管理器** | `/mcp` | MCP 服务器管理（启用/停用/删除/配置导入） |
+| **MCP 面板** | MCP 工具选择时 | 服务器工具浏览、搜索、调用 |
+| **MCP 设置面板** | 首次 MCP 配置时 | 引导式配置（导入/脚手架/仓库提示） |
+| **进度树** | Teammate 执行时 | Agent 执行进度可视化 |
+| **Attach 覆盖层** | Teammate 启动时 | 附加到 Agent 子进程 |
+| **状态栏** | 持续显示 | 当前模式、压缩状态、MCP 连接状态 |
+
+---
+
+## 10. Agent 角色
+
+### 内置角色
+
+| 角色 | 用途 | 边界 |
+|---|---|---|
+| `general` | 通用实现、分析和验证 | 读写与命令工具 |
+| `explorer` | 代码发现与调用链追踪 | 只读 |
+| `planner` | 架构与执行规划 | 只读，高 thinking |
+| `analyst` | 技术分析和审查 | 只读，高 thinking |
+| `research` | 项目架构知识与外部网络研究 | 只读，知识 CLI 与网络搜索 |
+| `verifier` | 无 acceptance commands 时的 Goal 备用验证 | 严格只读，结构化 fail-closed verdict |
+| `workflow` | 分解并派发依赖 DAG | 读取与 teammate 协作工具 |
+
+旧 `delegate`、`goal-verifier` 和 `coordinator` 不再是内置名称。Goal 优先运行 acceptance commands；仅在未声明 commands 时调用 `verifier`。项目自定义角色放在 `.pi/agents/*.md`，用户角色放在 `~/.agents/*.md`；内置名称不可覆盖。
+
+## 11. Prompt 输入
+
+`tasks[].prompt` 是必需的字面任务文本。Teammate 1.0 不发现 `.pi/prompts`，不提供 bundled Prompt 模板，也不支持 `promptArgs`、位置参数或模板名展开。可复用指令应由调用方或 Skill 生成后作为完整 prompt 传入。
+
+## 12. Skills 索引（68 个）
+
+Skills 是按需加载的能力包，通过 `/skill:name` 调用或由 Agent 自动加载。
+完整 Skill 定义和工作流详情请参阅 [Maestro Flow](https://github.com/catlog22/maestro-flow) 项目。
+
+### 编排与生命周期
+
+| Skill | 简介 |
+|-------|------|
+| `maestro` | 意图到链的规划器，自动路由到最优命令链 |
+| `maestro-next` | 统一开发意图入口，分类复杂度并路由到正确执行通道 |
+| `maestro-companion` | 小任务快速执行，最小化 Run 生命周期 |
+| `maestro-ralph` | 规范化 Session/Run 链上的闭环策略 |
+| `maestro-init` | 项目初始化，自动状态检测 |
+| `maestro-fork` | 创建/同步会话工作树，用于并行开发 |
+| `maestro-merge` | 合并工作树分支回主分支 |
+| `maestro-session-seal` | 封印当前会话，提取知识并推进 DAG |
+| `maestro-update` | 检测版本、预览变更、应用工作流升级 |
+| `maestro-help` | 命令帮助系统，搜索命令、浏览技能 |
+| `maestro-guard` | 管理编辑边界限制 |
+| `maestro-overlay` | 从自然语言创建/编辑命令覆盖层 |
+
+### 质量与测试
+
+| Skill | 简介 |
+|-------|------|
+| `quality-refactor` | 系统性技术债识别与安全削减 |
+| `security-audit` | OWASP Top 10 + STRIDE 安全审计 |
+| `insight-challenge` | 对代码质量发现进行对抗性审查 |
+| `delegation-check` | 检查工作流委派 Prompt 的内容分离违规 |
+
+### UI / 设计
+
+| Skill | 简介 |
+|-------|------|
+| `maestro-impeccable` | 前端 UI 设计、审计、打磨 |
+
+### 团队协作
+
+| Skill | 简介 |
+|-------|------|
+| `team-coordinate` | 通用团队协调，动态角色生成 |
+| `team-lifecycle-v4` | 完整生命周期：计划→开发→测试→审查 |
+| `team-review` | 3 角色代码审查管线：扫描→审查→修复 |
+| `team-testing` | 渐进式测试覆盖（Generator-Critic 循环） |
+| `team-quality-assurance` | 全闭环 QA（问题发现 + 测试） |
+| `team-brainstorm` | 统一头脑风暴团队 |
+| `team-arch-opt` | 架构优化 |
+| `team-perf-opt` | 性能优化（单/扇出/并行模式） |
+| `team-tech-debt` | 技术债识别与修复 |
+| `team-roadmap-dev` | 路线图驱动开发 |
+| `team-planex` | 计划-执行管线 |
+| `team-ultra-analyze` | 深度协作多角色调查 |
+| `team-issue` | 问题解决团队 |
+| `team-swarm` | ACO 蚁群智能多 Agent 探索 |
+| `team-adversarial-swarm` | 带对抗决策门的蚁群智能 |
+| `team-frontend` | 统一前端开发（含 ui-ux-pro-max 设计智能） |
+| `team-frontend-debug` | Chrome DevTools MCP 前端调试 |
+| `team-uidesign` | UI 设计团队：研究→令牌→审计→实现 |
+| `team-ui-polish` | 自动发现/修复 UI 问题 |
+| `team-motion-design` | 动画令牌系统、滚动编排、GPU 变换 |
+| `team-visual-a11y` | 视觉无障碍 QA（OKLCH 对比度、WCAG AA/AAA） |
+| `team-ux-improve` | 发现/修复 UI/UX 交互问题 |
+| `team-interactive-craft` | 原生 JS+CSS 交互组件（零依赖） |
+| `team-designer` | 团队 Skill 生成元技能 |
+| `team-executor` | 轻量级会话执行（恢复已有 team-coordinate 会话） |
+
+### 长时循环（Odyssey）
+
+| Skill | 简介 |
+|-------|------|
+| `odyssey` | 长时迭代循环，五模式（debug/improve/planex/review/ui） |
+| `maestro-odyssey` | 长时迭代循环，六模式（+security） |
+
+### 知识管理
+
+| Skill | 简介 |
+|-------|------|
+| `maestro-spec` | Spec 沉淀（意图驱动录入项目约束规则） |
+| `maestro-knowhow` | KnowHow 沉淀（意图驱动按类型捕获可复用知识） |
+| `maestro-knowledge` | 知识存储管理（意图驱动：audit/harvest/wiki/extractors/domain） |
+| `maestro-issue` | Issue 管理（意图驱动：报告/列出/关闭/关联 + 自动发现） |
+| `codify-to-knowhow` | 清单驱动的知识资产生成器 |
+
+### 学术写作（Scholar）
+
+| Skill | 简介 |
+|-------|------|
+| `scholar-ideation` | 研究构思（文献→缺口分析→规划） |
+| `scholar-writing` | 端到端学术论文写作（NeurIPS/ICML/ICLR 等） |
+| `scholar-review` | 系统性论文审查（自审 + Rebuttal） |
+| `scholar-rebuttal-pro` | 增强型 Rebuttal（协作分析 + 多视角） |
+| `scholar-experiment` | ML/AI 论文实验结果分析 |
+| `scholar-citation-verify` | 四层引用验证 |
+| `scholar-anti-ai-writing` | 去除学术文章中的 AI 写作模式 |
+| `scholar-latex-organizer` | 整理 LaTeX 模板为 Overleaf 可用结构 |
+| `scholar-publish` | 录用后会议准备（幻灯片/海报/宣传） |
+| `scholar-thesis-docx` | 创建/修订学位论文 Word 文档 |
+
+### 元 / 工具
+
+| Skill | 简介 |
+|-------|------|
+| `prompt-generator` | 生成/转换 Prompt 文件（GSD 风格质量门） |
+| `skill-generator` | 创建新 Skill 的元技能 |
+| `skill-iter-tune` | 迭代 Skill 调优（执行→评估→改进） |
+| `skill-simplify` | SKILL.md 简化（功能完整性验证） |
+| `skill-tuning` | 通用 Skill 诊断与优化 |
+| `workflow-skill-designer` | 编排器+阶段工作流 Skill 设计元技能 |
+| `swarm` | 蚁群优化状态投影 |
+
+### 学习
+
+| Skill | 简介 |
+|-------|------|
+| `learn` / `maestro-learn` | 引导式阅读、调查、模式提取、第二意见 |
+
+---
+
+## 13. 知识系统
+
+知识系统确保 Agent 在接触代码前拥有完整的项目上下文。
+
+### 强制知识门
+
+在任何代码访问或调度之前执行：
+
+```bash
+# 搜索（跨 spec、knowhow、domain、issue、session）
+maestro search "<查询>" [--type spec|knowhow|domain|issue] [--code] [--kg]
+
+# 加载特定知识
+maestro load --type <type> [--list] [--category <cat>] [--keyword <word>] [--id <id>]
+```
+
+### 查询规则
+
+```bash
+# ❌ 避免关键词堆砌
+maestro search "topology display frontend DetailedTopologySVG elk layout rendering"
+
+# ✅ 使用聚焦查询
+maestro search "topology layout"
+maestro search "DetailedTopologySVG" --code
+maestro load --type spec --category coding
+```
+
+### 知识类型
+
+| 类型 | 分类 | 用途 |
+|------|------|------|
+| `spec` | `arch`, `coding`, `debug`, `test`, `review`, `learning`, `ui` | 可复用约定和规则 |
+| `knowhow` | `compact`, `tip` | 任务特定模式和配方 |
+| `domain` | — | 项目术语表 |
+| `issue` | — | 跟踪的 Bug 和任务 |
+| `roadmap` | — | 里程碑和阶段规划 |
+
+### 知识生命周期
+
+```bash
+# 添加
+/maestro-spec "coding: 使用 Result<T,E> — 服务方法必须返回 Result<T,AppError>"
+/maestro-knowhow
+
+# 演化
+maestro spec supersede SPEC-042 --by SPEC-089     # 替代旧规则
+maestro spec conflict mark src/auth.ts 45 --note "JWT vs session: 两者均有效"
+
+# 维护
+maestro spec health                                # 健康检查
+maestro spec history SPEC-042                     # 查看历史
+maestro search "旧模式" --include-deprecated       # 搜索全部
+```
+
+### 有界历史证据（v0.33.0）
+
+历史发现先完成 Maestro 知识搜索，无相关命中再查 `workspace_sessions`。`session_history` 默认为大小写不敏感的 literal 短语；`mode: "terms"` 做 NFKC、小写、空白归一化，同一可见 projected entry 必须含所有去重词，顺序不限；不做中文分词、正则、模糊、同义词或语义搜索。`sort: "source"` 为默认；`relevance` 优先精确文本/连续短语，再按更紧词跨度，同分保留来源顺序。
+
+```javascript
+session_history({ action: "search", scope: "workspace_sessions",
+  query: "browser timeout", mode: "terms", sort: "relevance", limit: 10 })
+// 用返回的 nextOffset 作为 offset，保留相同 query/scope/mode/sort
+```
+
+`offset` 为 0-based，`limit <= 20`；`matchCount`、`hasMore`、`nextOffset` 描述本次扫描。末页仅在扫描本身不完整时才标为截断。每页重新扫描 live transcripts，不是冻结快照，历史变化可移动结果；复读证据使用返回的精确 `session://<id>/entry/<id>`。隐藏行、thinking、工具调用参数不返回，tool results 显式 opt-in。历史是证据而非治理知识，必须与当前源码和 live 状态核对。
+
+### 三轴正交
+
+| 轴 | 说明 |
+|----|------|
+| `confidence` | 人工/审计裁决 |
+| `status` | active / deprecated 生命周期 |
+| 时间衰减 | 自动新鲜度衰减 |
+
+---
+
+## 14. 工作流模式
+
+### 模式 1：门控 → 探索 → 实现
+
+```
+1. maestro search + load      → 知识门
+2. teammate (explorer × 2-3)  → 交叉搜索建立信心
+3. 定向读取                    → 验证单匹配结果
+4. teammate (delegate)         → 带完整上下文实现
+5. /skill:quality-review       → 验证
+```
+
+### 模式 2：计划 → 执行 → 验证
+
+```
+1. maestro search + load      → 知识门
+2. /skill:maestro-plan         → 创建执行计划
+3. /skill:maestro-execute      → 逐步执行 + 验证
+4. workflow-verifier           → 目标反向验证
+5. /skill:quality-test         → 验收测试
+```
+
+### 模式 3：并行审查 → 合成 → 修复 → 复审
+
+```
+1. teammate (reviewer × 3)    → 安全、性能、可维护性
+2. teammate (delegate)         → 合成发现
+3. teammate (delegate)         → 修复最高优先级问题
+4. teammate (reviewer × 3)    → 复审修复
+```
+
+### 模式 4：Odyssey 完整循环
+
+```
+1. /skill:odyssey-debug        → 考古 → 诊断 → 修复 → 泛化
+2. /skill:quality-test         → 验证修复
+3. /maestro-knowhow            → 持久化经验
+```
+
+### 模式 5：多阶段 DAG 管线
+
+```javascript
+teammate({
+  tasks: [
+    // 阶段 1: 并行研究
+    { name: "api-research", agent: "workflow-external-researcher", prompt: "研究速率限制最佳实践" },
+    { name: "codebase-survey", agent: "explorer", prompt: "FIND: 所有 API 端点\nSCOPE: src/api/" },
+    // 阶段 2: 规划（研究 + 调查完成后）
+    { name: "plan", agent: "workflow-planner", prompt: "整合 {api-research} + {codebase-survey} 制定计划" },
+    // 阶段 3: 实现
+    { name: "implement", agent: "workflow-executor", prompt: "执行 {plan}" },
+    // 阶段 4: 验证
+    { name: "verify", agent: "workflow-verifier", prompt: "验证 {implement} 是否满足 {plan}" }
+  ]
+})
+```
+
+### Explorer 交叉搜索策略
+
+| 角度 | 任务 A | 任务 B |
+|------|--------|--------|
+| 定义 vs 使用 | 查找导出定义 | 查找导入和调用点 |
+| 正面 vs 缺失 | 查找正确实现 | 查找缺少约定的地方 |
+| 入口 vs 实现 | 查找路由或导出 | 查找内部逻辑 |
+
+**信心规则：**
+- ✅ 两个角度匹配 → 高信心，直接使用
+- ⚠️ 一个角度匹配 → 用 `rg` 或定向读取验证
+- ❌ 零匹配 → 换角度或结论目标不存在
+
+---
+
+## 15. 配置参考
+
+### 模型路由 Profile
+
+全局共享 Profile 保存在 `~/.pi/agent/teammate-models.json`：
+
+```json
+{
+  "version": 3,
+  "defaultProfile": "balanced",
+  "profiles": {
+    "balanced": {
+      "name": "均衡",
+      "mappings": {
+        "explore": "deepseek/deepseek-v4-flash",
+        "analysis": "deepseek/deepseek-v4-pro"
+      },
+      "fallbackMappings": {
+        "analysis": ["deepseek/deepseek-v4-flash"]
+      },
+      "thinkingLevels": {
+        "explore": "low",
+        "analysis": "high"
+      }
+    }
+  }
+}
+```
+
+项目文件 `.pi/teammate-models.json` 只持久化当前选择和可选兼容覆盖：
+
+```json
+{
+  "version": 3,
+  "activeProfile": "balanced",
+  "applyOverrides": false,
+  "overrides": {
+    "mappings": {},
+    "thinkingLevels": {}
+  }
+}
+```
+
+通过 `Alt+M` 或 `/teammate-models` 打开 Control Center。`Profiles` tab 支持激活、新建、复制、重命名、设为全局默认和删除；旧项目覆盖可恢复、提升为全局 Profile 或清除。切换 Profile 会停用但保留旧覆盖。v1/v2 配置读取时不会改盘，首次保存时无损迁移到 v3；项目引用缺失 Profile 时回退到全局默认项。
+
+路由来源优先级：启用的项目 overrides > 项目选中的全局 Profile > 全局默认 Profile。
+
+### 项目级配置
+
+| 文件 | 用途 |
+|------|------|
+| `.pi/teammate-models.json` | 本项目的 active Profile 与可选兼容覆盖 |
+| `.pi/agents/` | 项目特定 Agent 定义 |
+| `.pi/settings.json` | Pi 设置覆盖 |
+
+### 全局配置
+
+| 文件 | 用途 |
+|------|------|
+| `~/.pi/agent/teammate-models.json` | 跨项目共享的 Profile registry 与全局默认项 |
+| `~/.pi/agent/settings.json` | 全局 Pi 设置 |
+
+---
+
+## 16. 故障排除
+
+### Teammate 无法启动
+
+```
+Error: Failed to spawn teammate process
+```
+
+**检查：** `which pi`、`node --version`（≥22.19.0）、`/teammate-models` 模型配置。
+
+### Explorer 无结果
+
+**修复：** 验证 `SCOPE` 路径存在，使 `FIND` 更具体，添加 `ATTENTION` 说明命名约定。
+
+### 知识门失败
+
+```
+maestro: command not found
+```
+
+**修复：** `npm install -g maestro-flow`
+
+### 模型不可用
+
+```
+Error: Model not found in authenticated catalog
+```
+
+**修复：** `/teammate-models` → 检查可用模型 → `/login` 认证。
+
+### Agent 挂起
+
+```javascript
+teammate-list({ view: "all" })                          // 检查状态
+teammate-watch({ name: "stuck", lines: 50 })            // 查看输出
+teammate-send({ to: "stuck", mode: "abort" })           // 终止
+// 带超时重试:
+teammate({ tasks: [{ agent: "general", prompt: "...", timeoutMs: 120000 }] })
+```
+
+### 长会话上下文溢出
+
+```bash
+/compact "总结关键决策和当前状态"
+# 或对重工作使用 fresh 上下文:
+teammate({ tasks: [{ agent: "general", context: "fresh", prompt: "PURPOSE: 读取状态并继续\n..." }] })
+```
+
+---
+
+## 快速参考
+
+```bash
+# ─── 安装 ───
+pi install npm:pi-graph@0.2.7
+
+# ─── 知识 ───
+maestro search "查询" --code
+maestro load --type spec --category coding
+
+# ─── 探索 ───
+teammate({ tasks: [{ agent: "explorer", taskType: "explore", prompt: "FIND: ...\nSCOPE: src/..." }] })
+
+# ─── 分析 ───
+teammate({ tasks: [{ agent: "analyst", taskType: "analysis", prompt: "分析目标并提供 file:line 证据" }] })
+
+# ─── 实现 ───
+teammate({ tasks: [{ agent: "general", taskType: "development", prompt: "实现目标并运行 focused tests" }] })
+
+# ─── 审查 ───
+/skill:team-review src/ --level deep
+
+# ─── 完整循环 ───
+/skill:maestro-analyze → /skill:maestro-plan → /skill:maestro-execute → /skill:quality-review
+
+# ─── 调试 ───
+/skill:odyssey-debug "问题描述"
+
+# ─── Agent 控制 ───
+teammate-list({ view: "all" })
+teammate-watch({ name: "agent", lines: 30 })
+teammate-send({ to: "agent", message: "..." })
+teammate-send({ to: "agent", mode: "abort" })
+```

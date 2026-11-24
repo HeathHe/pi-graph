@@ -1,0 +1,99 @@
+name: Release Pi Graph Fluent TUI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (must match packages/pi-graph-terminal-ui/package.json)"
+        required: true
+  push:
+    tags:
+      - "pi-graph-terminal-ui-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          PKG=$(node -p "require('./packages/pi-graph-terminal-ui/package.json').version")
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            EXPECTED="${GITHUB_REF_NAME#pi-graph-terminal-ui-v}"
+          else
+            EXPECTED="$REQUESTED_VERSION"
+          fi
+          if [[ "$PKG" != "$EXPECTED" ]]; then
+            echo "::error::package.json version ($PKG) != release version ($EXPECTED)"
+            exit 1
+          fi
+          echo "version=$PKG" >> "$GITHUB_OUTPUT"
+
+  build-platform:
+    needs: version-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, runs-on: windows-latest }
+          - { target: x86_64-unknown-linux-gnu, runs-on: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, runs-on: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, runs-on: macos-14 }
+          - { target: aarch64-apple-darwin, runs-on: macos-14 }
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Install system deps (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig-dev
+      - name: Build platform package
+        run: node packages/pi-graph-terminal-ui/scripts/build-platform.mjs --target ${{ matrix.target }}
+      - name: Publish platform package
+        working-directory: packages/pi-graph-terminal-ui/platforms
+        shell: bash
+        run: |
+          for d in pi-graph-terminal-ui-*/; do
+            spec="$(node -p "require('./$d/package.json').name + '@' + require('./$d/package.json').version")"
+            if npm view "$spec" version >/dev/null 2>&1; then
+              echo "$spec already published — skipping"
+            else
+              (cd "$d" && npm publish --access public)
+            fi
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-main:
+    needs: build-platform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Publish pi-graph-terminal-ui
+        working-directory: packages/pi-graph-terminal-ui
+        run: |
+          spec="$(node -p "require('./package.json').name + '@' + require('./package.json').version")"
+          if npm view "$spec" version >/dev/null 2>&1; then
+            echo "$spec already published — skipping"
+          else
+            npm publish --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

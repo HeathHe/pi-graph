@@ -1,0 +1,517 @@
+import { altKey } from "pi-graph-shared-settings/v1";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { buildProgressTree, selectPriorityProgressRows } from "../src/tui/progress-tree.ts";
+import { renderTeammateCall, renderTeammateResult } from "../src/tui/render.ts";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { Details, SingleResult } from "../src/shared/types.ts";
+
+/** `altKey` escaped for use inside a regular expression: `+` is a metacharacter. */
+const altRe = (key: string): string => altKey(key).replaceAll("+", "\\+");
+
+const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
+
+function makeResult(): SingleResult {
+  return {
+    agent: "scout",
+    task: "inspect output",
+    exitCode: 0,
+    messages: [{ role: "assistant", content: "complete output" }],
+    usage: { inputTokens: 10, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0, turns: 1 },
+    model: "test-model",
+    correlationId: "scout-correlation",
+    durationMs: 1000,
+  };
+}
+
+test("background multi-task call shows a placeholder before the result snapshot", () => {
+  const rendered = renderTeammateCall({
+    tasks: [
+      { agent: "explorer", name: "scan", prompt: "find auth" },
+      { agent: "general", name: "review", prompt: "review {scan}" },
+      { agent: "general", prompt: "summarize" },
+    ],
+    background: true,
+  }, theme as never, { expanded: false }).render(80);
+
+  assert.equal(rendered.length, 1);
+  assert.match(rendered[0], /teammate.*@scan/);
+});
+
+test("foreground multi-task call shows a placeholder before streaming progress", () => {
+  const rendered = renderTeammateCall({
+    tasks: [
+      { agent: "explorer", name: "pkgs", prompt: "inspect packages" },
+      { agent: "general", name: "summary", prompt: "summarize {pkgs}" },
+    ],
+    background: false,
+  }, theme as never, { expanded: false }).render(80);
+
+  assert.equal(rendered.length, 1);
+  assert.match(rendered[0], /teammate.*@pkgs/);
+});
+
+test("expanded multi-task call shows a placeholder before DAG progress", () => {
+  const rendered = renderTeammateCall({
+    tasks: [
+      { agent: "explorer", name: "a", prompt: "find auth" },
+      { agent: "explorer", name: "b", prompt: "find db" },
+      { agent: "general", name: "merge", prompt: "combine {a} and {b}" },
+    ],
+    background: true,
+  }, theme as never, { expanded: true }).render(80);
+
+  assert.equal(rendered.length, 1);
+  assert.match(rendered[0], /teammate.*@a/);
+});
+
+test("expanded multi-result rows trust results over lifecycle-pending progress snapshots", () => {
+  const first = makeResult();
+  const second = { ...makeResult(), agent: "reviewer", correlationId: "review-correlation" };
+  const final: AgentToolResult<Details> = {
+    content: [{ type: "text", text: "done" }],
+    details: {
+      mode: "parallel",
+      results: [first, second],
+      // Both dispatch paths rewrite lifecycle-pending tasks back to "running"
+      // for the live admission gate; the terminal expanded rows must still
+      // agree with the "2/2 completed" header derived from results.
+      progress: [
+        { agent: "scout", correlationId: first.correlationId, taskIndex: 0, dependencies: [], status: "running", resultReadyAt: Date.now() },
+        { agent: "reviewer", correlationId: second.correlationId, taskIndex: 1, dependencies: [], status: "running", resultReadyAt: Date.now() },
+      ],
+    },
+  };
+  const rendered = renderTeammateResult(final, { expanded: true }, theme as never).render(160);
+  const joined = rendered.join("\n");
+  assert.match(joined, /2\/2 completed/);
+  assert.match(joined, /◉ sleeping · completed scout/);
+  assert.match(joined, /◉ sleeping · completed reviewer/);
+  assert.doesNotMatch(joined, /■ running/);
+});
+
+test("completed teammate results expose the expand affordance", () => {
+  const result = makeResult();
+  const collapsed = renderTeammateResult({
+    content: [{ type: "text", text: "complete output" }],
+    details: { mode: "single", results: [result] },
+  }, { expanded: false }, theme as never).render(80);
+  assert.equal(collapsed.length, 1);
+  assert.match(collapsed[0], new RegExp(`${altRe("R")} details`));
+});
+
+test("priority progress rows keep failures and the live edge visible", () => {
+  const rows = Array.from({ length: 9 }, (_, taskIndex) => ({ taskIndex, text: `task ${taskIndex}` }));
+  const visible = selectPriorityProgressRows(rows, 5, 1, [7, 8]);
+  assert.equal(visible.rows.length, 5);
+  assert.ok(visible.rows.some((row) => row.taskIndex === 1));
+  assert.ok(visible.rows.some((row) => row.taskIndex === 7));
+  assert.ok(visible.rows.some((row) => row.taskIndex === 8));
+  assert.equal(visible.hidden, 4);
+});
+
+test("priority progress rows reserve the live edge when failures exceed the budget", () => {
+  const rows = Array.from({ length: 8 }, (_, taskIndex) => ({ taskIndex, text: `task ${taskIndex}` }));
+  const visible = selectPriorityProgressRows(rows, 5, 7, [0, 1, 2, 3, 4, 5, 6]);
+  assert.equal(visible.rows.length, 5);
+  assert.ok(visible.rows.some((row) => row.taskIndex === 7));
+  assert.ok(visible.rows.some((row) => row.taskIndex === 0));
+});
+
+test("progress tree renders one row per task index when snapshots repeat", () => {
+  const palette = {
+    dim: (text: string) => text,
+    accent: (text: string) => text,
+    running: (text: string) => text,
+    success: (text: string) => text,
+    error: (text: string) => text,
+    bold: (text: string) => text,
+  };
+  const rows = buildProgressTree([
+    {
+      agent: "general",
+      correlationId: "first-correlation",
+      taskIndex: 0,
+      dependencies: [],
+      status: "running",
+      startedAt: new Date().toISOString(),
+      toolCount: 0,
+      tokens: 0,
+    },
+    {
+      agent: "general",
+      correlationId: "second-correlation",
+      taskIndex: 0,
+      dependencies: [],
+      status: "completed",
+      startedAt: new Date().toISOString(),
+      toolCount: 1,
+      tokens: 10,
+    },
+  ], palette);
+
+  assert.equal(rows.length, 1);
+  assert.match(rows[0]?.text ?? "", /◉ sleeping · completed general/);
+  assert.match(rows[0]?.text ?? "", /second-c/);
+});
+
+test("progress tree uses one clock snapshot for every row in a frame", (t) => {
+  const palette = {
+    dim: (text: string) => text,
+    accent: (text: string) => text,
+    running: (text: string) => text,
+    success: (text: string) => text,
+    error: (text: string) => text,
+    bold: (text: string) => text,
+  };
+  let nowReads = 0;
+  t.mock.method(Date, "now", () => {
+    nowReads += 1;
+    return 65_000;
+  });
+
+  const rows = buildProgressTree([
+    { agent: "general", correlationId: "first", taskIndex: 0, dependencies: [], status: "running", startedAt: new Date(0).toISOString() },
+    { agent: "general", correlationId: "second", taskIndex: 1, dependencies: [], status: "running", startedAt: new Date(0).toISOString() },
+  ], palette);
+
+  assert.equal(nowReads, 1);
+  assert.match(rows[0]?.text ?? "", /1m5s/);
+  assert.match(rows[1]?.text ?? "", /1m5s/);
+});
+
+test("progress tree shows dependencies as result flow rather than agent hierarchy", () => {
+  const palette = {
+    dim: (text: string) => text,
+    accent: (text: string) => text,
+    running: (text: string) => text,
+    success: (text: string) => text,
+    error: (text: string) => text,
+    bold: (text: string) => text,
+  };
+  const rows = buildProgressTree([
+    { agent: "researcher", name: "research", correlationId: "research", taskIndex: 0, dependencies: [], status: "completed" },
+    { agent: "writer", name: "write", correlationId: "write", taskIndex: 1, dependencies: [0], status: "pending" },
+  ], palette);
+
+  assert.match(rows[0]?.text ?? "", /^• 1/);
+  assert.match(rows[1]?.text ?? "", /^→ 2/);
+  assert.match(rows[1]?.text ?? "", /result #1/);
+  assert.doesNotMatch(rows[1]?.text ?? "", /[├└│]/);
+});
+
+test("streaming progress shows live duration and split token usage", () => {
+  const now = Date.now();
+  const rendered = renderTeammateResult({
+    content: [{ type: "text", text: "working" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "general",
+        name: "metrics",
+        correlationId: "metrics-agent",
+        taskIndex: 0,
+        dependencies: [],
+        status: "running",
+        startedAt: new Date(now - 65_000).toISOString(),
+        lastActivityAt: now - 45_000,
+        durationMs: 60_000,
+        inputTokens: 1_234,
+        outputTokens: 56,
+        tokens: 1_290,
+      }],
+    },
+  }, { expanded: false }, theme as never).render(120).join("\n");
+
+  assert.match(rendered, /1m5s/);
+  assert.match(rendered, /in 1\.2k/);
+  assert.match(rendered, /out 56/);
+  assert.match(rendered, /stalled 4[45]s/);
+});
+
+test("ordinary in-flight task rows stay stable while live telemetry changes", () => {
+  const result: AgentToolResult<Details> = {
+    content: [{ type: "text", text: "working" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "reviewer",
+        name: "review",
+        correlationId: "review-agent",
+        taskIndex: 0,
+        dependencies: [],
+        status: "running",
+        durationMs: 60_000,
+        toolCount: 1,
+        inputTokens: 100,
+        outputTokens: 20,
+      }],
+    },
+  };
+  const component = renderTeammateResult(result, { expanded: false }, theme as never);
+  const first = component.render(120);
+  const firstTask = first.find((line) => line.includes("@review"));
+  assert.ok(firstTask);
+  assert.doesNotMatch(firstTask, /1 tools|1m|in 100|out 20/);
+  assert.match(first.join("\n"), /1 tools.*1m0s.*in 100.*out 20/);
+
+  result.details = {
+    ...result.details!,
+    progress: result.details!.progress!.map((entry) => ({
+      ...entry,
+      durationMs: 61_000,
+      toolCount: 2,
+      inputTokens: 140,
+      outputTokens: 30,
+    })),
+  };
+  component.invalidate();
+  const second = component.render(120);
+  assert.equal(second.find((line) => line.includes("@review")), firstTask);
+  assert.match(second.join("\n"), /2 tools.*1m1s.*in 140.*out 30/);
+});
+
+test("streaming progress leaves the final terminal column empty", () => {
+  const now = Date.now();
+  const width = 80;
+  const lines = renderTeammateResult({
+    content: [{ type: "text", text: "working" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "scholar-ralph-executor",
+        name: "scholar-ralph-executor",
+        correlationId: "125d198c-live",
+        taskIndex: 0,
+        dependencies: [],
+        status: "running",
+        startedAt: new Date(now - 65_000).toISOString(),
+        toolCount: 15,
+        inputTokens: 377_100,
+        outputTokens: 8_000,
+        cacheReadTokens: 128,
+        cacheWriteTokens: 0,
+        lastActivityAt: now,
+      }],
+    },
+  }, { expanded: false }, theme as never).render(width);
+
+  assert.ok(Math.max(...lines.map(visibleWidth)) <= width - 1);
+  for (const line of lines) assert.ok(visibleWidth(line) < width);
+});
+
+test("streaming progress memoizes by width and snapshot reference", () => {
+  const details: Details = {
+    mode: "single",
+    results: [],
+    progress: [{
+      agent: "general",
+      name: "memo",
+      correlationId: "memo-agent",
+      taskIndex: 0,
+      dependencies: [],
+      status: "running",
+      durationMs: 1_000,
+    }],
+  };
+  const result: AgentToolResult<Details> = {
+    content: [{ type: "text", text: "working" }],
+    details,
+  };
+  const component = renderTeammateResult(result, { expanded: false }, theme as never);
+
+  const first = component.render(120);
+  assert.match(first.join("\n"), /1s/);
+  details.progress![0].durationMs = 2_000;
+  const sameSnapshot = component.render(120);
+  assert.deepEqual(sameSnapshot, first);
+  assert.notEqual(sameSnapshot, first, "memoized output must not alias the cached array");
+
+  assert.match(component.render(121).join("\n"), /2s/);
+  result.details = {
+    ...details,
+    progress: details.progress!.map((entry) => ({ ...entry, durationMs: 3_000 })),
+  };
+  assert.match(component.render(121).join("\n"), /3s/);
+});
+
+test("streaming progress keeps per-second metrics off the header line", () => {
+  const now = Date.now();
+  const lines = renderTeammateResult({
+    content: [{ type: "text", text: "working" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "general",
+        name: "metrics",
+        correlationId: "metrics-agent",
+        taskIndex: 0,
+        dependencies: [],
+        status: "running",
+        startedAt: new Date(now - 65_000).toISOString(),
+        lastActivityAt: now - 45_000,
+        durationMs: 60_000,
+        inputTokens: 1_234,
+        outputTokens: 56,
+        tokens: 1_290,
+      }],
+    },
+  }, { expanded: false }, theme as never).render(120);
+
+  // Header (line 0) must not carry the ticking duration/tokens/stalled, so a tall
+  // component's top line stays stable across per-second refreshes (avoids full redraw).
+  assert.doesNotMatch(lines[0], /1m5s/);
+  assert.doesNotMatch(lines[0], /stalled/);
+  assert.doesNotMatch(lines[0], /in 1\.2k/);
+  // The metrics are still rendered, just on a lower always-visible line.
+  const rest = lines.slice(1).join("\n");
+  assert.match(rest, /1m5s/);
+  assert.match(rest, /stalled 4[45]s/);
+  assert.match(rest, /in 1\.2k · out 56/);
+});
+
+test("streaming progress shows a Pi result-ready turn instead of stalled", () => {
+  const now = Date.now();
+  const rendered = renderTeammateResult({
+    content: [{ type: "text", text: "answer captured" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "explorer",
+        name: "explorer",
+        correlationId: "explorer-agent",
+        taskIndex: 0,
+        dependencies: [],
+        status: "running",
+        startedAt: new Date(now - 65_000).toISOString(),
+        lastActivityAt: now - 45_000,
+        resultReadyAt: now - 44_000,
+      }],
+    },
+  }, { expanded: false }, theme as never).render(120).join("\n");
+
+  assert.match(rendered, /result ready; confirming terminal/);
+  assert.doesNotMatch(rendered, /stalled/);
+});
+
+test("streaming teammate result shows child agent lifecycle separately from task progress", () => {
+  const rendered = renderTeammateResult({
+    content: [{ type: "text", text: "delegating" }],
+    details: {
+      mode: "single",
+      results: [],
+      childCalls: [{
+        agent: "reviewer",
+        name: "review",
+        correlationId: "review-child",
+        parentCorrelationId: "planner-parent",
+        parentName: "planner",
+        status: "running",
+        recentTools: [{ name: "teammate", status: "running" }],
+      }],
+    },
+  }, { expanded: false }, theme as never).render(100).join("\n");
+
+  assert.match(rendered, /1 child agent/);
+  assert.match(rendered, /└─ ■ @review child agent · running · using teammate/);
+  assert.doesNotMatch(rendered, /called by/);
+});
+
+test("streaming teammate result nests child agents under their parent as a tree", () => {
+  const rendered = renderTeammateResult({
+    content: [{ type: "text", text: "delegating" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "general",
+        name: "planner",
+        correlationId: "task-1",
+        taskIndex: 0,
+        dependencies: [],
+        status: "pending",
+      }],
+      childCalls: [
+        {
+          agent: "reviewer",
+          name: "review",
+          correlationId: "child-1",
+          parentCorrelationId: "task-1",
+          parentName: "planner",
+          status: "running",
+        },
+        {
+          agent: "scanner",
+          name: "deep",
+          correlationId: "child-2",
+          parentCorrelationId: "child-1",
+          parentName: "review",
+          status: "running",
+        },
+      ],
+    },
+  }, { expanded: false }, theme as never).render(100).join("\n");
+
+  const lines = rendered.split("\n");
+  assert.match(rendered, /• 1 ■ running · starting @planner \(general\)/);
+  const reviewLine = lines.find((line) => line.includes("@review"));
+  const deepLine = lines.find((line) => line.includes("@deep"));
+  assert.ok(reviewLine?.startsWith("  └─ "), `review should nest under task: ${reviewLine}`);
+  assert.ok(deepLine?.startsWith("     └─ "), `deep should nest under review: ${deepLine}`);
+  assert.doesNotMatch(rendered, /called by/);
+});
+
+test("streaming child agent shows stalled state, duration, and split tokens", () => {
+  const now = Date.now();
+  const rendered = renderTeammateResult({
+    content: [{ type: "text", text: "delegating" }],
+    details: {
+      mode: "single",
+      results: [],
+      childCalls: [{
+        agent: "reviewer",
+        name: "review",
+        correlationId: "review-child",
+        status: "running",
+        startedAt: now - 70_000,
+        lastActivityAt: now - 40_000,
+        durationMs: 65_000,
+        inputTokens: 200,
+        outputTokens: 30,
+      }],
+    },
+  }, { expanded: false }, theme as never).render(120).join("\n");
+
+  assert.match(rendered, /@review child agent · stalled 4[01]s · 1m1[01]s/);
+  assert.match(rendered, /in 200 · out 30/);
+});
+
+test("streaming teammate result wraps long agent output instead of truncating it", () => {
+  const message = "There are no previous user messages, no prior assistant turns, and no inherited parent context visible.";
+  const rendered = renderTeammateResult({
+    content: [{ type: "text", text: "streaming" }],
+    details: {
+      mode: "single",
+      results: [],
+      progress: [{
+        agent: "general",
+        name: "fresh",
+        correlationId: "fresh-agent",
+        taskIndex: 0,
+        dependencies: [],
+        status: "running",
+        lastMessage: message,
+      }],
+    },
+  }, { expanded: false }, theme as never).render(40).join("\n");
+
+  assert.match(rendered, /previous user messages/);
+  assert.match(rendered, /inherited parent context visible/);
+  assert.doesNotMatch(rendered.split("\n").filter((line) => line.startsWith("│")).join("\n"), /…/);
+});

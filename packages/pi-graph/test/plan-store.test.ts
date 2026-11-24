@@ -1,0 +1,1061 @@
+import assert from "node:assert/strict";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import {
+  checksumText,
+  PlanApprovalError,
+  PlanRevisionConflictError,
+  PlanStore as RuntimePlanStore,
+  planSessionStorageId,
+  workspaceStorageId,
+} from "../src/tools/plan-store.ts";
+
+// Storage/lifecycle tests exercise lock ownership, not the platform process probe.
+// A slow/unavailable Windows CIM subprocess must not consume their test budget;
+// explicit process-identity overrides in lock-reclamation tests still take precedence.
+class PlanStore extends RuntimePlanStore {
+  constructor(cwd: string, options: ConstructorParameters<typeof RuntimePlanStore>[1] = {}) {
+    super(cwd, { getProcessIdentity: (pid) => `test-process:${pid}`, ...options });
+  }
+}
+
+test("workspace storage IDs are readable and collision resistant", () => {
+  const first = workspaceStorageId(join("C:\\work", "demo"));
+  const second = workspaceStorageId(join("D:\\other", "demo"));
+  assert.match(first, /^demo-[a-f0-9]{8}$/);
+  assert.match(second, /^demo-[a-f0-9]{8}$/);
+  assert.notEqual(first, second);
+});
+
+test("session storage IDs are readable, stable and collision resistant", () => {
+  const first = planSessionStorageId("019f-chat-a");
+  const repeated = planSessionStorageId("019f-chat-a");
+  const second = planSessionStorageId("019f-chat-b");
+  assert.match(first, /^019f-chat-a-[a-f0-9]{8}$/);
+  assert.equal(first, repeated);
+  assert.notEqual(first, second);
+});
+
+test("PlanStore isolates chat sessions and assigns legacy workspace data once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-session-store-"));
+  const cwd = join(root, "workspace");
+  const rootDir = join(root, "global");
+  try {
+    const legacy = new PlanStore(cwd, { rootDir });
+    await legacy.saveDraft("legacy workspace draft", 0);
+
+    const chatA = new PlanStore(cwd, { rootDir, session: { id: "chat-a", file: "chat-a.jsonl", name: "Chat A" } });
+    const loadedA = await chatA.load();
+    assert.equal(loadedA.markdown, "legacy workspace draft");
+    assert.equal(loadedA.manifest.sessionId, "chat-a");
+    assert.equal(loadedA.manifest.sessionFile, "chat-a.jsonl");
+    assert.equal(loadedA.manifest.sessionName, "Chat A");
+    assert.match(chatA.plansDir.replaceAll("\\", "/"), /\/sessions\/chat-a-[a-f0-9]{8}\/plans$/);
+
+    const chatB = new PlanStore(cwd, { rootDir, session: { id: "chat-b" } });
+    const loadedB = await chatB.load();
+    assert.equal(loadedB.markdown, "");
+    assert.equal(loadedB.manifest.sessionId, "chat-b");
+    await chatB.saveDraft("chat B draft", 0);
+
+    assert.equal((await new PlanStore(cwd, { rootDir, session: { id: "chat-a" } }).load()).markdown, "legacy workspace draft");
+    assert.equal((await new PlanStore(cwd, { rootDir, session: { id: "chat-b" } }).load()).markdown, "chat B draft");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore persists drafts, revisions and restart state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-store-"));
+  const now = new Date("2026-07-11T10:00:00.000Z");
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), now: () => now });
+    const initial = await store.load();
+    assert.equal(initial.markdown, "");
+    assert.equal(initial.manifest.revision, 0);
+
+    const saved = await store.saveDraft("# Draft\n\nStep one", 0);
+    assert.equal(saved.manifest.revision, 1);
+    assert.equal(saved.manifest.status, "draft");
+    assert.equal(await readFile(store.currentPath, "utf8"), "# Draft\n\nStep one");
+
+    const restarted = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), now: () => now });
+    const loaded = await restarted.load();
+    assert.equal(loaded.markdown, saved.markdown);
+    assert.equal(loaded.manifest.revision, 1);
+
+    await assert.rejects(
+      restarted.saveDraft("stale overwrite", 0),
+      (error) => error instanceof PlanRevisionConflictError,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore approval archives the exact draft and commits manifest last", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-approve-"));
+  const now = new Date("2026-07-11T10:15:30.000Z");
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), now: () => now });
+    const markdown = "# Approved plan\n\n1. Implement storage\n2. Verify";
+    const approved = await store.approve(markdown, 0);
+    assert.equal(approved.manifest.status, "approved");
+    assert.equal(approved.manifest.approvedChecksum, checksumText(markdown));
+    assert.match(approved.manifest.handoffKey ?? "", /^[a-f0-9]{64}$/);
+    assert.ok(approved.manifest.approvedPath);
+    const archive = join(store.plansDir, approved.manifest.approvedPath!);
+    assert.equal(await readFile(archive, "utf8"), markdown);
+
+    const persistedManifest = JSON.parse(await readFile(store.manifestPath, "utf8"));
+    assert.equal(persistedManifest.status, "approved");
+    assert.equal(persistedManifest.approvedPath, approved.manifest.approvedPath);
+    assert.equal(persistedManifest.handoffKey, approved.manifest.handoffKey);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore persists execution choice and reconciles Workflow binding without revising the Plan", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-workflow-binding-"));
+  const now = new Date("2026-07-11T10:15:30.000Z");
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), now: () => now });
+    const markdown = "# Workflow approved Plan";
+    const approved = await store.approve(markdown, 0, {
+      execution: { backend: "workflow", context: "compact", workflowTarget: "new" },
+    });
+    const handoffKey = approved.manifest.handoffKey!;
+    const checksum = checksumText(markdown);
+    assert.deepEqual(approved.manifest.execution, {
+      backend: "workflow",
+      context: "compact",
+      workflowTarget: "new",
+    });
+    assert.deepEqual(approved.manifest.workflowBinding, {
+      status: "pending",
+      handoffKey,
+      sourceChecksum: checksum,
+      updatedAt: now.toISOString(),
+    });
+
+    const boundAt = "2026-07-11T10:16:00.000Z";
+    const bound = await store.updateWorkflowBinding(handoffKey, {
+      status: "bound",
+      handoffKey,
+      sourceChecksum: checksum,
+      workflowSessionId: "workflow-1",
+      workflowSessionGeneration: "canonical:valid:workflow-1:2",
+      artifactId: "ART-001-001",
+      producerRunId: "run-plan-publish",
+      executionRunId: "run-execute",
+      requestId: `plan-pub-${handoffKey}`,
+      updatedAt: boundAt,
+    });
+    assert.equal(bound.manifest.revision, approved.manifest.revision);
+    assert.equal(bound.manifest.approvedChecksum, checksum);
+    assert.equal(bound.manifest.workflowBinding?.status, "bound");
+    assert.equal((await store.load()).manifest.workflowBinding?.artifactId, "ART-001-001");
+
+    const pendingDelivery = await store.updateWorkflowBinding(handoffKey, {
+      ...bound.manifest.workflowBinding!,
+      deliveryId: `delivery-${handoffKey}`,
+      deliveryStatus: "pending",
+      updatedAt: "2026-07-11T10:16:30.000Z",
+    });
+    const delivered = await store.updateWorkflowBinding(handoffKey, {
+      ...pendingDelivery.manifest.workflowBinding!,
+      deliveryStatus: "delivered",
+      deliveredAt: "2026-07-11T10:17:00.000Z",
+      updatedAt: "2026-07-11T10:17:00.000Z",
+    });
+    await assert.rejects(
+      store.updateWorkflowBinding(handoffKey, {
+        status: "failed",
+        handoffKey,
+        sourceChecksum: checksum,
+        error: "stale retry",
+        updatedAt: "2026-07-11T10:18:00.000Z",
+      }),
+      /terminal and cannot be downgraded/,
+    );
+    assert.equal((await store.load()).manifest.workflowBinding?.deliveryStatus, "delivered");
+
+    const draft = await store.saveDraft("# Revised Plan", delivered.manifest.revision);
+    assert.equal(draft.manifest.status, "draft");
+    assert.equal(draft.manifest.execution, undefined);
+    assert.equal(draft.manifest.workflowBinding, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore persists a bound decision document through approval and reload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-source-doc-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("# Plan with decision doc", 0, {
+      execution: {
+        backend: "standalone",
+        context: "current",
+        sourceDocument: "docs/session-run-minimal-state-architecture-20260812.md",
+      },
+    });
+    assert.deepEqual(approved.manifest.sourceDocuments, [
+      "docs/session-run-minimal-state-architecture-20260812.md",
+    ]);
+    assert.equal(
+      approved.manifest.execution?.sourceDocument,
+      "docs/session-run-minimal-state-architecture-20260812.md",
+    );
+
+    const reloaded = await store.load();
+    assert.deepEqual(reloaded.manifest.sourceDocuments, [
+      "docs/session-run-minimal-state-architecture-20260812.md",
+    ]);
+
+    const withoutDoc = await store.approve("# Plan without decision doc", reloaded.manifest.revision, {
+      execution: { backend: "standalone", context: "current" },
+    });
+    assert.equal(withoutDoc.manifest.sourceDocuments, undefined);
+    assert.equal((await store.load()).manifest.sourceDocuments, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore rejects Workflow binding updates that do not match the approved handoff", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-workflow-binding-fence-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("# Workflow Plan", 0, {
+      execution: { backend: "workflow", context: "current", workflowTarget: "current" },
+    });
+    await assert.rejects(
+      store.updateWorkflowBinding("f".repeat(64), approved.manifest.workflowBinding!),
+      /handoff changed/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore uses private files and directories and tightens existing POSIX permissions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-private-mode-"));
+  let commitStarted!: () => void;
+  let releaseCommit!: () => void;
+  const started = new Promise<void>((resolve) => { commitStarted = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCommit = resolve; });
+  let approval: ReturnType<PlanStore["approve"]> | undefined;
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      approvalCommitHook: async () => {
+        commitStarted();
+        await release;
+      },
+    });
+    await store.saveDraft("initial", 0);
+    if (process.platform !== "win32") {
+      await Promise.all([
+        chmod(store.plansDir, 0o777),
+        chmod(store.currentPath, 0o666),
+        chmod(store.manifestPath, 0o666),
+      ]);
+    }
+
+    approval = store.approve("private approval", 1);
+    await started;
+    const archiveName = (await readdir(store.approvalsDir)).find((entry) => entry.endsWith(".md"));
+    assert.ok(archiveName);
+    const privateDirectories = [store.plansDir, store.approvalsDir, store.recoveryDir, store.lockPath];
+    const privateFiles = [
+      store.currentPath,
+      store.manifestPath,
+      store.pendingPath,
+      store.lockOwnerPath,
+      join(store.approvalsDir, archiveName),
+    ];
+    for (const directory of privateDirectories) {
+      const details = await lstat(directory);
+      assert.equal(details.isSymbolicLink(), false);
+      assert.equal(details.isDirectory(), true);
+      if (process.platform !== "win32") assert.equal(details.mode & 0o777, 0o700);
+    }
+    for (const file of privateFiles) {
+      const details = await lstat(file);
+      assert.equal(details.isSymbolicLink(), false);
+      assert.equal(details.isFile(), true);
+      if (process.platform !== "win32") assert.equal(details.mode & 0o777, 0o600);
+    }
+
+    releaseCommit();
+    assert.equal((await approval).manifest.status, "approved");
+  } finally {
+    releaseCommit?.();
+    await approval?.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore rejects a non-regular persisted file target", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-non-file-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    await store.saveDraft("initial", 0);
+    await rm(store.currentPath);
+    await mkdir(store.currentPath);
+    await assert.rejects(store.load(), /Plan storage path must be a regular file/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore rejects a symlink persisted file target on POSIX", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-symlink-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    await store.saveDraft("initial", 0);
+    const outside = join(root, "outside.md");
+    await writeFile(outside, "outside", "utf8");
+    await rm(store.currentPath);
+    await symlink(outside, store.currentPath);
+    await assert.rejects(store.load(), /Plan storage path must be a regular file/);
+    assert.equal(await readFile(outside, "utf8"), "outside");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore recovers an externally changed current.md as a new draft revision", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-recover-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    await store.saveDraft("first", 0);
+    await writeFile(store.currentPath, "human edit", "utf8");
+    const recovered = await store.load();
+    assert.equal(recovered.markdown, "human edit");
+    assert.equal(recovered.manifest.revision, 2);
+    assert.equal(recovered.manifest.status, "draft");
+    assert.deepEqual(await readdir(store.approvalsDir), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore removes orphan approval files but preserves committed history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-orphan-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("committed", 0);
+    assert.ok(approved.manifest.approvedPath);
+    await mkdir(store.approvalsDir, { recursive: true });
+    await writeFile(join(store.approvalsDir, "orphan.md"), "orphan", "utf8");
+    await store.load();
+    const entries = await readdir(store.approvalsDir);
+    assert.ok(entries.includes(approved.manifest.approvedPath!.split(/[\\/]/).at(-1)!));
+    assert.ok(!entries.includes("orphan.md"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore rebuilds approval history when manifest.json is missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-manifest-rebuild-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("durable approval", 0);
+    const archiveName = approved.manifest.approvedPath!.split(/[\\/]/).at(-1)!;
+    await rm(store.manifestPath, { force: true });
+
+    const recovered = await new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") }).load();
+    assert.equal(recovered.manifest.status, "approved");
+    assert.ok(recovered.manifest.approvals.some((path) => path.endsWith(archiveName)));
+    assert.equal(await readFile(join(store.approvalsDir, archiveName), "utf8"), "durable approval");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore advances the recovered revision when current.md diverges from the latest approval", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-manifest-diverged-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("approved text", 0);
+    await writeFile(store.currentPath, "later human draft", "utf8");
+    await rm(store.manifestPath, { force: true });
+
+    const recovered = await new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") }).load();
+    assert.equal(recovered.manifest.status, "draft");
+    assert.equal(recovered.manifest.revision, approved.manifest.revision + 1);
+    assert.equal(recovered.markdown, "later human draft");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore rebuilds semantically damaged manifest without deleting valid approval history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-manifest-invariant-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("historical approval", 0);
+    const archivePath = join(store.plansDir, approved.manifest.approvedPath!);
+    const damaged = {
+      ...approved.manifest,
+      status: "draft",
+      approvals: [],
+    };
+    delete damaged.approvedAt;
+    delete damaged.approvedPath;
+    delete damaged.approvedChecksum;
+    await writeFile(store.manifestPath, `${JSON.stringify(damaged, null, 2)}\n`, "utf8");
+
+    const recovered = await new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") }).load();
+    assert.equal(recovered.manifest.status, "approved");
+    assert.deepEqual(recovered.manifest.approvals, approved.manifest.approvals);
+    assert.equal(await readFile(archivePath, "utf8"), "historical approval");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore chooses the highest approval revision when the clock moves backwards", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-clock-rollback-"));
+  let current = new Date("2026-07-11T12:00:00.000Z");
+  try {
+    const cwd = join(root, "workspace");
+    const options = { rootDir: join(root, "global"), now: () => current };
+    const store = new PlanStore(cwd, options);
+    await store.approve("revision one", 0);
+    current = new Date("2026-07-11T11:00:00.000Z");
+    const second = await store.approve("revision two", 1);
+    await rm(store.manifestPath, { force: true });
+
+    const recovered = await new PlanStore(cwd, options).load();
+    assert.equal(recovered.manifest.revision, 2);
+    assert.equal(recovered.manifest.approvedPath, second.manifest.approvedPath);
+    assert.equal(recovered.markdown, "revision two");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore quarantines an interrupted pending approval instead of approving or deleting it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-pending-recovery-"));
+  try {
+    const cwd = join(root, "workspace");
+    const options = { rootDir: join(root, "global") };
+    const store = new PlanStore(cwd, options);
+    await store.saveDraft("pending draft", 0);
+    const checksum = checksumText("pending draft");
+    const archiveName = `20260711T120000000Z-r0001-${checksum.slice(0, 8)}.md`;
+    await writeFile(join(store.approvalsDir, archiveName), "pending draft", "utf8");
+    await writeFile(store.pendingPath, `${JSON.stringify({
+      version: 1,
+      token: "interrupted-owner",
+      archiveName,
+      revision: 1,
+      checksum,
+      createdAt: "2026-07-11T12:00:00.000Z",
+    })}\n`, "utf8");
+
+    const recovered = await new PlanStore(cwd, options).load();
+    assert.equal(recovered.manifest.status, "draft");
+    assert.deepEqual(recovered.manifest.approvals, []);
+    assert.equal((await readdir(store.approvalsDir)).includes(archiveName), false);
+    assert.ok((await readdir(store.recoveryDir)).some((entry) => entry.startsWith(archiveName)));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore quarantines archives associated with a structurally invalid pending marker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-invalid-pending-"));
+  try {
+    const cwd = join(root, "workspace");
+    const options = { rootDir: join(root, "global") };
+    const store = new PlanStore(cwd, options);
+    await store.saveDraft("invalid pending draft", 0);
+    const checksum = checksumText("invalid pending draft");
+    const archiveName = `20260711T120000000Z-r0001-${checksum.slice(0, 8)}.md`;
+    await writeFile(join(store.approvalsDir, archiveName), "invalid pending draft", "utf8");
+    await writeFile(store.pendingPath, `${JSON.stringify({ version: 1, token: "missing-fields" })}\n`, "utf8");
+
+    const recovered = await new PlanStore(cwd, options).load();
+    assert.equal(recovered.manifest.status, "draft");
+    assert.deepEqual(recovered.manifest.approvals, []);
+    assert.equal((await readdir(store.approvalsDir)).includes(archiveName), false);
+    const recoveryEntries = await readdir(store.recoveryDir);
+    assert.ok(recoveryEntries.some((entry) => entry.startsWith(archiveName)));
+    assert.ok(recoveryEntries.some((entry) => entry.startsWith("invalid-pending.json")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore heartbeat prevents a live long approval from being reclaimed as stale", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-lock-heartbeat-"));
+  let releaseCommit: (() => void) | undefined;
+  let commitStarted: (() => void) | undefined;
+  let ownerClockReads = 0;
+  let approval: ReturnType<PlanStore["approve"]> | undefined;
+  const started = new Promise<void>((resolve) => { commitStarted = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCommit = resolve; });
+  try {
+    const cwd = join(root, "workspace");
+    const rootDir = join(root, "global");
+    const owner = new PlanStore(cwd, {
+      rootDir,
+      lockStaleMs: 20,
+      lockHeartbeatMs: 1,
+      lockNow: () => {
+        ownerClockReads += 1;
+        return ownerClockReads > 2 ? 100 : 0;
+      },
+      isProcessAlive: () => false,
+      getProcessIdentity: (pid: number) => `test-process:${pid}`,
+      approvalCommitHook: async () => {
+        commitStarted?.();
+        await release;
+      },
+    });
+    approval = owner.approve("long approval", 0);
+    await started;
+    await waitForCondition(async () => {
+      try {
+        const lockOwner = JSON.parse(await readFile(owner.lockOwnerPath, "utf8"));
+        return lockOwner.heartbeatAt === 100;
+      } catch {
+        return false;
+      }
+    });
+    assert.equal(
+      JSON.parse(await readFile(owner.lockOwnerPath, "utf8")).processIdentity,
+      `test-process:${process.pid}`,
+    );
+
+    const contender = new PlanStore(cwd, {
+      rootDir,
+      lockStaleMs: 20,
+      lockRetryMs: 1,
+      lockTimeoutMs: 1,
+      lockNow: () => 100,
+      isProcessAlive: () => false,
+      getProcessIdentity: (pid: number) => `test-process:${pid}`,
+    });
+    await assert.rejects(contender.load(), /Timed out waiting for Plan transaction lock/);
+    assert.equal(
+      JSON.parse(await readFile(owner.lockOwnerPath, "utf8")).processIdentity,
+      `test-process:${process.pid}`,
+    );
+
+    releaseCommit?.();
+    const approved = await approval;
+    assert.equal(approved.manifest.status, "approved");
+  } finally {
+    releaseCommit?.();
+    await approval?.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore reclaims a dead stale owner and releases only its own token", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-stale-owner-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      lockStaleMs: 10,
+      lockRetryMs: 2,
+      lockTimeoutMs: 500,
+      isProcessAlive: () => false,
+      getProcessIdentity: () => "test-process:current",
+    });
+    await mkdir(store.lockPath, { recursive: true });
+    await writeFile(store.lockOwnerPath, `${JSON.stringify({
+      token: "dead-owner",
+      pid: 999_999,
+      processIdentity: "test-process:dead",
+      createdAt: Date.now() - 1_000,
+      heartbeatAt: Date.now() - 1_000,
+    })}\n`, "utf8");
+
+    const loaded = await store.load();
+    assert.equal(loaded.manifest.revision, 0);
+    assert.equal(await storePathExists(store.lockPath), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore does not reclaim a stale lock when the live PID birth identity matches", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-live-owner-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      lockStaleMs: 10,
+      lockRetryMs: 1,
+      lockTimeoutMs: 1,
+      lockNow: () => 1_000,
+      isProcessAlive: () => true,
+      getProcessIdentity: (pid) => pid === 42_424 ? "test-process:birth-a" : "test-process:contender",
+    });
+    await mkdir(store.lockPath, { recursive: true });
+    await writeFile(store.lockOwnerPath, `${JSON.stringify({
+      token: "live-owner",
+      pid: 42_424,
+      processIdentity: "test-process:birth-a",
+      createdAt: 0,
+      heartbeatAt: 0,
+    })}\n`, "utf8");
+
+    await assert.rejects(store.load(), /Timed out waiting for Plan transaction lock/);
+    assert.equal(JSON.parse(await readFile(store.lockOwnerPath, "utf8")).token, "live-owner");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore reclaims a stale lock when a live PID was reused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-reused-pid-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      lockStaleMs: 10,
+      lockRetryMs: 1,
+      lockTimeoutMs: 100,
+      lockNow: () => 1_000,
+      isProcessAlive: () => true,
+      getProcessIdentity: (pid) => pid === 42_424 ? "test-process:birth-new" : "test-process:contender",
+    });
+    await mkdir(store.lockPath, { recursive: true });
+    await writeFile(store.lockOwnerPath, `${JSON.stringify({
+      token: "reused-pid-owner",
+      pid: 42_424,
+      processIdentity: "test-process:birth-old",
+      createdAt: 0,
+      heartbeatAt: 0,
+    })}\n`, "utf8");
+
+    const loaded = await store.load();
+    assert.equal(loaded.manifest.revision, 0);
+    assert.equal(await storePathExists(store.lockPath), false);
+    assert.deepEqual(
+      (await readdir(store.plansDir)).filter((entry) => entry.includes(".transaction-lock.stale-")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore keeps legacy stale locks fail-closed while their PID is live", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-legacy-live-owner-"));
+  let legacyIdentityReads = 0;
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      lockStaleMs: 10,
+      lockRetryMs: 1,
+      lockTimeoutMs: 1,
+      lockNow: () => 1_000,
+      isProcessAlive: () => true,
+      getProcessIdentity: (pid) => {
+        if (pid === 42_424) legacyIdentityReads += 1;
+        return "test-process:contender";
+      },
+    });
+    await mkdir(store.lockPath, { recursive: true });
+    await writeFile(store.lockOwnerPath, `${JSON.stringify({
+      token: "legacy-live-owner",
+      pid: 42_424,
+      createdAt: 0,
+      heartbeatAt: 0,
+    })}\n`, "utf8");
+
+    await assert.rejects(store.load(), /Timed out waiting for Plan transaction lock/);
+    assert.equal(legacyIdentityReads, 0);
+    assert.equal(JSON.parse(await readFile(store.lockOwnerPath, "utf8")).token, "legacy-live-owner");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("A stale former owner cannot remove a replacement owner's lock or pending approval", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-owner-handoff-"));
+  let releaseOld: (() => void) | undefined;
+  let oldStarted: (() => void) | undefined;
+  let releaseReplacement: (() => void) | undefined;
+  let replacementStarted: (() => void) | undefined;
+  const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+  const oldReady = new Promise<void>((resolve) => { oldStarted = resolve; });
+  const replacementGate = new Promise<void>((resolve) => { releaseReplacement = resolve; });
+  const replacementReady = new Promise<void>((resolve) => { replacementStarted = resolve; });
+  try {
+    const cwd = join(root, "workspace");
+    const baseOptions = {
+      rootDir: join(root, "global"),
+      lockStaleMs: 20,
+      lockRetryMs: 2,
+      lockTimeoutMs: 1_000,
+      isProcessAlive: () => false,
+      // Every other lock test stubs this. Without it each acquisition resolves the
+      // real process identity, which on Windows is a PowerShell subprocess — seconds
+      // of wall clock against a 20ms staleness budget, so the handoff being tested
+      // races against subprocess latency instead of against the other owner.
+      getProcessIdentity: () => "test-process:current",
+    };
+    const oldStore = new PlanStore(cwd, {
+      ...baseOptions,
+      lockHeartbeatMs: 1_000,
+      approvalCommitHook: async () => {
+        oldStarted?.();
+        await oldGate;
+      },
+    });
+    const oldApproval = oldStore.approve("old approval", 0);
+    await oldReady;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    const recovered = await new PlanStore(cwd, { ...baseOptions, lockHeartbeatMs: 5 }).load();
+    assert.equal(recovered.manifest.status, "draft");
+
+    const replacementStore = new PlanStore(cwd, {
+      ...baseOptions,
+      lockHeartbeatMs: 5,
+      approvalCommitHook: async () => {
+        replacementStarted?.();
+        await replacementGate;
+      },
+    });
+    const replacementApproval = replacementStore.approve("replacement approval", recovered.manifest.revision);
+    await replacementReady;
+
+    releaseOld?.();
+    await assert.rejects(
+      oldApproval,
+      (error) => error instanceof PlanApprovalError && /ownership was lost/.test(error.message),
+    );
+    const replacementPending = JSON.parse(await readFile(replacementStore.pendingPath, "utf8"));
+    const replacementOwner = JSON.parse(await readFile(replacementStore.lockOwnerPath, "utf8"));
+    assert.equal(replacementPending.token, replacementOwner.token);
+
+    releaseReplacement?.();
+    const approved = await replacementApproval;
+    assert.equal(
+      await readFile(join(replacementStore.plansDir, approved.manifest.approvedPath!), "utf8"),
+      "replacement approval",
+    );
+  } finally {
+    releaseOld?.();
+    releaseReplacement?.();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore serializes approval commit and concurrent recovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-approval-lock-"));
+  let releaseCommit: (() => void) | undefined;
+  let commitStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { commitStarted = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCommit = resolve; });
+  try {
+    const cwd = join(root, "workspace");
+    const options = { rootDir: join(root, "global") };
+    const approvingStore = new PlanStore(cwd, {
+      ...options,
+      approvalCommitHook: async () => {
+        commitStarted?.();
+        await release;
+      },
+    });
+    const approval = approvingStore.approve("concurrent approval", 0);
+    await started;
+
+    let recoveryFinished = false;
+    const recovery = new PlanStore(cwd, options).load().then((loaded) => {
+      recoveryFinished = true;
+      return loaded;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(recoveryFinished, false);
+
+    releaseCommit?.();
+    const [approved, recovered] = await Promise.all([approval, recovery]);
+    assert.equal(recovered.manifest.approvedPath, approved.manifest.approvedPath);
+    assert.equal(
+      await readFile(join(approvingStore.plansDir, approved.manifest.approvedPath!), "utf8"),
+      "concurrent approval",
+    );
+  } finally {
+    releaseCommit?.();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore keeps a recoverable draft revision when approval commit fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-approval-fail-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      approvalCommitHook: async () => { throw new Error("manifest unavailable"); },
+    });
+    await assert.rejects(
+      store.approve("human buffer", 0),
+      (error) => error instanceof PlanApprovalError
+        && error.revision === 1
+        && error.draftPersisted,
+    );
+    const recovered = await store.load();
+    assert.equal(recovered.markdown, "human buffer");
+    assert.equal(recovered.manifest.revision, 1);
+    assert.equal(recovered.manifest.status, "draft");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore keeps a committed approval when pending cleanup fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-cleanup-fail-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      approvalCleanupHook: async () => { throw new Error("cleanup unavailable"); },
+    });
+    const approved = await store.approve("committed before cleanup", 0);
+    assert.equal(approved.manifest.status, "approved");
+    assert.equal(
+      await readFile(join(store.plansDir, approved.manifest.approvedPath!), "utf8"),
+      "committed before cleanup",
+    );
+    const reloaded = await new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") }).load();
+    assert.equal(reloaded.manifest.approvedPath, approved.manifest.approvedPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function storePathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function waitForCondition(predicate: () => Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    if (await predicate()) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error("Timed out waiting for deterministic PlanStore test condition");
+}
+
+test("PlanStore archives the previous draft on saveDraft when content changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-draft-archive-"));
+  let now = new Date("2026-08-24T10:00:00.000Z");
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), now: () => now });
+
+    const first = await store.saveDraft("# v1", 0);
+    assert.equal(first.manifest.revision, 1);
+    let drafts = await store.listDrafts();
+    assert.equal(drafts.length, 0, "first save has nothing to archive");
+
+    now = new Date("2026-08-24T10:00:01.000Z");
+    const second = await store.saveDraft("# v2", 1);
+    assert.equal(second.manifest.revision, 2);
+    drafts = await store.listDrafts();
+    assert.equal(drafts.length, 1);
+    assert.equal(drafts[0]!.revision, 1);
+    assert.equal(await store.readDraft(drafts[0]!.path), "# v1");
+    assert.equal(checksumText("# v1"), drafts[0]!.checksum);
+
+    // Saving identical content does not create another archive.
+    now = new Date("2026-08-24T10:00:02.000Z");
+    const same = await store.saveDraft("# v2", 2);
+    assert.equal(same.manifest.revision, 3);
+    drafts = await store.listDrafts();
+    assert.equal(drafts.length, 1, "identical content is not re-archived");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore restores an archived draft as a new revision", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-draft-restore-"));
+  let now = new Date("2026-08-24T11:00:00.000Z");
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), now: () => now });
+    await store.saveDraft("# r1", 0);
+    now = new Date("2026-08-24T11:00:01.000Z");
+    await store.saveDraft("# r2", 1);
+    now = new Date("2026-08-24T11:00:02.000Z");
+    const latest = await store.saveDraft("# r3", 2);
+    assert.equal(latest.manifest.revision, 3);
+    assert.equal(await readFile(store.currentPath, "utf8"), "# r3");
+
+    now = new Date("2026-08-24T11:00:03.000Z");
+    const restored = await store.restoreDraft(1, 3);
+    assert.equal(restored.manifest.revision, 4);
+    assert.equal(await readFile(store.currentPath, "utf8"), "# r1");
+    assert.equal(restored.manifest.status, "draft");
+
+    // Restoring also archives the superseded current draft (r3) so it remains reachable.
+    const drafts = await store.listDrafts();
+    const revisions = drafts.map((entry) => entry.revision).sort((a, b) => a - b);
+    assert.deepEqual(revisions, [1, 2, 3]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore restoreDraft rejects an unknown revision", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-draft-unknown-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    await store.saveDraft("# only", 0);
+    await assert.rejects(() => store.restoreDraft(99, 1), /revision 99 was not found/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore readDraft rejects path traversal and malformed paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-draft-traversal-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    await store.saveDraft("# safe", 0);
+    await assert.rejects(() => store.readDraft("../current.md"), /Invalid draft archive path/);
+    await assert.rejects(() => store.readDraft("drafts/not-an-archive.md"), /Invalid draft archive path/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore prunes the draft history to the configured limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-draft-prune-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global"), draftHistoryLimit: 3 });
+    for (let i = 0; i < 6; i += 1) {
+      await store.saveDraft(`# v${i + 1}`, i);
+    }
+    const drafts = await store.listDrafts();
+    assert.equal(drafts.length, 3, "only the newest 3 archives are kept");
+    // Newest first → revisions 5, 4, 3 survive; 1 and 2 pruned.
+    assert.deepEqual(drafts.map((entry) => entry.revision), [5, 4, 3]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore exposes session-bound Plan versions and persisted Review outputs as Artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-artifacts-"));
+  let now = new Date("2026-08-28T10:00:00.000Z");
+  try {
+    const store = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      session: { id: "pi-session-a" },
+      now: () => now,
+    });
+    await store.saveDraft("# Plan r1", 0);
+    now = new Date("2026-08-28T10:01:00.000Z");
+    await store.saveDraft("# Plan r2", 1);
+    await store.saveReviewArtifact({
+      revision: 2,
+      role: "reviewer",
+      markdown: "# Review\n\nRevise acceptance checks.",
+      createdAt: "2026-08-28T10:02:00.000Z",
+    });
+    now = new Date("2026-08-28T10:03:00.000Z");
+    await store.approve("# Plan r2", 2);
+
+    const artifacts = await store.listArtifacts();
+    assert.deepEqual(
+      artifacts.map((artifact) => [artifact.kind, artifact.revision]),
+      [["draft", 1], ["approved", 3], ["review", 2]],
+    );
+    assert.equal(await store.hasArtifacts(), true);
+    const review = artifacts.find((artifact) => artifact.kind === "review")!;
+    assert.equal(review.role, "reviewer");
+    assert.equal(await store.readArtifact(review), "# Review\n\nRevise acceptance checks.");
+    const collisionA = await store.saveReviewArtifact({
+      revision: 2,
+      role: "optimizer",
+      markdown: "review-21641",
+      createdAt: "2026-08-28T10:04:00.000Z",
+    });
+    const collisionB = await store.saveReviewArtifact({
+      revision: 2,
+      role: "optimizer",
+      markdown: "review-24060",
+      createdAt: "2026-08-28T10:04:00.000Z",
+    });
+    assert.notEqual(collisionA.path, collisionB.path, "full checksums keep distinct review outputs immutable");
+    assert.equal(await store.readArtifact(collisionA), "review-21641");
+    assert.equal(await store.readArtifact(collisionB), "review-24060");
+    const approved = artifacts.find((artifact) => artifact.kind === "approved")!;
+    assert.equal(await store.readArtifact(approved), "# Plan r2");
+
+    const otherSession = new PlanStore(join(root, "workspace"), {
+      rootDir: join(root, "global"),
+      session: { id: "pi-session-b" },
+    });
+    assert.deepEqual(await otherSession.listArtifacts(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PlanStore rejects forged Artifact paths and detects current-draft changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-artifact-fence-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    await store.saveDraft("# Safe", 0);
+    const current = (await store.listArtifacts()).find((artifact) => artifact.kind === "current")!;
+    await writeFile(store.currentPath, "# Changed", "utf8");
+    await assert.rejects(() => store.readArtifact(current), /changed after it was listed/);
+    await assert.rejects(
+      () => store.readArtifact({ ...current, kind: "review", path: "../current.md" }),
+      /Invalid Plan review artifact path/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("read-only approved snapshot validates the archive without repairing storage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-approved-readonly-"));
+  try {
+    const missingStore = new PlanStore(join(root, "missing-workspace"), { rootDir: join(root, "global") });
+    const missingApproved = await missingStore.approve("# Missing archive", 0);
+    const missingManifestBefore = await readFile(missingStore.manifestPath, "utf8");
+    await rm(join(missingStore.plansDir, missingApproved.manifest.approvedPath!), { force: true });
+    const missingEntriesBefore = (await readdir(missingStore.plansDir, { recursive: true })).sort();
+
+    await assert.rejects(
+      () => missingStore.loadApprovedSnapshotReadOnly(),
+      /ENOENT|no such file|cannot find/i,
+    );
+    assert.equal(await readFile(missingStore.manifestPath, "utf8"), missingManifestBefore);
+    assert.deepEqual((await readdir(missingStore.plansDir, { recursive: true })).sort(), missingEntriesBefore);
+
+    const tamperedStore = new PlanStore(join(root, "tampered-workspace"), { rootDir: join(root, "global") });
+    const tamperedApproved = await tamperedStore.approve("# Original archive", 0);
+    const tamperedManifestBefore = await readFile(tamperedStore.manifestPath, "utf8");
+    await writeFile(join(tamperedStore.plansDir, tamperedApproved.manifest.approvedPath!), "# Tampered archive", "utf8");
+    const tamperedEntriesBefore = (await readdir(tamperedStore.plansDir, { recursive: true })).sort();
+
+    await assert.rejects(
+      () => tamperedStore.loadApprovedSnapshotReadOnly(),
+      /checksum does not match/,
+    );
+    assert.equal(await readFile(tamperedStore.manifestPath, "utf8"), tamperedManifestBefore);
+    assert.deepEqual((await readdir(tamperedStore.plansDir, { recursive: true })).sort(), tamperedEntriesBefore);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,32 @@
+{
+  "name": "pi-graph-terminal-ui",
+  "version": "0.1.2",
+  "description": "Fluent TUI for pi — a fast, fluent terminal interface over pi-rpc.",
+  "keywords": [
+    "pi",
+    "tui",
+    "terminal",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "bin": {
+    "pi-f": "bin/run.js",
+    "pi-graph-fluent-tui": "bin/run.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "pi-graph-terminal-ui-win32-x64": "0.1.2",
+    "pi-graph-terminal-ui-linux-x64": "0.1.2",
+    "pi-graph-terminal-ui-linux-arm64": "0.1.2",
+    "pi-graph-terminal-ui-darwin-x64": "0.1.2",
+    "pi-graph-terminal-ui-darwin-arm64": "0.1.2"
+  },
+  "scripts": {
+    "build:platform": "node scripts/build-platform.mjs"
+  }
+}

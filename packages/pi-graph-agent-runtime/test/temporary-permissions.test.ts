@@ -1,0 +1,202 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import type { AgentConfig } from "../src/agents/agents.ts";
+import {
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  ensurePrivateDirectory,
+  writePrivateTextFile,
+  writeSchemaFile,
+  writeSystemPromptFile,
+} from "../src/runs/execution.ts";
+import {
+  STRUCTURED_OUTPUT_FILE_MODE,
+  writeStructuredOutputFile,
+} from "../src/extension/structured-output.ts";
+
+const promptAgent: AgentConfig = {
+  name: "permission-test",
+  description: "Permission test",
+  tools: ["read"],
+  systemPromptMode: "append",
+  inheritProjectContext: true,
+  inheritSkills: false,
+  systemPrompt: "private prompt",
+  source: "builtin",
+  filePath: "permission-test.md",
+};
+
+function posixMode(filePath: string): number {
+  return fs.statSync(filePath).mode & 0o777;
+}
+
+test("private teammate helpers tighten existing directory and file modes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-teammate-permissions-"));
+  const directory = path.join(root, "existing");
+  const file = path.join(directory, "existing.txt");
+  try {
+    fs.mkdirSync(directory, { mode: 0o777 });
+    fs.writeFileSync(file, "old", { mode: 0o666 });
+    if (process.platform !== "win32") {
+      fs.chmodSync(directory, 0o777);
+      fs.chmodSync(file, 0o666);
+    }
+
+    ensurePrivateDirectory(directory);
+    writePrivateTextFile(file, "new private content");
+
+    assert.equal(fs.readFileSync(file, "utf8"), "new private content");
+    if (process.platform !== "win32") {
+      assert.equal(posixMode(directory), PRIVATE_DIRECTORY_MODE);
+      assert.equal(posixMode(file), PRIVATE_FILE_MODE);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prompt schema and reserved result files are private on creation", () => {
+  const correlationId = `permission-${randomUUID()}`;
+  const promptFile = writeSystemPromptFile(promptAgent, correlationId);
+  const { schemaFile, outputFile } = writeSchemaFile({ type: "object" }, correlationId);
+  try {
+    assert.match(fs.readFileSync(promptFile, "utf8"), /^private prompt/);
+    assert.match(fs.readFileSync(promptFile, "utf8"), /## Result publication discipline/);
+    assert.match(fs.readFileSync(promptFile, "utf8"), /## Coordination reporting discipline/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(schemaFile, "utf8")), { type: "object" });
+    assert.equal(fs.readFileSync(outputFile, "utf8"), "");
+    if (process.platform !== "win32") {
+      assert.equal(posixMode(path.dirname(promptFile)), PRIVATE_DIRECTORY_MODE);
+      assert.equal(posixMode(promptFile), PRIVATE_FILE_MODE);
+      assert.equal(posixMode(schemaFile), PRIVATE_FILE_MODE);
+      assert.equal(posixMode(outputFile), PRIVATE_FILE_MODE);
+    }
+  } finally {
+    fs.rmSync(promptFile, { force: true });
+    fs.rmSync(schemaFile, { force: true });
+    fs.rmSync(outputFile, { force: true });
+  }
+});
+
+test("child prompt inlines bounded search guidance instead of loading user-home templates", () => {
+  const promptFile = writeSystemPromptFile({
+    ...promptAgent,
+    systemPrompt:
+      "Review the target.\n~/.maestro/templates/search-tools.md\n@~/.maestro/templates/search-tools.md",
+  }, `search-discipline-${randomUUID()}`);
+  try {
+    const promptText = fs.readFileSync(promptFile, "utf8");
+    assert.doesNotMatch(promptText, /@?~\/\.maestro\/templates\/search-tools\.md/);
+    assert.match(promptText, /## Tool path and search discipline/);
+    assert.match(promptText, /supersedes any role instruction to load a user-home search template/);
+    assert.match(promptText, /Never search a filesystem root or drive root/);
+    assert.match(promptText, /`find \/`/);
+    assert.match(promptText, /give shell searches an explicit timeout/);
+  } finally {
+    fs.rmSync(promptFile, { force: true });
+  }
+});
+
+test("child prompt preserves compaction recovery discipline with and without Todo binding", () => {
+  for (const systemPromptMode of ["append", "replace"] as const) {
+    for (const todos of [undefined, ["#12"]]) {
+      const promptFile = writeSystemPromptFile({
+        ...promptAgent,
+        systemPromptMode,
+      }, `compact-recovery-${randomUUID()}`, { type: "object" }, todos);
+      try {
+        const prompt = fs.readFileSync(promptFile, "utf8");
+        assert.match(prompt, /## Compaction recovery discipline/);
+        assert.match(prompt, /original target, scope, acceptance condition, output contract, caller identity/);
+        assert.match(prompt, /even without an assigned Todo/);
+        assert.match(prompt, /searched paths and negative results/);
+        assert.match(prompt, /Compaction does not reset the task's cumulative budget/);
+        assert.match(prompt, /neither do replacement workers, task names, or approaches/);
+        assert.match(prompt, /same shared interface\/state machine and delivery blocker/);
+        assert.match(prompt, /report its necessity and any simpler equivalent option to the caller/);
+        assert.match(prompt, /rather than expanding the assignment or bypassing gates/);
+        assert.match(prompt, /correlation IDs and known result\/publication URIs/);
+        assert.match(prompt, /missing completion notification is not proof a child is still running/);
+        assert.match(prompt, /budget is exhausted, return the consolidated result/);
+        assert.match(prompt, /report the blocker to the caller instead of guessing/);
+        assert.match(prompt, /must finish by calling the structured_output tool exactly once/);
+      } finally {
+        fs.rmSync(promptFile, { force: true });
+      }
+    }
+  }
+});
+
+test("structured output tightens a pre-existing result file before writing", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-structured-permissions-"));
+  const outputFile = path.join(root, "result.json");
+  try {
+    fs.writeFileSync(outputFile, "stale", { mode: 0o666 });
+    if (process.platform !== "win32") fs.chmodSync(outputFile, 0o666);
+
+    writeStructuredOutputFile(outputFile, JSON.stringify({ ok: true }));
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(outputFile, "utf8")), { ok: true });
+    if (process.platform !== "win32") {
+      assert.equal(posixMode(outputFile), STRUCTURED_OUTPUT_FILE_MODE);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private writers refuse pre-existing symbolic-link targets", {
+  skip: process.platform === "win32",
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-private-symlink-"));
+  const target = path.join(root, "target.json");
+  const link = path.join(root, "result.json");
+  try {
+    fs.writeFileSync(target, "original");
+    fs.symlinkSync(target, link);
+    assert.throws(() => writePrivateTextFile(link, "replacement"), /not a regular file/);
+    assert.throws(() => writeStructuredOutputFile(link, "replacement"), /not a regular file/);
+    assert.equal(fs.readFileSync(target, "utf8"), "original");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("todo binding appends an assigned-task instruction to the child system prompt", () => {
+  const correlationId = `todo-prompt-${randomUUID()}`;
+  const plain = writeSystemPromptFile(promptAgent, correlationId);
+  const bound = writeSystemPromptFile(promptAgent, `todo-prompt-2-${randomUUID()}`, undefined, ["#12", "7"]);
+  try {
+    assert.match(fs.readFileSync(plain, "utf8"), /^private prompt/);
+    assert.match(fs.readFileSync(plain, "utf8"), /## Result publication discipline/);
+    assert.match(fs.readFileSync(plain, "utf8"), /## Coordination reporting discipline/);
+    const boundText = fs.readFileSync(bound, "utf8");
+    assert.match(boundText, /## Assigned Todo tasks/);
+    assert.match(boundText, /#12, #7/);
+    assert.match(boundText, /already active \(status=in_progress\)/);
+    assert.match(boundText, /Drive your queue with \`todo update\` only/);
+    assert.match(boundText, /private prompt/);
+    assert.match(boundText, /## Result publication discipline/);
+    assert.match(boundText, /## Coordination reporting discipline/);
+  } finally {
+    fs.rmSync(plain, { force: true });
+    fs.rmSync(bound, { force: true });
+  }
+});
+
+test("child system prompt does not append taskType behavior instructions", () => {
+  const promptFile = writeSystemPromptFile(promptAgent, `tasktype-prompt-${randomUUID()}`);
+  try {
+    const promptText = fs.readFileSync(promptFile, "utf8");
+    assert.match(promptText, /^private prompt/);
+    assert.match(promptText, /## Result publication discipline/);
+    assert.match(promptText, /## Coordination reporting discipline/);
+    assert.doesNotMatch(promptText, /Assigned taskType|routed as `explore`/);
+  } finally {
+    fs.rmSync(promptFile, { force: true });
+  }
+});

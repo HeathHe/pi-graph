@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "mappings": {
+    "analysis": "maestro-qwen/qwen3.8-max-preview"
+  },
+  "fallbackMappings": {
+    "explore": [
+      "maestro-openai/gpt-5.6-sol"
+    ],
+    "analysis": [
+      "maestro-openai/gpt-5.6-sol"
+    ],
+    "review": [
+      "maestro-qwen/qwen3.8-max"
+    ],
+    "debug": [
+      "maestro-qwen/qwen3.8-max"
+    ],
+    "development": [
+      "maestro-qwen/qwen3.8-max"
+    ],
+    "testing": [
+      "maestro-qwen/qwen3.8-max"
+    ],
+    "planning": [
+      "maestro-qwen/qwen3.8-max"
+    ]
+  },
+  "thinkingLevels": {
+    "explore": "low",
+    "analysis": "high"
+  }
+}

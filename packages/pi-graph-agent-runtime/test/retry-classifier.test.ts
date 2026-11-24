@@ -1,0 +1,363 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
+import {
+  classifyRetryError,
+  classifyRetryErrorDetailed,
+  extractRetryAfterMs,
+  isAuthError,
+  isFallbackProviderError,
+  isRetryableProviderError,
+  markPiRetryErrorCancelled,
+  normalizePiRetryErrorMessage,
+} from "../src/runs/retry.ts";
+
+test("standalone transport terminations and timeouts classify as network errors", () => {
+  // undici fetch aborts surface as a bare "terminated" error; pi-ai's own
+  // retry classifier treats it as transient, so the failover classifier must
+  // agree or the main agent and teammate paths silently skip retry/fallback.
+  assert.equal(classifyRetryError("Error: terminated"), "network");
+  assert.equal(classifyRetryError("terminated"), "network");
+  assert.equal(classifyRetryError("connection terminated"), "network");
+  assert.equal(classifyRetryError("Error: timeout"), "network");
+  assert.equal(classifyRetryError("request timed out"), "network");
+  assert.equal(classifyRetryError("fetch failed"), "network");
+  assert.equal(isRetryableProviderError("Error: terminated"), true);
+  assert.equal(isFallbackProviderError("Error: terminated"), true);
+});
+
+test("unknown provider failures and upstream HTTP/2 stream errors are retryable", () => {
+  const unknownError = "Error: An unknown error occurred";
+  const http2Error = "Error: stream_error: error: Upstream HTTP/2 stream failed, code: upstream_http2_stream_error, type: error";
+
+  assert.equal(classifyRetryError(unknownError), "provider");
+  assert.equal(isRetryableProviderError(unknownError), true);
+  assert.equal(isFallbackProviderError(unknownError), true);
+
+  const normalizedUnknown = normalizePiRetryErrorMessage(unknownError);
+  assert.equal(normalizedUnknown, `${unknownError} (service unavailable)`);
+  assert.equal(normalizePiRetryErrorMessage(normalizedUnknown), normalizedUnknown);
+  assert.equal(isRetryableAssistantError({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "openai",
+    model: "test-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: normalizedUnknown,
+    timestamp: 0,
+  }), true);
+
+  assert.equal(classifyRetryError(http2Error), "network");
+  assert.equal(isRetryableProviderError(http2Error), true);
+  const normalizedHttp2 = normalizePiRetryErrorMessage(http2Error);
+  assert.equal(normalizedHttp2, `${http2Error} (network error)`);
+  assert.equal(isRetryableAssistantError({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "openai",
+    model: "test-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: normalizedHttp2,
+    timestamp: 0,
+  }), true);
+  assert.equal(classifyRetryError("upstream_http2_stream_error"), "network");
+});
+
+test("upstream_stream_read_error is normalized into Pi-owned network retry", () => {
+  const upstreamStreamReadError = "Error: stream_error: error: Upstream response stream was interrupted, code: upstream_stream_read_error, type: error";
+
+  assert.deepEqual(classifyRetryErrorDetailed(upstreamStreamReadError), { kind: "network", defaulted: false });
+  assert.equal(classifyRetryError("upstream_stream_read_error"), "network");
+  assert.equal(isRetryableProviderError(upstreamStreamReadError), true);
+  assert.equal(isFallbackProviderError(upstreamStreamReadError), true);
+  const normalizedUpstreamStreamRead = normalizePiRetryErrorMessage(upstreamStreamReadError);
+  assert.equal(normalizedUpstreamStreamRead, `${upstreamStreamReadError} (network error)`);
+  assert.equal(normalizePiRetryErrorMessage(normalizedUpstreamStreamRead), normalizedUpstreamStreamRead);
+  assert.equal(classifyRetryError(upstreamStreamReadError, 401), "auth");
+  assert.equal(classifyRetryError(upstreamStreamReadError, 400), "non-retryable");
+  const cancelled = markPiRetryErrorCancelled(upstreamStreamReadError);
+  assert.equal(normalizePiRetryErrorMessage(cancelled), cancelled);
+  assert.equal(normalizePiRetryErrorMessage("upstream_stream_read_error: HTTP 400 bad request"),
+    "upstream_stream_read_error: HTTP 400 bad request");
+  assert.equal(isRetryableAssistantError({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "openai",
+    model: "test-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: normalizedUpstreamStreamRead,
+    timestamp: 0,
+  }), true);
+});
+
+test("stream_read_error is normalized into Pi-owned provider retry", () => {
+  const raw = "stream_read_error: upstream response body closed";
+  assert.equal(classifyRetryError(raw), "network");
+  assert.equal(classifyRetryError("Stream read error"), "network");
+  assert.equal(isRetryableProviderError(raw), true);
+  assert.equal(isFallbackProviderError(raw), true);
+
+  const normalized = normalizePiRetryErrorMessage(raw);
+  assert.equal(normalized, `${raw} (network error)`);
+  assert.equal(normalizePiRetryErrorMessage(normalized), normalized);
+  assert.equal(normalizePiRetryErrorMessage("context_length_exceeded"), "context_length_exceeded");
+  assert.equal(
+    normalizePiRetryErrorMessage("stream_read_error: HTTP 400 bad request"),
+    "stream_read_error: HTTP 400 bad request",
+  );
+  assert.equal(isRetryableAssistantError({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "openai",
+    model: "test-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: normalized,
+    timestamp: 0,
+  }), true);
+});
+
+test("host:port text in connection errors is not mistaken for an HTTP status", () => {
+  assert.equal(classifyRetryError("connect ECONNREFUSED 127.0.0.1:401"), "network");
+  assert.equal(classifyRetryError("connect ECONNREFUSED 10.0.0.1:403"), "network");
+  assert.equal(classifyRetryError("request to http://localhost:4000/v1 failed: connection refused"), "network");
+});
+
+test("auth failures classify as auth and are fallback-eligible but never retried", () => {
+  assert.equal(classifyRetryError("Unauthorized: invalid API key"), "auth");
+  assert.equal(classifyRetryError("HTTP 401 Unauthorized"), "auth");
+  assert.equal(classifyRetryError("status 403 forbidden"), "auth");
+  assert.equal(classifyRetryError("Error code: (401)"), "auth");
+  assert.equal(classifyRetryError("access token expired"), "auth");
+  assert.equal(classifyRetryError("authentication failed"), "auth");
+  assert.equal(isAuthError("invalid api key"), true);
+  assert.equal(isAuthError("connection reset"), false);
+  // A broken credential will not heal by retrying the same model — but a
+  // different model (with its own key) can recover, so fallback stays open.
+  assert.equal(isRetryableProviderError("HTTP 401 Unauthorized"), false);
+  assert.equal(isFallbackProviderError("Unauthorized: invalid API key"), true);
+});
+
+test("abort/cancellation diagnostics classify as non-retryable (never switch models on ESC)", () => {
+  // bash ESC interrupt can surface as stopReason="error" with an abort
+  // diagnostic when a transport/provider does not set stopReason="aborted".
+  // These are user/lifecycle cancellations, not model failures: retrying the
+  // same model or switching to a fallback would replay work the user stopped.
+  assert.equal(classifyRetryError("This operation was aborted"), "non-retryable");
+  assert.equal(classifyRetryError("The operation was aborted"), "non-retryable");
+  assert.equal(classifyRetryError("The user aborted a request"), "non-retryable");
+  assert.equal(classifyRetryError("Request was aborted"), "non-retryable");
+  assert.equal(classifyRetryError("Operation aborted"), "non-retryable");
+  assert.equal(classifyRetryError("aborted"), "non-retryable");
+  // Neither same-model retry nor fallback model switch should trigger.
+  assert.equal(isRetryableProviderError("This operation was aborted"), false);
+  assert.equal(isFallbackProviderError("This operation was aborted"), false);
+});
+
+test("a raced connect error can be marked as user-cancelled without losing its diagnostic", () => {
+  const raw = "connect ECONNREFUSED 127.0.0.1:401";
+  const cancelled = markPiRetryErrorCancelled(raw);
+  assert.equal(cancelled, `${raw} (The user aborted a request)`);
+  assert.equal(classifyRetryError(cancelled), "non-retryable");
+  assert.equal(isRetryableProviderError(cancelled), false);
+  assert.equal(markPiRetryErrorCancelled(cancelled), cancelled);
+  assert.equal(markPiRetryErrorCancelled(undefined), "The user aborted a request");
+  assert.equal(isRetryableAssistantError({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "openai",
+    model: "test-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: cancelled,
+    timestamp: 0,
+  }), false);
+});
+
+test("HTTP status short-circuits message text (authoritative)", () => {
+  assert.equal(classifyRetryError("Provider returned error", 401), "auth");
+  assert.equal(classifyRetryError("everything looks fine", 403), "auth");
+  assert.equal(classifyRetryError("random failure", 402), "fallback-only");
+  assert.equal(classifyRetryError("random failure", 429), "provider");
+  assert.equal(classifyRetryError("random failure", 503), "provider");
+  assert.equal(classifyRetryError("random failure", 400), "non-retryable");
+  assert.equal(classifyRetryError("random failure", 404), "non-retryable");
+  assert.equal(classifyRetryError("random failure", 422), "non-retryable");
+  // A sub-400 status leaves the message text in charge.
+  assert.equal(classifyRetryError("fetch failed", 200), "network");
+  // Statuses embedded in messages take the same authoritative path.
+  assert.equal(classifyRetryError("Provider error: 408"), "provider");
+  assert.equal(classifyRetryError("429 Too Many Requests"), "provider");
+});
+
+test("configured upstream model-unavailable failures switch candidates without same-model retry", () => {
+  const groupedAccountError =
+    'OpenAI API error (404): {"message":"Model \\"gpt-5.3-spark\\" is not supported by any configured account in this group","type":"model_not_found"}';
+  assert.equal(classifyRetryError(groupedAccountError), "fallback-only");
+  assert.equal(classifyRetryError("404 model_not_found", 404), "fallback-only");
+  assert.equal(
+    classifyRetryError('The model "retired-model" does not exist or you do not have access', 404),
+    "fallback-only",
+  );
+  assert.equal(
+    classifyRetryError('The model "retired-model" does not exist or you do not have access', 403),
+    "fallback-only",
+  );
+  assert.equal(isRetryableProviderError(groupedAccountError), false);
+  assert.equal(isFallbackProviderError(groupedAccountError), true);
+});
+
+test("Devin temporary third-party outages override a misleading invalid_argument classification", () => {
+  const raw = "Devin stream error invalid_argument: The third-party model provider is experiencing issues and is currently not available. Please try this model again later. (trace ID: trace-1)";
+
+  assert.equal(classifyRetryError(raw), "provider");
+  assert.equal(classifyRetryError(raw, 400), "provider");
+  assert.equal(isRetryableProviderError(raw), true);
+  assert.equal(isFallbackProviderError(raw), true);
+
+  const normalized = normalizePiRetryErrorMessage(raw);
+  assert.equal(normalized, `${raw} (service unavailable)`);
+  assert.equal(normalizePiRetryErrorMessage(normalized), normalized);
+  assert.equal(isRetryableAssistantError({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "devin",
+    model: "test-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: normalized,
+    timestamp: 0,
+  }), true);
+
+  const genuineInvalidArgument = "invalid_argument: reasoning_effort 'max' is not supported";
+  assert.equal(classifyRetryError(genuineInvalidArgument, 400), "non-retryable");
+  assert.equal(normalizePiRetryErrorMessage(genuineInvalidArgument), genuineInvalidArgument);
+});
+
+test("genuine permanent errors stay non-retryable and not fallback-eligible", () => {
+  assert.equal(classifyRetryError("context_length_exceeded"), "non-retryable");
+  assert.equal(classifyRetryError("invalid model: gpt-9"), "non-retryable");
+  assert.equal(classifyRetryError("validation error"), "non-retryable");
+  assert.equal(classifyRetryError("the child exited before the correction prompt started"), "non-retryable");
+  assert.equal(classifyRetryError("the partial response was not accepted as success"), "non-retryable");
+  assert.equal(isFallbackProviderError("context_length_exceeded"), false);
+});
+
+test("unrecognized failures default to retryable provider", () => {
+  // Real-world unknown diagnostics observed in failover events: these used to
+  // be judged permanent and killed runs; the default now retries/falls back.
+  assert.equal(classifyRetryError("Provider finish_reason: error"), "provider");
+  assert.equal(classifyRetryError("ERROR"), "provider");
+  assert.equal(classifyRetryError("some totally new failure mode"), "provider");
+  assert.equal(classifyRetryError(""), "provider");
+  assert.equal(classifyRetryError(undefined), "provider");
+  assert.equal(isRetryableProviderError("Provider finish_reason: error"), true);
+  assert.equal(isFallbackProviderError("ERROR"), true);
+});
+
+test("wrapped runtime diagnostics classify by their inner error, not the envelope", () => {
+  const wrap = (inner: string): string =>
+    `Teammate runtime error (phase=message_end, agent=general, model=p/m, correlationId=c-1): ${inner}`;
+  // Inner provider/network failures stay retryable and fallback-eligible even
+  // though the envelope names the teammate runtime.
+  assert.equal(classifyRetryError(wrap("ECONNRESET")), "network");
+  assert.equal(isFallbackProviderError(wrap("ECONNRESET")), true);
+  assert.equal(isRetryableProviderError(wrap("Provider overloaded: 503")), true);
+  // Inner local-infrastructure failures stay non-retryable.
+  assert.equal(classifyRetryError(wrap("failed to spawn pi subprocess: ENOENT")), "non-retryable");
+  assert.equal(isFallbackProviderError(wrap("failed to spawn pi subprocess: ENOENT")), false);
+  // The recurring-boundary suffix must not defeat classification either.
+  const recurring = `${wrap("ECONNRESET")} [recurred across turn boundary]`;
+  assert.equal(isFallbackProviderError(recurring), true);
+});
+
+test("provider and quota classes keep their existing routing", () => {
+  assert.equal(classifyRetryError("Provider overloaded: 503"), "provider");
+  assert.equal(classifyRetryError("402 insufficient_quota"), "fallback-only");
+  assert.equal(isRetryableProviderError("402 insufficient_quota"), false);
+  assert.equal(isFallbackProviderError("402 insufficient_quota"), true);
+});
+
+test("concurrency-limit wording without a status code classifies as retryable provider", () => {
+  assert.equal(classifyRetryError("concurrency_limit_error: Too many concurrent requests"), "provider");
+  assert.equal(classifyRetryError("maximum concurrent requests reached"), "provider");
+  assert.equal(classifyRetryError("Too many concurrent invokes"), "provider");
+  assert.equal(classifyRetryError("concurrency limit exceeded"), "provider");
+  assert.equal(classifyRetryError("too many simultaneous requests"), "provider");
+  assert.equal(classifyRetryError("You are sending requests too quickly"), "provider");
+  assert.equal(isRetryableProviderError("Too many concurrent invokes"), true);
+  assert.equal(isFallbackProviderError("concurrency limit exceeded"), true);
+});
+
+test("Python-style transport names classify as retryable", () => {
+  assert.equal(classifyRetryError("requests.exceptions.ConnectionError: Max retries exceeded"), "network");
+  assert.equal(classifyRetryError("ConnectionResetError: connection reset by peer"), "network");
+  assert.equal(classifyRetryError("urllib3 ConnectionRefusedError"), "network");
+  assert.equal(classifyRetryError("BrokenPipeError: [Errno 32]"), "network");
+  assert.equal(classifyRetryError("TimeoutError: Read timed out"), "network");
+  assert.equal(isRetryableProviderError("ConnectionResetError"), true);
+});
+
+test("retry-after hints parse into relative delays", () => {
+  const now = 1_800_000_000_000;
+  assert.equal(extractRetryAfterMs("Retry-After: 30", now), 30_000);
+  assert.equal(extractRetryAfterMs("retry-after: 120", now), 120_000);
+  assert.equal(extractRetryAfterMs("x-ratelimit-reset-ms: 1800000300000", now), 300_000);
+  assert.equal(extractRetryAfterMs("x-ratelimit-reset: 1800000300", now), 300_000);
+  assert.equal(extractRetryAfterMs("reset at 2027-01-01T00:00:00Z", Date.parse("2027-01-01T00:00:00Z")), 0);
+  assert.equal(extractRetryAfterMs("no hints here", now), undefined);
+  assert.equal(extractRetryAfterMs(undefined), undefined);
+  // A bare status code is not a retry hint.
+  assert.equal(extractRetryAfterMs("Provider overloaded: 503", now), undefined);
+});

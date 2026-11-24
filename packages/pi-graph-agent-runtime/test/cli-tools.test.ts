@@ -1,0 +1,330 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import test from "node:test";
+import {
+  cliToolArgv,
+  cliToolCommand,
+  getEnabledTools,
+  getGlobalCliToolsConfigPath,
+  getProjectCliToolsConfigPath,
+  loadMaestroDelegateConfig,
+  loadCliToolsConfig,
+  probeCliToolCommand,
+  resolveSshHostConfigOf,
+  sshHostConfigIssue,
+  sshHostConfigOf,
+  toCliToolModelEntries,
+  type CliToolConfig,
+  type CliToolsConfig,
+} from "../src/cli-tools/cli-tools-config.ts";
+import {
+  cliToolNameFromModel,
+  isCliToolModel,
+} from "../src/cli-tools/local-acp.ts";
+import { registerSshHostProvider } from "../src/public/v1/ssh-hosts.ts";
+
+const baseConfig: CliToolsConfig = {
+  version: "1",
+  tools: {
+    codex: {
+      enabled: true,
+      command: "codex",
+      env: ["OPENAI_API_KEY"],
+    },
+    "no-exec": {
+      enabled: true,
+    },
+    "with-args": {
+      enabled: true,
+      command: "node",
+      args: ["--version"],
+      env: ["OPENAI_API_KEY"],
+    },
+    disabled: {
+      enabled: false,
+    },
+  },
+};
+
+test("getEnabledTools filters disabled tools", () => {
+  const tools = getEnabledTools(baseConfig).map(({ name }) => name);
+  assert.deepEqual(tools, ["codex", "no-exec", "with-args"]);
+});
+
+test("cliToolCommand falls back to the tool name; cliToolArgv appends args", () => {
+  assert.equal(cliToolCommand("codex", baseConfig.tools["codex"]!), "codex");
+  assert.deepEqual(cliToolArgv("codex", baseConfig.tools["codex"]!), ["codex"]);
+  assert.equal(cliToolCommand("with-args", baseConfig.tools["with-args"]!), "node");
+  assert.deepEqual(cliToolArgv("with-args", baseConfig.tools["with-args"]!), ["node", "--version"]);
+});
+
+test("sshHostConfigOf preserves legacy inline fields and rejects incomplete or mixed sources", () => {
+  const complete: CliToolConfig = {
+    enabled: true,
+    mode: "ssh",
+    host: "devbox",
+    user: "dyw",
+    port: 22,
+    hostKeySha256: "SHA256:abc",
+    identityFile: "~/.ssh/id_ed25519",
+  };
+  assert.deepEqual(sshHostConfigOf(complete), {
+    host: "devbox",
+    user: "dyw",
+    port: 22,
+    hostKeySha256: "SHA256:abc",
+    identityFile: "~/.ssh/id_ed25519",
+  });
+  assert.equal(sshHostConfigOf({ enabled: true, mode: "ssh", host: "devbox" }), null);
+  assert.equal(sshHostConfigOf({ enabled: true, mode: "ssh", host: "devbox", user: "u", port: 99999, hostKeySha256: "SHA256:abc" }), null);
+  assert.equal(sshHostConfigOf({ enabled: true, mode: "ssh", sshHostRef: "managed-1" }), null);
+  assert.match(
+    sshHostConfigIssue({ enabled: true, mode: "ssh", sshHostRef: "managed-1", port: 2222 }) ?? "",
+    /cannot be combined/,
+  );
+  assert.match(sshHostConfigIssue({ enabled: true, mode: "ssh", sshHostRef: " " }) ?? "", /non-empty/);
+  // local tools never need ssh fields
+  assert.equal(sshHostConfigOf({ enabled: true }), null);
+});
+
+test("resolveSshHostConfigOf maps a fresh manager profile without copying credentials", async () => {
+  let resolutions = 0;
+  const registration = registerSshHostProvider({
+    async list() { return []; },
+    async resolve(hostRef) {
+      resolutions += 1;
+      return {
+        id: hostRef,
+        label: "Managed",
+        host: "managed.example.test",
+        user: "runner",
+        port: 2222,
+        shell: "bash",
+        hostKeySha256: `SHA256:${"A".repeat(43)}`,
+        authentication: { kind: "identity", identityFile: "/home/runner/.ssh/id_ed25519" },
+      };
+    },
+  });
+  try {
+    const config = { enabled: true, mode: "ssh" as const, sshHostRef: "managed-1" };
+    assert.deepEqual(await resolveSshHostConfigOf(config), {
+      host: "managed.example.test",
+      user: "runner",
+      port: 2222,
+      hostKeySha256: `SHA256:${"A".repeat(43)}`,
+      identityFile: "/home/runner/.ssh/id_ed25519",
+    });
+    await resolveSshHostConfigOf(config);
+    assert.equal(resolutions, 2, "each new connection resolves the reference again");
+  } finally {
+    registration.dispose();
+  }
+});
+
+test("probeCliToolCommand reports reachable and missing local executables", () => {
+  const reachable = probeCliToolCommand("reachable-probe", {
+    enabled: true,
+    command: "node",
+  });
+  assert.equal(reachable.ok, true);
+  assert.equal(reachable.command, "node");
+
+  const missing = probeCliToolCommand("missing-probe", {
+    enabled: true,
+    command: "definitely-not-a-real-executable-xyz",
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error ?? "", /not found|unreachable/);
+});
+
+test("probeCliToolCommand names the install package for known ACP adapters", () => {
+  const codex = probeCliToolCommand("codex-adapter-missing-probe", {
+    enabled: true,
+    command: "codex-acp",
+  });
+  assert.equal(codex.ok, false);
+  assert.match(codex.error ?? "", /npm i -g @agentclientprotocol\/codex-acp/);
+
+  // Windows launcher shims resolve to the same hint.
+  const shim = probeCliToolCommand("codex-shim-missing-probe", {
+    enabled: true,
+    command: "C:\\definitely\\missing\\codex-acp.cmd",
+  });
+  assert.equal(shim.ok, false);
+  assert.match(shim.error ?? "", /npm i -g @agentclientprotocol\/codex-acp/);
+
+  // Unknown commands stay hint-free.
+  const unknown = probeCliToolCommand("unknown-adapter-missing-probe", {
+    enabled: true,
+    command: "some-other-tool",
+  });
+  assert.equal(unknown.ok, false);
+  assert.doesNotMatch(unknown.error ?? "", /npm i -g/);
+});
+
+test("probeCliToolCommand validates absolute executable paths directly", () => {
+  const reachable = probeCliToolCommand("absolute-reachable-probe", {
+    enabled: true,
+    command: process.execPath,
+  });
+  assert.equal(reachable.ok, true);
+  assert.equal(reachable.command, process.execPath);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-tools-absolute-probe-"));
+  const missingPath = path.join(dir, "missing-executable");
+  const missing = probeCliToolCommand("absolute-missing-probe", {
+    enabled: true,
+    command: missingPath,
+  });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error, `executable ${JSON.stringify(missingPath)} does not exist`);
+
+  const nonFile = probeCliToolCommand("absolute-non-file-probe", {
+    enabled: true,
+    command: dir,
+  });
+  assert.equal(nonFile.ok, false);
+  assert.equal(nonFile.error, `executable ${JSON.stringify(dir)} is not a file`);
+
+  const unusablePath = `${path.join(dir, "invalid-executable")}\0`;
+  const unusable = probeCliToolCommand("absolute-unusable-probe", {
+    enabled: true,
+    command: unusablePath,
+  });
+  assert.equal(unusable.ok, false);
+  assert.equal(unusable.error, `executable ${JSON.stringify(unusablePath)} is unusable`);
+  assert.doesNotMatch(unusable.error, /\0/);
+});
+
+test("probeCliToolCommand caches by the resolved command, not by the tool name", () => {
+  // Two registrations may serve the same `cli/<tool>` route with different
+  // executables, so a verdict cached under the route name would validate the
+  // second registration against the first one's binary for the whole TTL.
+  const first = probeCliToolCommand("shared-route", { enabled: true, command: "node" });
+  assert.equal(first.ok, true);
+
+  const second = probeCliToolCommand("shared-route", {
+    enabled: true,
+    command: "definitely-not-a-real-executable-xyz",
+  });
+  assert.equal(second.command, "definitely-not-a-real-executable-xyz");
+  assert.equal(second.ok, false);
+});
+
+test("ssh probe fails closed on incomplete config; optimistic pass on complete config", () => {
+  const incomplete = probeCliToolCommand("ssh-incomplete", {
+    enabled: true,
+    mode: "ssh",
+    host: "devbox",
+  });
+  assert.equal(incomplete.ok, false);
+  assert.match(incomplete.error ?? "", /sshHostRef or host, user and hostKeySha256/);
+
+  const referenced = probeCliToolCommand("ssh-reference-optimistic", {
+    enabled: true,
+    mode: "ssh",
+    sshHostRef: "managed-probe",
+    command: "codex",
+  });
+  assert.equal(referenced.ok, true, "a complete reference starts a real async provider/remote probe");
+
+  // Complete config optimistically passes while the async probe runs.
+  const complete = probeCliToolCommand("ssh-optimistic", {
+    enabled: true,
+    mode: "ssh",
+    host: "127.0.0.1",
+    user: "u",
+    port: 22,
+    hostKeySha256: "SHA256:abc",
+    command: "codex",
+  });
+  assert.equal(complete.ok, true);
+});
+
+test("toCliToolModelEntries exposes reachable tools as cli/<tool> and skips missing", () => {
+  const entries = toCliToolModelEntries({
+    version: "1",
+    tools: {
+      reachable: {
+        enabled: true,
+        command: "node",
+      },
+      unreachable: {
+        enabled: true,
+        command: "definitely-not-a-real-executable-xyz",
+      },
+      "ssh-incomplete": {
+        enabled: true,
+        mode: "ssh",
+        host: "devbox",
+      },
+    },
+  });
+  assert.deepEqual(entries.map((entry) => `${entry.provider}/${entry.id}`), ["cli/reachable"]);
+  assert.equal(entries[0]?.reasoning, false);
+});
+
+test("cli tool model specifier helpers", () => {
+  assert.equal(isCliToolModel("cli/codex"), true);
+  assert.equal(isCliToolModel("cli/"), false);
+  assert.equal(isCliToolModel("codex"), false);
+  assert.equal(isCliToolModel("cli/a/b"), false);
+  assert.equal(cliToolNameFromModel("cli/codex"), "codex");
+});
+
+test("loadCliToolsConfig merges project over global and returns null without files", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-tools-config-"));
+  const globalFile = path.join(dir, "global.json");
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+  const projectFile = getProjectCliToolsConfigPath(projectDir);
+
+  fs.writeFileSync(globalFile, JSON.stringify({
+    version: "1",
+    tools: {
+      globalOnly: { enabled: true, command: "node" },
+      shared: { enabled: true, command: "node" },
+      hidden: { enabled: true, command: "node" },
+    },
+  }));
+  fs.writeFileSync(projectFile, JSON.stringify({
+    version: "2",
+    tools: {
+      shared: { enabled: true, command: "node", args: ["--version"] },
+      hidden: { enabled: false },
+      projectOnly: { enabled: true, mode: "ssh", host: "devbox", user: "u", port: 22, hostKeySha256: "SHA256:abc" },
+    },
+  }));
+
+  const merged = loadCliToolsConfig(projectDir, globalFile);
+  assert.ok(merged);
+  assert.deepEqual(Object.keys(merged.tools).sort(), ["globalOnly", "hidden", "projectOnly", "shared"]);
+  assert.deepEqual(merged.tools["shared"]!.args, ["--version"]);
+  assert.equal(merged.tools["hidden"]!.enabled, false);
+  assert.equal(merged.version, "2");
+
+  const emptyDir = path.join(dir, "empty");
+  fs.mkdirSync(emptyDir, { recursive: true });
+  assert.equal(loadCliToolsConfig(emptyDir, path.join(dir, "missing.json")), null);
+  assert.equal(getGlobalCliToolsConfigPath(), path.join(os.homedir(), ".pi", "agent", "teammate-cli-tools.json"));
+});
+
+test("loadMaestroDelegateConfig parses the legacy cli-tools.json shape", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-tools-legacy-"));
+  const legacyFile = path.join(dir, "cli-tools.json");
+  fs.writeFileSync(legacyFile, JSON.stringify({
+    version: "1.1.0",
+    tools: {
+      claude: { enabled: true, primaryModel: "claude-opus-4-6", tags: ["fullstack"], type: "builtin" },
+      codex: { enabled: true, primaryModel: "gpt-5.5", tags: [], type: "builtin", acp: { command: "codex" } },
+    },
+    roles: {},
+  }));
+  const config = loadMaestroDelegateConfig(legacyFile);
+  assert.ok(config);
+  assert.equal(config.tools["claude"]!.primaryModel, "claude-opus-4-6");
+  assert.equal(config.tools["codex"]!.acp!.command, "codex");
+  assert.equal(loadMaestroDelegateConfig(path.join(dir, "missing.json")), null);
+});

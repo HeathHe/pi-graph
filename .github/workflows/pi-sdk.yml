@@ -1,0 +1,44 @@
+name: Pi SDK compatibility
+
+on:
+  pull_request:
+    paths:
+      - package.json
+      - package-lock.json
+      - packages/*/package.json
+      - scripts/workspace-identities.test.mjs
+      - packages/pi-graph/test/sdk-resolution-contract.test.mjs
+      - .github/dependabot.yml
+      - .github/workflows/pi-sdk.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-sdk-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install locked development dependencies without plugin setup
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify workspace identities and links
+        run: node --test scripts/workspace-identities.test.mjs
+      - name: Verify SDK versions and host-provided package boundaries
+        run: node --test packages/pi-graph/test/sdk-resolution-contract.test.mjs
+      - name: Check extension SDK types
+        run: |
+          npm --prefix packages/pi-graph-dashboard run typecheck
+          npm --prefix packages/pi-graph-agent-runtime run typecheck
+          npm --prefix packages/pi-graph run typecheck
+      - name: Verify native edit ownership
+        working-directory: packages/pi-graph-dashboard
+        run: node --test --experimental-transform-types --test-name-pattern='native quiet decorates|UTF8 tool_call policy' tests/native-host.test.ts

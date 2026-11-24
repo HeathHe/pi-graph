@@ -1,0 +1,166 @@
+---
+name: team-review
+description: "Unified team skill for code review. 3-role pipeline: scanner, reviewer, fixer. Triggers on team-review."
+allowed-tools: teammate Read Write Edit Bash Glob Grep observe maestro
+disable-model-invocation: true
+session-mode: run
+contract:
+  contract_version: 2.1
+  consumes: []
+  produces:
+    - {path: outputs/scan, kind: review-scan-collection, schema: review-scan-collection/1.0, role: attachment, required: false}
+    - {path: outputs/review, kind: review-findings-collection, schema: review-findings-collection/1.0, role: primary, required: false}
+    - {path: outputs/fix, kind: review-fix-collection, schema: review-fix-collection/1.0, role: attachment, required: false}
+  gates: {entry: [], exit: []}
+---
+
+<teammate_contract>
+
+- `background: false` is the default. Use foreground dispatch whenever the result determines the current answer or next action.
+- Use `background: true` only for independent work. If this turn must consume a background result, call `observe` exactly once with `action: "wait"` and a bounded timeout before continuing; never continue independently while the result is pending.
+- Otherwise end the turn and wait for the automatic `teammate-complete` notification. Do not rely on `SendMessage`, `team_msg`, or hook callbacks as completion signals.
+- Never silently ignore an unfinished dispatch.
+
+</teammate_contract>
+
+<required_reading>
+~/.maestro/workflows/run-mode-lite.md
+</required_reading>
+
+# Team Review
+
+Orchestrate multi-agent code review: scanner -> reviewer -> fixer. Toolchain + LLM scan, deep analysis with root cause enrichment, and automated fix with rollback-on-failure.
+
+## Architecture
+
+```
+Skill(skill="team-review", args="task description")
+                    |
+         SKILL.md (this file) = Router
+                    |
+     +--------------+--------------+
+     |                             |
+  no --role flag              --role <name>
+     |                             |
+  Coordinator                  Worker
+  roles/coordinator/role.md    roles/<name>/role.md
+     |
+     +-- analyze -> dispatch -> spawn workers -> STOP
+                                    |
+                    +-------+-------+-------+
+                    v       v       v
+                [scan]  [review]  [fix]
+                team-worker agents, each loads roles/<role>/role.md
+```
+
+## Role Registry
+
+| Role | Path | Prefix | Inner Loop |
+|------|------|--------|------------|
+| coordinator | [roles/coordinator/role.md](roles/coordinator/role.md) | — | — |
+| scanner | [roles/scanner/role.md](roles/scanner/role.md) | SCAN-* | false |
+| reviewer | [roles/reviewer/role.md](roles/reviewer/role.md) | REV-* | false |
+| fixer | [roles/fixer/role.md](roles/fixer/role.md) | FIX-* | true |
+
+## Role Router
+
+Parse `$ARGUMENTS`:
+- Has `--role <name>` -> Read `roles/<name>/role.md`, execute Phase 2-4
+- No `--role` -> `@roles/coordinator/role.md`, execute entry router
+
+## Shared Constants
+
+- **Session prefix**: `RV`
+- **Session path**: `{run_dir}/work/team/`
+- **Team name**: `review`
+- **CLI tools**: `teammate({ agent: "general", taskType: "analysis" })` (read-only), `teammate({ agent: "general", taskType: "development" })` (modifications)
+- **Message bus**: `mcp__maestro__team_msg(session_id=<run-id>, ...)`
+
+## Worker Spawn Template
+
+Coordinator spawns workers using this template:
+
+```
+teammate({ agent: "team-worker", tasks: [{ taskType: "<task_type>", name: "<role>", prompt: `## Role Assignment
+role: <role>
+role_spec: <skill_root>/roles/<role>/role.md
+session: {run_dir}/work/team
+session_id: <run-id>
+team_name: review
+requirement: <task-description>
+inner_loop: <true|false>
+
+## Progress Milestones
+session_id: <run-id>
+Report progress via team_msg at natural phase boundaries (context loaded -> core work done -> verification).
+Report blockers immediately via team_msg type="blocker".
+Report completion via team_msg type="task_complete" after final SendMessage.
+
+Read role_spec file (@<skill_root>/roles/<role>/role.md) to load Phase 2-4 domain instructions.
+Execute built-in Phase 1 (task discovery) -> role Phase 2-4 -> built-in Phase 5 (report).`, description: "Spawn <role> worker" }], background: true })
+```
+
+## User Commands
+
+| Command | Action |
+|---------|--------|
+| `check` / `status` | View pipeline status graph |
+| `resume` / `continue` | Advance to next step |
+| `--full` | Enable scan + review + fix pipeline |
+| `--fix` | Fix-only mode (skip scan/review) |
+| `-q` / `--quick` | Quick scan only |
+| `--dimensions=sec,cor,prf,mnt` | Custom dimensions |
+| `-y` / `--yes` | Skip confirmations |
+
+## Completion Action
+
+When pipeline completes, coordinator presents:
+
+```
+ask user ({
+  questions: [{
+    question: "Review pipeline complete. What would you like to do?",
+    header: "Completion",
+    multiSelect: false,
+    options: [
+      { label: "Archive & Clean (Recommended)", description: "Archive session, clean up team" },
+      { label: "Keep Active", description: "Keep session for follow-up work" },
+      { label: "Export Results", description: "Export deliverables to target directory" }
+    ]
+  }]
+})
+```
+
+## Session Directory
+
+```
+{run_dir}/
+├── outputs/
+│   ├── scan/               # Scanner output
+│   ├── review/             # Reviewer output
+│   └── fix/                # Fixer output
+├── report.md              # Human-readable synthesis + handoff
+└── work/team/             # Team coordination (non-artifact)
+    ├── .msg/messages.jsonl # Team message bus
+    ├── .msg/meta.json      # Message-bus state + cross-role state
+    └── wisdom/             # Cross-task knowledge
+```
+
+## Specs Reference
+
+- [specs/pipelines.md](specs/pipelines.md) — Pipeline definitions and task registry
+- [specs/dimensions.md](specs/dimensions.md) — Review dimension definitions (SEC/COR/PRF/MNT)
+- [specs/finding-schema.json](specs/finding-schema.json) — Finding data schema
+- [specs/team-config.json](specs/team-config.json) — Team configuration
+
+## Error Handling
+
+| Scenario | Resolution |
+|----------|------------|
+| Unknown --role value | Error with available role list |
+| Role not found | Error with expected path (roles/<name>/role.md) |
+| CLI tool fails | Worker fallback to direct implementation |
+| Scanner finds 0 findings | Report clean, skip review + fix |
+| User declines fix | Delete FIX tasks, complete with review-only results |
+| Fast-advance conflict | Coordinator reconciles on next callback |
+| Completion action fails | Default to Keep Active |

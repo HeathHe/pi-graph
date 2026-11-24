@@ -1,18 +1,175 @@
-/node_modules
-dist/
-coverage/
-*.log
-.DS_Store
-.env
-.env.*
-!.env.example
-.pi/
-.pi-subagents/
-/.dsh/
+# Dependencies
+node_modules/
 
-# Legacy installed pi-subagents patch backups are local evidence, not package source.
-/maintenance/native-runtime/backup-*
-/maintenance/native-runtime/target-*
-/maintenance/native-runtime/native-patch-manifest.json
-*.tgz
-/.test-evidence/
+# Build output
+dist/
+*.tsbuildinfo
+
+# IDE & editor
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+# Ignore local script scratch directories, not the maintained source trees.
+scripts
+!/scripts/
+!/.pi/skills/team-swarm/scripts/
+!/optional/skills/scholar-thesis-docx/scripts/
+!/packages/pi-graph-terminal-ui/scripts/
+!/packages/pi-graph/scripts/
+!/packages/pi-graph-agent-runtime/scripts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pi / Maestro runtime artifacts (see .workflow/specs/ for tracked config)
+.history/
+.pi/settings.local.json
+.pi/scratch/
+# Per-workspace Experts Mode runtime state may contain prompt previews.
+**/.experts-mode.json
+# Runtime capture records under .pi/agents stay ignored; role definitions
+# and the executor report schema are versioned package inputs.
+.pi/agents/*
+!.pi/agents/*.md
+!/.pi/agents/general-executor-report.schema.json
+# Runtime monitor ledger (per-session binding/supervision trace).
+.pi/monitor-ledger.jsonl
+# Runtime Monitor sessions and editable delegation drafts.
+.pi/monitor-sessions/
+.pi/delegations/
+# Flow-schedule v2 runtime state (owner identity, leases, dispatches, schedules).
+.pi/flow-schedule/
+# Gateway runtime state (boards, jobs, sessions, tasks, and private receipts).
+.pi/gateway/
+# Materialized by prepare-package-skills/sync-pi; canonical sources live at
+# the workspace root .pi.
+packages/pi-graph/.pi/
+
+# Sync toolchain staging dir (replaces the old tracked flow/ mirror)
+.pi-sync/
+.maestro-lifecycle.coordinator
+.workflow/*.pid
+.workflow/*.lock
+.workflow/.backups/
+.workflow/recovery/
+.workflow/.csv-wave/
+.workflow/.maestro/
+.workflow/.scratchpad/
+.workflow/sessions/
+.workflow/embedding-index.bin
+.workflow/embedding.zvec/
+.workflow/embedding.zvec.meta.json
+.workflow/explore/
+.workflow/impeccable/
+.workflow/kg/
+.workflow/search-cache.json
+.workflow/search-daemon.json
+.workflow/spec-analytics.jsonl
+.workflow/specs/.hit-log.jsonl
+.workflow/specs/learnings.md
+.workflow/specs/quality-rules.md
+.workflow/specs/test-conventions.md
+.workflow/specs/ui-conventions.md
+.workflow/state.json
+.workflow/tmp/
+.workflow/swarms/
+.workflow/wiki-index.json
+
+# Scratch session artifacts
+.workflow/scratch/*/.history/
+.workflow/scratch/*/.summaries/
+.workflow/scratch/*/.task/
+.workflow/scratch/*/evidence.ndjson
+.workflow/scratch/*/session.json
+.workflow/scratch/*/tasks.csv
+.workflow/scratch/*/wave-*-results.csv
+.workflow/scratch/*/verify-*.txt
+.workflow/scratch/*/verify-*.md
+.workflow/scratch/*/execute-stage.patch
+.workflow/scratch/*/*.ndjson
+.workflow/scratch/*/*.csv
+.workflow/scratch/*/*.txt
+.workflow/scratch/*/*.patch
+
+# Nested package artifacts
+packages/*/dist/
+# The Nut compatibility packages track and ship this compiled output.
+!/packages/pi-graph-desktop-automation/dist/
+!/packages/pi-graph-desktop-shared/dist/
+!/packages/pi-graph-desktop-provider-api/dist/
+packages/*/node_modules/
+packages/*/package/
+packages/*/.workflow/
+packages/*/.tmp-*.log
+packages/*/.verify-*.ts
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Local development sandboxes
+.local/
+
+# Misc
+nul
+.pi/model-failover.json
+
+# Reference clones (nested repos, not vendored)
+.references/
+.reference/
+
+# Team swarm runtime session artifacts
+.workflow/.team/
+
+# One-off tooling scratch
+add-imports.mjs
+idx-names.txt
+
+# Eval artifacts (pi-terminal-bench / tbench21 runs)
+.cache/
+filter.py
+instr.txt
+
+# self-evolve runtime artifacts (global output lives in ~/.maestro/self-evolve)
+.pi/self-evolve/
+.pi/self-evolve.json
+
+# Local analysis scratch (unpacked npm sources, diagnostic dumps)
+.tmp-analysis/
+.tmp/
+# Pi session transcript logs
+pi-session-*.html
+# Devin CLI usage stats page (local generated report)
+devin-cli-stats.html
+# Unrelated local Python experiment scripts
+/fit_engine*.py
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/combined.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/01.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/02.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/03.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/04.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/05.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/06.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/07.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/08.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/09.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/10.jpg
+wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/11.jpg
+
+# Reverse-engineering artifacts (devin.exe analysis dump)
+devin-re/
+
+# Rust build artifacts
+pi-tui/target/
+pi-tui/target-check/
+pi-tui/target-test/
+pi-tui/spikes/*/target/
+packages/pi-graph-terminal-ui/platforms/
+target-check/
+
+# Preserve the upstream-tracked root Claude permissions fixture despite global excludes.
+!/.claude/settings.local.json

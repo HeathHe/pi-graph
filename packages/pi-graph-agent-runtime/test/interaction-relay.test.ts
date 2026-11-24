@@ -1,0 +1,752 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { PassThrough } from "node:stream";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  createTeammateDirectChildRequestHandler,
+  handleChildInteractionRequest,
+  handleChildRpcUiRequest,
+  handleProxyRequest,
+  checkActiveAgentBudget,
+  resolveAgentCorrelationId,
+  settleAgent,
+  sweepFailedAgents,
+  FAILED_AGENT_RETENTION_MS,
+} from "../src/extension/index.ts";
+import { dispatchChildIpcMessage } from "../src/runs/execution.ts";
+import { createChildProxyRequest, resolveChildProxyRequest } from "../src/extension/teammate-core.ts";
+import {
+  getTeammateChildExtensions,
+  getTeammateChildToolBroker,
+  getTeammatePermissionBroker,
+  registerTeammateChildExtension,
+  registerTeammateChildToolBroker,
+  registerTeammatePermissionBroker,
+  resolvedRunLocation,
+} from "../src/runs/child-extensions.ts";
+import type { ActiveAgent, TeammateState } from "../src/shared/types.ts";
+
+function createState(): { state: TeammateState; agent: ActiveAgent } {
+  const agent: ActiveAgent = {
+    agent: "general",
+    name: "reviewer",
+    correlationId: "child-12345678",
+    startedAt: Date.now(),
+    abortController: new AbortController(),
+    inbox: [],
+    outputLog: [],
+    lastActivityAt: Date.now(),
+    status: "running",
+    depth: 0,
+    sleepMs: 0,
+  };
+  return {
+    agent,
+    state: {
+      baseCwd: "D:/workspace",
+      currentSessionId: "main",
+      activeRuns: new Map([[agent.correlationId, agent]]),
+      namedAgents: new Map([[agent.name!, agent.correlationId]]),
+    },
+  };
+}
+
+function createPi() {
+  const messages: unknown[] = [];
+  const events: unknown[] = [];
+  const pi = {
+    sendMessage(message: unknown) { messages.push(message); },
+    events: { emit(name: string, payload: unknown) { events.push({ name, payload }); } },
+  } as unknown as ExtensionAPI;
+  return { pi, messages, events };
+}
+
+test("question broker workspace resolution is wired at root and nested task creation", async () => {
+  const base = resolve("workspace");
+  assert.equal(resolvedRunLocation(undefined, base), base);
+  assert.equal(resolvedRunLocation("child", base), resolve(base, "child"));
+  assert.equal(resolvedRunLocation("remote:worker", base), "remote:worker");
+  const root = await readFile(new URL("../src/extension/index.ts", import.meta.url), "utf8");
+  const nested = await readFile(new URL("../src/extension/teammate-proxy.ts", import.meta.url), "utf8");
+  assert.match(root, /cwd: resolvedRunLocation\(task\.cwd \?\? params\.cwd, state\.baseCwd \|\| ctx\.cwd\)/);
+  assert.match(nested, /cwd: normalizedTasks \? undefined : resolvedRunLocation\(singleTask\.cwd \?\? p\.cwd, dispatchOriginCwd\)/);
+  assert.match(nested, /cwd: resolvedRunLocation\(task\.cwd \?\? p\.cwd, dispatchOriginCwd\)/);
+});
+
+test("root question broker returns advisory decisions in headless mode using authoritative task cwd", async () => {
+  const { state, agent } = createState();
+  agent.cwd = "D:/workspace/child-project";
+  const { pi } = createPi();
+  const replies: unknown[] = [];
+  const decisions = [{ questionIndex: 0, question: "Which helper?", evaluation: { owner: "internal", advice: { recommendation: "Reuse helper" } } }];
+  const dispose = registerTeammateChildToolBroker("ask-user-question", async (request) => {
+    assert.equal(request.actor.cwd, agent.cwd);
+    assert.deepEqual(request.input, { questions: [{ question: "Which helper?" }] });
+    return { content: [{ type: "text", text: "Machine recommendation, not a user answer" }], details: { answers: [], decisions } };
+  });
+  try {
+    await handleChildInteractionRequest(pi, state, { requestId: "question-policy", interaction: "question", correlationId: agent.correlationId, payload: { questions: [{ question: "Which helper?" }], cwd: "D:/forged", decisions: [{ approved: true }] } }, (message) => replies.push(message), { hasUI: false } as ExtensionContext);
+    assert.deepEqual(replies, [{ type: "teammate_interaction_response", requestId: "question-policy", result: { action: "answer", answers: [], decisions } }]);
+  } finally { dispose(); }
+});
+
+test("root question broker forwards timeout recommendations without converting them to human answers", async () => {
+  const { state, agent } = createState();
+  const { pi } = createPi();
+  const replies: unknown[] = [];
+  const questions = [{ question: "Which helper?", options: [{ label: "A", recommended: true }, { label: "B" }] }];
+  const recommendations = [{ questionIndex: 0, question: "Which helper?", selected: ["A"], source: "timeout", timeoutMs: 60_000 }];
+  const dispose = registerTeammateChildToolBroker("ask-user-question", async (request) => {
+    assert.deepEqual(request.input, { questions });
+    return { content: [{ type: "text", text: "Timeout recommendation, not an approval" }], details: { answers: [], recommendations } };
+  });
+  try {
+    await handleChildInteractionRequest(pi, state, { requestId: "question-timeout", interaction: "question", correlationId: agent.correlationId,
+      payload: { questions, recommendations: [{ selected: ["B"], approved: true }] } }, (message) => replies.push(message), { hasUI: false } as ExtensionContext);
+    assert.deepEqual(replies, [{ type: "teammate_interaction_response", requestId: "question-timeout", result: { action: "answer", answers: [], recommendations } }]);
+  } finally { dispose(); }
+});
+
+test("unknown child cannot access root question broker", async () => {
+  const { state } = createState();
+  const { pi } = createPi();
+  const replies: unknown[] = [];
+  const dispose = registerTeammateChildToolBroker("ask-user-question", async () => { throw new Error("must not reach broker"); });
+  try {
+    await handleChildInteractionRequest(pi, state, { requestId: "question-unknown", interaction: "question", correlationId: "unknown", payload: { questions: [{ question: "Approve?" }] } }, (message) => replies.push(message), { hasUI: false } as ExtensionContext);
+    assert.deepEqual(replies, [{ type: "teammate_interaction_response", requestId: "question-unknown", result: { action: "cancel" } }]);
+  } finally { dispose(); }
+});
+
+test("teammate permission request is displayed, captured, and replied to", async () => {
+  const { state, agent } = createState();
+  const { pi, messages, events } = createPi();
+  const replies: unknown[] = [];
+  let promptTitle = "";
+  const ctx = {
+    hasUI: true,
+    ui: {
+      async select(title: string) {
+        promptTitle = title;
+        assert.equal(agent.pendingInteractions?.has("permission-1"), true);
+        return "Always allow";
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  await handleChildInteractionRequest(pi, state, {
+    type: "teammate_interaction_request",
+    requestId: "permission-1",
+    interaction: "permission",
+    correlationId: agent.correlationId,
+    payload: {
+      toolName: "bash",
+      input: { command: "npm test" },
+      reason: "Approval required",
+      suggestion: "Bash(npm test)",
+    },
+  }, (message) => replies.push(message), ctx);
+
+  assert.match(promptTitle, /@reviewer requests bash/);
+  assert.equal(agent.pendingInteractions?.size, 0);
+  assert.equal(messages.length, 1);
+  assert.equal(events.length, 1);
+  assert.deepEqual(replies, [{
+    type: "teammate_interaction_response",
+    requestId: "permission-1",
+    result: { action: "always_allow" },
+  }]);
+});
+
+test("teammate AskUserQuestion captures option and free-text answers", async () => {
+  const { state, agent } = createState();
+  const { pi } = createPi();
+  const replies: any[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      async select(_title: string, options: string[]) { return options[0]; },
+      async input() { return "Use the nearest region"; },
+    },
+  } as unknown as ExtensionContext;
+
+  await handleChildInteractionRequest(pi, state, {
+    type: "teammate_interaction_request",
+    requestId: "question-1",
+    interaction: "question",
+    correlationId: agent.correlationId,
+    payload: {
+      questions: [
+        {
+          header: "Deploy",
+          question: "Which strategy?",
+          options: [{ label: "Preset", description: "Fast" }, { label: "Custom" }],
+        },
+        { header: "Notes", question: "Any constraints?" },
+      ],
+    },
+  }, (message) => replies.push(message), ctx);
+
+  assert.equal(replies[0].type, "teammate_interaction_response");
+  assert.equal(replies[0].result.action, "answer");
+  assert.deepEqual(replies[0].result.answers, [
+    { question: "Which strategy?", header: "Deploy", selected: ["Preset"] },
+    { question: "Any constraints?", header: "Notes", selected: [], text: "Use the nearest region" },
+  ]);
+});
+
+test("child IPC dispatch treats teammate interactions as reply-capable requests", () => {
+  const requests: unknown[] = [];
+  const events: unknown[] = [];
+  const message = { type: "teammate_interaction_request", requestId: "request-1" };
+  const kind = dispatchChildIpcMessage(
+    message,
+    (event) => requests.push(event),
+    (event) => events.push(event),
+    () => undefined,
+  );
+  assert.equal(kind, "request");
+  assert.deepEqual(requests, [message]);
+  assert.deepEqual(events, []);
+});
+
+test("child IPC dispatch routes proxy cancellation as a one-way control request", () => {
+  const requests: unknown[] = [];
+  const events: unknown[] = [];
+  const replies: unknown[] = [];
+  const message = { type: "teammate_proxy_cancel", requestId: "cancel-1", reason: "timeout" };
+
+  assert.equal(dispatchChildIpcMessage(
+    message,
+    (event) => requests.push(event),
+    (event) => events.push(event),
+    (reply) => replies.push(reply),
+  ), "request");
+  assert.deepEqual(requests, [message]);
+  assert.deepEqual(events, []);
+  assert.deepEqual(replies, [], "one-way cancellation must not synthesize a proxy result");
+});
+
+test("proxy cancellation without a request handler stays observable without replying", () => {
+  const events: unknown[] = [];
+  const replies: unknown[] = [];
+  const message = { type: "teammate_proxy_cancel", requestId: "cancel-unhandled" };
+
+  assert.equal(dispatchChildIpcMessage(
+    message,
+    undefined,
+    (event) => events.push(event),
+    (reply) => replies.push(reply),
+  ), "request");
+  assert.deepEqual(events, [message]);
+  assert.deepEqual(replies, []);
+});
+
+test("child IPC dispatch fails closed immediately when a direct runner omits its request handler", () => {
+  const replies: any[] = [];
+  const events: unknown[] = [];
+  const permissionKind = dispatchChildIpcMessage(
+    {
+      type: "teammate_interaction_request",
+      requestId: "missing-handler-permission",
+      interaction: "permission",
+    },
+    undefined,
+    (event) => events.push(event),
+    (reply) => replies.push(reply),
+  );
+  const proxyKind = dispatchChildIpcMessage(
+    { type: "teammate_proxy_request", requestId: "missing-handler-proxy", tool: "todo" },
+    undefined,
+    (event) => events.push(event),
+    (reply) => replies.push(reply),
+  );
+
+  assert.equal(permissionKind, "request");
+  assert.equal(proxyKind, "request");
+  assert.equal(events.length, 2, "unhandled requests remain observable as lifecycle events");
+  assert.equal(replies[0].result.action, "deny");
+  assert.match(replies[0].result.reason, /no parent child-request handler/i);
+  assert.equal(replies[1].result.isError, true);
+});
+
+test("unhandled child request reply failure cannot escape the IPC callback", () => {
+  const events: Array<Record<string, unknown>> = [];
+  assert.doesNotThrow(() => dispatchChildIpcMessage(
+    { type: "teammate_proxy_request", requestId: "closed-channel", tool: "todo" },
+    undefined,
+    (event) => events.push(event),
+    () => { throw new Error("channel closed"); },
+  ));
+  assert.equal(events[1].type, "teammate_reply_delivery_failed");
+});
+
+for (const { label, message, expected } of [
+  {
+    label: "recovery proxy",
+    message: { type: "teammate_proxy_request", requestId: "recovery-preflight", tool: "maestro-new-context-recovery" },
+    expected: {
+      type: "teammate_proxy_result", requestId: "recovery-preflight",
+      result: {
+        content: [{ type: "text", text: "Parent child-request dispatch failed: catalog preflight failed" }],
+        isError: true, details: {},
+      },
+    },
+  },
+  {
+    label: "permission",
+    message: { type: "teammate_interaction_request", requestId: "permission-preflight", interaction: "permission" },
+    expected: {
+      type: "teammate_interaction_response", requestId: "permission-preflight",
+      result: { action: "deny", reason: "Parent child-request dispatch failed: catalog preflight failed" },
+    },
+  },
+  {
+    label: "question",
+    message: { type: "teammate_interaction_request", requestId: "question-preflight", interaction: "question" },
+    expected: {
+      type: "teammate_interaction_response", requestId: "question-preflight",
+      result: { action: "cancel", reason: "Parent child-request dispatch failed: catalog preflight failed" },
+    },
+  },
+  {
+    label: "RPC UI",
+    message: { type: "teammate_rpc_ui_request", id: "ui-preflight" },
+    expected: { type: "extension_ui_response", id: "ui-preflight", cancelled: true },
+  },
+]) {
+  test(`child IPC dispatch answers a throwing ${label} handler`, () => {
+    const replies: unknown[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    assert.equal(dispatchChildIpcMessage(
+      message,
+      () => { throw new Error("catalog preflight failed"); },
+      (event) => events.push(event),
+      (reply) => replies.push(reply),
+    ), "request");
+    assert.deepEqual(replies, [expected]);
+    assert.equal(events[0].type, "teammate_reply_delivery_failed");
+    assert.equal(events[0].error, "catalog preflight failed");
+  });
+}
+
+test("child IPC dispatch does not reply again when a handler throws after replying", () => {
+  const replies: unknown[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const response = { type: "teammate_proxy_result", requestId: "already-answered", result: { isError: true } };
+  dispatchChildIpcMessage(
+    { type: "teammate_proxy_request", requestId: "already-answered", tool: "todo" },
+    (_event, reply) => { reply(response); throw new Error("after reply"); },
+    (event) => events.push(event),
+    (reply) => replies.push(reply),
+  );
+  assert.deepEqual(replies, [response]);
+  assert.equal(events[0].error, "after reply");
+});
+
+test("throwing cancellation handlers remain one-way", () => {
+  const replies: unknown[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  dispatchChildIpcMessage(
+    { type: "teammate_proxy_cancel", requestId: "cancel-throw" },
+    () => { throw new Error("cancel failed"); },
+    (event) => events.push(event),
+    (reply) => replies.push(reply),
+  );
+  assert.deepEqual(replies, []);
+  assert.equal(events[0].error, "cancel failed");
+});
+
+test("unhandled RPC UI requests use the native cancellation envelope", () => {
+  const replies: unknown[] = [];
+  dispatchChildIpcMessage(
+    { type: "teammate_rpc_ui_request", id: "ui-unhandled" },
+    undefined,
+    undefined,
+    (reply) => replies.push(reply),
+  );
+  assert.deepEqual(replies, [{ type: "extension_ui_response", id: "ui-unhandled", cancelled: true }]);
+});
+
+test("a failing unhandled-request observer cannot strand the child", () => {
+  const replies: unknown[] = [];
+  assert.doesNotThrow(() => dispatchChildIpcMessage(
+    { type: "teammate_proxy_request", requestId: "observer-throw", tool: "todo" },
+    undefined,
+    () => { throw new Error("observer failed"); },
+    (reply) => replies.push(reply),
+  ));
+  assert.equal(replies.length, 1);
+});
+
+for (const fails of [false, true]) {
+  test(`recovery proxy promise settles and clears its timer when dispatch ${fails ? "throws" : "replies asynchronously"}`, async () => {
+    const pending: Parameters<typeof createChildProxyRequest>[0] = new Map();
+    const result = await createChildProxyRequest(
+      pending,
+      "recovery-ipc-roundtrip",
+      { type: "teammate_proxy_request", requestId: "recovery-ipc-roundtrip", tool: "maestro-new-context-recovery" },
+      (message, sent) => {
+        queueMicrotask(() => {
+          dispatchChildIpcMessage(
+            message,
+            (_request, reply) => {
+              if (fails) throw new Error("root snapshot preflight failed");
+              queueMicrotask(() => reply({
+                type: "teammate_proxy_result", requestId: "recovery-ipc-roundtrip",
+                result: { content: [{ type: "text", text: "refreshed" }], details: {} },
+              }));
+            },
+            undefined,
+            (response) => {
+              assert.ok(response && typeof response === "object" && "requestId" in response && "result" in response);
+              assert.equal(typeof response.requestId, "string");
+              assert.equal(resolveChildProxyRequest(pending, String(response.requestId), response.result), true);
+            },
+          );
+          sent(null);
+        });
+        return true;
+      },
+      1000,
+    );
+    assert.equal(pending.size, 0);
+    assert.deepEqual(result, fails ? {
+      content: [{ type: "text", text: "Parent child-request dispatch failed: root snapshot preflight failed" }],
+      isError: true, details: {},
+    } : { content: [{ type: "text", text: "refreshed" }], details: {} });
+  });
+}
+
+test("failure replies retain delivery errors without escaping the IPC callback", () => {
+  const events: Array<Record<string, unknown>> = [];
+  assert.doesNotThrow(() => dispatchChildIpcMessage(
+    { type: "teammate_proxy_request", requestId: "failure-channel-closed", tool: "todo" },
+    () => { throw new Error("preflight failed"); },
+    (event) => events.push(event),
+    () => { throw new Error("channel closed"); },
+  ));
+  assert.deepEqual(events, [{
+    type: "teammate_reply_delivery_failed", requestId: "failure-channel-closed",
+    error: "preflight failed", replyError: "channel closed",
+  }]);
+});
+
+test("headless main session denies permission interactions", async () => {
+  const { state, agent } = createState();
+  const { pi } = createPi();
+  const replies: any[] = [];
+  await handleChildInteractionRequest(pi, state, {
+    type: "teammate_interaction_request",
+    requestId: "permission-headless",
+    interaction: "permission",
+    correlationId: agent.correlationId,
+    payload: { toolName: "write", input: { path: "src/app.ts" } },
+  }, (message) => replies.push(message), { hasUI: false } as ExtensionContext);
+  assert.equal(replies[0].result.action, "deny");
+});
+
+test("headless parent still runs the authoritative broker for silent allows", async () => {
+  const { state, agent } = createState();
+  const { pi, messages } = createPi();
+  const replies: any[] = [];
+  const unregister = registerTeammatePermissionBroker(async () => ({ action: "allow_once" }));
+  try {
+    await handleChildInteractionRequest(pi, state, {
+      type: "teammate_interaction_request",
+      requestId: "permission-headless-broker",
+      interaction: "permission",
+      correlationId: agent.correlationId,
+      payload: {
+        authorization: "parent",
+        toolName: "read",
+        input: { path: "README.md" },
+      },
+    }, (message) => replies.push(message), {
+      hasUI: false,
+      cwd: state.baseCwd,
+    } as ExtensionContext);
+    assert.equal(replies[0].result.action, "allow_once");
+    assert.equal(messages.length, 0);
+  } finally {
+    unregister();
+  }
+});
+
+test("direct execution child bridge replies to permissions and rejects nested proxy calls without hanging", async () => {
+  const { pi } = createPi();
+  const ctx = { hasUI: false, cwd: "D:/workspace" } as ExtensionContext;
+  const unregister = registerTeammatePermissionBroker(async (request) => {
+    assert.equal(request.toolName, "read");
+    return { action: "allow_once" };
+  });
+  try {
+    const handler = createTeammateDirectChildRequestHandler(pi, ctx);
+    const permissionReply = await new Promise<any>((resolve) => handler({
+      type: "teammate_interaction_request",
+      requestId: "direct-permission",
+      interaction: "permission",
+      correlationId: "direct-child",
+      payload: {
+        authorization: "parent",
+        toolName: "read",
+        input: { path: "README.md" },
+      },
+    }, resolve));
+    assert.deepEqual(permissionReply, {
+      type: "teammate_interaction_response",
+      requestId: "direct-permission",
+      result: { action: "allow_once" },
+    });
+
+    const proxyReply = await new Promise<any>((resolve) => handler({
+      type: "teammate_proxy_request",
+      requestId: "direct-proxy",
+      tool: "teammate",
+      params: {},
+    }, resolve));
+    assert.equal(proxyReply.type, "teammate_proxy_result");
+    assert.equal(proxyReply.requestId, "direct-proxy");
+    assert.equal(proxyReply.result.isError, true);
+  } finally {
+    unregister();
+  }
+});
+
+test("direct execution child bridge dispatches registered extension tools with trusted actor identity", async () => {
+  const { pi } = createPi();
+  const ctx = { hasUI: false, cwd: "D:/workspace" } as ExtensionContext;
+  const { state, agent } = createState();
+  const unregister = registerTeammateChildToolBroker("todo", async (request) => {
+    assert.equal(request.input.subject, "Child task");
+    assert.deepEqual(request.actor, {
+      correlationId: agent.correlationId,
+      name: agent.name,
+      agent: agent.agent,
+    });
+    return {
+      content: [{ type: "text", text: "created" }],
+      details: { id: "todo-1" },
+    };
+  });
+  try {
+    const handler = createTeammateDirectChildRequestHandler(pi, ctx, { state });
+    const reply = await new Promise<any>((resolve) => handler({
+      type: "teammate_proxy_request",
+      requestId: "direct-todo",
+      correlationId: agent.correlationId,
+      tool: "todo",
+      params: { action: "create", subject: "Child task" },
+    }, resolve));
+    assert.equal(reply.type, "teammate_proxy_result");
+    assert.equal(reply.result.content[0].text, "created");
+  } finally {
+    unregister();
+  }
+});
+
+test("root proxy bridge converts broker rejection into one error envelope", async () => {
+  const { pi } = createPi();
+  const { state, agent } = createState();
+  const replies: any[] = [];
+  const unregister = registerTeammateChildToolBroker("rejecting-tool", async () => {
+    throw new Error("broker rejected request");
+  });
+  try {
+    await handleProxyRequest(
+      pi, state,
+      { type: "teammate_proxy_request", requestId: "broker-rejection", correlationId: agent.correlationId, tool: "rejecting-tool", params: {} },
+      (message) => replies.push(message), agent.correlationId,
+    );
+  } finally {
+    unregister();
+  }
+
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].result.isError, true);
+  assert.match(replies[0].result.content[0].text, /broker rejected request/);
+});
+
+test("child extension registration replacement is generation-owned and old disposal cannot remove the replacement", () => {
+  const path = "D:/extensions/flow.ts";
+  const disposeOld = registerTeammateChildExtension(path, { tools: ["old-tool"] });
+  const disposeCurrent = registerTeammateChildExtension(path, { tools: ["todo"] });
+
+  assert.deepEqual(
+    getTeammateChildExtensions().filter((registration) => registration.path === path),
+    [{ path, tools: ["todo"] }],
+  );
+  disposeOld();
+  assert.deepEqual(
+    getTeammateChildExtensions().filter((registration) => registration.path === path),
+    [{ path, tools: ["todo"] }],
+  );
+  disposeCurrent();
+  assert.deepEqual(
+    getTeammateChildExtensions().filter((registration) => registration.path === path),
+    [],
+  );
+});
+
+test("child tool broker rejects foreign collisions and same-owner replacement survives stale disposal", async () => {
+  const first = async () => ({ content: [{ type: "text" as const, text: "first" }] });
+  const current = async () => ({ content: [{ type: "text" as const, text: "current" }] });
+  const disposeFirst = registerTeammateChildToolBroker("owned-test", first, { owner: "test-owner" });
+  const disposeCurrent = registerTeammateChildToolBroker("owned-test", current, { owner: "test-owner" });
+
+  assert.equal(getTeammateChildToolBroker("owned-test"), current);
+  disposeFirst();
+  assert.equal(getTeammateChildToolBroker("owned-test"), current);
+  assert.throws(
+    () => registerTeammateChildToolBroker("owned-test", first, { owner: "foreign-owner" }),
+    /conflicting teammate child tool broker/i,
+  );
+  disposeCurrent();
+  assert.equal(getTeammateChildToolBroker("owned-test"), undefined);
+});
+
+test("permission broker rejects foreign collisions and disposal restores fail-closed fallback", () => {
+  const first = async () => ({ action: "allow_once" as const });
+  const current = async () => ({ action: "deny" as const, reason: "current" });
+  const disposeFirst = registerTeammatePermissionBroker(first, { owner: "test-permission-owner" });
+  const disposeCurrent = registerTeammatePermissionBroker(current, { owner: "test-permission-owner" });
+
+  assert.equal(getTeammatePermissionBroker(), current);
+  disposeFirst();
+  assert.equal(getTeammatePermissionBroker(), current);
+  assert.throws(
+    () => registerTeammatePermissionBroker(first, { owner: "foreign-permission-owner" }),
+    /conflicting teammate permission broker/i,
+  );
+  disposeCurrent();
+  assert.equal(getTeammatePermissionBroker(), undefined);
+});
+
+test("disposed child tool broker falls back immediately instead of retaining stale authority", async () => {
+  const { pi } = createPi();
+  const ctx = { hasUI: false, cwd: "D:/workspace" } as ExtensionContext;
+  const dispose = registerTeammateChildToolBroker("ephemeral-test", async () => ({
+    content: [{ type: "text", text: "handled" }],
+  }));
+  dispose();
+
+  const handler = createTeammateDirectChildRequestHandler(pi, ctx);
+  const reply = await new Promise<any>((resolve) => handler({
+    type: "teammate_proxy_request",
+    requestId: "disposed-proxy",
+    tool: "ephemeral-test",
+    params: {},
+  }, resolve));
+  assert.equal(reply.result.isError, true);
+  assert.match(reply.result.content[0].text, /unavailable in this direct runtime/i);
+});
+
+test("official child RPC UI requests are answered through the parent dialog UI", async () => {
+  const replies: unknown[] = [];
+  await handleChildRpcUiRequest({
+    type: "teammate_rpc_ui_request",
+    id: "rpc-select-1",
+    method: "select",
+    title: "Choose",
+    options: ["A", "B"],
+  }, (message) => replies.push(message), {
+    hasUI: true,
+    ui: { async select() { return "B"; } },
+  } as unknown as ExtensionContext);
+  assert.deepEqual(replies, [{ type: "extension_ui_response", id: "rpc-select-1", value: "B" }]);
+});
+
+test("recoverable failures sleep with outcome metadata while unrecoverable failures retain a tombstone", () => {
+  const failed = createState();
+  let handoffResolved: boolean | undefined;
+  failed.agent.stdin = new PassThrough();
+  failed.agent.sendControl = () => true;
+  failed.agent.pendingInteractions = new Map();
+  failed.agent.pendingHandoff = {
+    nonce: "pending",
+    resolve(value) { handoffResolved = value; },
+    timer: setTimeout(() => {}, 60_000),
+  };
+  settleAgent(failed.state, failed.agent.correlationId, 1, "boom");
+  assert.equal(failed.agent.status, "sleeping");
+  assert.equal(failed.agent.lastOutcome?.status, "failed");
+  assert.equal(failed.state.activeRuns.size, 1);
+  assert.equal(failed.agent.stdin?.writable, true, "recoverable failure keeps the warm RPC runtime");
+  assert.equal(typeof failed.agent.sendControl, "function");
+  assert.equal(failed.agent.pendingHandoff, undefined);
+  assert.equal(handoffResolved, false);
+  assert.equal(
+    resolveAgentCorrelationId(failed.state, failed.agent.correlationId.slice(0, 8)),
+    failed.agent.correlationId,
+  );
+  assert.equal(checkActiveAgentBudget(failed.state).active, 1, "warm sleeping runtime still owns a slot");
+  assert.deepEqual(sweepFailedAgents(failed.state, Date.now() + FAILED_AGENT_RETENTION_MS + 1), []);
+
+  const unrecoverable = createState();
+  settleAgent(unrecoverable.state, unrecoverable.agent.correlationId, 1, "boom", false);
+  assert.equal(unrecoverable.agent.status, "failed");
+  assert.equal(unrecoverable.agent.lastOutcome?.status, "failed");
+  assert.equal(checkActiveAgentBudget(unrecoverable.state).active, 0);
+  assert.deepEqual(
+    sweepFailedAgents(unrecoverable.state, Date.now() + FAILED_AGENT_RETENTION_MS + 1),
+    [unrecoverable.agent.correlationId],
+  );
+  assert.equal(unrecoverable.state.activeRuns.size, 0);
+
+  const successful = createState();
+  successful.state.namedAgents.clear();
+  settleAgent(successful.state, successful.agent.correlationId, 0, "done");
+  assert.equal(successful.agent.status, "sleeping");
+  assert.equal(
+    resolveAgentCorrelationId(successful.state, successful.agent.correlationId.slice(0, 8)),
+    successful.agent.correlationId,
+  );
+});
+
+test("explicit process ownership excludes graph containers from admission", () => {
+  const { state, agent } = createState();
+  agent.ownsChildProcess = false;
+  assert.equal(checkActiveAgentBudget(state).active, 0);
+  agent.ownsChildProcess = true;
+  assert.equal(checkActiveAgentBudget(state).active, 1);
+});
+
+test("terminal tombstone remains inspectable but rejects proxy commands", async () => {
+  const { state, agent } = createState();
+  settleAgent(state, agent.correlationId, 1, "failed terminal", false);
+  const { pi } = createPi();
+  const replies: any[] = [];
+  await handleProxyRequest(
+    pi, state,
+    { type: "teammate_proxy_request", requestId: "terminal-send", tool: "teammate-send", params: {
+      to: agent.name, mode: "abort", message: "stop",
+    } },
+    (message) => replies.push(message), undefined,
+  );
+  assert.equal(replies[0].result.isError, true);
+  assert.match(replies[0].result.content[0].text, /is failed and has no restorable runtime/);
+  assert.match(replies[0].result.content[0].text, /Dispatch a new teammate/);
+  assert.match(replies[0].result.content[0].text, /tasks\[\]\.briefing/);
+  assert.equal(state.activeRuns.get(agent.correlationId)?.status, "failed");
+});
+
+test("a fork that succeeded is not reported as a failure", () => {
+  // `settleAgent` folded "not wakeable" in with "failed", so a fork — which
+  // succeeds and then hands its session to the parent — settled as failed.
+  // Invisible while failures were deleted on sight; a red ✗ once they are not.
+  const { state, agent } = createState();
+  settleAgent(state, agent.correlationId, 0, "handed off", false);
+
+  assert.notEqual(agent.status, "failed");
+  assert.equal(state.activeRuns.size, 0, "a fork has no session left to wake");
+  assert.equal(state.recentlySettled?.get(agent.correlationId)?.status, "completed");
+});
+
+test("agent routing accepts displayed @name and name#id-prefix selectors", () => {
+  const { state, agent } = createState();
+  for (const target of ["reviewer", "@reviewer", "reviewer#child-12", "@reviewer#child-12"]) {
+    assert.equal(resolveAgentCorrelationId(state, target), agent.correlationId, target);
+  }
+});

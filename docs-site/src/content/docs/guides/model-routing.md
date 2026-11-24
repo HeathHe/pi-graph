@@ -1,0 +1,136 @@
+---
+title: "模型路由与思考深度"
+icon: "🎚️"
+---
+
+teammate 支持逐任务的模型覆盖与思考深度控制。模型定义与故障转移配置见[API Provider 配置](/guides/api-provider-config)。
+
+---
+
+## 模型路由优先级
+
+```
+task model > 顶层 model > taskType 映射 > 角色 model > 父 Pi 模型
+```
+
+| 层级 | 说明 |
+|------|------|
+| `task.model` | 单个任务显式指定模型 |
+| 顶层 `model` | dispatch 级默认值 |
+| `taskType` 映射 | 按任务类型（explore/analysis/debug/...）配置模型，Control Center（`Alt+M` / `/teammate-models`）管理 |
+| 角色 model | Agent frontmatter 中声明的模型 |
+| 父 Pi 模型 | 继承主会话模型 |
+
+```javascript
+teammate({
+  model: "provider/fast-model",              // 顶层默认
+  tasks: [
+    { name: "quick", agent: "explorer", prompt: "..." },
+    { name: "deep", agent: "analyst", model: "provider/deep-model", prompt: "..." }
+  ]
+})
+```
+
+## 思考深度级别
+
+| 级别 | 说明 |
+|------|------|
+| `off` | 关闭扩展思考，最快响应 |
+| `minimal` | 最小思考开销 |
+| `low` | 低深度推理 |
+| `medium` | 中等深度（平衡速度和质量） |
+| `high` | 高深度推理 |
+| `xhigh` | 极高深度 |
+| `max` | 独立 canonical 级别（与 Pi runtime 的 ThinkingLevel 一致，不再降级为 `xhigh`） |
+
+### 使用方式
+
+```javascript
+teammate({
+  thinking: "high",
+  tasks: [
+    { name: "quick-scan", agent: "explorer", prompt: "...", thinking: "off" },
+    { name: "deep-analysis", agent: "general", prompt: "...", thinking: "xhigh" }
+  ]
+})
+```
+
+### 优先级
+
+```
+任务级 thinking > 顶层 thinking > taskType 映射 > Agent frontmatter > Pi 默认
+```
+
+> 不同模型支持的思考级别范围不同，且由运行时模型目录（`<available_teammate_models>`）动态决定——同一模型在不同环境可能支持不同的级别集。超出范围的级别会被模型拒绝或降级，以实际输出为准。
+
+## 路由 Profiles（v0.25+）
+
+命名 profile 把 `mappings` / `fallbackMappings` / `thinkingLevels` / `fastModes` / `roleMappings` 打包为一套可切换的路由配置，运行时附带 safeguards（ Authority 生成围栏、完成消息 outbox GC 有界、进程树清理确认回收而非仅凭退出码判断）。
+
+| 项 | 说明 |
+|----|------|
+| 全局配置 | `~/.pi/agent/teammate-models.json`（`defaultProfile` + `profiles` + 可选 `retiredProfileIds`） |
+| 会话覆盖 | `<cwd>/.pi/teammate-models.session.<safe>.json` |
+| 管理入口 | Control Center（`Alt+M` / `/teammate-models` 模型映射覆盖层） |
+| 请求覆盖 | 单次派发可用 `model` / `fallbackModels` / `thinking` 覆盖 profile 结果 |
+
+> 优先级仍为：任务级 `model` > 顶层 `model` > `taskType` 映射（含 profile 内映射）> 角色 model > 父 Pi 模型。
+
+## Teammate Smart Mode
+
+Smart Mode 是全局的智能选模策略，保存在 `~/.pi/agent/teammate-models.json` 的 model-routing v4 store 中。进入 Control Center 的 **Routing** tab 后，按 `Ctrl+S` 会按 `off → economy → balanced → sota → off` 循环切换；界面状态与提示均提供中英文 locale。
+
+| 模式 | 行为 |
+|------|------|
+| `off` | 关闭智能选模，继续使用既有 taskType/profile/角色路由（也是默认值） |
+| `economy` | 在任务证据可信的候选中优先参考价格，仅在便宜候选明显更弱时升级 |
+| `balanced` | 综合任务能力、参考价格与延迟，候选没有明显优势时保留既有路由 |
+| `sota` | 优先任务相关的 intelligence、coding 或 agentic 排名，价格和延迟只用于同级证据的决胜 |
+
+启用后，只有 root agent 的系统提示会注入带起止标记的可逆 Smart Mode 块：它要求按 `taskType` 查询 `model-availability`，并把 `model_intelligence` 当作建议性证据；已显式指定的模型和实际可用性始终优先。切回 `off` 时该标记块会被移除，child agent 不注入此块。智能推荐不会回写持久化 profile；证据过期、低置信或候选接近时仍沿用既有路由。
+
+## taskType 与路由
+
+`taskType` 只影响模型路由，不改变角色行为。Control Center 自动合并内置类型、当前发现的内置/项目/用户 Agent YAML 类型及已有映射类型；自定义 Agent 可声明新的小写类型标识。
+
+```javascript
+teammate({ tasks: [{ agent: "security-auditor", taskType: "review", prompt: "..." }] })
+```
+
+## Fallback 链
+
+任务可通过 `fallbackModels` 声明有序回退模型：
+
+```javascript
+teammate({
+  tasks: [{
+    agent: "general",
+    model: "provider/model-a",
+    fallbackModels: ["provider/model-b", "provider/model-c"],
+    prompt: "..."
+  }]
+})
+```
+
+配置了[模型故障转移](/guides/api-provider-config)时，熔断触发后自动按 fallback 链切换；切换可不重启 run，经 `set_model` RPC 在进程内热切换，手动切换模型会重置该模型的熔断器。
+
+## Codex Fast 与 scoped child routing（v0.32.0）
+
+`/fast on|off|status` 保存项目 `.pi/codex-fast.json`（`{"enabled":true}`）；`pi --fast` 仅启动启用。只对 provider `openai-codex`、API `openai-codex-responses` 且 payload.model/input 匹配的请求设置 `service_tier:"priority"`，不影响其他 provider，也不保证低延迟，可能消耗更多配额。
+
+Teammate 可用 boolean `fast`，显式 false 不被默认值覆盖：
+
+```javascript
+teammate({ fast: true, tasks: [
+  { agent: "general", prompt: "实现模块" },
+  { agent: "analyst", prompt: "审查模块", fast: false }
+] })
+```
+
+优先级：task.fast > 顶层 fast > taskType `fastModes` > roleMappings.fast > Agent frontmatter.fast > 子项目 Codex Fast 默认。路由 store v4 保留旧配置迁移；Routing 面板可维护 fast。子进程使用 scoped override（包括 false），并显式注册 child hook，`--no-extensions` 也不丢失这一偏好；它不是其他 backend 的通用“加速”承诺。
+
+## 下一步
+
+- [API Provider 与模型故障转移](/guides/api-provider-config) — 模型定义、熔断器、故障转移配置
+- [Agent 角色体系](/guides/agents) — 角色与模型的配合
+- [并行多智能体调度](/guides/teammate-dispatch) — 调度参数总览

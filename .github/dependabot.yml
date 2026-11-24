@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 1
+    versioning-strategy: increase
+    allow:
+      - dependency-name: '@earendil-works/pi-agent-core'
+        dependency-type: development
+      - dependency-name: '@earendil-works/pi-ai'
+        dependency-type: development
+      - dependency-name: '@earendil-works/pi-coding-agent'
+        dependency-type: development
+      - dependency-name: '@earendil-works/pi-tui'
+        dependency-type: development
+      - dependency-name: typebox
+    groups:
+      pi-sdk:
+        patterns:
+          - '@earendil-works/pi-agent-core'
+          - '@earendil-works/pi-ai'
+          - '@earendil-works/pi-coding-agent'
+          - '@earendil-works/pi-tui'
+          - typebox
+    commit-message:
+      prefix: 'chore(deps)'

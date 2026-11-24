@@ -1,0 +1,166 @@
+/**
+ * TypeBox schemas for teammate tool parameters.
+ *
+ * Unified TaskSpec model:
+ *   - Every public dispatch uses a non-empty tasks array
+ *   - prompt is the task text; agent may inherit from the top level
+ *   - Top-level fields serve as defaults, per-task overrides win
+ *
+ * P0 three-axis decoupling:
+ *   - name: addressability + variable referencing
+ *   - reply_to: result routing (caller | main)
+ */
+import { Type, type Static, type TSchema } from "typebox";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { TeammatePlacementV1 } from "pi-graph-device-api/v1/placement";
+export declare const TaskSpec: Type.TObject<{
+    prompt: Type.TString;
+    description: Type.TOptional<Type.TString>;
+    agent: Type.TOptional<Type.TString>;
+    taskType: Type.TOptional<Type.TString>;
+    name: Type.TOptional<Type.TString>;
+    dependsOn: Type.TOptional<Type.TArray<Type.TString>>;
+    context: Type.TOptional<Type.TUnsafe<"fresh" | "fork">>;
+    model: Type.TOptional<Type.TString>;
+    fallbackModels: Type.TOptional<Type.TArray<Type.TString>>;
+    thinking: Type.TOptional<Type.TUnsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">>;
+    fast: Type.TOptional<Type.TBoolean>;
+    cwd: Type.TOptional<Type.TString>;
+    placement: Type.TOptional<Type.TUnsafe<TeammatePlacementV1>>;
+    outputSchema: Type.TOptional<Type.TUnsafe<Record<string, unknown>>>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+    background: Type.TOptional<Type.TBoolean>;
+    todo: Type.TOptional<Type.TUnion<[Type.TString, Type.TArray<Type.TString>]>>;
+    briefing: Type.TOptional<Type.TArray<Type.TString>>;
+    maxNestingDepth: Type.TOptional<Type.TInteger>;
+}>;
+export declare const TeammateParams: Type.TObject<{
+    mode: Type.TOptional<Type.TUnsafe<"default" | "expert">>;
+    agent: Type.TOptional<Type.TString>;
+    taskType: Type.TOptional<Type.TString>;
+    reply_to: Type.TOptional<Type.TUnsafe<"main" | "caller">>;
+    tasks: Type.TArray<Type.TObject<{
+        prompt: Type.TString;
+        description: Type.TOptional<Type.TString>;
+        agent: Type.TOptional<Type.TString>;
+        taskType: Type.TOptional<Type.TString>;
+        name: Type.TOptional<Type.TString>;
+        dependsOn: Type.TOptional<Type.TArray<Type.TString>>;
+        context: Type.TOptional<Type.TUnsafe<"fresh" | "fork">>;
+        model: Type.TOptional<Type.TString>;
+        fallbackModels: Type.TOptional<Type.TArray<Type.TString>>;
+        thinking: Type.TOptional<Type.TUnsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">>;
+        fast: Type.TOptional<Type.TBoolean>;
+        cwd: Type.TOptional<Type.TString>;
+        placement: Type.TOptional<Type.TUnsafe<TeammatePlacementV1>>;
+        outputSchema: Type.TOptional<Type.TUnsafe<Record<string, unknown>>>;
+        timeoutMs: Type.TOptional<Type.TInteger>;
+        background: Type.TOptional<Type.TBoolean>;
+        todo: Type.TOptional<Type.TUnion<[Type.TString, Type.TArray<Type.TString>]>>;
+        briefing: Type.TOptional<Type.TArray<Type.TString>>;
+        maxNestingDepth: Type.TOptional<Type.TInteger>;
+    }>>;
+    concurrency: Type.TOptional<Type.TInteger>;
+    concurrencyWaitMs: Type.TOptional<Type.TInteger>;
+    maxAgents: Type.TOptional<Type.TInteger>;
+    maxNestingDepth: Type.TOptional<Type.TInteger>;
+    steeringMode: Type.TOptional<Type.TUnsafe<"all" | "one-at-a-time">>;
+    outputSchema: Type.TOptional<Type.TUnsafe<Record<string, unknown>>>;
+    background: Type.TOptional<Type.TBoolean>;
+    context: Type.TOptional<Type.TUnsafe<"fresh" | "fork">>;
+    model: Type.TOptional<Type.TString>;
+    fallbackModels: Type.TOptional<Type.TArray<Type.TString>>;
+    thinking: Type.TOptional<Type.TUnsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">>;
+    fast: Type.TOptional<Type.TBoolean>;
+    cwd: Type.TOptional<Type.TString>;
+    placement: Type.TOptional<Type.TUnsafe<TeammatePlacementV1>>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+}>;
+export declare const LocalTeammateListParams: Type.TObject<{
+    view: Type.TOptional<Type.TUnsafe<"active" | "roles" | "all" | "named">>;
+}>;
+export declare const TeammateSendParams: Type.TObject<{
+    to: Type.TString;
+    message: Type.TOptional<Type.TString>;
+    mode: Type.TOptional<Type.TUnsafe<"follow_up" | "steer" | "abort" | "interrupt">>;
+    kind: Type.TOptional<Type.TUnsafe<"coordination" | "request" | "supervision">>;
+}>;
+export declare const TeammateListParams: Type.TObject<{
+    view: Type.TOptional<Type.TUnsafe<"active" | "roles" | "windows" | "all" | "named" | "inbox">>;
+    scope: Type.TOptional<Type.TUnsafe<"local" | "remote" | "all">>;
+    session: Type.TOptional<Type.TString>;
+    peer: Type.TOptional<Type.TString>;
+    direction: Type.TOptional<Type.TUnsafe<"outgoing" | "incoming">>;
+    status: Type.TOptional<Type.TUnsafe<"pending" | "accepted" | "queued" | "injected" | "rejected" | "timeout">>;
+    since: Type.TOptional<Type.TString>;
+    limit: Type.TOptional<Type.TInteger>;
+}>;
+export declare const TeammateWatchParams: Type.TObject<{
+    name: Type.TString;
+    lines: Type.TOptional<Type.TInteger>;
+}>;
+export declare const TeammateWaitParams: Type.TObject<{
+    name: Type.TOptional<Type.TString>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+    waitMs: Type.TOptional<Type.TInteger>;
+}>;
+export declare const ObserveParams: Type.TObject<{
+    action: Type.TUnsafe<"status" | "wait" | "diagnose" | "watch">;
+    targets: Type.TArray<Type.TObject<{
+        kind: Type.TString;
+        id: Type.TString;
+        cursor: Type.TOptional<Type.TString>;
+    }>>;
+    detail: Type.TOptional<Type.TUnsafe<"summary" | "full" | "tail">>;
+    lines: Type.TOptional<Type.TInteger>;
+    waitMode: Type.TOptional<Type.TUnsafe<"all" | "count" | "any">>;
+    waitCount: Type.TOptional<Type.TInteger>;
+    until: Type.TOptional<Type.TUnsafe<"completed" | "result-ready">>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+    view: Type.TOptional<Type.TUnsafe<"turns" | "session" | "todos" | "live">>;
+    turn: Type.TOptional<Type.TInteger>;
+}>;
+type LocalObserveParamsInput = Omit<Static<typeof ObserveParams>, "targets" | "view"> & {
+    targets: Array<{
+        kind: "teammate" | "bash_bg";
+        id: string;
+    }>;
+    view?: "live" | "turns";
+};
+export declare const LocalObserveParams: Type.TUnsafe<LocalObserveParamsInput>;
+export declare const MonitorQueryParams: Type.TObject<{
+    action: Type.TUnsafe<"get" | "unsubscribe" | "list" | "subscribe" | "wait" | "subscriptions">;
+    target: Type.TOptional<Type.TString>;
+    subscriptionId: Type.TOptional<Type.TString>;
+    events: Type.TOptional<Type.TArray<Type.TUnsafe<"completed" | "failed" | "running" | "disconnected" | "settled">>>;
+    detail: Type.TOptional<Type.TUnsafe<"summary" | "full">>;
+    cursor: Type.TOptional<Type.TString>;
+    until: Type.TOptional<Type.TUnsafe<"settled" | "attention" | "change">>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+}>;
+export declare const TeammateMonitorParams: Type.TObject<{
+    action: Type.TUnsafe<"status" | "wait">;
+    targets: Type.TArray<Type.TString>;
+    waitMode: Type.TOptional<Type.TUnsafe<"all" | "count" | "any">>;
+    waitCount: Type.TOptional<Type.TInteger>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+    lines: Type.TOptional<Type.TInteger>;
+    verbose: Type.TOptional<Type.TBoolean>;
+}>;
+export declare const WorkspaceWindowParams: Type.TObject<{
+    action: Type.TUnsafe<"close" | "list" | "create">;
+    name: Type.TOptional<Type.TString>;
+    objective: Type.TOptional<Type.TString>;
+    provider: Type.TOptional<Type.TUnsafe<"native" | "herdr">>;
+    herdrSession: Type.TOptional<Type.TString>;
+    presentation: Type.TOptional<Type.TUnsafe<"headless" | "interactive">>;
+}>;
+export declare const RemoteWorkerParams: Type.TObject<{
+    action: Type.TUnsafe<"close" | "list" | "targets" | "create">;
+    targetId: Type.TOptional<Type.TString>;
+    name: Type.TOptional<Type.TString>;
+    objective: Type.TOptional<Type.TString>;
+    runId: Type.TOptional<Type.TString>;
+}>;
+export declare function projectConditionalTeammateTool<T extends TSchema, D>(tool: ToolDefinition<T, D>): ToolDefinition<T, D>;
+export {};

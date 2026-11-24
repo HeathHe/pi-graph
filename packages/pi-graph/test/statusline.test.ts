@@ -1,0 +1,1142 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { deriveWorkflowViewModel, type WorkflowSnapshotLike } from "../src/session/view-model.ts";
+import { installStatusline, renderWorkflowStatusline } from "../src/statusline/statusline.ts";
+
+type EventHandler = (event: unknown, ctx: ExtensionContext) => unknown;
+
+function stripAnsi(value: string): string {
+  return value.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function colorCode(color: ThemeColor): string {
+  return String(color.length % 256);
+}
+
+function makeFakeTheme(): Theme {
+  const fg = (color: ThemeColor, text: string) => `\x1b[38;5;${colorCode(color)}m${text}\x1b[39m`;
+  return {
+    name: "fake",
+    fg,
+    bg: (_color, text) => text,
+    bold: (text) => `\x1b[1m${text}\x1b[22m`,
+    dim: (text) => `\x1b[2m${text}\x1b[22m`,
+    italic: (text) => text,
+    underline: (text) => text,
+    inverse: (text) => text,
+    strikethrough: (text) => text,
+    getFgAnsi: (color) => fg(color, "").slice(0, -3),
+    getBgAnsi: () => "",
+    getColorMode: () => "truecolor",
+    getThinkingBorderColor: () => (s) => s,
+    getBashModeBorderColor: () => (s) => s,
+  } as unknown as Theme;
+}
+
+function assertLiveRows(lines: string[], width: number): void {
+  if (width <= 1) {
+    assert.deepEqual(lines, [], `width ${width} cannot reserve a terminal column`);
+    return;
+  }
+  for (const line of lines) {
+    assert.ok(visibleWidth(line) <= width - 1, `width ${width}: ${visibleWidth(line)} ${line}`);
+  }
+}
+
+async function settleAsyncWork(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function createHarness(options: {
+  activeToolCalls?: number;
+  workflowSnapshot?: WorkflowSnapshotLike;
+  branchEntries?: unknown[];
+  cwd?: string;
+  terminalWidth?: number;
+  hasUI?: boolean;
+  exec?: (cwd: string) => Promise<{ code: number; stdout: string; stderr: string }>;
+} = {}) {
+  const handlers = new Map<string, EventHandler[]>();
+  const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+  const statuses = new Map<string, string>();
+  const branchChangeHandlers = new Set<() => void>();
+  let component: { render(width: number): string[]; dispose?(): void } | undefined;
+  let terminalWidth = options.terminalWidth ?? 120;
+  let invalidations = 0;
+  let renderRequests = 0;
+  let forcedRenderRequests = 0;
+  let lastRequestedRender: string[] | undefined;
+  let footerInstallCount = 0;
+  const footerData = {
+    getGitBranch: () => null,
+    getExtensionStatuses: () => statuses,
+    getAvailableProviderCount: () => 1,
+    onBranchChange(callback: () => void) {
+      branchChangeHandlers.add(callback);
+      return () => branchChangeHandlers.delete(callback);
+    },
+  };
+  const pi = {
+    on(name: string, handler: EventHandler) {
+      const registered = handlers.get(name) ?? [];
+      registered.push(handler);
+      handlers.set(name, registered);
+    },
+    async exec(_command: string, _args: string[], execOptions: { cwd?: string }) {
+      return options.exec?.(execOptions.cwd ?? "") ?? { code: 1, stdout: "", stderr: "" };
+    },
+    events: {
+      on(name: string, handler: (payload: unknown) => void) {
+        const registered = eventHandlers.get(name) ?? [];
+        registered.push(handler);
+        eventHandlers.set(name, registered);
+      },
+    },
+  } as unknown as ExtensionAPI;
+  let branchEntries = options.branchEntries ?? [];
+  let branchReads = 0;
+  let branchEntryVisits = 0;
+  const fakeTheme = makeFakeTheme();
+  let ctx = {
+    cwd: options.cwd ?? "D:\\pi-graph",
+    hasUI: options.hasUI ?? true,
+    model: { id: "claude-test" },
+    getContextUsage: () => ({ percent: 42 }),
+    sessionManager: {
+      getBranch: () => {
+        branchReads += 1;
+        return {
+          *[Symbol.iterator]() {
+            for (const entry of branchEntries) {
+              branchEntryVisits += 1;
+              yield entry;
+            }
+          },
+        };
+      },
+    },
+    ui: {
+      setStatus(key: string, value: string | undefined) {
+        if (value === undefined) statuses.delete(key);
+        else statuses.set(key, value);
+      },
+      setFooter(factory: Function | undefined) {
+        component?.dispose?.();
+        component = undefined;
+        if (!factory) return;
+        footerInstallCount += 1;
+        component = factory({
+          terminal: { get columns() { return terminalWidth; } },
+          invalidate() { invalidations++; },
+          requestRender(force = false) {
+            renderRequests++;
+            if (force) forcedRenderRequests++;
+            lastRequestedRender = component?.render(terminalWidth);
+          },
+        }, fakeTheme, footerData);
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const activeToolCalls = new Map(Array.from(
+    { length: options.activeToolCalls ?? 0 },
+    (_, index) => [String(index), { action: "tool", startedAt: 0, correlationId: String(index) }],
+  ));
+  installStatusline(
+    pi,
+    () => ({ activeToolCalls }),
+    () => options.workflowSnapshot,
+  );
+  for (const handler of handlers.get("session_start") ?? []) handler({}, ctx);
+
+  return {
+    statuses,
+    emit(name: string, event: unknown = {}) {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    },
+    emitExtensionEvent(name: string, payload: unknown) {
+      for (const handler of eventHandlers.get(name) ?? []) handler(payload);
+    },
+    footerState() {
+      return { installed: component !== undefined, installCount: footerInstallCount };
+    },
+    startSession(nextCwd: string) {
+      ctx = { ...ctx, cwd: nextCwd } as ExtensionContext;
+      for (const handler of handlers.get("session_start") ?? []) handler({}, ctx);
+    },
+    emitBranchChange() {
+      for (const handler of branchChangeHandlers) handler();
+    },
+    setBranch(entries: unknown[]) {
+      branchEntries = entries;
+    },
+    tokenScanCounts() {
+      return { branchReads, branchEntryVisits };
+    },
+    render(width: number): string[] {
+      assert.ok(component);
+      return component.render(width);
+    },
+    setTerminalWidth(width: number) {
+      terminalWidth = width;
+    },
+    resizeState() {
+      return { invalidations, renderRequests, forcedRenderRequests, lastRequestedRender };
+    },
+    dispose() {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({}, ctx);
+      component?.dispose?.();
+    },
+  };
+}
+
+test("Cockpit ownership isolates the Flow footer from lifecycle reinstalls", () => {
+  const harness = createHarness();
+  try {
+    assert.deepEqual(harness.footerState(), { installed: true, installCount: 1 });
+
+    harness.emitExtensionEvent("cockpit:ui-ownership", { footer: true });
+    assert.deepEqual(harness.footerState(), { installed: false, installCount: 1 });
+
+    harness.emit("session_tree", { type: "session_tree", oldLeafId: "old", newLeafId: "new" });
+    assert.deepEqual(
+      harness.footerState(),
+      { installed: false, installCount: 1 },
+      "Flow must not reclaim the single footer slot while Cockpit owns it",
+    );
+
+    harness.emitExtensionEvent("cockpit:ui-ownership", { footer: false });
+    assert.deepEqual(harness.footerState(), { installed: true, installCount: 2 });
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline emits no rows when the terminal cannot reserve its final column", () => {
+  const harness = createHarness();
+  try {
+    assertLiveRows(harness.render(0), 0);
+    assertLiveRows(harness.render(1), 1);
+    assertLiveRows(harness.render(2), 2);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline reflows on stable silent terminal width changes using the same footer instance", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const harness = createHarness({ terminalWidth: 120 });
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("approval-mode", "APPROVAL default");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO ON");
+    const initial = harness.render(120)[0];
+    assert.match(stripAnsi(initial), /AUTO-COMPACT ON/);
+    assert.ok(visibleWidth(initial) <= 119, "live footer must reserve the final column");
+
+    harness.setTerminalWidth(42);
+    t.mock.timers.tick(500);
+    assert.equal(harness.resizeState().forcedRenderRequests, 0, "one width sample must not redraw");
+
+    t.mock.timers.tick(500);
+    let state = harness.resizeState();
+    assert.deepEqual(
+      { invalidations: state.invalidations, forcedRenderRequests: state.forcedRenderRequests },
+      { invalidations: 1, forcedRenderRequests: 1 },
+    );
+    assert.ok(state.lastRequestedRender);
+    assert.match(stripAnsi(state.lastRequestedRender[0]), /AUTO/);
+    assert.doesNotMatch(stripAnsi(state.lastRequestedRender[0]), /AUTO-COMPACT ON/);
+    assert.ok(visibleWidth(state.lastRequestedRender[0]) <= 41);
+
+    t.mock.timers.tick(1_000);
+    assert.equal(harness.resizeState().forcedRenderRequests, 1, "unchanged width must not redraw");
+
+    harness.setTerminalWidth(120);
+    t.mock.timers.tick(500);
+    assert.equal(harness.resizeState().forcedRenderRequests, 1);
+    t.mock.timers.tick(500);
+    state = harness.resizeState();
+    assert.equal(state.forcedRenderRequests, 2);
+    assert.ok(state.lastRequestedRender);
+    assert.match(stripAnsi(state.lastRequestedRender[0]), /AUTO-COMPACT ON/);
+    assert.ok(visibleWidth(state.lastRequestedRender[0]) <= 119);
+
+    const renderRequestsBeforeSameBandResize = state.renderRequests;
+    harness.setTerminalWidth(100);
+    t.mock.timers.tick(1_000);
+    state = harness.resizeState();
+    assert.equal(state.renderRequests, renderRequestsBeforeSameBandResize + 1);
+    assert.equal(state.forcedRenderRequests, 2, "same-layout-band changes use incremental rendering");
+    assert.ok(state.lastRequestedRender);
+    assert.ok(visibleWidth(state.lastRequestedRender[0]) <= 99);
+
+    harness.setTerminalWidth(70);
+    harness.render(70);
+    t.mock.timers.tick(1_000);
+    assert.equal(
+      harness.resizeState().forcedRenderRequests,
+      2,
+      "a normal resize render must suppress the watchdog redraw",
+    );
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("periodic Git refresh redraws only when visible Git content changes", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  let stdout = "## main...origin/main [ahead 1]\n M tracked.ts\n";
+  let execCalls = 0;
+  const harness = createHarness({
+    exec: async () => {
+      execCalls += 1;
+      return { code: 0, stdout, stderr: "" };
+    },
+  });
+  try {
+    await settleAsyncWork();
+    const initialRenderRequests = harness.resizeState().renderRequests;
+    assert.equal(execCalls, 1);
+
+    t.mock.timers.tick(30_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 2);
+    assert.equal(
+      harness.resizeState().renderRequests,
+      initialRenderRequests,
+      "unchanged branch/dirty/ahead/behind must not invalidate",
+    );
+
+    stdout = "## main...origin/main [behind 2]\n";
+    t.mock.timers.tick(30_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 3);
+    assert.equal(harness.resizeState().renderRequests, initialRenderRequests + 1);
+    assert.match(stripAnsi(harness.render(120)[0]), /main.*↓2/);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("statusline serializes Git requests across Sessions and rejects stale results", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  const calls: Array<{
+    cwd: string;
+    resolve(result: { code: number; stdout: string; stderr: string }): void;
+  }> = [];
+  const harness = createHarness({
+    cwd: "D:\\old-session",
+    exec: (cwd) => new Promise((resolve) => calls.push({ cwd, resolve })),
+  });
+  try {
+    assert.deepEqual(calls.map((call) => call.cwd), ["D:\\old-session"]);
+
+    t.mock.timers.tick(30_000);
+    assert.equal(calls.length, 1, "periodic ticks must not overlap an in-flight request");
+
+    harness.startSession("D:\\new-session");
+    assert.equal(calls.length, 1, "the replacement Session must wait for the old request");
+    calls[0]!.resolve({ code: 0, stdout: "## stale-initial\n", stderr: "" });
+    await settleAsyncWork();
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /stale-initial/);
+    assert.deepEqual(calls.map((call) => call.cwd), ["D:\\old-session", "D:\\new-session"]);
+
+    calls[1]!.resolve({ code: 0, stdout: "## new-branch\n", stderr: "" });
+    await settleAsyncWork();
+    assert.match(stripAnsi(harness.render(120)[0]), /new-branch/);
+
+    t.mock.timers.tick(30_000);
+    assert.equal(calls.length, 3);
+    harness.startSession("D:\\third-session");
+    calls[2]!.resolve({ code: 0, stdout: "## stale-periodic\n", stderr: "" });
+    await settleAsyncWork();
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /new-branch|stale-periodic/);
+    t.mock.timers.tick(4_999);
+    assert.equal(calls.length, 3, "a Session switch must preserve the periodic request cooldown");
+    t.mock.timers.tick(1);
+    assert.equal(calls[3]!.cwd, "D:\\third-session");
+    calls[3]!.resolve({ code: 0, stdout: "## third-branch\n", stderr: "" });
+    await settleAsyncWork();
+    assert.match(stripAnsi(harness.render(120)[0]), /third-branch/);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("rapid Session switches preserve the Git minimum interval before and after settlement", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const calls: Array<{
+    cwd: string;
+    startedAt: number;
+    resolve(result: { code: number; stdout: string; stderr: string }): void;
+  }> = [];
+  const harness = createHarness({
+    cwd: "D:\\first-session",
+    exec: (cwd) => new Promise((resolve) => calls.push({ cwd, startedAt: Date.now(), resolve })),
+  });
+  try {
+    t.mock.timers.tick(100);
+    harness.startSession("D:\\second-session");
+    calls[0]!.resolve({ code: 0, stdout: "## stale-first\n", stderr: "" });
+    await settleAsyncWork();
+    assert.equal(calls.length, 1, "settling the previous request must not bypass the cooldown");
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /stale-first/);
+    t.mock.timers.tick(4_899);
+    assert.equal(calls.length, 1);
+    t.mock.timers.tick(1);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]!.cwd, "D:\\second-session");
+    assert.equal(calls[1]!.startedAt - calls[0]!.startedAt, 5_000);
+    calls[1]!.resolve({ code: 0, stdout: "## second-branch\n", stderr: "" });
+    await settleAsyncWork();
+
+    t.mock.timers.tick(100);
+    harness.startSession("D:\\third-session");
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /second-branch/);
+    t.mock.timers.tick(4_899);
+    assert.equal(calls.length, 2, "a settled request must retain its cooldown across Sessions");
+    t.mock.timers.tick(1);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2]!.cwd, "D:\\third-session");
+    assert.equal(calls[2]!.startedAt - calls[1]!.startedAt, 5_000);
+    calls[2]!.resolve({ code: 0, stdout: "## third-branch\n", stderr: "" });
+    await settleAsyncWork();
+    assert.match(stripAnsi(harness.render(120)[0]), /third-branch/);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("session_tree keeps the replacement footer live and fences the replaced footer Git request", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const calls: Array<{
+    cwd: string;
+    resolve(result: { code: number; stdout: string; stderr: string }): void;
+  }> = [];
+  const harness = createHarness({
+    exec: (cwd) => new Promise((resolve) => calls.push({ cwd, resolve })),
+  });
+  try {
+    calls[0]!.resolve({ code: 0, stdout: "## initial-branch\n", stderr: "" });
+    await settleAsyncWork();
+
+    harness.emitBranchChange();
+    t.mock.timers.tick(5_000);
+    assert.equal(calls.length, 2);
+
+    harness.emit("session_tree", { type: "session_tree", oldLeafId: "old", newLeafId: "new" });
+    harness.emitBranchChange();
+    t.mock.timers.tick(5_000);
+    assert.equal(calls.length, 2, "replacement must not overlap the old footer request");
+
+    calls[1]!.resolve({ code: 0, stdout: "## replaced-footer-stale\n", stderr: "" });
+    await settleAsyncWork();
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /replaced-footer-stale/);
+    assert.equal(calls.length, 3, "the replacement footer must refresh after the old request settles");
+    calls[2]!.resolve({ code: 0, stdout: "## replacement-branch\n", stderr: "" });
+    await settleAsyncWork();
+    const rendered = stripAnsi(harness.render(120)[0]);
+    assert.match(rendered, /replacement-branch/);
+    assert.doesNotMatch(rendered, /replaced-footer-stale/);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("all tools including write/edit and agent completion leave Git to the periodic refresh", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  let execCalls = 0;
+  const harness = createHarness({
+    exec: async () => {
+      execCalls++;
+      return { code: 0, stdout: "## main\n", stderr: "" };
+    },
+  });
+  try {
+    await settleAsyncWork();
+    for (const toolName of ["read", "search", "fffind", "resource", "todo", "bash", "bash_bg", "custom-tool", "write", "edit"]) {
+      harness.emit("tool_execution_end", { toolName, input: { command: "maestro search git --json" } });
+      harness.emit("agent_end");
+      t.mock.timers.tick(1_000);
+      await settleAsyncWork();
+      assert.equal(execCalls, 1, `${toolName} must not cause a Git query`);
+    }
+    t.mock.timers.tick(20_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 2, "the periodic query still detects file changes");
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("branch changes refresh Git with a shared minimum interval and a trailing update", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let execCalls = 0;
+  let stdout = "## main\n";
+  const harness = createHarness({
+    exec: async () => {
+      execCalls++;
+      return { code: 0, stdout, stderr: "" };
+    },
+  });
+  try {
+    await settleAsyncWork();
+    stdout = "## main\n M tracked.ts\n";
+    for (let index = 0; index < 3; index++) {
+      harness.emitBranchChange();
+      t.mock.timers.tick(1_000);
+    }
+    t.mock.timers.tick(1_999);
+    assert.equal(execCalls, 1);
+    t.mock.timers.tick(1);
+    await settleAsyncWork();
+    assert.equal(execCalls, 2, "a burst must coalesce without dropping its trailing update");
+    assert.match(stripAnsi(harness.render(120)[0]), /main.*△/);
+
+    t.mock.timers.tick(5_000);
+    stdout = "## edited-branch\n";
+    harness.emitBranchChange();
+    t.mock.timers.tick(499);
+    assert.equal(execCalls, 2);
+    t.mock.timers.tick(1);
+    await settleAsyncWork();
+    assert.equal(execCalls, 3);
+    assert.match(stripAnsi(harness.render(120)[0]), /edited-branch/);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("periodic and event Git refreshes coalesce and queue only one in-flight follow-up", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  const calls: Array<(result: { code: number; stdout: string; stderr: string }) => void> = [];
+  const harness = createHarness({ exec: () => new Promise((resolve) => calls.push(resolve)) });
+  try {
+    calls[0]!({ code: 0, stdout: "## main\n", stderr: "" });
+    await settleAsyncWork();
+    t.mock.timers.tick(29_500);
+    harness.emitBranchChange();
+    t.mock.timers.tick(500);
+    assert.equal(calls.length, 2, "the event and periodic tick must launch one query");
+    for (let index = 0; index < 10; index++) {
+      harness.emitBranchChange();
+    }
+    t.mock.timers.tick(30_000);
+    assert.equal(calls.length, 2, "a slow query must never overlap a later tick or event");
+    calls[1]!({ code: 0, stdout: "## main\n", stderr: "" });
+    await settleAsyncWork();
+    assert.equal(calls.length, 3, "in-flight branch changes require one trailing query");
+    calls[2]!({ code: 0, stdout: "## updated-branch\n", stderr: "" });
+    await settleAsyncWork();
+    assert.match(stripAnsi(harness.render(120)[0]), /updated-branch/);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("Git refresh is disabled without a UI", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  let execCalls = 0;
+  const harness = createHarness({ hasUI: false, exec: async () => {
+    execCalls++;
+    return { code: 0, stdout: "## main\n", stderr: "" };
+  } });
+  try {
+    harness.emit("tool_execution_end", { toolName: "write" });
+    harness.emit("agent_end");
+    t.mock.timers.tick(60_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 0);
+    assert.equal(harness.footerState().installed, false);
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("Cockpit ownership stops pending Git queries and restores polling when released", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  let execCalls = 0;
+  const harness = createHarness({ exec: async () => {
+    execCalls++;
+    return { code: 0, stdout: "## main\n", stderr: "" };
+  } });
+  try {
+    await settleAsyncWork();
+    harness.emitBranchChange();
+    harness.emitExtensionEvent("cockpit:ui-ownership", { footer: true });
+    harness.emit("tool_execution_end", { toolName: "edit" });
+    harness.emit("agent_end");
+    t.mock.timers.tick(60_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 1, "hidden footer must not run Git timers or queued events");
+
+    harness.startSession("D:\\another-session");
+    t.mock.timers.tick(60_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 1, "a new Session must respect Cockpit ownership");
+    harness.emitExtensionEvent("cockpit:ui-ownership", { footer: false });
+    await settleAsyncWork();
+    assert.equal(execCalls, 2);
+    t.mock.timers.tick(30_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 3, "polling must resume when Flow reclaims the footer");
+
+    harness.emit("session_tree");
+    t.mock.timers.tick(30_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 4, "footer replacement must not leak a second periodic timer");
+    harness.dispose();
+    t.mock.timers.tick(60_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 4, "shutdown must stop periodic and pending refreshes");
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("footer replacements share one Git polling clock without delaying its next tick", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"] });
+  let execCalls = 0;
+  const harness = createHarness({ exec: async () => {
+    execCalls++;
+    return { code: 0, stdout: "## main\n", stderr: "" };
+  } });
+  try {
+    await settleAsyncWork();
+    for (let index = 0; index < 3; index++) {
+      t.mock.timers.tick(9_000);
+      harness.emit("session_tree");
+      await settleAsyncWork();
+      assert.equal(execCalls, 1, "replacing a settled footer must not query Git again");
+    }
+    t.mock.timers.tick(3_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 2, "replacement must preserve the original periodic deadline");
+    t.mock.timers.tick(30_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 3, "only one periodic query may run per interval");
+    harness.dispose();
+    t.mock.timers.tick(60_000);
+    await settleAsyncWork();
+    assert.equal(execCalls, 3, "shutdown must cancel the shared polling clock");
+  } finally {
+    harness.dispose();
+    t.mock.timers.reset();
+  }
+});
+
+test("statusline accumulates message usage incrementally and rebuilds only at branch lifecycle boundaries", () => {
+  const initialBranch = Array.from({ length: 1_000 }, () => ({
+    type: "message",
+    message: { role: "assistant", usage: { input: 1, output: 2 } },
+  }));
+  const harness = createHarness({ branchEntries: initialBranch });
+  try {
+    assert.deepEqual(harness.tokenScanCounts(), { branchReads: 1, branchEntryVisits: 1_000 });
+
+    for (let index = 0; index < 1_000; index++) {
+      harness.emit("message_end", {
+        type: "message_end",
+        message: { role: "assistant", usage: { input: 1, output: 3 } },
+      });
+    }
+    harness.emit("message_end", { type: "message_end", message: { role: "user" } });
+
+    assert.deepEqual(
+      harness.tokenScanCounts(),
+      { branchReads: 1, branchEntryVisits: 1_000 },
+      "message_end must remain O(1) instead of rescanning the growing branch",
+    );
+    assert.match(stripAnsi(harness.render(120)[0]), /↑2\.0k ↓5\.0k/);
+
+    harness.setBranch([{
+      type: "message",
+      message: { role: "assistant", usage: { input: 7, output: 11 } },
+    }]);
+    harness.emit("session_tree", { type: "session_tree", oldLeafId: "old", newLeafId: "new" });
+    assert.deepEqual(harness.tokenScanCounts(), { branchReads: 2, branchEntryVisits: 1_001 });
+    assert.match(stripAnsi(harness.render(120)[0]), /↑7 ↓11/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline surfaces prompt cache hit rate from usage cacheRead/cacheWrite", () => {
+  const harness = createHarness({
+    branchEntries: [{
+      type: "message",
+      message: { role: "assistant", usage: { input: 100, output: 50, cacheRead: 300, cacheWrite: 0 } },
+    }],
+  });
+  try {
+    // hitRate = 300 / (100 + 300 + 0) = 75%
+    assert.match(stripAnsi(harness.render(120)[0]), /↑100 ↓50.*⚡75%/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline omits cache segment when no cache activity is present", () => {
+  const harness = createHarness({
+    branchEntries: [{
+      type: "message",
+      message: { role: "assistant", usage: { input: 100, output: 50 } },
+    }],
+  });
+  try {
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /⚡/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline renders cache hit rate even when only cached input is present", () => {
+  const harness = createHarness({
+    branchEntries: [{
+      type: "message",
+      message: { role: "assistant", usage: { input: 0, output: 0, cacheRead: 500, cacheWrite: 0 } },
+    }],
+  });
+  try {
+    // hitRate = 500 / (0 + 500) = 100%; token line renders because cacheRead > 0
+    assert.match(stripAnsi(harness.render(120)[0]), /⚡100%/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline accumulates cache usage incrementally across message_end events", () => {
+  const harness = createHarness();
+  try {
+    harness.emit("message_end", {
+      type: "message_end",
+      message: { role: "assistant", usage: { input: 10, output: 5, cacheRead: 30, cacheWrite: 0 } },
+    });
+    harness.emit("message_end", {
+      type: "message_end",
+      message: { role: "assistant", usage: { input: 10, output: 5, cacheRead: 50, cacheWrite: 0 } },
+    });
+    // totals: input=20, cacheRead=80 -> hitRate = 80 / (20 + 80) = 80%
+    assert.match(stripAnsi(harness.render(120)[0]), /⚡80%/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline hides inactive Plan-auto and projects active memory state without claiming footer ownership", () => {
+  const harness = createHarness();
+  try {
+    harness.statuses.set("maestro-plan-auto", "PLAN-AUTO off");
+    assert.ok(harness.render(120).every((line) => !stripAnsi(line).includes("PLAN-AUTO")));
+    for (const value of ["PLAN-AUTO confirm+ask g7", "PLAN-AUTO ask g7"]) {
+      harness.statuses.set("maestro-plan-auto", value);
+      assert.ok(harness.render(120).some((line) => stripAnsi(line).includes(value)));
+      for (let width = 1; width <= 120; width++) assertLiveRows(harness.render(width), width);
+    }
+    harness.statuses.set("maestro-plan-auto", "PLAN-AUTO off");
+    for (let width = 1; width <= 120; width++) {
+      const lines = harness.render(width);
+      assert.ok(lines.every((line) => !stripAnsi(line).includes("PLAN-AUTO")));
+      assertLiveRows(lines, width);
+    }
+    harness.statuses.delete("maestro-plan-auto");
+    assert.ok(harness.render(120).every((line) => !stripAnsi(line).includes("PLAN-AUTO")));
+  } finally { harness.dispose(); }
+});
+
+test("statusline links approval mode with ACT, PLAN and READY using width-aware labels", () => {
+  const harness = createHarness();
+  try {
+    for (const [status, approval, full, compact, narrow] of [
+      ["ACT", "APPROVAL default", "[A] ACT · APPROVAL default", "ACT/default", "A/D"],
+      ["ACT", "APPROVAL acceptEdits", "[A] ACT · APPROVAL acceptEdits", "ACT/acceptEdits", "A/E"],
+      ["ACT", "APPROVAL dontAsk", "[A] ACT · APPROVAL dontAsk", "ACT/dontAsk", "A/N"],
+      ["ACT", "APPROVAL YOLO", "[A] ACT · YOLO", "ACT/YOLO", "A/Y"],
+      ["PLAN", "APPROVAL default", "[P] PLAN · APPROVAL plan", "PLAN/plan", "P/P"],
+      ["READY", "APPROVAL bypassPermissions", "[P] READY · YOLO", "READY/YOLO", "R/Y"],
+    ] as const) {
+      harness.statuses.set("mode", status);
+      harness.statuses.set("approval-mode", approval);
+      assert.ok(stripAnsi(harness.render(100)[0]).startsWith(full));
+      assert.ok(stripAnsi(harness.render(60)[0]).startsWith(compact));
+      assert.ok(stripAnsi(harness.render(30)[0]).startsWith(narrow));
+    }
+
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("approval-mode", "APPROVAL default");
+    assert.ok(stripAnsi(harness.render(48)[0]).startsWith("ACT/default"));
+    assert.ok(stripAnsi(harness.render(80)[0]).startsWith("[A] ACT · APPROVAL default"));
+
+    harness.statuses.set("approval-mode", "APPROVAL YOLO");
+    const yolo = harness.render(100)[0];
+    // YOLO is rendered in error color and bold.
+    const errorWrap = `\x1b[38;5;${colorCode("error")}m\x1b[1mYOLO\x1b[22m\x1b[39m`;
+    assert.ok(yolo.includes(errorWrap), `expected YOLO styled in error+bold, got ${JSON.stringify(yolo)}`);
+
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("short YOLO label preserves the full mode, cwd and Git layout", async () => {
+  const harness = createHarness({
+    exec: async () => ({ code: 0, stdout: "## master\n", stderr: "" }),
+  });
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("approval-mode", "APPROVAL YOLO");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO ON");
+    await settleAsyncWork();
+
+    const line = stripAnsi(harness.render(94)[0]);
+    assert.match(line, /^\[A\] ACT · YOLO/);
+    assert.match(line, /AUTO-COMPACT ON/);
+    assert.match(line, /pi-graph/);
+    assert.match(line, /master/);
+    assert.doesNotMatch(line, /…/);
+    assert.ok(visibleWidth(harness.render(94)[0]) <= 94);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline keeps a short context progress bar in compact layouts", () => {
+  const harness = createHarness();
+  try {
+    const compact = stripAnsi(harness.render(70)[0]);
+    const narrow = stripAnsi(harness.render(36)[0]);
+    assert.match(compact, /██░░░ 42%/);
+    assert.match(narrow, /██░░░ 42%/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline renders the linked effort name after the model", () => {
+  const harness = createHarness();
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("approval-mode", "APPROVAL default");
+    harness.statuses.set("maestro-effort", "high");
+    assert.match(stripAnsi(harness.render(120)[0]), /test · high/);
+    assert.match(stripAnsi(harness.render(70)[0]), /test · high/);
+    assert.match(stripAnsi(harness.render(42)[0]), /test · high/);
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /EFFORT/);
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /high\s+\[/);
+
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline drops an extreme Git branch as a whole before dropping the cwd", async () => {
+  const longBranch = `feature/${"界面修复🚀".repeat(20)}`;
+  const harness = createHarness({
+    exec: async () => ({ code: 0, stdout: `## ${longBranch}\n`, stderr: "" }),
+  });
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("approval-mode", "APPROVAL YOLO");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO ON");
+    await settleAsyncWork();
+
+    const rendered = harness.render(94)[0];
+    const line = stripAnsi(rendered);
+    assert.match(line, /pi-graph/);
+    assert.doesNotMatch(line, /feature\/|界面修复|…/);
+    assert.ok(visibleWidth(rendered) <= 94);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline renders Swarm iteration and convergence on one optional compact line", () => {
+  const harness = createHarness();
+  try {
+    assert.equal(harness.render(120).length, 1);
+    harness.statuses.set("maestro-swarm", "SWARM 2/4 · CONV 65%");
+    const wide = harness.render(120);
+    assert.equal(wide.length, 2);
+    assert.equal(stripAnsi(wide[1]!), "SWARM 2/4 · CONV 65%");
+
+    assertLiveRows(harness.render(1), 1);
+    for (let width = 2; width <= 80; width++) {
+      const lines = harness.render(width);
+      assert.equal(lines.length, 2);
+      assertLiveRows(lines, width);
+    }
+
+    harness.statuses.delete("maestro-swarm");
+    assert.equal(harness.render(120).length, 1);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline renders context pressure across full compact and narrow widths", () => {
+  const harness = createHarness();
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("approval-mode", "APPROVAL default");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO ON");
+    assert.equal(harness.render(120).length, 1);
+    assert.match(stripAnsi(harness.render(120)[0]), /AUTO-COMPACT ON/);
+    assert.match(stripAnsi(harness.render(70)[0]), /AUTO ON/);
+    assert.match(stripAnsi(harness.render(36)[0]), /AUTO/);
+
+    harness.statuses.set("maestro-auto-compact", "CTX AUTO-PRUNE 82000/90000 -3");
+    assert.equal(harness.render(120).length, 2);
+    assert.match(stripAnsi(harness.render(120)[0]), /AUTO-COMPACT ON/);
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX AUTO-PRUNE 82000\/90000 -3/);
+    assert.match(stripAnsi(harness.render(70)[1]), /CTX PRUNE -3/);
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX PRUNE -3/);
+    assert.equal(harness.render(36).length, 2);
+    assert.doesNotMatch(stripAnsi(harness.render(36)[0]), /CTX PRUNE/);
+
+    harness.statuses.set("maestro-auto-compact", "CTX CRITICAL 91000/90000");
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX CRITICAL 91000\/90000/);
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX CRITICAL/);
+
+    harness.statuses.set("maestro-auto-compact", "COMPACT 91000/90000");
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX COMPACT 91000\/90000/);
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX COMPACT/);
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+
+    harness.statuses.delete("maestro-auto-compact");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO OFF");
+    assert.equal(harness.render(120).length, 1);
+    assert.match(stripAnsi(harness.render(120)[0]), /AUTO-COMPACT OFF/);
+    assert.match(stripAnsi(harness.render(36)[0]), /AUTO OFF/);
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /AUTO-PRUNE|CRITICAL|P!|C!/);
+
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+
+    harness.statuses.delete("maestro-auto-compact-mode");
+    assert.doesNotMatch(stripAnsi(harness.render(120)[0]), /AUTO-COMPACT/);
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline renders reason-bearing context pressure without dropping the line", () => {
+  const harness = createHarness();
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO ON");
+
+    // Reason-bearing status: band + telemetry must be visible, not silently dropped.
+    harness.statuses.set("maestro-auto-compact", "CTX AUTO-PRUNE 140000/180000 -3 prunable:42% cache:88%");
+    assert.equal(harness.render(120).length, 2);
+    const wide = stripAnsi(harness.render(120)[1]);
+    assert.match(wide, /CTX AUTO-PRUNE 140000\/180000 -3/);
+    assert.match(wide, /prunable:42%/);
+    assert.match(wide, /cache:88%/);
+    // Mid tier keeps the band and appends reasons where they fit.
+    const mid = stripAnsi(harness.render(70)[1]);
+    assert.match(mid, /CTX PRUNE -3/);
+    assert.match(mid, /cache:88%/);
+    // Narrowest tier stays minimal — band only, no reasons.
+    const narrow = stripAnsi(harness.render(36)[1]);
+    assert.match(narrow, /CTX PRUNE -3/);
+    assert.doesNotMatch(narrow, /prunable|cache:/);
+
+    // NUDGE with reasons but no pruned count still renders.
+    harness.statuses.set("maestro-auto-compact", "CTX NUDGE 130000/180000 prunable:31%");
+    const nudge = stripAnsi(harness.render(120)[1]);
+    assert.match(nudge, /CTX NUDGE 130000\/180000/);
+    assert.match(nudge, /prunable:31%/);
+
+    // Reason-less status still renders exactly as before (no regression).
+    harness.statuses.set("maestro-auto-compact", "CTX AUTO-PRUNE 82000/90000 -3");
+    assert.equal(stripAnsi(harness.render(120)[1]), "CTX AUTO-PRUNE 82000/90000 -3");
+
+    // O7 forward-compat: pruned segment with /<amount> suffix must not break the parse.
+    harness.statuses.set("maestro-auto-compact", "CTX AUTO-PRUNE 140000/180000 -3/-4.2k prunable:42% cache:88%");
+    const withAmount = stripAnsi(harness.render(120)[1]);
+    assert.match(withAmount, /CTX AUTO-PRUNE 140000\/180000 -3\/-4.2k/);
+    assert.match(withAmount, /cache:88%/);
+
+    // Every reason-bearing tier must respect its width budget.
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline keeps hard-compaction statuses owner-distinguishing across widths", () => {
+  const harness = createHarness();
+  try {
+    harness.statuses.set("mode", "ACT");
+    harness.statuses.set("maestro-auto-compact-mode", "AUTO ON");
+
+    // mid-turn keeps its effective denominator and carries owner+reason in the tail.
+    harness.statuses.set("maestro-auto-compact", "COMPACT 23000/25000 mid-turn ratio-floor");
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX COMPACT 23000\/25000 mid-turn ratio-floor/);
+    assert.match(stripAnsi(harness.render(70)[1]), /CTX COMPACT mid-turn ratio-floor/);
+    // Narrow tier drops numbers and reasons but keeps the owner.
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX COMPACT mid-turn/);
+
+    // output-limit and plan-handoff owners render distinctly.
+    harness.statuses.set("maestro-auto-compact", "COMPACT 180000/200000 output-limit gate:80% 90%");
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX COMPACT 180000\/200000 output-limit gate:80% 90%/);
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX COMPACT output-limit/);
+
+    harness.statuses.set("maestro-auto-compact", "COMPACT 180000/200000 plan-handoff");
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX COMPACT 180000\/200000 plan-handoff/);
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX COMPACT plan-handoff/);
+
+    harness.statuses.set("maestro-auto-compact", "COMPACT 180000/175000 native configured");
+    assert.match(stripAnsi(harness.render(120)[1]), /CTX COMPACT 180000\/175000 native configured/);
+    assert.match(stripAnsi(harness.render(36)[1]), /CTX COMPACT native/);
+
+    // Legacy reason tails without an owner render exactly as before.
+    harness.statuses.set("maestro-auto-compact", "CTX AUTO-PRUNE 82000/90000 -3");
+    assert.equal(stripAnsi(harness.render(120)[1]), "CTX AUTO-PRUNE 82000/90000 -3");
+
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("statusline renders canonical Session/Run separately from active tool calls", () => {
+  const harness = createHarness({
+    activeToolCalls: 2,
+    workflowSnapshot: {
+      source: "canonical",
+      projectRoot: "D:\\pi-graph",
+      loadedAt: "2026-07-15T00:00:00.000Z",
+      revision: { sessionRevision: 1, fingerprint: "statusline" },
+      diagnostics: [],
+      session: {
+        sessionId: "20260715-auth-m1",
+        label: "auth-m1",
+        intent: "Auth",
+        status: "paused",
+        revision: 1,
+        activeRunId: "003",
+        definitionOfDone: "Auth verified",
+        gates: [
+          { id: "GATE-001", blocking: true, status: "passed" },
+          { id: "GATE-002", blocking: true, status: "passed" },
+          { id: "GATE-003", blocking: true, status: "pending" },
+        ],
+        chain: [
+          { step: "analyze", command: "analyze", status: "completed", runId: null },
+          { step: "grill", command: "grill", status: "completed", runId: null },
+          { step: "plan", command: "plan", status: "blocked", runId: "003" },
+        ],
+        runs: [{
+          runId: "003",
+          parentRunId: null,
+          command: "plan",
+          status: "blocked",
+          goal: null,
+          args: [],
+          gates: [{ id: "GATE-003", blocking: true, status: "pending" }],
+          primaryArtifactId: null,
+          handoff: null,
+          startedAt: "2026-07-15T00:00:00.000Z",
+          endedAt: null,
+        }],
+        artifacts: [],
+        aliases: {},
+      },
+      recoveryAction: "Resume from gate",
+      goal: { objective: "Auth", status: "paused", tokensUsed: 45_000, tokenBudget: 300_000 },
+    },
+  });
+  try {
+    const full = harness.render(120).map(stripAnsi);
+    assert.equal(full.length, 2);
+    assert.match(full[0], /2 calls/);
+    assert.doesNotMatch(full[0], /2 runs/);
+    assert.match(full[1], /⚑ auth-m1/);
+    assert.match(full[1], /! blocked/);
+    assert.match(full[1], /003\/plan/);
+    assert.doesNotMatch(full.join("\n"), /milestone|phase/i);
+    const narrow = stripAnsi(harness.render(40)[1]);
+    assert.match(narrow, /^⚑ auth-m1/, "session label leads the narrow workflow line");
+    assert.match(narrow, /» Resume from gate/, "recovery action stays visible after the label");
+
+    for (let width = 1; width <= 120; width++) {
+      assertLiveRows(harness.render(width), width);
+    }
+  } finally {
+    harness.dispose();
+  }
+});
+
+test("workflow statusline leads with the session label at every width so concurrent sessions stay identifiable", () => {
+  const snapshot: WorkflowSnapshotLike = {
+    source: "canonical",
+    projectRoot: "D:\\pi-graph",
+    loadedAt: "2026-07-24T00:00:00.000Z",
+    revision: { sessionRevision: 1, fingerprint: "concurrent" },
+    diagnostics: [],
+    session: {
+      sessionId: "20260724-companion-goal-final-fixes",
+      intent: "Fix goal",
+      status: "running",
+      revision: 1,
+      activeRunId: "003",
+      definitionOfDone: "done",
+      gates: [],
+      chain: [
+        { step: "analyze", command: "analyze", status: "completed", runId: "001" },
+        { step: "execute", command: "execute", status: "running", runId: "003" },
+        { step: "verify", command: "verify", status: "pending", runId: null },
+      ],
+      runs: [
+        { runId: "001", parentRunId: null, command: "analyze", status: "sealed", goal: null, args: [], gates: [], primaryArtifactId: null, handoff: null, startedAt: "", endedAt: "" },
+        { runId: "003", parentRunId: null, command: "execute", status: "running", goal: null, args: [], gates: [], primaryArtifactId: null, handoff: null, startedAt: "", endedAt: null },
+      ],
+      artifacts: [],
+      aliases: {},
+    },
+    recoveryAction: "Resume from gate",
+    goal: { objective: "Fix goal", status: "running", tokensUsed: 45_000, tokenBudget: 300_000 },
+  };
+  const view = deriveWorkflowViewModel(snapshot);
+  assert.ok(view);
+  assert.equal(view.sessionLabel, "20260724-companion-goal-final-fixes");
+  const fakeTheme = makeFakeTheme();
+
+  for (let width = 1; width <= 120; width++) {
+    const line = renderWorkflowStatusline(fakeTheme, view, width);
+    assert.ok(visibleWidth(line) <= width, `width ${width}: ${visibleWidth(line)} ${line}`);
+    if (width >= 3) {
+      assert.ok(stripAnsi(line).startsWith("⚑ "), `width ${width} must lead with the session label: ${stripAnsi(line)}`);
+    }
+  }
+
+  const narrow = stripAnsi(renderWorkflowStatusline(fakeTheme, view, 47));
+  assert.match(narrow, /^⚑ 20260724-companion-goal-final-fixes/);
+});

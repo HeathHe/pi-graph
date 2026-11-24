@@ -1,0 +1,1435 @@
+# pi-graph Usage Guide
+
+<p align="center">
+  <a href="USAGE.md">中文</a> | <strong>English</strong>
+</p>
+
+> Complete documentation of all tools, capabilities, and usage registered by the pi-graph plugin for Pi Coding Agent.
+> Skills are briefly indexed here; see [Maestro Flow](https://github.com/catlog22/maestro-flow) for full definitions.
+
+---
+
+## Table of Contents
+
+1. [Installation & Configuration](#1-installation--configuration)
+2. [Core Tools](#2-core-tools)
+   - [teammate — Multi-Agent Dispatch](#21-teammate--multi-agent-dispatch)
+   - [maestro — Knowledge-Aware Dispatch](#22-maestro--knowledge-aware-dispatch)
+   - [goal — Long-Running Objective Lifecycle](#23-goal--long-running-objective-lifecycle)
+   - [todo — Task Management](#24-todo--task-management)
+     - [Single-TODO Progress Supervision](#single-todo-progress-supervision)
+   - [run-control — Workflow Run Control](#25-run-control--workflow-run-control)
+3. [Intelligence Tools](#3-intelligence-tools)
+   - [lsp — Language Server Integration](#31-lsp--language-server-integration)
+   - [browser — Browser Control](#32-browser--browser-control)
+   - [smart_search — Web Search & Research](#33-smart_search--web-search--research)
+   - [search / fffind — Fast Search](#34-search--fffind--fast-search)
+   - [search_tool_bm25 — Tool Discovery](#35-search_tool_bm25--tool-discovery)
+4. [MCP Integration](#4-mcp-integration)
+5. [Permission System](#5-permission-system)
+6. [Thinking Depth Control](#6-thinking-depth-control)
+7. [Interaction Tools](#7-interaction-tools)
+   - [ask-user-question — Structured User Input](#71-ask-user-question--structured-user-input)
+   - [plan-enter — Plan Mode](#72-plan-enter--plan-mode)
+8. [Agent Control Tools](#8-agent-control-tools)
+9. [Runtime Subsystems](#9-runtime-subsystems)
+   - [Auto-Compaction](#91-auto-compaction)
+   - [GUI Subsystem (UCL)](#92-gui-subsystem-ucl)
+   - [TUI Components](#93-tui-components)
+10. [Agent Roles (27)](#10-agent-roles-27)
+11. [Prompt Input](#11-prompt-input)
+12. [Skills Index (68)](#12-skills-index-68)
+13. [Knowledge System](#13-knowledge-system)
+14. [Workflow Patterns](#14-workflow-patterns)
+15. [Configuration Reference](#15-configuration-reference)
+16. [Troubleshooting](#16-troubleshooting)
+
+---
+
+## 1. Installation & Configuration
+
+### Prerequisites
+
+| Component | Version |
+|-----------|---------|
+| Node.js | ≥ 22.19.0 |
+| [Pi Coding Agent](https://github.com/earendil-works/pi) | 0.99.0 validation baseline; version-gated legacy compatibility for 0.87–0.98 |
+
+> [Maestro Flow](https://github.com/catlog22/maestro-flow) (knowledge system) is auto-installed as a dependency — no separate prerequisite install needed.
+
+### Install
+
+> **Source checkout:** Graph npm install examples apply after publication; see [local development and package mapping](GRAPH-PACKAGING.md).
+
+> **v0.34.0 baseline:** Flow 0.34.0, Backends 0.1.7, Teammate 2.10.0, Cockpit 0.24.4; other packages unchanged. The engine remains `maestro-flow >=0.5.91` (latest upstream/local 0.5.92, not an exact pin). Fork provenance and verification scope are in [RELEASE.md](../RELEASE.md). Native checks cover Windows x64 / Node 22.22; minimum Node and macOS/Linux remain unverified.
+
+```bash
+# Install or upgrade (pi-graph-agent-runtime is installed as a dependency)
+pi install npm:pi-graph@0.2.7
+
+# Confirm Flow, Teammate, and Cockpit are listed, then restart Pi or reload extensions.
+pi list
+```
+
+Upgrades migrate Flow-managed companion registrations. A same-name local development override is preserved and reported in the startup log; update or remove that override explicitly.
+
+### v0.34.0 Usage Notes
+
+- Browser `start_video` / `stop_video` and chapter/action presentation capture silent WebM across runs/navigation on managed/profile/CDP. FFmpeg with VP8/WebM support is required; artifacts survive tab closure. Extension video is unsupported. See the [browser guide](../docs-site/src/content/docs/guides/lsp-browser.md).
+- Compaction summaries add thinking/timeout settings, live progress and retry/usage metrics; see [compaction settings](../docs-site/src/content/docs/guides/compaction-config.md).
+- Teammate aligns routing guidance; Monitor adds exact-owner lifecycle `subscribe` / `unsubscribe` / `subscriptions`. Workspace root delivery distinguishes queued from actual consumption, and interactive worker completion does not close its terminal. See [dispatch](../docs-site/src/content/docs/guides/teammate-dispatch.md).
+- Cockpit improves viewport and terminal restoration stability. HTTP/2, unknown-provider and stream-read failures enter retry classification; observation/RPC/search/error previews are bounded, not complete result evidence.
+
+### Pi 0.99 Native Host and New Tools
+
+On Pi 0.99+, the host owns the tool loadout, `tool_search`, model/classifier runtime, MCP, and keyboard capabilities. Missing native APIs do not start a second legacy runtime. Optional Pi host peers keep their `*` ranges. Use native `/mcp`; disable `builtin:mcp` before previewing and approving old-config migration with `/maestro-mcp-migrate`, then restore the native manager.
+
+- `search` replaces `ffgrep`: literal/regex/fuzzy matching and lines/files/count output; bounded `rg` handles unavailable indexes and root-wide plain/regex searches. Fuzzy still requires the index. Narrow path/glob for large projects.
+- `open-code-review` needs a separately installed `ocr` CLI. `preview`/`rules` resolve files/rules only; `review` performs OCR-managed review with the runtime model; `health` checks connectivity. Configure the model via `/api-manager open-code-review`; see `packages/pi-graph/optional/OCR-SETUP.md` for installation.
+- Optional Ask transports race the local TUI and cancel the other surface; Mobile cancellation also closes the local wizard. Plan confirm/review exposes an optional transport seam with revision checks, not a promise that every client already has a Plan UI. The v0.35.0 Refine transport instead mirrors the local panel and relays intents without running another subagent. The local TUI stays authoritative and survives mirror failure. Optimized drafts report `applied` only after the PlanStore commit; review feedback still returns to discussion, not draft application or Plan approval.
+- Native Quiet mode toggles live without activating extra tools; initial resumed-history rendering and third-party execution-only overrides remain limitations. See the docs-site [Cockpit guide](../docs-site/src/content/docs/guides/cockpit.md).
+
+### Registered Tools Overview
+
+After installation, the plugin registers these tools with Pi:
+
+| Source Package | Tool | Purpose |
+|---------------|------|---------|
+| pi-graph-agent-runtime | `teammate` | Multi-agent dispatch (single/parallel/DAG) |
+| pi-graph-agent-runtime | `teammate-send` | Message running agents |
+| pi-graph-agent-runtime | `teammate-list` | List active agents |
+| pi-graph-agent-runtime | `teammate-watch` | Inspect agent output |
+| pi-graph-agent-runtime | `teammate-wait` | Wait for agent completion |
+| pi-graph | `maestro` | Knowledge-aware dispatch (explore/delegate/moa) |
+| pi-graph | `goal` | Long-running objective lifecycle |
+| pi-graph | `todo` | Task decomposition and tracking |
+| pi-graph | `run-control` | Workflow Run lifecycle |
+| pi-graph | `ask-user-question` | Structured user input collection |
+| pi-graph | `lsp` | Language Server Protocol integration |
+| pi-graph | `browser` | Chromium browser control |
+| pi-graph | `smart_search` | Web search / deep research / URL fetch |
+| pi-graph | `search` | FFF indexed content search (literal/regex/fuzzy, rg fallback) |
+| pi-graph | `fffind` | FFF fast fuzzy file search |
+| pi-graph | `search_tool_bm25` | BM25 tool discovery |
+| pi-graph | `model-availability` | Secret-free model registration and route diagnostics |
+| pi-graph | `plan-enter` | Enter Plan mode |
+
+---
+
+## 2. Core Tools
+
+### 2.1 teammate — Multi-Agent Dispatch
+
+Every call uses a required non-empty `tasks[]` array. One task represents single-agent work; multiple tasks represent parallel or dependency-aware work. Each `prompt` is literal task text and no prompt template is loaded.
+
+```javascript
+teammate({ tasks: [{
+  agent: "explorer",
+  taskType: "explore",
+  prompt: "FIND: auth entry points
+SCOPE: src/"
+}] })
+
+teammate({
+  agent: "explorer",
+  model: "provider/fast-model",
+  tasks: [
+    { name: "scan", prompt: "Locate auth entry points" },
+    { name: "calls", prompt: "Locate call sites" },
+    { name: "review", agent: "analyst", taskType: "review",
+      model: "provider/deep-model", prompt: "Review {scan} and {calls}" }
+  ],
+  concurrency: 2,
+  background: false
+})
+```
+
+Top-level `agent/taskType/model/thinking/context/cwd/outputSchema/timeoutMs` values are task defaults; task values override them. The final role default is `general`. `{name}`/`{name.field}` inject upstream output and `dependsOn` declares ordering only. `background` defaults to `false`.
+
+Model precedence is task model > top-level model > taskType mapping > role model > parent Pi model. taskType affects routing only. The Control Center automatically combines built-in types, types declared by currently discovered built-in/project/user agent YAML, and types already present in routing configuration; custom agents may declare new lower-case identifiers.
+
+#### Model-registry mode
+
+`.pi/teammate-backends.json` supports three distinct modes: absent/`legacy` keeps the original path, `backend-registry` uses backend registrations with the older incidental model catalog, and v2 `model-registry` requires explicit `models`, `defaultModel`, and deployment topology. A teammate `model` value is then the canonical model registration id, not a backend id or adapter selector.
+
+For DSH, register a deployment using `pi-graph-executors/dsh` and give its model registration an `adapter-model` selector whose `value` is the DSH model. Pi and local/direct-SSH ACP routes are session-available in root and child sessions; `remote-workers` routes use `fixed` and are session-available only in the active root Monitor session.
+
+Run `model-availability` after migration. The compatible `teammate_models`, `delegate_tools`, `delegate_fallback`, and `delegate_config_path` fields remain; additive `model_registry.registrations` rows expose only registration/model/deployment identity, normalized harness/transport, the `registered`, `resolvable`, `sessionAvailable`, and `healthy` gates, and a sanitized `unavailableReason`. Remote rows stay diagnostic-visible outside Monitor with a deterministic reason.
+
+CLI compatibility is opt-in through `compatibility: { "version": 1, "teammateCliToolsProjection": { "enabled": true } }`. It projects an enabled `teammate-cli-tools.json` name only when exactly one ACP deployment owns the matching `cli/<tool>` route; it does not restore that file as a launch authority.
+
+**External CLI adapters must be installed separately**: a connection config only names an executable; teammate never auto-installs packages. Install commands for the known ACP adapters (one global install each; the adapter bundles its agent runtime): `codex-acp` ← `npm i -g @agentclientprotocol/codex-acp`; `claude-agent-acp` ← `npm i -g @agentclientprotocol/claude-agent-acp`. When the command is missing, launch probes and catalog refreshes surface this exact install command.
+
+Migration: back up the file, retain deployment ids/config, add `version: 2`, explicit model registrations and one default model on the default deployment, optionally enable the CLI projection, reload extensions, then inspect all four diagnostic gates. Roll back by changing only `mode` to `backend-registry` or `legacy` and reloading; keeping `models`, `defaultModel`, and `compatibility` provides round-trip preservation, not guaranteed valid re-entry. Flow Settings edits backend fields only, preserves v2/unknown sections and CAS/credential custody, and does not provide a model registration editor. The strict v2 parser may still reject unsupported or unknown fields, which must be removed or updated before re-entering `model-registry`.
+
+Known gap: registry dispatch still drops task-level `timeoutMs`; neither `backend-registry` nor `model-registry` has a host watchdog. Configure a deployment timeout such as ACP `runTimeoutMs` where required. The complete manifest and topology contract is in [Teammate Backend Adapter Contract](teammate-backend-adapter-contract.md).
+
+#### Reusing `/ssh` hosts
+
+Remote Worker, ACP direct-SSH/`cli/<tool>`, and DSH SSH can use `sshHostRef` to reference a host in the encrypted SSH manager. Unlock the manager through `/ssh`, then select a compatible host in Connections. The current `#ssh` selection binds only the independent `ssh` tool and never changes teammate routing.
+
+SSH manager store v3 encrypts Gateway bindings separately from host profiles. For a host whose key has already been pinned by Test, the user can run `/ssh pair <targetId>`; the extension runs only the fixed bootstrap, consumes endpoint/token internally, and displays a secret-free receipt. Gateway calls then prefer direct Streamable HTTPS. `/ssh unpair <targetId>` revokes the remote pairing before deleting the local binding and restoring the fixed stdio relay. Only connection refusal/timeout or 404/405 protocol unavailability may downgrade. TLS/hostname/certificate, 401/403, expiry/revocation, server identity, and host-digest failures fail closed. Endpoint, token, and pairing id never enter tool schemas, target listings, the system prompt, logs, or errors.
+
+Remote Worker v4 configuration places the reference on a host alias; each target/workspace still owns its remote `cwd`, driver, and command:
+
+```json
+{
+  "version": 4,
+  "hosts": { "production": { "sshHostRef": "server-id-from-ssh-manager" } },
+  "targets": {
+    "production/pi": {
+      "host": "production",
+      "cwd": "/srv/project",
+      "driver": "pi-rpc",
+      "command": ["pi", "--mode", "rpc"]
+    }
+  },
+  "workspaces": {}
+}
+```
+
+ACP/DSH deployments set `sshHostRef` directly under `mode: "ssh"`. A reference is mutually exclusive with embedded `host`, `user`, `port`, `hostKeySha256`, and `identityFile`; existing embedded configurations remain supported. Teammate references accept only `bash` hosts using ssh-agent or an identity file **without a passphrase**. Password, passphrase-protected identity, and PowerShell hosts remain usable by the independent `ssh` tool but are explicitly rejected for teammate references. A locked manager, deleted reference, or missing provider fails new connections closed; an authenticated channel already executing may finish.
+
+#### DSH direct-SSH mode
+
+A DSH deployment with `"mode": "ssh"` launches its runtime on a remote host over OpenSSH. Its connection source is either one `sshHostRef` or the original five embedded SSH fields:
+
+| Field | Kind | Meaning |
+|---|---|---|
+| `mode` | enum | `"ssh"` selects the remote launch; default `"local"` ignores every field below |
+| `sshHostRef` | text | host id from the `/ssh` manager; cannot be combined with embedded SSH fields |
+| `host` | text | embedded remote hostname; **required** when `sshHostRef` is absent |
+| `user` | text | embedded remote login name; **required** when `sshHostRef` is absent |
+| `port` | integer | TCP port, default `22` |
+| `hostKeySha256` | text | optional `SHA256:...` fingerprint pinned via a pre-flight `ssh-keyscan` |
+| `identityFile` | path | optional private key; ssh then offers only that key (`IdentitiesOnly`) |
+
+`cordisConfig` and `cwd` are **remote paths** under `ssh`: they are consumed by the remote shell command (`cd <cwd> && exec <runtime> <cordisConfig>`), not by this host. Validation runs locally and therefore checks shape only — control characters are refused because the values cross an ssh command line, but existence is **not verified**: a local path check would simply be wrong for a remote path, so a typo surfaces as a failed launch, not a rejected registration.
+
+Authentication is BatchMode and identity-file/agent-only: the launch runs `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes`, so nothing prompts. With `identityFile` only that key is offered; without one, the host's ssh agent authenticates. Password prompts are failures by design.
+
+`hostKeySha256` is a pre-flight pin, not handshake-time verification: `ssh-keyscan` runs before launch and the fingerprint match is enforced against the pinned known_hosts file at connect time. Pin a fingerprint obtained over a trusted channel; a rotated host key fails the launch closed.
+
+`envPassthrough` degrades to best-effort `SendEnv`: values remain only in the scrubbed ssh child environment and never enter argv; only names this host resolves are forwarded, and the remote sshd drops any name its `AcceptEnv` does not permit — keep anything essential in the runtime's own configuration beside `cordis.yml`.
+
+`todoBridge` is unsupported with `mode: ssh` and rejected at load: the todo endpoint listens on this host's loopback, unreachable from a remote runtime.
+
+`requestTimeoutMs` bounds each JSON-RPC request, not the whole turn; over ssh every request crosses the network, so raise it (the resolver warns below `300000`) rather than letting a localhost-tuned timeout fail mid-turn.
+
+#### pi-teammate-models CLI
+
+`pi-teammate-models` is a standalone CLI for reading and maintaining `.pi/teammate-backends.json` without opening the Control Center:
+
+```bash
+pi-teammate-models list                     # static route table (no backend modules loaded)
+pi-teammate-models edit                     # edit one deployment's configuration fields
+pi-teammate-models add                      # guided deployment + model registration wizard
+pi-teammate-models path                     # print the resolved document path
+```
+
+- **`list`** compiles the manifest through the same parser the runtime loads with and prints registration, model, deployment, topology, selector, and the `registered`/`resolvable`/`healthy` gates. Session availability is always `n/a` — a CLI holds no root-monitor authority. Legacy/backend-registry documents render a computed v2 upgrade skeleton and are **never written**; the only escape is `[E]xplicitly write upgraded copy`, which writes `<file>.upgraded.json` (never the legacy document itself), with `[A]bort` as the default.
+- **`edit`** lists deployments, then prompts over one deployment's declared configuration fields with current values shown; empty input keeps the current value. Credential-ref fields take a variable **NAME** only — pasting a secret value is rejected with an explicit warning and never echoed.
+- **`add`** walks family (`pi`/`dsh`/`acp`/third-party) → transport variant (`local`/`ssh` where applicable, with `host`/`user` enforced) → a unique deployment id → kind-validated fields with defaults applied on empty input → the model registration (id, intrinsic modelId, selector, deployment default). The whole candidate manifest is recompiled before writing; numbered compiler errors (duplicate selectors, competing deployment defaults, selector/topology mismatches) are shown and the registration block re-prompts.
+
+Options: `--file <path>` (alternate document path), `--locale en|zh-CN`, `--yes` (pre-confirm overwriting external changes). Concurrency is documented **last-writer-wins**: the file is re-read before publishing and any external change is shown as a redacted diff that must be confirmed (or pre-confirmed with `--yes`). Every write rotates backups — `<file>.bak` holds the previous document and `<file>.bak.1` the one before it — so undo is `cp <file>.bak <file>`.
+
+#### Connections tab in the Control Center
+
+Open the Teammate Control Center with `Alt+M` or `/teammate-models`. Its single **Connections** tab (labelled **连接** under `zh-CN`) merges two configuration families in one filterable list: v2 model-registry deployments and legacy worker hosts/targets. A v2 deployment can be inspected, edited with Enter through the field forms shared with the CLI, or added with `a` through the shared wizard. Invalid fields re-prompt in place, while whole-manifest compiler errors return to the relevant registration block.
+
+Deployment additions and edits write the same `.pi/teammate-backends.json` document through the CLI's D12 write pipeline, preserving the same runtime-parser validation, external-change confirmation, `.bak`/`.bak.1` rotation, and atomic publish. A legacy/backend-registry document exposes an upgrade preview only; explicit confirmation can create `<file>.upgraded.json` and never overwrites the source document. The TUI does not delete deployments; use `pi-teammate-models edit` when a deployment needs adjustment.
+
+Existing worker host/target operations and hotkeys are preserved: `n`/`N` creates a host/target, Enter edits, `d` deletes, `t` tests, `g`/`p` switches global/project scope, Tab/Shift+Tab or Left/Right changes tabs, and Esc closes. Deployment rows ignore `d`, so the legacy delete command cannot remove them.
+
+### 2.2 maestro — Knowledge-Aware Dispatch
+
+Three actions connecting external CLI endpoints and the knowledge system:
+
+#### explore — Parallel Code Search
+
+```javascript
+maestro({
+  action: "explore",
+  prompts: [
+    "FIND: All JWT validation middleware\nSCOPE: src/middleware/\nEXPECTED: file:line + control-flow summary",
+    "FIND: All auth.login() call sites\nSCOPE: src/**/*.ts\nEXPECTED: file:line list"
+  ],
+  concurrency: 3,
+  maxTurns: 6
+})
+```
+
+#### delegate — Task Delegation to External Tools
+
+```javascript
+maestro({
+  action: "delegate",
+  prompt: "PURPOSE: Implement password reset flow\nMODE: write\nCONTEXT: @src/auth/",
+  tool: "claude",       // gemini | claude | codex
+  mode: "write"
+})
+```
+
+#### moa — Mixture-of-Agents Synthesis
+
+```javascript
+maestro({
+  action: "moa",
+  prompts: ["Analyze payment flow from security and architecture perspectives"],
+  preset: "deep"
+})
+// Runs analysis across multiple models, then synthesizes into a unified report
+```
+
+---
+
+### 2.3 goal — Long-Running Objective Lifecycle
+
+Persistent engine for multi-turn autonomous work: auto-continuation, token budget, compaction survival, independent verification.
+
+#### Model-Side Operations
+
+```javascript
+goal({ action: "create", objective: "Implement JWT auth module" })
+goal({ action: "create", objective: "Implement JWT auth module", tokenBudget: "100k" })
+goal({ action: "get" })
+goal({ action: "update", objective: "Implement JWT auth + refresh tokens" })
+goal({ action: "complete", summary: "All modules implemented and tests passing" })
+```
+
+#### User-Side Commands
+
+| Command | Effect |
+|---------|--------|
+| `/goal status` | Show current Goal |
+| `/goal create [--tokens 100k] <objective>` | Create Goal and start agent loop |
+| `/goal stop` | Pause, persist state |
+| `/goal resume [--tokens 200k]` | Resume; optionally raise budget |
+| `/goal clear` | Abandon and remove Goal |
+
+#### Verification
+
+- Normal `agent_end` automatically triggers independent verification
+- `pass` → marked complete, Goal cleared
+- `fail` → stays active, next loop with unmet requirements
+- `inconclusive` → stays active, waits for `/goal resume`
+
+#### Goal Panel
+
+While a Goal exists, a `goal-panel` renders above the input editor showing:
+- Status (ACTIVE / WAITING / VERIFYING / VERIFIED / STOPPED / BUDGET / BLOCKED / ERROR)
+- Objective, elapsed time, loop count
+- Explicitly configured token budget (hidden when unset)
+
+---
+
+### 2.4 todo — Task Management
+
+8 actions with plain-text context and optional Pi Skill execution:
+
+```javascript
+// Create task
+todo({ action: "create", subject: "Implement user auth", description: "JWT + refresh tokens" })
+
+// Task with skill binding
+todo({
+  action: "create",
+  subject: "Code review",
+  skills: [{ name: "quality-review", role: "primary", args: "--level deep" }]
+})
+
+// Activate the caller's first runnable task
+todo({ action: "advance" })
+
+// Complete the active task immediately and activate the caller's next task
+todo({ action: "advance", id: "abc123", summary: "Auth module done" })
+
+// Complete without activating another task
+todo({ action: "update", id: "abc123", status: "completed", summary: "Auth module done" })
+
+// List tasks
+todo({ action: "list", filter: { status: "pending" } })
+
+// Compatibility entry point: activate only
+todo({ action: "next" })
+
+// Assign to teammate
+todo({ action: "create", subject: "Explore codebase", assignee: "explorer-1" })
+```
+
+| Action | Description |
+|--------|-------------|
+| `create` | Create task (subject required) |
+| `update` | Update status/summary/context/skills; may complete without continuing |
+| `advance` | Activate when idle, or complete the active task and promote the caller's next task |
+| `list` | List filtered by status/member |
+| `get` | Get single task details |
+| `delete` | Delete task |
+| `clear` | Clear all tasks |
+| `next` | Compatibility action: activate the next pending task and return resolved context |
+
+`advance` is actor-scoped: it only completes or activates tasks assigned to the caller, while completion still releases cross-role dependencies globally. When one logical outcome needs several roles, use a parent task with singly owned role-specific child tasks instead of shared terminal ownership of one Todo. Canonical Workflow Session/Run mirror Todos remain lifecycle projections and continue to be driven through Run control.
+
+---
+
+#### Single-TODO Progress Supervision
+
+Advisor can supervise the current ordinary `in_progress` TODO. A step or active-time threshold triggers `todo-progress` classification, followed by continued execution, a history-backed reflection prompt, or an independent advisor. **Crossing a threshold does not mean the task is stuck.** This feature is off by default and does not change Goal continuation or TODO lifecycle authority.
+
+```text
+/advisor on                    # Advisor master switch
+/advisor mode automatic        # automatic or hybrid permits automatic supervision
+/advisor todo                  # TODO settings TUI; /advisor settings opens the same panel
+/advisor todo on               # Enable TODO supervision separately
+/advisor todo mode shadow      # Observe only; active permits reflection/advice
+/advisor status                # Effective configuration and runtime status
+```
+
+The TUI edits the Advisor master switch, mode and model, plus TODO supervision, thresholds, cooldown and budgets. Use `↑↓` to select, `Enter` to edit, `Ctrl+S` then `Enter` to confirm saving, `Ctrl+R` to reset the draft, and `Esc` to return/cancel; press `Esc` again to discard an unsaved draft. Changes go to project `.pi/advisor.json`. Cancelling does not write or implicitly enable Advisor/classification. Configured and effective values are shown separately; unavailable model pins are preserved.
+
+| `todoReview` field | Default | Meaning |
+|---|---:|---|
+| `enabled` | `false` | Separate switch; Advisor must also be enabled |
+| `mode` | `active` | `active` permits intervention; `shadow` records classifications only |
+| `reviewSteps` / `reviewActiveMs` | `12` / `480000` | Light review after 12 model iterations or 8 active minutes |
+| `sameFailureLimit` | `3` | Repeated same-problem failures trigger earlier reflection |
+| `reflectionSteps` | `6` | Consider advice after 6 additional steps without new evidence |
+| `unresolvedSteps` / `unresolvedActiveMs` | `24` / `900000` | Escalation thresholds after reflection while unresolved: 24 steps or 15 active minutes |
+| `cooldownMs` | `30000` | Per-task review cooldown; Advisor delivery gating also applies |
+| `maxReviewsPerTask` / `maxEscalationsPerTask` | `3` / `1` | Review/advisor budgets per task activation |
+
+Example `.pi/advisor.json`:
+
+```json
+{
+  "enabled": true,
+  "mode": "automatic",
+  "todoReview": {
+    "enabled": true,
+    "mode": "shadow",
+    "reviewSteps": 12,
+    "reviewActiveMs": 480000,
+    "sameFailureLimit": 3,
+    "reflectionSteps": 6,
+    "unresolvedSteps": 24,
+    "unresolvedActiveMs": 900000,
+    "cooldownMs": 30000,
+    "maxReviewsPerTask": 3,
+    "maxEscalationsPerTask": 1
+  }
+}
+```
+
+Start in shadow, then switch to active in the TUI. `/advisor status` shows the shadow count and the latest task/actor, classification, confidence and source; shadow also emits a read-only verdict on `supervision:event`. Observations are bounded session state, not a persisted review report. Review budgets accumulate per activation: mode/model changes and compaction do not replenish them. If exhausted, explicitly adjust the budget in the TUI or use a new budget on the next task activation. Classification has its own switch and domain mode: explicitly use `/classifier on` and `/classifier mode todo-progress jev` for semantic adjudication. `off` uses rules; semantic shadow results are not authoritative. Unavailable classification, insufficient evidence or low confidence produce conservative reflection, not permission escalation or implicit classifier activation.
+
+- A step is a model/action iteration, not a tool-result count. Active time excludes known tool execution, human/dependency/capacity waits, compaction and offline periods; elapsed TODO status age is not a stall detector.
+- `on-track` needs no intervention; `waiting` waits; `looping` first requests `session_history` recovery of hypotheses, actions and results, verified against current source. An independent Advisor is requested only when reflection does not converge. `blocked`/`uncertain` never grant permissions; report missing credentials, resources or human decisions explicitly.
+- Main-session and local TODO-bound child agents use host-authoritative task/actor identities. Results for completed, reassigned, reactivated or replaced sessions are discarded. Canonical Workflow mirror TODOs are excluded; this is not remote Fabric monitoring.
+- Prompts are consumed at safe model boundaries. Tools are not aborted, TODOs are not automatically completed/transferred, and idle timers do not start new turns. Legacy Advisor reviews are deduplicated against TODO reviews; manual consultation remains available. Advice is not approval or proof of completion.
+
+---
+
+### 2.5 run-control — Maestro CLI passthrough shell
+
+Drive the canonical Maestro CLI through argv passthrough. This is the single LLM surface for Session/Run lifecycle operations; do not hand-write `maestro run/session` mutations in bash. The Workflow Coordinator must be available for every call. `session open` may create a new Session when none is active; other mutations operate on an active or explicitly named Session.
+
+Session/3.0 uses no mutation lease. The coordinator supplies the current Pi host identity as `--actor` (the CLI derives `--participant` from it), a distinct request ID, reason, and JSON output; a caller-supplied `--participant` that conflicts with coordinator authority is refused. It adds the exact `--session` and orchestration CAS revision for active-Session mutations, plus the Run revision for Run-entity mutations. `session open` has no Session/revision target yet; `session migrate` instead receives the legacy identity/activity revision fences. A CAS conflict is returned to the caller after a fresh authority read and is never silently replayed with a replacement revision.
+
+| Command class | Current v3 surface |
+|---------------|--------------------|
+| Read | `session status`; `run brief`; `run check`; lists/shows, resume view, Artifact inspect, and knowledge lookups |
+| Session mutation | `session open/complete/archive/unarchive`; `session chain insert/update/replace/skip`; `run next/create/decide` |
+| Run mutation | `run complete/transition/cancel/seal`; `run complete --advance` carries both Run and orchestration CAS |
+| Migration | `session migrate`, fenced by legacy identity/activity revisions rather than orchestration CAS |
+
+```javascript
+run-control({ argv: ["session", "status", "--session", "session-123", "--json"] })
+run-control({ argv: ["run", "brief", "run-123", "--session", "session-123", "--json"] })
+run-control({ argv: ["run", "check", "run-123", "--session", "session-123", "--json"] })
+run-control({ argv: ["session", "chain", "insert", "--session", "session-123", "--step-id", "review-1", "--command", "review", "--arg", "src", "--json"] })
+run-control({ argv: ["session", "chain", "update", "--session", "session-123", "--step-id", "review-1", "--stage", "verification", "--json"] })
+run-control({ argv: ["run", "next", "--session", "session-123", "--json"] })
+run-control({ argv: ["run", "complete", "run-123", "--session", "session-123", "--verdict", "done", "--advance", "--json"] })
+```
+
+---
+
+## 3. Intelligence Tools
+
+### 3.1 lsp — Language Server Integration
+
+Connect to language servers for code intelligence:
+
+| Action | Description |
+|--------|-------------|
+| `diagnostics` | Get diagnostics (errors/warnings) |
+| `definition` | Go to definition |
+| `references` | Find all references |
+| `hover` | Hover info (type/docs) |
+| `symbols` | File/workspace symbol list |
+| `rename` | Rename symbol |
+| `rename_file` | Rename file (update references) |
+| `code_actions` | Available code actions |
+| `type_definition` | Go to type definition |
+| `implementation` | Find implementations |
+| `status` | Language server status |
+| `reload` | Reload |
+| `capabilities` | Server capabilities |
+| `request` | Raw LSP request |
+
+```javascript
+lsp({ action: "diagnostics", file: "src/auth/login.ts" })
+lsp({ action: "definition", file: "src/auth/login.ts", line: 42, symbol: "validateToken" })
+lsp({ action: "references", file: "src/auth/login.ts", line: 42, symbol: "validateToken" })
+lsp({ action: "rename", file: "src/auth/login.ts", line: 42, symbol: "validateToken", new_name: "verifyToken", apply: true })
+lsp({ action: "symbols", file: "*" })  // Workspace symbols
+```
+
+The plugin also registers **LSP auto-diagnostics**: automatically triggers diagnostic checks after file edits.
+
+---
+
+### 3.2 browser — Browser Control
+
+Choose the backend explicitly with `app.channel: "managed" | "profile" | "cdp" | "extension"`. Without a selector, managed headless remains the default; daily Chrome is never taken over automatically. Before operations, call `browser({ action: "guide" })` and load the relevant SOP.
+
+| Action | Description |
+|--------|-------------|
+| `open` | Open/attach browser tab |
+| `close` | Close tab (`all: true` closes all) |
+| `run` | Execute host JS; use `page.evaluate` for page JS |
+| `guide` | SOP index/topic |
+| `status` | Start/probe bridge and named tabs live |
+| `pair` | Approve requestId/code in paired mode only |
+
+```javascript
+// Open page
+browser({ action: "open", url: "http://localhost:3000", name: "app" })
+
+// Execute JS + screenshot
+browser({
+  action: "run",
+  name: "app",
+  code: "await page.screenshot({ path: 'screenshot.png' }); return await page.title();"
+})
+
+// Set viewport
+browser({ action: "open", url: "...", viewport: { width: 1920, height: 1080 } })
+
+// Close
+browser({ action: "close", name: "app" })
+browser({ action: "close", all: true })
+```
+
+Configuration options:
+- `app.path` — custom Chromium/Chrome/Edge path
+- `app.cdp_url` — attach an existing endpoint with `channel:"cdp"` (borrowed)
+- `app.user_profile_dir` — explicitly chosen non-default user-data-dir for `channel:"profile"`; legacy `attach_user_profile:true` remains supported
+- `visible:true` — show Pi-launched managed/profile processes; ignored for existing attachments and rejected for extension
+- `wait_until` / `dialogs` — managed/profile/cdp navigation and dialog policies
+
+**Extension bridge:** after `/install browser-bridge`, call `browser({action:"status"})`. The extension discovers and connects multiple listeners in the default `19222..19231` range; each Pi binds one available port. Default `paired` mode requires matching the popup requestId/code with `pendingPairings`, approving via `browser pair`, then waiting for independent authenticated reconnection (`authenticatedConnected:true`). Set `PI_BROWSER_BRIDGE_AUTH_MODE=none` before starting Pi for token-free setup: no token or pair; readiness is `transportReady:true`, `authenticatedConnected:false`, `pendingPairings:[]`. NONE removes credential authorization; it is not authenticated success. A custom `PI_BROWSER_BRIDGE_PORT` shifts the ten-port server range: add status's actual listeningPort to popup **Advanced** (leave token empty for NONE).
+
+```javascript
+browser({ action: "open", name: "daily", app: { channel: "extension", target: "example.com" } })
+```
+
+Extension supports only URL/title/goto/evaluate, `browser.pages`, raw CDP/batch, cookies, tabs, and CDP screenshots—not Puppeteer/ElementHandle/DOM helpers/image OCR parity. Unsupported APIs and disconnects fail closed without fallback. Borrowed close releases mapping/lease; owned close closes the real tab. Physical-tab leases are exclusive across listeners; busy/draining does not mean page work stopped. Cookies/login state remain shared, not isolated.
+
+**Sessions and deadlines (v0.33.0):** named tabs are scoped to the trusted host
+session and stable across turns. `status.namedTabs` and `close all` target only
+that scope. Bridge discovery remains process-shared; tab ownership does not
+isolate cookies/login state.
+
+On managed/profile/CDP, `run.timeout` (seconds, default 30, maximum 300) is one deadline shared by setup,
+execution and postprocessing, not reset per step. Puppeteer/tab waits usually
+use milliseconds: leave budget headroom. Cleanup can add return latency.
+Extension command/execution waits are bounded, but setup/postprocessing can add latency.
+Failures carry bounded passive diagnostics without replaying scripts or
+interacting with the page; earlier actions may already have happened. Managed
+timeout closes owned resources; borrowed profile/CDP attachments only disconnect
+and page code may continue.
+
+After an interrupted extension run, `run` remains blocked until every entry
+command terminal and host operation drains; bridge-wide `drainingCommands: 0`
+alone does not prove reuse is safe. Then explicitly `open` the same name without
+a URL to revalidate its existing fixed tab/generation. Open also rejects while
+draining, preserves the tab and never replays the interrupted action.
+
+```javascript
+browser({ action: "status" }) // Observe named-entry and bridge drain state first
+// Only after all work drains: revalidate, not cancel/retry the prior action
+browser({ action: "open", name: "daily", app: { channel: "extension" } })
+```
+
+SOP loading recognizes published knowledge hints, including promoted entries;
+still read the guide index and relevant full topic. A hint is not a full SOP.
+
+Profile auto-launch uses `--remote-debugging-port=0` and reads `DevToolsActivePort`, or reuses a recorded endpoint. Chrome 136+ blocks debugging the default user-data-dir even after all windows close: choose a non-default profile explicitly or use extension for daily Chrome. Profiles are never copied/switched automatically, and a real login environment does not guarantee CAPTCHA success. See [setup, security, and troubleshooting](../packages/pi-graph/optional/BROWSER-BRIDGE-SETUP.md).
+
+---
+
+### 3.3 smart_search — Web Search & Research
+
+External information retrieval — web search, deep research, URL content extraction:
+
+| Mode | Purpose | Key Params |
+|------|---------|------------|
+| `search` | Quick lookup | `platform`, `validation` |
+| `research` | Multi-source deep research | `budget` (quick/standard/deep), `validation` (strict) |
+| `fetch` | Extract known URL content | — |
+| `route` | Routing diagnostics | `router_mode` |
+
+```javascript
+smart_search({ mode: "search", query: "Express.js middleware error handling best practices" })
+smart_search({ mode: "research", query: "JWT vs session auth comparison", budget: "deep", validation: "strict" })
+smart_search({ mode: "fetch", query: "https://docs.example.com/api/auth" })
+```
+
+Configure via `Alt+S` or `/smart-search-config`.
+
+---
+
+### 3.4 search / fffind — Fast Search
+
+Workspace-native index search powered by [FFF](https://github.com/fff-labs/fff). The index warms up at session start and stays in memory; teammate child sessions share the same index through a broker:
+
+```javascript
+// Literal content search (default mode="plain")
+search({ pattern: "validateToken", context: 3, limit: 20 })
+
+// Regex / fuzzy content search
+search({ pattern: "fn\\s+validate\\w*", mode: "regex" })
+search({ pattern: "valdiate token", mode: "fuzzy" })
+
+// Output shapes: files = paths only; count = per-file hit counts
+search({ pattern: "TODO", output: "files" })
+search({ pattern: "deprecated", output: "count", glob: "*.ts" })
+
+// Fuzzy file path search
+fffind({ pattern: "auth middleware", limit: 10 })
+```
+
+When the index is unavailable, `search` falls back to ripgrep (results are annotated `[engine: rg]`); `mode="fuzzy"` has no fallback equivalent and reports an explicit error instead.
+
+---
+
+### 3.5 search_tool_bm25 — Tool Discovery
+
+Search all registered tools by name, description, and parameter names using BM25 weighted ranking:
+
+```javascript
+search_tool_bm25({ query: "code search", limit: 10 })
+```
+
+Matching inactive tools are automatically activated.
+
+---
+
+## 4. MCP Integration
+
+The plugin includes a full MCP (Model Context Protocol) client, connecting external MCP servers through a unified `mcp` proxy tool.
+
+> Design principle: instead of registering hundreds of MCP server tools individually, a single `mcp` proxy tool provides unified access, keeping LLM context lean.
+
+### Basic Operations
+
+```javascript
+// Check server status
+mcp({ })
+
+// List server tools
+mcp({ server: "server-name" })
+
+// Search tools (by name/description)
+mcp({ search: "query" })
+mcp({ search: "pattern.*", regex: true })
+
+// Show tool details and parameters
+mcp({ describe: "tool_name" })
+
+// Connect server and refresh metadata
+mcp({ connect: "server-name" })
+
+// Call tool
+mcp({ tool: "tool_name", args: '{"key": "value"}' })
+mcp({ server: "server-name", tool: "tool_name", args: '{"key": "value"}' })
+```
+
+### OAuth Authentication
+
+```javascript
+// Start manual OAuth flow, get browser URL
+mcp({ action: "auth-start", server: "server-name" })
+
+// Complete manual OAuth
+mcp({ action: "auth-complete", server: "server-name", args: '{"redirectUrl":"..."}' })
+
+// Retrieve completed UI session messages
+mcp({ action: "ui-messages" })
+```
+
+### Transport Protocols
+
+Three transport types supported:
+- **stdio** — local process communication (most common)
+- **SSE** — Server-Sent Events HTTP stream
+- **Streamable HTTP** — streamable HTTP transport
+
+### Advanced Features
+
+| Feature | Description |
+|---------|-------------|
+| **Metadata Cache** | Persistent tool/resource metadata cache (7-day TTL), avoids reconnection |
+| **NPX Resolution** | Auto-resolves `npx`/`npm exec` binary paths, avoids npm parent process overhead |
+| **Output Guard** | Large output auto-truncated (default 50KB / 2000 lines), full output written to temp file |
+| **Sampling** | Supports MCP Sampling requests (server requests LLM generation), requires user confirmation |
+| **UI Sessions** | Supports MCP UI resources (`ui://` protocol), renders interactive interfaces in browser |
+| **UI Streaming** | Supports `eager` / `stream-first` UI streaming modes |
+| **OAuth Provider** | Full OAuth client implementation (registration, token storage, authorization redirect) |
+| **Config Import** | Import config from Cursor / Claude Code / Claude Desktop / Codex / Windsurf / VSCode |
+| **MCP Manager** | TUI management interface (`/mcp` command), enable/disable/delete servers |
+| **Resource Tools** | MCP resources auto-converted to `get_<name>` tools |
+| **Consent Management** | Tool call consent management with auto-approve configuration |
+
+### Configuration
+
+MCP servers are defined in Pi config files (user-level or project-level):
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "npx",
+      "args": ["-y", "@my/mcp-server"],
+      "env": { "API_KEY": "..." },
+      "enabled": true,
+      "excludeTools": ["dangerous_tool"]
+    }
+  }
+}
+```
+
+---
+
+## 5. Permission System
+
+The plugin implements full tool-call permission control with multiple modes and fine-grained rules.
+
+### Permission Modes
+
+| Mode | Behavior |
+|------|----------|
+| `default` | Default mode, dangerous operations require user confirmation |
+| `acceptEdits` | Auto-accept file edits, other operations still require confirmation |
+| `plan` | Plan mode, mutating operations blocked |
+| `dontAsk` | Never ask, auto-allow all operations |
+| `bypassPermissions` | YOLO mode, skip all permission checks (can be disabled by config) |
+
+### Permission Rules
+
+Three behavior levels:
+
+| Behavior | Description |
+|----------|-------------|
+| `allow` | Auto-allow, never ask |
+| `ask` | Ask user every time |
+| `deny` | Refuse execution |
+
+Rules can be configured at session level (temporary) or local settings file (persistent):
+
+```json
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": ["Bash(npm test)", "Bash(npm run *)"],
+    "ask": ["Bash(rm *)"],
+    "deny": ["Bash(rm -rf /)"],
+    "disableBypassPermissionsMode": "disable"
+  }
+}
+```
+
+### Always-Allowed Tools
+
+These tools are auto-allowed in all modes (read-only or side-effect free):
+
+`Read`, `Grep`, `Glob`, `Ls`, `Find`, `search`, `fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
+
+### Teammate Child Permission Relay
+
+Teammate subprocesses have no local terminal; permission requests are relayed to the parent via IPC:
+- Parent owns live mode, session rules, hooks, and persistence
+- Child permission requests forwarded via `teammate_proxy_request`
+- Parent evaluates and returns `allow_once` or `deny`
+
+---
+
+## 6. Thinking Depth Control
+
+Teammate dispatch supports fine-grained thinking depth control, affecting subprocess agent reasoning depth.
+
+### Available Levels
+
+| Level | Description |
+|-------|-------------|
+| `off` | Disable extended thinking, fastest response |
+| `minimal` | Minimal thinking overhead |
+| `low` | Low depth reasoning |
+| `medium` | Medium depth (balance of speed and quality) |
+| `high` | High depth reasoning |
+| `xhigh` | Extra-high depth (slowest but most thorough) |
+| `max` | Alias for `xhigh` |
+
+### Usage
+
+```javascript
+// Top-level default
+teammate({
+  thinking: "high",
+  tasks: [
+    { name: "quick-scan", agent: "explorer", prompt: "...", thinking: "off" },
+    { name: "deep-analysis", agent: "general", prompt: "...", thinking: "xhigh" }
+  ]
+})
+```
+
+### Precedence
+
+Task-level `thinking` → top-level `thinking` → `taskType` mapping → agent frontmatter → Pi default
+
+> Note: thinking depth is never restricted by the teammate layer — every level in the table above is selectable for any routed model. If a provider cannot honor a level, the child Pi host clamps to its own capability boundary.
+
+---
+
+## 7. Interaction Tools
+
+### 7.1 ask-user-question — Structured User Input
+
+Collect structured user answers through a keyboard-first TUI wizard:
+
+```javascript
+// Single select
+ask-user-question({
+  questions: [{
+    question: "Which approach?",
+    header: "Approach",
+    options: [
+      { label: "A: Microservices", description: "Independent deployment, loose coupling" },
+      { label: "B: Monolith", description: "Simple, easy to debug" }
+    ]
+  }]
+})
+
+// Multi-select
+ask-user-question({
+  questions: [{
+    question: "Which features?",
+    multiSelect: true,
+    options: [
+      { label: "Auth" }, { label: "Authorization" },
+      { label: "Audit log" }, { label: "Rate limiting" }
+    ]
+  }]
+})
+
+// Open-ended
+ask-user-question({
+  questions: [{ question: "What should the project name be?" }]
+})
+```
+
+- Up to 4 questions per call
+- 2-4 options per question
+- Supports single-select, multi-select, open-ended
+
+**Ask-auto (v0.33.0):** a human can enable `/auto ask on [seconds]` (default
+60 seconds). On timeout, remaining safe option questions may adopt explicit
+`recommended: true` choices: exactly one for single-select, all marked choices
+for multi-select. Machine results go to `recommendations` (`source: timeout`),
+not human `answers` or approval; mixed batches retain the original
+`questionIndex`. Policy classification takes priority. External/uncertain/degraded
+decisions, human-only questions, missing/ambiguous recommendations and sensitive
+approvals never auto-confirm; open-ended questions still need a human. Advice is
+not Plan/permission/payment/publication/knowledge-promotion authority.
+
+---
+
+### 7.2 plan-enter — Plan Mode
+
+Enter durable Plan mode, load the current session's `current.md` draft, activate plan-only tools:
+
+```javascript
+plan-enter()
+```
+
+**Plan mode behavior:**
+- Edit/write tools and file-mutating commands are blocked
+- Bash stays enabled; read-only commands pass and only mutating shell commands (file writes/redirection, package installs, git writes) are blocked
+- Read/search/explore tools remain available
+- Draft Markdown plans with `plan-update`
+- Inspect plan status with `plan-status`
+- `plan-confirm` (or `/plan approve`) commits the plan and restores Act tools
+- `plan-exit` abandons the plan and returns to Act mode
+
+**Toggle:** `Alt+Shift+P` or `/plan` to switch Plan/Act mode.
+
+**Session Plan-auto (v0.33.0):** default off. Only a human in the parent TUI can
+enable `/plan-auto on` or `Alt+Shift+A` in Act or Plan; `off` revokes and `status`
+inspects. Model injection, RPC, children and history cannot grant authority.
+Each cycle's `plan-confirm` still uses normal archive/manifest approval of the
+exact draft and executes standalone/current. Enabling never approves immediately;
+`plan-update` only saves and `plan-review` remains manual.
+
+The switch survives Plan cycles, exit/clear, revisions, compaction and same-session
+`new_context`. Each new cycle binds fresh task authority; manual exit/clear
+invalidates old task authority. Footer states are `PLAN-AUTO on`, `confirm+ask`
+and `ask`. Off, session/cwd changes, fork, history navigation and
+reload/restart/shutdown revoke it; it is never restored from disk. Off does not
+stop already-started execution, but stops an approved automatic handoff that has
+not started.
+
+Classified internal Ask advice needs current bounded task authority; project
+policy remains an additional restriction. Machine `decisions` are separate from
+human `answers`, not Plan/permission/governance approval. Classifier settings and
+diagnostics follow shared `zh-CN` / `en` locale without changing canonical
+domain/mode identifiers or authorization boundaries.
+
+---
+
+## 8. Agent Control Tools
+
+Manage running teammate agents:
+
+```javascript
+// List all active agents
+teammate-list({ view: "all" })     // all | active | named | roles
+
+// Inspect agent output
+teammate-watch({ name: "my-agent", lines: 30 })
+
+// Wait for agent completion (event-driven, avoids polling)
+teammate-wait({ name: "my-agent", timeoutMs: 60000 })
+teammate-wait({ waitMs: 5000 })  // Fixed delay
+
+// Send message to running agent
+teammate-send({ to: "my-agent", message: "Also check edge cases", mode: "follow_up" })
+
+// Urgent correction (interrupts current turn)
+teammate-send({ to: "my-agent", message: "Stop current approach, try alternative", mode: "steer" })
+
+// Terminate
+teammate-send({ to: "my-agent", mode: "abort" })
+```
+
+| Tool | Purpose |
+|------|---------|
+| `teammate-list` | List agents (active / named / all / roles) |
+| `teammate-watch` | View recent output, tool activity, inbox |
+| `teammate-wait` | Event-driven wait for completion or fixed delay |
+| `teammate-send` | Send message (follow_up / steer / abort) |
+
+---
+
+## 9. Runtime Subsystems
+
+### 9.1 Auto-Compaction
+
+Intelligent context window management preventing long session overflow:
+
+| Feature | Description |
+|---------|-------------|
+| **Auto-prune** | Automatically prunes large tool results (≥4KB) when context hits threshold (~70%) |
+| **Keep recent** | Always preserves ~20K tokens of recent conversation |
+| **Reserve space** | Reserves ~16K tokens for model response |
+| **Replayable tools** | `read`, `grep`, `glob`, `search`, `find`, `resource` results safely prunable (re-executable on demand; pruned `resource` results keep their URI for re-reading) |
+| **Compaction continue** | Auto-injects continuation prompt after compaction, agent resumes from checkpoint |
+| **State persistence** | Prune state persisted across sessions |
+
+### 9.2 GUI Subsystem (UCL)
+
+Unified Communication Layer, enabled via `PI_GUI=1` environment variable:
+
+```bash
+PI_GUI=1 pi   # Start Pi with GUI sidecar
+```
+
+| Feature | Description |
+|---------|-------------|
+| **Tool discovery** | `GET /tools` — list all available tools |
+| **Tool invocation** | `POST /tools/:name` — invoke tools via HTTP (with permission gateway) |
+| **State aggregation** | `GET /state` / `GET /state/:sub` — aggregated session state |
+| **Change events** | SSE (Server-Sent Events) real-time state change push |
+| **Zero intrusion** | No behavior change when disabled (no listener, no discovery file) |
+
+### 9.3 TUI Components
+
+The plugin registers multiple TUI overlays and panels:
+
+| Component | Trigger | Function |
+|-----------|---------|----------|
+| **Goal Panel** | Auto-shown when Goal exists | Status, objective, time, loop count, token budget |
+| **Todo Overlay** | During todo operations | Task list and status |
+| **Session Overlay** | `/maestro-session` | Workflow session control center |
+| **Maestro Panel** | During maestro operations | Run status and progress |
+| **Swarm Overlay** | `/swarm` | ACO swarm status, topology, metrics |
+| **Model Mapping Overlay** | `Alt+M` / `/teammate-models` | Configure taskType → model mappings |
+| **Smart Search Config** | `Alt+S` / `/smart-search-config` | Search engine and provider config |
+| **MCP Manager** | `/mcp` | MCP server management (enable/disable/delete/import) |
+| **MCP Panel** | During MCP tool selection | Server tool browsing, search, invocation |
+| **MCP Setup Panel** | First MCP configuration | Guided setup (import/scaffold/repo prompt) |
+| **Progress Tree** | During teammate execution | Agent execution progress visualization |
+| **Attach Overlay** | During teammate startup | Attach to agent subprocess |
+| **Status Bar** | Always visible | Current mode, compaction status, MCP connection status |
+
+---
+
+## 10. Agent Roles
+
+### Built-In Roles
+
+| Role | Purpose | Boundary |
+|---|---|---|
+| `general` | General implementation, analysis, and verification | Read/write/command tools |
+| `explorer` | Code discovery and call-chain tracing | Read-only |
+| `planner` | Architecture and execution planning | Read-only, high thinking |
+| `analyst` | Technical analysis and review | Read-only, high thinking |
+| `research` | Project architecture knowledge and external web research | Read-only, knowledge CLI and web search |
+| `verifier` | Goal fallback when no acceptance commands are declared | Strictly read-only, structured fail-closed verdict |
+| `workflow` | Dependency-aware DAG decomposition and dispatch | Read and teammate collaboration tools |
+
+The old `delegate`, `goal-verifier`, and `coordinator` names are not built-ins. Goal runs acceptance commands first and invokes `verifier` only when no commands were declared. Project roles live in `.pi/agents/*.md`; user roles live in `~/.agents/*.md`. Built-in names cannot be overridden.
+
+## 11. Prompt Input
+
+`tasks[].prompt` is required literal task text. Teammate 1.0 does not discover `.pi/prompts`, ship bundled prompt templates, or support `promptArgs`, positional parameters, or template-name expansion. Reusable instructions must be rendered by the caller or a Skill and passed as a complete prompt.
+
+## 12. Skills Index (68)
+
+Skills are on-demand capability packages invoked via `/skill:name` or auto-loaded by agents.
+See [Maestro Flow](https://github.com/catlog22/maestro-flow) for full skill definitions and workflow details.
+
+### Orchestration & Lifecycle
+
+| Skill | Description |
+|-------|-------------|
+| `maestro` | Intent-to-chain planner, auto-routes to optimal command chain |
+| `maestro-next` | Unified dev intent entry, classifies complexity and routes to execution channel |
+| `maestro-companion` | Quick execution for small tasks, minimal Run lifecycle |
+| `maestro-ralph` | Closed-loop policy over canonical Session/Run chain |
+| `maestro-init` | Project initialization with auto state detection |
+| `maestro-fork` | Create/sync session worktree for parallel dev |
+| `maestro-merge` | Merge worktree branch back to main |
+| `maestro-session-seal` | Seal current session with knowledge extraction and DAG progression |
+| `maestro-update` | Detect version, preview changes, apply workflow upgrades |
+| `maestro-help` | Command help system, search commands, browse skills |
+| `maestro-guard` | Manage editing boundary restrictions |
+| `maestro-overlay` | Create/edit command overlays from natural language |
+
+### Quality & Testing
+
+| Skill | Description |
+|-------|-------------|
+| `quality-refactor` | Systematic tech-debt identification and safe reduction |
+| `security-audit` | OWASP Top 10 + STRIDE security auditing |
+| `insight-challenge` | Adversarial review of code quality findings |
+| `delegation-check` | Check workflow delegation prompts for content separation violations |
+
+### UI / Design
+
+| Skill | Description |
+|-------|-------------|
+| `maestro-impeccable` | Frontend UI design, audit, polish |
+
+### Team Coordination
+
+| Skill | Description |
+|-------|-------------|
+| `team-coordinate` | Universal team coordination with dynamic role generation |
+| `team-lifecycle-v4` | Full lifecycle: plan → develop → test → review |
+| `team-review` | 3-role code review pipeline: scanner → reviewer → fixer |
+| `team-testing` | Progressive test coverage (Generator-Critic loops) |
+| `team-quality-assurance` | Full closed-loop QA (issue discovery + testing) |
+| `team-brainstorm` | Unified brainstorming team |
+| `team-arch-opt` | Architecture optimization |
+| `team-perf-opt` | Performance optimization (single/fan-out/parallel modes) |
+| `team-tech-debt` | Tech debt identification and remediation |
+| `team-roadmap-dev` | Roadmap-driven development |
+| `team-planex` | Plan-and-execute pipeline |
+| `team-ultra-analyze` | Deep collaborative multi-role investigation |
+| `team-issue` | Issue resolution team |
+| `team-swarm` | ACO swarm intelligence multi-agent exploration |
+| `team-adversarial-swarm` | ACO swarm with adversarial decision gates |
+| `team-frontend` | Unified frontend dev (with ui-ux-pro-max design intelligence) |
+| `team-frontend-debug` | Chrome DevTools MCP frontend debugging |
+| `team-uidesign` | UI design team: research → tokens → audit → implementation |
+| `team-ui-polish` | Auto-discover/fix UI issues |
+| `team-motion-design` | Animation token systems, scroll choreography, GPU transforms |
+| `team-visual-a11y` | Visual accessibility QA (OKLCH contrast, WCAG AA/AAA) |
+| `team-ux-improve` | Discover/fix UI/UX interaction issues |
+| `team-interactive-craft` | Vanilla JS+CSS interactive components (zero dependencies) |
+| `team-designer` | Team skill generator meta-skill |
+| `team-executor` | Lightweight session execution (resume existing team-coordinate sessions) |
+
+### Long-Running Cycles (Odyssey)
+
+| Skill | Description |
+|-------|-------------|
+| `odyssey` | Long-running iterative cycle, five modes (debug/improve/planex/review/ui) |
+| `maestro-odyssey` | Long-running iterative cycle, six modes (+security) |
+
+### Knowledge Management
+
+| Skill | Description |
+|-------|-------------|
+| `maestro-spec` | Spec precipitation (intent-driven capture of project constraints) |
+| `maestro-knowhow` | KnowHow precipitation (intent-driven capture of reusable knowledge by type) |
+| `maestro-knowledge` | Knowledge-store management (intent-driven: audit/harvest/wiki/extractors/domain) |
+| `maestro-issue` | Issue management (intent-driven: report/list/close/link + auto-discovery) |
+| `codify-to-knowhow` | Manifest-driven knowledge asset generator |
+
+### Academic Writing (Scholar)
+
+| Skill | Description |
+|-------|-------------|
+| `scholar-ideation` | Research ideation (literature → gap analysis → planning) |
+| `scholar-writing` | End-to-end academic paper writing (NeurIPS/ICML/ICLR etc.) |
+| `scholar-review` | Systematic paper review (self-review + rebuttal) |
+| `scholar-rebuttal-pro` | Enhanced rebuttal (collaborative analysis + multi-perspective) |
+| `scholar-experiment` | ML/AI paper experimental results analysis |
+| `scholar-citation-verify` | Four-layer citation verification |
+| `scholar-anti-ai-writing` | Remove AI writing patterns from academic prose |
+| `scholar-latex-organizer` | Organize LaTeX templates for Overleaf |
+| `scholar-publish` | Post-acceptance conference preparation (slides/poster/promotion) |
+| `scholar-thesis-docx` | Create/revise thesis Word documents |
+
+### Meta / Tooling
+
+| Skill | Description |
+|-------|-------------|
+| `prompt-generator` | Generate/convert prompt files (GSD-style quality gates) |
+| `skill-generator` | Meta-skill for creating new skills |
+| `skill-iter-tune` | Iterative skill tuning (execute → evaluate → improve) |
+| `skill-simplify` | SKILL.md simplification (functional integrity verification) |
+| `skill-tuning` | Universal skill diagnosis and optimization |
+| `workflow-skill-designer` | Orchestrator+phases workflow skill design meta-skill |
+| `swarm` | ACO swarm optimization state projection |
+
+### Learning
+
+| Skill | Description |
+|-------|-------------|
+| `learn` / `maestro-learn` | Guided reading, investigation, pattern extraction, second opinions |
+
+---
+
+## 13. Knowledge System
+
+The knowledge system ensures agents have full project context before touching code.
+
+### Mandatory Knowledge Gate
+
+Execute before any code access or dispatch:
+
+```bash
+# Search (across spec, knowhow, domain, issue, session)
+maestro search "<query>" [--type spec|knowhow|domain|issue] [--code] [--kg]
+
+# Load specific knowledge
+maestro load --type <type> [--list] [--category <cat>] [--keyword <word>] [--id <id>]
+```
+
+### Query Rules
+
+```bash
+# ❌ Avoid keyword dumps
+maestro search "topology display frontend DetailedTopologySVG elk layout rendering"
+
+# ✅ Use focused queries
+maestro search "topology layout"
+maestro search "DetailedTopologySVG" --code
+maestro load --type spec --category coding
+```
+
+### Knowledge Types
+
+| Type | Categories | Purpose |
+|------|-----------|---------|
+| `spec` | `arch`, `coding`, `debug`, `test`, `review`, `learning`, `ui` | Reusable conventions and rules |
+| `knowhow` | `compact`, `tip` | Task-specific patterns and recipes |
+| `domain` | — | Project glossary terms |
+| `issue` | — | Tracked bugs and tasks |
+| `roadmap` | — | Milestone and phase planning |
+
+### Knowledge Lifecycle
+
+```bash
+# Add
+/maestro-spec "coding: Use Result<T,E> — Service methods must return Result<T,AppError>"
+/maestro-knowhow
+
+# Evolve
+maestro spec supersede SPEC-042 --by SPEC-089     # Replace old rule
+maestro spec conflict mark src/auth.ts 45 --note "JWT vs session: both valid"
+
+# Maintain
+maestro spec health                                # Health check
+maestro spec history SPEC-042                     # View history
+maestro search "old pattern" --include-deprecated  # Search all
+```
+
+### Bounded History Evidence (v0.33.0)
+
+Run the mandatory Maestro knowledge search before historical discovery; query
+`workspace_sessions` only after no relevant knowledge hits. `session_history`
+defaults to case-insensitive literal phrases. `mode: "terms"` applies NFKC,
+lowercase and whitespace normalization and requires all unique terms in one
+visible projected entry, in any order; no Chinese segmentation, regex, fuzzy,
+synonym or semantic search. Default `sort: "source"` preserves source order;
+`relevance` ranks exact/continuous phrases before tighter term spans, with stable
+source-order ties.
+
+```javascript
+session_history({ action: "search", scope: "workspace_sessions",
+  query: "browser timeout", mode: "terms", sort: "relevance", limit: 10 })
+// Use returned nextOffset as offset, retaining query/scope/mode/sort
+```
+
+`offset` is zero-based and `limit <= 20`; `matchCount`, `hasMore` and `nextOffset`
+describe that scan. The final page is truncated only if the scan itself is
+incomplete. Every page freshly scans live transcripts, not a frozen snapshot,
+so history changes may shift results. Reread evidence through the returned exact
+`session://<id>/entry/<id>` URI. Hidden rows, thinking and tool-call arguments are
+excluded; tool results require explicit opt-in. History is evidence, not
+governing knowledge: verify it against current code and live state.
+
+### Three Orthogonal Axes
+
+| Axis | Description |
+|------|-------------|
+| `confidence` | Human/audit ruling |
+| `status` | active / deprecated lifecycle |
+| Time decay | Automatic freshness decay |
+
+---
+
+## 14. Workflow Patterns
+
+### Pattern 1: Gate → Explore → Implement
+
+```
+1. maestro search + load      → Knowledge Gate
+2. teammate (explorer × 2-3)  → Cross-search for confidence
+3. Targeted reads              → Verify single-match results
+4. teammate (delegate)         → Implement with full context
+5. /skill:quality-review       → Validate
+```
+
+### Pattern 2: Plan → Execute → Verify
+
+```
+1. maestro search + load      → Knowledge Gate
+2. /skill:maestro-plan         → Create execution plan
+3. /skill:maestro-execute      → Step-by-step execution + verification
+4. workflow-verifier           → Goal-backward verification
+5. /skill:quality-test         → Acceptance testing
+```
+
+### Pattern 3: Parallel Review → Synthesize → Fix → Re-Review
+
+```
+1. teammate (reviewer × 3)    → Security, performance, maintainability
+2. teammate (delegate)         → Synthesize findings
+3. teammate (delegate)         → Fix highest-priority issues
+4. teammate (reviewer × 3)    → Re-review fixes
+```
+
+### Pattern 4: Odyssey Full Cycle
+
+```
+1. /skill:odyssey-debug        → Archaeology → Diagnosis → Fix → Generalize
+2. /skill:quality-test         → Verify fix
+3. /maestro-knowhow            → Persist lessons
+```
+
+### Pattern 5: Multi-Stage DAG Pipeline
+
+```javascript
+teammate({
+  tasks: [
+    // Stage 1: Parallel research
+    { name: "api-research", agent: "workflow-external-researcher", prompt: "Research rate limiting best practices" },
+    { name: "codebase-survey", agent: "explorer", prompt: "FIND: All API endpoints\nSCOPE: src/api/" },
+    // Stage 2: Plan (after research + survey complete)
+    { name: "plan", agent: "workflow-planner", prompt: "Incorporate {api-research} + {codebase-survey} into plan" },
+    // Stage 3: Implement
+    { name: "implement", agent: "workflow-executor", prompt: "Execute {plan}" },
+    // Stage 4: Verify
+    { name: "verify", agent: "workflow-verifier", prompt: "Verify {implement} against {plan}" }
+  ]
+})
+```
+
+### Explorer Cross-Search Strategy
+
+| Angle | Task A | Task B |
+|-------|--------|--------|
+| Definition vs usage | Find exported definitions | Find imports and call sites |
+| Positive vs missing | Find correct implementations | Find places missing the convention |
+| Entry vs implementation | Find routes or exports | Find internal logic |
+
+**Confidence rules:**
+- ✅ Two matching angles → high confidence, use result
+- ⚠️ One matching angle → verify with `rg` or targeted read
+- ❌ Zero matches → change angle or conclude target absent
+
+---
+
+## 15. Configuration Reference
+
+### Model Routing Profiles
+
+Shared Profiles are stored globally in `~/.pi/agent/teammate-models.json`:
+
+```json
+{
+  "version": 3,
+  "defaultProfile": "balanced",
+  "profiles": {
+    "balanced": {
+      "name": "Balanced",
+      "mappings": {
+        "explore": "deepseek/deepseek-v4-flash",
+        "analysis": "deepseek/deepseek-v4-pro"
+      },
+      "fallbackMappings": {
+        "analysis": ["deepseek/deepseek-v4-flash"]
+      },
+      "thinkingLevels": {
+        "explore": "low",
+        "analysis": "high"
+      }
+    }
+  }
+}
+```
+
+The project `.pi/teammate-models.json` persists only the active selection and optional compatibility overrides:
+
+```json
+{
+  "version": 3,
+  "activeProfile": "balanced",
+  "applyOverrides": false,
+  "overrides": {
+    "mappings": {},
+    "thinkingLevels": {}
+  }
+}
+```
+
+Open the Control Center with `Alt+M` or `/teammate-models`. The **Profiles** tab activates, creates, duplicates, renames, sets the global default, and deletes Profiles. Legacy project overrides can be restored, promoted to a global Profile, or cleared. Switching Profiles disables but preserves existing overrides. v1/v2 files are not rewritten on read and migrate losslessly on their first save; missing project Profile references fall back to the global default.
+
+Routing source precedence: enabled project overrides > project-selected global Profile > global default Profile.
+
+### Project-Level Configuration
+
+| File | Purpose |
+|------|---------|
+| `.pi/teammate-models.json` | Active Profile and optional compatibility overrides for this project |
+| `.pi/agents/` | Project-specific agent definitions |
+| `.pi/settings.json` | Pi settings overrides |
+
+### Global Configuration
+
+| File | Purpose |
+|------|---------|
+| `~/.pi/agent/teammate-models.json` | Cross-project Profile registry and global default |
+| `~/.pi/agent/settings.json` | Global Pi settings |
+
+---
+
+## 16. Troubleshooting
+
+### Teammate Fails to Start
+
+```
+Error: Failed to spawn teammate process
+```
+
+**Check:** `which pi`, `node --version` (≥22.19.0), `/teammate-models` model config.
+
+### Explorer Returns No Results
+
+**Fix:** Verify `SCOPE` paths exist, make `FIND` more concrete, add `ATTENTION` with naming conventions.
+
+### Knowledge Gate Fails
+
+```
+maestro: command not found
+```
+
+**Fix:** `npm install -g maestro-flow`
+
+### Model Not Available
+
+```
+Error: Model not found in authenticated catalog
+```
+
+**Fix:** `/teammate-models` → check available models → `/login` to authenticate.
+
+### Agent Hangs
+
+```javascript
+teammate-list({ view: "all" })                          // Check status
+teammate-watch({ name: "stuck", lines: 50 })            // Inspect output
+teammate-send({ to: "stuck", mode: "abort" })           // Terminate
+// Retry with timeout:
+teammate({ tasks: [{ agent: "general", prompt: "...", timeoutMs: 120000 }] })
+```
+
+### Long Session Context Overflow
+
+```bash
+/compact "Summarize key decisions and current state"
+# Or use fresh context for heavy work:
+teammate({ tasks: [{ agent: "general", context: "fresh", prompt: "PURPOSE: Read state and continue\n..." }] })
+```
+
+---
+
+## Quick Reference
+
+```bash
+# ─── Install ───
+pi install npm:pi-graph@0.2.7
+
+# ─── Knowledge ───
+maestro search "query" --code
+maestro load --type spec --category coding
+
+# ─── Explore ───
+teammate({ tasks: [{ agent: "explorer", taskType: "explore", prompt: "FIND: ...\nSCOPE: src/..." }] })
+
+# ─── Analyze ───
+teammate({ tasks: [{ agent: "analyst", taskType: "analysis", prompt: "Analyze the target with file:line evidence" }] })
+
+# ─── Implement ───
+teammate({ tasks: [{ agent: "general", taskType: "development", prompt: "Implement the target and run focused tests" }] })
+
+# ─── Review ───
+/skill:team-review src/ --level deep
+
+# ─── Full Cycle ───
+/skill:maestro-analyze → /skill:maestro-plan → /skill:maestro-execute → /skill:quality-review
+
+# ─── Debug ───
+/skill:odyssey-debug "issue description"
+
+# ─── Agent Control ───
+teammate-list({ view: "all" })
+teammate-watch({ name: "agent", lines: 30 })
+teammate-send({ to: "agent", message: "..." })
+teammate-send({ to: "agent", mode: "abort" })
+```

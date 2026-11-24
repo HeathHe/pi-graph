@@ -1,0 +1,179 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { TeammateBrowserBroker } from "../src/teammate/browser-broker.ts";
+import { browserManager } from "../src/tools/browser/manager.ts";
+import type {
+  BrowserManagerLike,
+  BrowserManagerStatus,
+  BrowserOpenOptions,
+  BrowserRunOutput,
+  BrowserTabInfo,
+} from "../src/tools/browser/manager.ts";
+
+class FakeBrowserManager implements BrowserManagerLike {
+  readonly opened = new Map<string, BrowserOpenOptions>();
+  readonly closed: string[] = [];
+  readonly videoCalls: string[] = [];
+  closeBarrier?: Promise<void>;
+
+  async open(options: BrowserOpenOptions): Promise<BrowserTabInfo> {
+    this.opened.set(options.name, options);
+    return {
+      name: options.name,
+      kind: "headless",
+      connection: {
+        channel: "managed",
+        ownership: "owned",
+        capabilities: { page: true, cdp: true, cookies: true },
+      },
+      url: options.url ?? "about:blank",
+      title: "test",
+      reused: false,
+    };
+  }
+
+  async run(name: string): Promise<BrowserRunOutput> {
+    if (!this.opened.has(name)) throw new Error(`No tab named ${name}`);
+    return { displays: [], returnValue: undefined, screenshots: [], url: "about:blank" };
+  }
+
+  async startVideo(name: string) {
+    if (!this.opened.has(name)) throw new Error(`No tab named ${name}`);
+    this.videoCalls.push(`start:${name}`);
+    return { path: `${name}.webm`, mimeType: "video/webm" as const, recording: true };
+  }
+
+  async stopVideo(name: string) {
+    if (!this.opened.has(name)) throw new Error(`No tab named ${name}`);
+    this.videoCalls.push(`stop:${name}`);
+    return { path: `${name}.webm`, mimeType: "video/webm" as const, recording: false, bytes: 42 };
+  }
+
+  async videoChapter(name: string) { this.videoCalls.push(`chapter:${name}`); }
+  async videoShowActions(name: string) { this.videoCalls.push(`show:${name}`); }
+  async videoHideActions(name: string) { this.videoCalls.push(`hide:${name}`); }
+
+  async status(): Promise<BrowserManagerStatus> {
+    return {
+      bridge: {
+        serverStarted: true,
+        state: "disconnected",
+        listeningPort: 19222,
+        authenticatedConnected: false,
+        tabCount: 0,
+        pendingPairings: [],
+      },
+      namedTabs: [...this.opened.keys()].map((name) => ({
+        name,
+        channel: "managed",
+        ownership: "owned",
+        capabilities: { page: true, cdp: true, cookies: true },
+      })),
+    };
+  }
+
+  async pair(requestId: string, _code: string) {
+    return { requestId, port: 19222, installationId: "11111111-1111-4111-8111-111111111111" };
+  }
+
+  async close(name: string): Promise<boolean> {
+    await this.closeBarrier;
+    const existed = this.opened.delete(name);
+    if (existed) this.closed.push(name);
+    return existed;
+  }
+
+  async closeAll(): Promise<number> {
+    const names = [...this.opened.keys()];
+    for (const name of names) await this.close(name);
+    return names.length;
+  }
+}
+
+const ctx = { cwd: "D:/workspace" } as ExtensionContext;
+
+function request(actorId: string, input: Record<string, unknown>, signal?: AbortSignal) {
+  return {
+    toolName: "browser",
+    input,
+    actor: { correlationId: actorId, agent: "general" },
+    ...(signal ? { signal } : {}),
+  };
+}
+
+test("teammate browser broker runs in root manager with actor-scoped tab names", async () => {
+  const manager = new FakeBrowserManager();
+  const broker = new TeammateBrowserBroker(manager);
+  const controller = new AbortController();
+
+  await broker.execute(request("actor-a", { action: "open", name: "main", url: "https://a.test" }, controller.signal), ctx);
+  await broker.execute(request("actor-b", { action: "open", name: "main", url: "https://b.test" }), ctx);
+
+  assert.deepEqual([...manager.opened.keys()], [
+    "teammate:actor-a:main",
+    "teammate:actor-b:main",
+  ]);
+  assert.equal(manager.opened.get("teammate:actor-a:main")?.signal, controller.signal);
+
+  const actorStatus = await broker.execute(request("actor-a", { action: "status" }), ctx);
+  assert.deepEqual(
+    (actorStatus.details as { status?: { namedTabs?: Array<{ name: string }> } } | undefined)?.status?.namedTabs,
+    [{
+      name: "main",
+      channel: "managed",
+      ownership: "owned",
+      capabilities: { page: true, cdp: true, cookies: true },
+    }],
+    "teammate status must translate and expose only the caller's named tabs",
+  );
+
+  await broker.execute(request("actor-a", { action: "start_video" }), ctx);
+  await broker.execute(request("actor-b", { action: "start_video" }), ctx);
+  await broker.execute(request("actor-a", { action: "stop_video" }), ctx);
+  assert.deepEqual(manager.videoCalls, ["start:teammate:actor-a:main", "start:teammate:actor-b:main", "stop:teammate:actor-a:main"]);
+
+  for (const action of ["video_chapter", "video_show_actions", "video_hide_actions"]) {
+    await broker.execute(request("actor-b", { action, title: "Chapter" }), ctx);
+  }
+  assert.deepEqual(manager.videoCalls.slice(-3), ["chapter:teammate:actor-b:main", "show:teammate:actor-b:main", "hide:teammate:actor-b:main"]);
+
+  await broker.execute(request("actor-a", { action: "close", all: true }), ctx);
+  assert.deepEqual(manager.closed, ["teammate:actor-a:main"]);
+  assert.equal(manager.opened.has("teammate:actor-b:main"), true);
+
+  assert.equal(await broker.closeActor("actor-b"), 1);
+  assert.equal(manager.opened.size, 0);
+});
+
+test("teammate browser broker rejects requests without a trusted actor", async () => {
+  const broker = new TeammateBrowserBroker(new FakeBrowserManager());
+  const result = await broker.execute(request("unknown", { action: "open" }), ctx);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /trusted correlation id/i);
+});
+
+test("default teammate browser manager is isolated from the root browser manager", async () => {
+  const broker = new TeammateBrowserBroker();
+  assert.notEqual(broker.manager, browserManager);
+  await broker.closeAll();
+});
+
+test("actor cleanup waits for physical browser disposal", async () => {
+  const manager = new FakeBrowserManager();
+  const broker = new TeammateBrowserBroker(manager);
+  await broker.execute(request("actor-a", { action: "open", name: "main" }), ctx);
+
+  let release!: () => void;
+  manager.closeBarrier = new Promise<void>((resolve) => { release = resolve; });
+  let settled = false;
+  const cleanup = broker.closeActor("actor-a").then((count) => {
+    settled = true;
+    return count;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  release();
+  assert.equal(await cleanup, 1);
+  assert.equal(settled, true);
+});

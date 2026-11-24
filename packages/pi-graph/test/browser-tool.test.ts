@@ -1,0 +1,1333 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { Check } from "typebox/value";
+import * as fs from "node:fs/promises";
+import * as http from "node:http";
+import * as path from "node:path";
+import { BrowserParams, createBrowserTool } from "../src/tools/browser-tool.ts";
+import { BrowserManager, browserRunErrorHint, canonicalizeBrowserOpenOptions, compileNavigationPolicy, compileRunCode, domainMatcher, observeBrowserRunApis, parseDevToolsActivePort, settleBrowserDialog, type BrowserManagerLike, type BrowserManagerStatus, type BrowserOpenOptions, type BrowserPickCaptureCallback, type BrowserPickResult, type BrowserRunOutput, type BrowserTabInfo } from "../src/tools/browser/manager.ts";
+import { PICKER_INJECT_JS, PICKER_POLL_JS, PICKER_TEARDOWN_JS } from "../src/tools/browser/picker.ts";
+import { STEALTH_INIT_JS, STEALTH_LAUNCH_ARGS } from "../src/tools/browser/stealth.ts";
+import { BROWSER_SOPS_BASELINE, BROWSER_HELPER_QUICKREF } from "../src/tools/sop/embedded/browser.ts";
+
+class FakeBrowserManager implements BrowserManagerLike {
+  opened?: BrowserOpenOptions;
+  runs: Array<{ name: string; code: string; cwd: string; timeoutMs: number }> = [];
+  closed: string[] = [];
+  closeAllCount = 2;
+  abortRun = false;
+  statusResult: BrowserManagerStatus = {
+    bridge: {
+      serverStarted: true,
+      state: "connected",
+      listeningPort: 19222,
+      authenticatedConnected: true,
+      drainingCommands: 0,
+      authMode: "paired",
+      transportConnected: true,
+      transportReady: true,
+      serverInstanceId: "11111111-1111-4111-8111-111111111111",
+      connectionGeneration: 1,
+      tabCount: 3,
+      pendingPairings: [{
+        requestId: "11111111-1111-4111-8111-111111111111",
+        code: "123456",
+        expiresAt: 4_000_000_000_000,
+        generation: 7,
+        origin: "chrome-extension://test",
+      }],
+    },
+    namedTabs: [{
+      name: "docs",
+      channel: "cdp",
+      ownership: "borrowed",
+      capabilities: { page: true, cdp: true, cookies: true },
+    }],
+  };
+
+  async open(options: BrowserOpenOptions): Promise<BrowserTabInfo> {
+    const canonical = canonicalizeBrowserOpenOptions(options);
+    this.opened = canonical;
+    const kind = canonical.channel === "extension"
+      ? "extension"
+      : canonical.channel === "managed"
+        ? canonical.visible ? "headed" : "headless"
+        : "connected";
+    return {
+      name: canonical.name,
+      kind,
+      connection: {
+        channel: canonical.channel,
+        ownership: canonical.channel === "managed" ? "owned" : "borrowed",
+        capabilities: { page: canonical.channel !== "extension", cdp: true, cookies: true },
+      },
+      url: canonical.url ?? "about:blank",
+      title: "Example",
+      reused: false,
+      viewport: { width: 1000, height: 700 },
+    };
+  }
+  async run(name: string, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserRunOutput> {
+    if (this.abortRun || signal?.aborted) {
+      const error = new Error("aborted"); error.name = "AbortError"; throw error;
+    }
+    this.runs.push({ name, code, cwd, timeoutMs });
+    return {
+      displays: [{ type: "text", text: "observed 3 elements" }, { type: "image", data: "cG5n", mimeType: "image/png" }],
+      returnValue: { ok: true },
+      screenshots: [{ path: "shot.png", mimeType: "image/png", bytes: 3 }],
+      url: "https://example.com",
+    };
+  }
+  pickResult: BrowserPickResult = { captures: [], status: "sent", errorCount: 0 };
+  pickCalls: Array<{ name: string; timeoutMs: number; hadCallback: boolean }> = [];
+  async pick(name: string, onCapture: BrowserPickCaptureCallback | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserPickResult> {
+    this.pickCalls.push({ name, timeoutMs, hadCallback: onCapture !== undefined });
+    if (onCapture && this.pickResult.captures.length > 0) onCapture(this.pickResult.captures);
+    return this.pickResult;
+  }
+  videoCalls: Array<{ action: string; name: string; cwd?: string; options?: unknown; timeoutMs: number }> = [];
+  async startVideo(name: string, cwd: string, options: unknown, _signal: AbortSignal | undefined, timeoutMs: number) {
+    this.videoCalls.push({ action: "start", name, cwd, options, timeoutMs });
+    return { path: "D:/workspace/demo.webm", mimeType: "video/webm" as const, recording: true };
+  }
+  async stopVideo(name: string, _signal: AbortSignal | undefined, timeoutMs: number) {
+    this.videoCalls.push({ action: "stop", name, timeoutMs });
+    return { path: "D:/workspace/demo.webm", mimeType: "video/webm" as const, recording: false, bytes: 42 };
+  }
+  async videoChapter(name: string, options: unknown, _signal: AbortSignal | undefined, timeoutMs: number) { this.videoCalls.push({ action: "chapter", name, options, timeoutMs }); }
+  async videoShowActions(name: string, options: unknown, _signal: AbortSignal | undefined, timeoutMs: number) { this.videoCalls.push({ action: "show", name, options, timeoutMs }); }
+  async videoHideActions(name: string, _signal: AbortSignal | undefined, timeoutMs: number) { this.videoCalls.push({ action: "hide", name, timeoutMs }); }
+  async status(): Promise<BrowserManagerStatus> { return structuredClone(this.statusResult); }
+  async pair(requestId: string, code: string) {
+    return { requestId, port: 19222, installationId: `11111111-1111-4111-8111-${code.repeat(2)}` };
+  }
+  async close(name: string): Promise<boolean> { this.closed.push(name); return true; }
+  async closeAll(): Promise<number> { return this.closeAllCount; }
+}
+
+test("stealth module exports the webdriver/plugins/chrome/permissions patches and the anti-automation launch flag", () => {
+  assert.match(STEALTH_INIT_JS, /webdriver/, 'STEALTH_INIT_JS must patch navigator.webdriver');
+  assert.match(STEALTH_INIT_JS, /plugins/, 'STEALTH_INIT_JS must patch navigator.plugins');
+  assert.match(STEALTH_INIT_JS, /chrome/, 'STEALTH_INIT_JS must patch window.chrome');
+  assert.match(STEALTH_INIT_JS, /permissions/, 'STEALTH_INIT_JS must patch permissions.query');
+  assert.ok(STEALTH_LAUNCH_ARGS.includes('--disable-blink-features=AutomationControlled'), 'STEALTH_LAUNCH_ARGS must disable AutomationControlled');
+});
+
+test("browser dialog settlement contains the stale CDP dialog race", async () => {
+  const stale = new Error("Protocol error (Page.handleJavaScriptDialog): No dialog is showing");
+  stale.name = "ProtocolError";
+  let reported: unknown;
+
+  await settleBrowserDialog({
+    accept: async () => { throw stale; },
+    dismiss: async () => undefined,
+  }, "accept", (error) => { reported = error; });
+
+  assert.equal(reported, undefined);
+});
+
+test("browser dialog settlement reports unexpected failures", async () => {
+  const failure = new Error("CDP session disconnected");
+  let reported: unknown;
+
+  await settleBrowserDialog({
+    accept: async () => undefined,
+    dismiss: async () => { throw failure; },
+  }, "dismiss", (error) => { reported = error; });
+
+  assert.equal(reported, failure);
+});
+
+test("browser schema preserves legacy actions and adds explicit status/pair surfaces", () => {
+  const actions = (BrowserParams.properties.action as unknown as { enum: string[] }).enum;
+  for (const action of ["open", "close", "run", "guide", "status", "pair", "pick", "start_video", "stop_video", "video_chapter", "video_show_actions", "video_hide_actions"]) assert.ok(actions.includes(action));
+  assert.deepEqual(Object.keys(BrowserParams.properties).sort(), [
+    "action", "all", "app", "code", "cursor", "description", "dialogs", "duration", "ffmpeg_path", "filename", "fps", "kill", "name", "position", "request_id", "scale", "size", "timeout", "title", "topic", "url", "viewport", "visible", "wait_until",
+  ]);
+  assert.equal(Check(BrowserParams, { action: "open" }), true);
+  assert.equal(Check(BrowserParams, { action: "close" }), true);
+  assert.equal(Check(BrowserParams, { action: "run" }), false);
+  assert.equal(Check(BrowserParams, { action: "run", code: "return true;" }), true);
+  assert.equal(Check(BrowserParams, { action: "run", code: "return true;", dialogs: "accept" }), false);
+  assert.equal(Check(BrowserParams, { action: "open", dialogs: "accept" }), true);
+  assert.equal(Check(BrowserParams, { action: "run", code: "" }), false);
+  assert.equal(Check(BrowserParams, { action: "status" }), true);
+  assert.equal(Check(BrowserParams, { action: "pair" }), false);
+  assert.equal(Check(BrowserParams, { action: "pair", request_id: "request", code: "123456" }), true);
+  assert.equal(Check(BrowserParams, { action: "pair", request_id: "request", code: "wrong" }), false);
+  assert.equal(Check(BrowserParams, { action: "pick" }), true);
+  assert.equal(Check(BrowserParams, { action: "pick", name: "docs", timeout: 60 }), true);
+  const timeoutDescription = (BrowserParams.properties.timeout as { description?: string }).description ?? "";
+  assert.match(timeoutDescription, /setup, execution and postprocessing share one deadline/i);
+  assert.match(timeoutDescription, /Extension command\/execution waits are bounded but setup\/postprocessing may add latency/i);
+  assert.match(timeoutDescription, /existing borrowed profile\/CDP pages only disconnect and may continue executing/i);
+});
+
+test("browser video actions validate options and forward scoped names, paths and budgets", async () => {
+  assert.equal(Check(BrowserParams, { action: "start_video" }), true);
+  assert.equal(Check(BrowserParams, { action: "stop_video" }), true);
+  for (const invalid of [{ fps: 0 }, { fps: 1.5 }, { fps: 61 }, { scale: 0 }, { scale: 5 }, { filename: "" }]) {
+    assert.equal(Check(BrowserParams, { action: "start_video", ...invalid }), false);
+  }
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const started = await tool.execute("start", {
+    action: "start_video", name: "demo", filename: "demo.webm", fps: 20, scale: 0.5, ffmpeg_path: "bin/ffmpeg", timeout: 12,
+  }, undefined, undefined, ctx);
+  assert.equal(started.details?.video?.recording, true);
+  assert.match(started.details?.result ?? "", /recording started/);
+  const stopped = await tool.execute("stop", { action: "stop_video", name: "demo" }, undefined, undefined, ctx);
+  assert.deepEqual(stopped.details?.video, { path: "D:/workspace/demo.webm", mimeType: "video/webm", recording: false, bytes: 42 });
+  assert.deepEqual(manager.videoCalls, [
+    { action: "start", name: "demo", cwd: "D:/workspace", options: { filename: "demo.webm", size: undefined, fps: 20, scale: 0.5, ffmpegPath: "bin/ffmpeg" }, timeoutMs: 12_000 },
+    { action: "stop", name: "demo", timeoutMs: 30_000 },
+  ]);
+});
+
+test("browser video chapter/show/hide expose the complete MCP contracts and forward options", async () => {
+  assert.equal(Check(BrowserParams, { action: "video_chapter" }), false);
+  assert.equal(Check(BrowserParams, { action: "video_chapter", title: "Chapter", duration: 0 }), true);
+  for (const position of ["top-left", "top", "top-right", "bottom-left", "bottom", "bottom-right"]) {
+    assert.equal(Check(BrowserParams, { action: "video_show_actions", position, cursor: "pointer" }), true);
+  }
+  for (const options of [{ position: "left" }, { cursor: "hand" }, { duration: -1 }]) assert.equal(Check(BrowserParams, { action: "video_show_actions", ...options }), false);
+  assert.equal(Check(BrowserParams, { action: "start_video", size: { width: 640, height: 480 } }), true);
+  assert.equal(Check(BrowserParams, { action: "start_video", size: { width: 0, height: 480 } }), false);
+  assert.equal(Check(BrowserParams, { action: "start_video", size: { width: 640, height: 480 }, scale: 1 }), false);
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  await tool.execute("chapter", { action: "video_chapter", name: "demo", title: "Checkout", description: "Pay now", duration: 200 }, undefined, undefined, ctx);
+  await tool.execute("show", { action: "video_show_actions", name: "demo", duration: 750, position: "bottom", cursor: "none" }, undefined, undefined, ctx);
+  const hidden = await tool.execute("hide", { action: "video_hide_actions", name: "demo" }, undefined, undefined, ctx);
+  assert.match(hidden.content[0]?.type === "text" ? hidden.content[0].text : "", /Action annotations disabled/);
+  assert.deepEqual(manager.videoCalls, [
+    { action: "chapter", name: "demo", options: { title: "Checkout", description: "Pay now", duration: 200 }, timeoutMs: 30_000 },
+    { action: "show", name: "demo", options: { duration: 750, position: "bottom", cursor: "none" }, timeoutMs: 30_000 },
+    { action: "hide", name: "demo", timeoutMs: 30_000 },
+  ]);
+});
+
+test("browser stop_video without an open tab reports the MCP no-video result", async () => {
+  const tool = createBrowserTool(new BrowserManager());
+  const result = await tool.execute("stop", { action: "stop_video" }, undefined, undefined, { cwd: process.cwd() } as never);
+  assert.equal(result.details?.video, undefined);
+  assert.equal(result.content[0]?.type === "text" && result.content[0].text, "No videos were recorded.");
+});
+
+test("browser tool guidelines expose probe/snapshot/diff/monitor helpers", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const snippet = tool.promptSnippet ?? "";
+  const guidelines = tool.promptGuidelines ?? [];
+  const joined = [tool.description, snippet, ...guidelines].join("\n");
+  // Each new probe capability is mentioned in the agent-facing prompt surface.
+  assert.match(joined, /extract\(['"]probe['"]\)/, "guidelines must mention extract('probe')");
+  assert.match(joined, /tab\.snapshot\(\)/, "guidelines must mention tab.snapshot()");
+  assert.match(joined, /tab\.diff\(/, "guidelines must mention tab.diff()");
+  assert.match(joined, /monitorStart/, "guidelines must mention monitorStart");
+  assert.match(joined, /monitorStop/, "guidelines must mention monitorStop");
+  assert.match(joined, /tab\.tabs\(\)/, "guidelines must mention tab.tabs()");
+  assert.match(joined, /navigated/, "guidelines must mention navigated detection");
+  // Wave 0/1 new capabilities.
+  assert.match(joined, /tab\.cdp\(/, "guidelines must mention tab.cdp()");
+  assert.match(joined, /tab\.cookies\./, "guidelines must mention tab.cookies.*");
+  assert.match(joined, /tab\.uploadFile\(/, "guidelines must mention tab.uploadFile()");
+  assert.match(joined, /attach_user_profile/, "guidelines must mention attach_user_profile");
+  // Wave 2 new capabilities.
+  assert.match(joined, /tab\.evalInFrame\(/, "guidelines must mention tab.evalInFrame()");
+  assert.match(joined, /tab\.pierce\(/, "guidelines must mention tab.pierce()");
+  assert.match(joined, /tab\.cdpClick\(/, "guidelines must mention tab.cdpClick()");
+  assert.match(joined, /tab\.autofillRelease\(/, "guidelines must mention tab.autofillRelease()");
+  assert.match(joined, /tab\.setDownloadBehavior\(/, "guidelines must mention tab.setDownloadBehavior()");
+  assert.match(joined, /tab\.cdpBatch\(/, "guidelines must mention tab.cdpBatch()");
+  assert.match(joined, /action:status/, "guidelines must identify status as the live bridge probe");
+  assert.match(joined, /pendingPairings/, "guidelines must expose pending pairing requests");
+  for (const surface of [tool.description, snippet, ...guidelines.filter((text) => text.startsWith("Use action:status"))]) {
+    assert.match(surface, /PI_BROWSER_BRIDGE_AUTH_MODE=none|NONE/);
+    assert.match(surface, /transportReady/);
+    assert.match(surface, /authenticatedConnected=false/);
+  }
+  assert.match(joined, /opaque owner/);
+  assert.match(joined, /lazily claim/);
+  assert.match(joined, /Cookies\/login state are not isolated/);
+  assert.match(joined, /ready\/busy\/draining\/needs_revalidation\/disconnected\/closed/);
+  assert.match(joined, /pendingCommands/);
+  assert.match(joined, /open rejects while draining/);
+  assert.match(joined, /all command terminals and host operations to drain/);
+  assert.match(joined, /revalidate its fixed tab\/generation/);
+  assert.match(joined, /preserves the owned tab and never replays interrupted operations/);
+  assert.match(joined, /ready is not login isolation/);
+  assert.match(joined, /action:pair/, "guidelines must expose one-time pairing approval");
+  assert.match(joined, /share one deadline/, "guidelines must explain the shared Puppeteer timeout budget");
+  assert.match(joined, /close the named tab's owned resources/, "guidelines must explain managed timeout cleanup");
+  assert.match(joined, /borrowed profile\/CDP pages only disconnect and may continue executing/);
+  assert.match(joined, /Extension command\/execution waits are bounded/);
+  assert.match(joined, /never falls back|no managed-browser fallback/, "guidelines must state that extension fails closed without fallback");
+  assert.match(joined, /--remote-debugging-port=0/, "profile launch must describe dynamic-port discovery");
+  assert.match(joined, /Chrome 136\+ blocks debugging of the default profile even after all windows close/);
+  assert.doesNotMatch(joined, /auto-launches Chrome with --remote-debugging-port=9222/);
+  assert.match((BrowserParams.properties.app.properties.attach_user_profile as unknown as { description?: string }).description ?? "", /dynamic debugging port/);
+  assert.match((BrowserParams.properties.app.properties.user_profile_dir as unknown as { description?: string }).description ?? "", /never copied or switched automatically/);
+  // Channel stays nested under app; recording options are separate from open options.
+  assert.equal(Object.hasOwn(BrowserParams.properties, "channel"), false);
+  assert.match(joined, /action:start_video/);
+  assert.match(joined, /action:stop_video/);
+  assert.match(joined, /Existing files are never overwritten/);
+});
+
+test("browser calling contracts clarify helper shapes, channels and timeout units", () => {
+  const tool = createBrowserTool(new FakeBrowserManager());
+  const surface = [tool.description, ...(tool.promptGuidelines ?? [])].join("\n");
+  assert.match(surface, /observed\.elements\.find/);
+  assert.match(surface, /save:'shot\.png'/);
+  assert.match(surface, /save is never a boolean/);
+  assert.match(surface, /tab\.tabs\(\).*metadata records[\s\S]*browser\.pages\(\).*Puppeteer Pages/);
+  assert.match(surface, /optional string \.title \(use record\.title \?\? ''\)/);
+  assert.match(surface, /await handle\.contentFrame\(\)/);
+  assert.match(surface, /evaluateOnNewDocument[\s\S]*not addInitScript/);
+  assert.match(surface, /Tool execution success is NOT application or assertion success/);
+  assert.match(surface, /count:0 with failures:\[\] is not a pass/);
+  assert.match(surface, /never blindly repeat submit/);
+  const props = BrowserParams.properties;
+  assert.match(props.code.description ?? "", /host-side[\s\S]*no document\/window[\s\S]*explicit arguments/);
+  assert.match(props.timeout.description ?? "", /SECONDS[\s\S]*default 30[\s\S]*MILLISECONDS/);
+  assert.match(props.wait_until.description ?? "", /Open-only[\s\S]*domcontentloaded[\s\S]*Unsupported on extension/);
+  assert.match(props.app.description ?? "", /Open-only[\s\S]*does not support[\s\S]*dialogs/);
+  assert.match(props.topic.description ?? "", /including custom topics[\s\S]*not reading the full SOP/);
+});
+
+test("browser SOP baseline and always-visible quickref explain observed misuse", () => {
+  const core = BROWSER_SOPS_BASELINE.core.body;
+  const automation = BROWSER_SOPS_BASELINE["automation-antipatterns"].body;
+  for (const surface of [core, BROWSER_HELPER_QUICKREF]) {
+    assert.match(surface, /elements:\[\{id,role,name,text,box\}\]/);
+    assert.match(surface, /save:'shot\.png'/);
+    assert.match(surface, /use record\.title \?\? ''/);
+    assert.match(surface, /tool success|Tool success/i);
+  }
+  assert.match(core, /bridge drainingCommands=0 alone does not authorize reuse/);
+  assert.match(core, /explicitly open the same name without url/);
+  assert.match(core, /await handle\.contentFrame\(\)/);
+  assert.match(automation, /SECONDS[\s\S]*MILLISECONDS/);
+  assert.match(automation, /options object is SECOND, not last/);
+  assert.match(automation, /count:0 proves nothing/);
+  assert.match(automation, /must not be hidden by catch/);
+  assert.match(automation, /Proxy\/transport errors also do not prove no side effect/);
+});
+
+test("browser run screenshot contract rejects invalid save before capture and preserves navigation guards", async () => {
+  let captures = 0;
+  const page = { async screenshot(options: unknown) { captures++; return options; }, async goto(url: string) { return url; } };
+  const tab = { async screenshot(options?: { save?: unknown; silent?: boolean }) { captures++; return options; }, async goto(url: string) { return url; } };
+  const visited: string[] = [];
+  const observed = observeBrowserRunApis("contracts", page, {}, tab, undefined, (url) => {
+    if (url === "https://denied.example") throw new Error("Navigation denied");
+    visited.push(url);
+  });
+  for (const save of [true, false, 42, null]) {
+    assert.throws(() => observed.tab.screenshot({ save }), /save must be a file path string[\s\S]*No screenshot was captured/);
+  }
+  await assert.rejects(compileRunCode("return await tab.screenshot({save:true});")(observed.page, observed.browser, observed.tab), /Omit save to auto-save/);
+  assert.equal(captures, 0);
+  assert.equal(await observed.tab.screenshot(), undefined);
+  assert.deepEqual(await observed.tab.screenshot({ save: "shot.png", silent: true }), { save: "shot.png", silent: true });
+  assert.deepEqual(await observed.page.screenshot({ path: "page.png" }), { path: "page.png" });
+  assert.equal(captures, 3);
+  assert.equal(await observed.page.goto("https://allowed.example"), "https://allowed.example");
+  assert.equal(await observed.tab.goto("https://allowed.example/tab"), "https://allowed.example/tab");
+  assert.throws(() => observed.tab.goto("https://denied.example"), /Navigation denied/);
+  assert.deepEqual(visited, ["https://allowed.example", "https://allowed.example/tab"]);
+});
+
+test("browser run preserves diagnostic failed outcomes without claiming application success", async () => {
+  const manager = new FakeBrowserManager();
+  manager.run = async () => ({ displays: [], returnValue: { ok: false, count: 0, failures: ["No samples"] }, screenshots: [], url: "https://example.com" });
+  const result = await createBrowserTool(manager).execute("diagnostic", { action: "run", code: "return diagnostics;" }, undefined, undefined, { cwd: process.cwd() } as never);
+  assert.equal(result.isError, undefined);
+  assert.match(result.details?.result ?? "", /"ok": false[\s\S]*"count": 0[\s\S]*No samples/);
+});
+
+test("browser tool forwards named-tab open options and returns run displays, images, and screenshots", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const opened = await tool.execute("open", {
+    action: "open", name: "docs", url: "https://example.com", app: { cdp_url: "http://127.0.0.1:9222" },
+    viewport: { width: 1000, height: 700, scale: 1 }, wait_until: "domcontentloaded", dialogs: "dismiss",
+  }, undefined, undefined, ctx);
+  assert.equal(opened.details?.browser, "connected");
+  assert.equal(opened.details?.connection?.channel, "cdp");
+  assert.equal(opened.details?.connection?.ownership, "borrowed");
+  assert.deepEqual(opened.details?.connection?.capabilities, { page: true, cdp: true, cookies: true });
+  assert.equal(manager.opened?.name, "docs");
+  assert.equal(manager.opened?.channel, "cdp");
+  assert.equal(manager.opened?.waitUntil, "domcontentloaded");
+
+  const run = await tool.execute("run", { action: "run", name: "docs", code: "return await tab.observe();", timeout: 5 }, undefined, undefined, ctx);
+  assert.equal(run.isError, undefined);
+  assert.equal(run.content.some((item) => item.type === "image"), true);
+  assert.deepEqual(run.details?.screenshots, [{ path: "shot.png", mimeType: "image/png", bytes: 3 }]);
+  assert.equal(manager.runs[0]?.timeoutMs, 5_000);
+});
+
+test("browser open forwards visible for a headed launch and reports the kind", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const opened = await tool.execute("open", {
+    action: "open", name: "ui", url: "https://example.com", visible: true,
+  }, undefined, undefined, ctx);
+  assert.equal(manager.opened?.visible, true);
+  assert.equal(manager.opened?.channel, "managed");
+  assert.equal(opened.details?.browser, "headed");
+  assert.equal(opened.details?.connection?.channel, "managed");
+  assert.equal(opened.details?.connection?.ownership, "owned");
+});
+
+test("browser open forwards attach_user_profile + user_profile_dir into the manager", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const opened = await tool.execute("open", {
+    action: "open",
+    name: "me",
+    url: "https://example.com",
+    visible: true,
+    app: {
+      attach_user_profile: true,
+      user_profile_dir: "C:/Users/me/AppData/Local/Google/Chrome/User Data",
+    },
+  }, undefined, undefined, ctx);
+  // FakeBrowserManager reports kind "connected" when cdpUrl is set OR (now) when
+  // attachUserProfile is set, mirroring the real connectBrowser attach branch.
+  assert.equal(manager.opened?.attachUserProfile, true);
+  assert.equal(manager.opened?.userProfileDir, "C:/Users/me/AppData/Local/Google/Chrome/User Data");
+  assert.equal(manager.opened?.channel, "profile");
+  assert.equal(opened.details?.browser, "connected");
+  assert.equal(opened.details?.connection?.channel, "profile");
+});
+
+test("browser schema accepts legacy profile selectors and canonical app.channel", () => {
+  assert.equal(Check(BrowserParams, {
+    action: "open",
+    app: { attach_user_profile: true, user_profile_dir: "C:/x" },
+  }), true);
+  assert.equal(Check(BrowserParams, { action: "open", app: { attach_user_profile: true } }), true);
+  for (const channel of ["managed", "profile", "cdp", "extension"]) {
+    assert.equal(Check(BrowserParams, { action: "open", app: { channel } }), true, channel);
+  }
+  assert.equal(Check(BrowserParams, { action: "open", app: { channel: "connected" } }), false);
+});
+
+test("canonical browser channel inference preserves legacy routing", () => {
+  const base = { name: "main", cwd: "D:/workspace", timeoutMs: 30_000 };
+  assert.equal(canonicalizeBrowserOpenOptions(base).channel, "managed");
+  assert.equal(canonicalizeBrowserOpenOptions({ ...base, cdpUrl: "http://127.0.0.1:9222" }).channel, "cdp");
+  assert.equal(canonicalizeBrowserOpenOptions({ ...base, attachUserProfile: true, userProfileDir: "C:/profile" }).channel, "profile");
+  assert.equal(
+    canonicalizeBrowserOpenOptions({ ...base, cdpUrl: "http://127.0.0.1:9222", attachUserProfile: true, userProfileDir: "C:/profile" }).channel,
+    "profile",
+    "the historical attach_user_profile precedence must remain intact",
+  );
+  assert.equal(canonicalizeBrowserOpenOptions({ ...base, channel: "managed" }).channel, "managed");
+  assert.equal(canonicalizeBrowserOpenOptions({ ...base, channel: "extension" }).channel, "extension");
+  assert.equal(canonicalizeBrowserOpenOptions({ ...base, channel: "profile", userProfileDir: "C:/profile" }).channel, "profile");
+  assert.equal(canonicalizeBrowserOpenOptions({ ...base, channel: "cdp", cdpUrl: "http://127.0.0.1:9222" }).channel, "cdp");
+});
+
+test("browser DevToolsActivePort parsing validates port and ws path", () => {
+  assert.deepEqual(parseDevToolsActivePort("9222\n/devtools/browser/abc-def\n"), { port: 9222, wsPath: "/devtools/browser/abc-def" });
+  assert.deepEqual(parseDevToolsActivePort("  9222 \r\n/devtools/browser/x"), { port: 9222, wsPath: "/devtools/browser/x" });
+  assert.equal(parseDevToolsActivePort("9222\n"), undefined, "missing ws path");
+  assert.equal(parseDevToolsActivePort("9222\n/other/path"), undefined, "ws path must start with /devtools/browser/");
+  assert.equal(parseDevToolsActivePort("0\n/devtools/browser/x"), undefined);
+  assert.equal(parseDevToolsActivePort("65536\n/devtools/browser/x"), undefined);
+  assert.equal(parseDevToolsActivePort("notaport\n/devtools/browser/x"), undefined);
+  assert.equal(parseDevToolsActivePort(""), undefined);
+});
+
+test("browser navigation policy compiles matchers and gates http(s) hosts", () => {
+  assert.equal(compileNavigationPolicy(undefined), undefined);
+  const policy = compileNavigationPolicy({ allow: ["*.example.com", "allowed.org"], deny: ["bad.example.com"] });
+  assert.ok(policy);
+  assert.equal(policy.allowed("about:blank"), true);
+  assert.equal(policy.allowed("data:text/html,<p>x</p>"), true);
+  assert.equal(policy.allowed("blob:https://example.com/id"), true);
+  assert.equal(policy.allowed("https://example.com/path"), true, "*.example.com includes the apex");
+  assert.equal(policy.allowed("https://sub.example.com"), true);
+  assert.equal(policy.allowed("https://bad.example.com"), false, "deny wins over allow");
+  assert.equal(policy.allowed("https://allowed.org"), true);
+  assert.equal(policy.allowed("https://other.org"), false, "not in the allow list");
+  assert.equal(policy.allowed("https://notexample.com"), false, "wildcard must not overmatch");
+  assert.equal(policy.allowed("https://example.com.evil.org"), false);
+  assert.equal(policy.allowed("file:///etc/passwd"), false, "non-http(s) denied under a policy");
+  assert.equal(policy.allowed("https://user:pw@example.com"), false, "credentialed URLs denied");
+  assert.equal(policy.allowed("not a url"), false);
+  const denyOnly = compileNavigationPolicy({ deny: ["denied.com"] });
+  assert.ok(denyOnly);
+  assert.equal(denyOnly.allowed("https://denied.com"), false);
+  assert.equal(denyOnly.allowed("https://sub.denied.com"), true, "exact deny does not cover subdomains");
+  assert.equal(denyOnly.allowed("https://ok.com"), true);
+  assert.throws(() => domainMatcher("*.bad*pat"), /wildcard/);
+  assert.throws(() => domainMatcher("http://x.com"), /hostname/);
+  assert.throws(() => compileNavigationPolicy({ deny: "x.com" as never }), /array/);
+});
+
+test("browser open canonicalization validates policy and rejects it on the extension channel", () => {
+  const base = { name: "main", cwd: "D:/workspace", timeoutMs: 30_000 };
+  const ok = canonicalizeBrowserOpenOptions({ ...base, policy: { deny: ["x.com"] } });
+  assert.equal(ok.channel, "managed");
+  assert.throws(
+    () => canonicalizeBrowserOpenOptions({ ...base, channel: "extension", policy: { deny: ["x.com"] } }),
+    /app\.channel "extension" conflicts with legacy app\.policy/,
+  );
+  assert.throws(
+    () => canonicalizeBrowserOpenOptions({ ...base, policy: { allow: ["not a host!!"] } }),
+    /hostname|wildcard/,
+  );
+});
+
+test("browser schema accepts app.policy and the tool forwards it to the manager", async () => {
+  assert.equal(Check(BrowserParams, { action: "open", app: { policy: { allow: ["*.ok.com"], deny: ["bad.com"] } } }), true);
+  assert.equal(Check(BrowserParams, { action: "open", app: { policy: "nope" } }), false);
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  await tool.execute("open", { action: "open", app: { policy: { deny: ["deny.example.com"] } } }, undefined, undefined, { cwd: "D:/workspace" } as never);
+  assert.deepEqual(manager.opened?.policy, { deny: ["deny.example.com"] });
+});
+
+test("browser tool guidelines and description expose the AX/CDP-event/policy helpers", () => {
+  const tool = createBrowserTool(new FakeBrowserManager());
+  const joined = `${tool.description}\n${(tool.promptGuidelines ?? []).join("\n")}`;
+  for (const name of ["tab.axTree", "tab.clickNode", "tab.typeNode", "tab.waitForCdp", "app.policy"]) {
+    assert.ok(joined.includes(name), `tool surface must mention ${name}`);
+  }
+});
+
+test("canonical browser channel conflicts fail closed", () => {
+  const base = { name: "main", cwd: "D:/workspace", timeoutMs: 30_000 };
+  assert.throws(
+    () => canonicalizeBrowserOpenOptions({ ...base, channel: "managed", cdpUrl: "http://127.0.0.1:9222" }),
+    /app\.channel "managed" conflicts with legacy app\.cdp_url/,
+  );
+  assert.throws(
+    () => canonicalizeBrowserOpenOptions({ ...base, channel: "cdp", attachUserProfile: true, userProfileDir: "C:/profile", cdpUrl: "http://127.0.0.1:9222" }),
+    /app\.channel "cdp" conflicts with legacy app\.attach_user_profile/,
+  );
+  assert.throws(
+    () => canonicalizeBrowserOpenOptions({ ...base, channel: "profile", userProfileDir: "C:/profile", cdpUrl: "http://127.0.0.1:9222" }),
+    /app\.channel "profile" conflicts with legacy app\.cdp_url/,
+  );
+  assert.throws(() => canonicalizeBrowserOpenOptions({ ...base, channel: "profile" }), /requires app\.user_profile_dir/);
+  assert.throws(() => canonicalizeBrowserOpenOptions({ ...base, channel: "cdp" }), /requires app\.cdp_url/);
+});
+
+test("browser tool forwards an explicit canonical channel and returns structured live status", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const opened = await tool.execute("open", {
+    action: "open",
+    app: { channel: "cdp", cdp_url: "http://127.0.0.1:9222" },
+  }, undefined, undefined, ctx);
+  assert.equal(manager.opened?.channel, "cdp");
+  assert.equal(opened.details?.browser, "connected", "the legacy browser projection must remain available");
+  assert.equal(opened.details?.connection?.channel, "cdp");
+  const status = await tool.execute("status", { action: "status" }, undefined, undefined, ctx);
+  assert.equal(status.details?.action, "status");
+  assert.deepEqual(status.details?.status, manager.statusResult);
+  assert.equal(status.details?.status?.bridge.serverStarted, true);
+  assert.equal(status.details?.status?.bridge.authenticatedConnected, true);
+  assert.equal(status.details?.status?.bridge.tabCount, 3);
+  assert.equal(status.details?.status?.bridge.pendingPairings[0]?.code, "123456");
+  assert.deepEqual(status.details?.status?.namedTabs[0], {
+    name: "docs",
+    channel: "cdp",
+    ownership: "borrowed",
+    capabilities: { page: true, cdp: true, cookies: true },
+  });
+  assert.match(status.details?.result ?? "", /Browser status \(live\)/);
+
+  const paired = await tool.execute("pair", {
+    action: "pair",
+    request_id: "11111111-1111-4111-8111-111111111111",
+    code: "123456",
+  }, undefined, undefined, ctx);
+  assert.equal(paired.details?.action, "pair");
+  assert.equal(paired.details?.pairingApproval?.requestId, "11111111-1111-4111-8111-111111111111");
+  assert.match(paired.details?.result ?? "", /store the credentials and reconnect/i);
+});
+
+test("browser guide returns registry index; topic loads one document", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  // Bare guide -> directory index listing all documents
+  const index = await tool.execute("guide", { action: "guide" }, undefined, undefined, ctx);
+  assert.equal(index.isError, undefined);
+  assert.equal(index.details?.action, "guide");
+  const idxText = index.content.filter((item) => item.type === "text").map((item) => "text" in item ? item.text : "").join("\n");
+  assert.match(idxText, /core/, "index must list core");
+  assert.match(idxText, /captcha-strategies/, "index must list captcha-strategies");
+  assert.match(idxText, /automation-antipatterns/, "index must list automation-antipatterns");
+  for (const id of ["network-mocking", "auth-flows", "form-widgets", "list-scraping", "antibot-landscape"]) {
+    assert.match(idxText, new RegExp(id), `index must list ${id}`);
+  }
+  assert.doesNotMatch(idxText, /render=explicit/, "bare index must not inline full document bodies");
+  // topic:"core" -> the full core SOP
+  const core = await tool.execute("guide", { action: "guide", topic: "core" }, undefined, undefined, ctx);
+  const coreText = core.content.filter((item) => item.type === "text").map((item) => "text" in item ? item.text : "").join("\n");
+  assert.match(coreText, /Turnstile/i, "core SOP must mention Turnstile");
+  assert.match(coreText, /evalInFrame/, "core SOP must mention evalInFrame");
+  assert.match(coreText, /cdpClick/, "core SOP must mention cdpClick");
+  assert.match(coreText, /attach_user_profile/, "core SOP must mention attach_user_profile");
+  assert.match(coreText, /--remote-debugging-port=0/);
+  assert.match(coreText, /Chrome 136\+ blocks remote debugging/);
+  assert.match(coreText, /Pi Browser Bridge in Chrome\/Edge/);
+  assert.match(coreText, /PI_BROWSER_BRIDGE_AUTH_MODE=none requires no token or pairing/);
+  assert.match(coreText, /transportReady=true, authenticatedConnected=false/);
+  assert.match(coreText, /exclusive lease/);
+  assert.match(coreText, /historical evidence/);
+  assert.match(coreText, /fixed port need not produce DevToolsActivePort/);
+  assert.doesNotMatch(coreText, /Chrome 147\+ may refuse|the profile may be locked by another Chrome instance/);
+  const antipatterns = await tool.execute("guide", { action: "guide", topic: "automation-antipatterns" }, undefined, undefined, ctx);
+  const antipatternText = antipatterns.content.filter((item) => item.type === "text").map((item) => "text" in item ? item.text : "").join("\n");
+  assert.match(antipatternText, /setup, execution and postprocessing share one deadline/i, "automation SOP must explain the shared Puppeteer budget");
+  assert.match(antipatternText, /owned resources and retires the named binding/i, "automation SOP must explain managed timeout cleanup");
+  assert.match(antipatternText, /borrowed profile\/CDP pages are not closed/i);
+  // Unknown topic -> error listing available ids
+  await assert.rejects(
+    () => tool.execute("guide", { action: "guide", topic: "nope" }, undefined, undefined, ctx),
+    /Unknown SOP topic/,
+  );
+});
+
+test("browser nudges on open/run before guide, and stays silent after", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const hint = /SOP registry not read this session/;
+  // open before guide -> nudge appended
+  const opened = await tool.execute("open", { action: "open" }, undefined, undefined, ctx);
+  assert.match(opened.content.map((c) => "text" in c ? c.text : "").join("\n"), hint);
+  // run before guide -> nudge appended
+  const ran = await tool.execute("run", { action: "run", code: "return 1;" }, undefined, undefined, ctx);
+  assert.match(ran.content.map((c) => "text" in c ? c.text : "").join("\n"), hint);
+  // after reading the registry (bare index suffices) -> no more nudges
+  await tool.execute("guide", { action: "guide" }, undefined, undefined, ctx);
+  const reopened = await tool.execute("open", { action: "open" }, undefined, undefined, ctx);
+  assert.doesNotMatch(reopened.content.map((c) => "text" in c ? c.text : "").join("\n"), hint);
+});
+
+test("browser close supports one tab and all tabs, while run validates code and propagates abort", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  assert.equal((await tool.execute("close", { action: "close", name: "docs" }, undefined, undefined, ctx)).details?.result, "Closed tab \"docs\".");
+  assert.equal((await tool.execute("close-all", { action: "close", all: true }, undefined, undefined, ctx)).details?.result, "Closed 2 browser tabs.");
+  await assert.rejects(() => tool.execute("empty", { action: "run", code: "   " }, undefined, undefined, ctx), /non-empty code/);
+  manager.abortRun = true;
+  await assert.rejects(() => tool.execute("abort", { action: "run", code: "await wait(1000)" }, undefined, undefined, ctx), { name: "AbortError" });
+});
+
+test("browser run error hints explain evaluate callback scoping", () => {
+  const reference = browserRunErrorHint(new ReferenceError("clicked is not defined")) as Error;
+  assert.equal(reference.name, "ReferenceError");
+  assert.match(reference.message, /Browser run hint/);
+  assert.match(reference.message, /`clicked` is referenced where it is not defined/);
+  assert.match(reference.message, /page\.evaluate\(\)\/tab\.evaluate\(\) callbacks runs in the browser page context/);
+  assert.match(reference.message, /Pass values explicitly: await tab\.evaluate\(\(v\) => …, v\)/);
+  assert.match(reference.message, /tab\.click\(\)\/tab\.type\(\)\/tab\.fill\(\) return undefined/);
+  assert.match(reference.message, /Top-level run code executes on the Node host, not in the page/);
+  const hostDom = browserRunErrorHint(new ReferenceError("document is not defined")) as Error;
+  assert.match(hostDom.message, /document\/window\/location\/getComputedStyle belong inside evaluate/);
+  const hostModule = browserRunErrorHint(new ReferenceError("require is not defined")) as Error;
+  assert.match(hostModule.message, /await import\('node:fs\/promises'\), not require/);
+  // 其他 ReferenceError（非 "is not defined"）不加浏览器提示，保持原样。
+  const other = browserRunErrorHint(new ReferenceError("Cannot read properties of null (reading 'x')")) as Error;
+  assert.equal(other.message, "Cannot read properties of null (reading 'x')");
+  // 语法错误附带解析提示。
+  const syntax = browserRunErrorHint(new SyntaxError("Unexpected token 'x'")) as Error;
+  assert.match(syntax.message, /Browser run hint: the run code failed to parse/);
+  // 普通错误原样透传。
+  const plain = new Error("boom");
+  assert.equal(browserRunErrorHint(plain), plain);
+});
+
+test("browser run error hints explain timeout budgeting and managed-tab cleanup", () => {
+  const timeout = browserRunErrorHint(new Error("Browser operation timed out after 300000ms.")) as Error;
+  assert.match(timeout.message, /total wall-clock budget/);
+  assert.match(timeout.message, /split long serial cases/);
+  assert.match(timeout.message, /stable semantic state/);
+  assert.match(timeout.message, /close the named tab/);
+  assert.match(timeout.message, /reopen it before retrying/i);
+  assert.match(timeout.message, /borrowed profile\/CDP pages.*may continue executing/);
+  assert.match(timeout.message, /never replay earlier actions/);
+});
+
+test("browser run rejects misplaced dialogs before any manager operation", async () => {
+  const manager = new FakeBrowserManager();
+  const tool = createBrowserTool(manager);
+  await assert.rejects(
+    tool.execute("run-dialogs", { action: "run", code: "await page.click('#submit');", dialogs: "accept" } as never, new AbortController().signal, undefined, { cwd: process.cwd() } as never),
+    /Set dialogs on browser open[\s\S]*No run code was executed/,
+  );
+  assert.equal(manager.runs.length, 0);
+  assert.equal(manager.opened, undefined);
+});
+
+test("browser wait and record URL errors keep their failure and explain safe recovery", () => {
+  const waitFailure = new Error("Waiting failed: 18000ms exceeded");
+  assert.equal(browserRunErrorHint(waitFailure), waitFailure);
+  assert.match(waitFailure.message, /earlier clicks, uploads or submissions may already have completed/);
+  assert.match(waitFailure.message, /do not replay the whole script/);
+  assert.match(waitFailure.message, /Hidden file inputs only need to exist/);
+  const selectorFailure = new Error("Waiting for selector `input[type=file]` failed");
+  selectorFailure.name = "TimeoutError";
+  assert.match((browserRunErrorHint(selectorFailure) as Error).message, /do not wait for them to be visible/);
+  const urlFailure = new TypeError("n.url is not a function");
+  assert.equal(browserRunErrorHint(urlFailure), urlFailure);
+  assert.match(urlFailure.message, /plain records store url as a string/);
+  assert.match(urlFailure.message, /Read record.url instead of calling it/);
+  const originFailure = new Error("Tab origin drift; no input");
+  assert.equal(browserRunErrorHint(originFailure), originFailure);
+  assert.equal(originFailure.message, "Tab origin drift; no input");
+});
+
+test("compileRunCode surfaces ReferenceError with the undefined name", async () => {
+  const execute = compileRunCode("return missingClicked;");
+  await assert.rejects(() => execute(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined), /missingClicked is not defined/);
+});
+
+test("browser run API contains floating method rejections without swallowing awaited failures", async () => {
+  const reports: Array<{ operation: string; message: string }> = [];
+  const page = {
+    value: "ok",
+    read() { return Promise.resolve(this.value); },
+    fail(message: string) { return Promise.reject(new Error(message)); },
+  };
+  const browser = { pages() { return Promise.resolve([]); } };
+  const tab = {
+    page,
+    cookies: { fail(message: string) { return Promise.reject(new Error(message)); } },
+  };
+  const observed = observeBrowserRunApis("test", page, browser, tab, (operation, error) => {
+    reports.push({ operation, message: error instanceof Error ? error.message : String(error) });
+  });
+
+  assert.equal(observed.tab.page, observed.page);
+  assert.equal(await observed.page.read(), "ok", "method this binding and awaited resolution must stay intact");
+  void observed.page.fail("floating-page");
+  void observed.tab.cookies.fail("floating-cookie");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(reports, [
+    { operation: "page.fail", message: "floating-page" },
+    { operation: "tab.cookies.fail", message: "floating-cookie" },
+  ]);
+
+  await assert.rejects(observed.page.fail("awaited"), /awaited/, "awaited failures must still reject normally");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(reports.length, 2, "an awaited rejection must not be reported as floating");
+});
+
+test("browser temporary screenshots use exclusive owner-only creation", async () => {
+  const source = await fs.readFile(new URL("../src/tools/browser/manager.ts", import.meta.url), "utf8");
+  assert.match(source, /flag:\s*options\?\.save\s*\?\s*"w"\s*:\s*"wx"/);
+  assert.match(source, /mode:\s*options\?\.save\s*\?\s*0o666\s*:\s*0o600/);
+});
+
+test("browser manager drives a real local Chromium tab when an executable is available", async (t) => {
+  const manager = new BrowserManager();
+  const openOptions = {
+    name: "live",
+    cwd: process.cwd(),
+    url: "data:text/html,<title>Smoke</title><input id='name'><button id='save'>Save</button>",
+    viewport: { width: 800, height: 600 },
+    timeoutMs: 15_000,
+  } as const;
+  try {
+    const opened = await Promise.all([manager.open(openOptions), manager.open(openOptions)]);
+    assert.deepEqual(opened.map((item) => item.reused).sort(), [false, true]);
+    assert.deepEqual(opened.map((item) => item.kind), ["headless", "headless"], "managed browser remains headless by default");
+    assert.deepEqual(opened.map((item) => item.connection), [
+      { channel: "managed", ownership: "owned", capabilities: { page: true, cdp: true, cookies: true } },
+      { channel: "managed", ownership: "owned", capabilities: { page: true, cdp: true, cookies: true } },
+    ]);
+  } catch (error) {
+    if (error instanceof Error && /No Chromium browser found/.test(error.message)) {
+      t.skip("No local Chromium executable is available.");
+      return;
+    }
+    throw error;
+  }
+  try {
+    const output = await manager.run("live", `
+      const observed = await tab.observe();
+      assert(observed.elements.some(element => element.name === 'Save'), 'button missing');
+      await tab.waitForUrl(/SMOKE/i);
+      await tab.fill('#name', 'Ada');
+      const value = await tab.evaluate(() => document.querySelector('#name').value);
+      const shot = await tab.screenshot({ silent: true });
+      return { value, shot };
+    `, process.cwd(), undefined, 15_000);
+    assert.equal((output.returnValue as { value: string }).value, "Ada");
+    assert.equal(output.screenshots.length, 1);
+    await assert.rejects(
+      manager.run("live", "display('x'.repeat(128)); return true;", process.cwd(), undefined, 15_000, 64),
+      /Browser output exceeds 64 UTF-8 bytes/,
+    );
+    const collision = await manager.run("live", `
+      const wait = "w"; const page = "p"; const assert = "a"; const display = "d";
+      const print = "pr"; const signal = "s"; const console = "c"; const browser = "b";
+      return { shadowed: [wait, page, assert, display, print, signal, console, browser].join(","), tabName: tab.name, ok: (await tab.observe()).elements.length >= 0 };
+    `, process.cwd(), undefined, 15_000);
+    const cv = collision.returnValue as { shadowed: string; tabName: string; ok: boolean };
+    assert.equal(cv.shadowed, "w,p,a,d,pr,s,c,b");
+    assert.equal(cv.tabName, "live");
+    assert.equal(cv.ok, true);
+    // Node-side variables are invisible inside evaluate callbacks (browser context);
+    // the error must carry the scoping hint so the agent can self-correct.
+    await assert.rejects(
+      manager.run("live", `const clicked = "n"; return await tab.evaluate(() => clicked);`, process.cwd(), undefined, 15_000),
+      (error) => error instanceof Error && /clicked is not defined/.test(error.message) && /Browser run hint/.test(error.message),
+    );
+    const screenshotPath = output.screenshots[0]?.path;
+    assert.ok(screenshotPath);
+    const screenshotStat = await fs.stat(screenshotPath);
+    assert.equal(screenshotStat.isFile(), true);
+    if (process.platform !== "win32") assert.equal(screenshotStat.mode & 0o777, 0o600);
+    await manager.run("live", "await page.close(); return true;", process.cwd(), undefined, 15_000);
+    for (let attempt = 0; attempt < 100 && manager.has("live"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.has("live"), false);
+    for (let attempt = 0; attempt < 500 && await fs.stat(screenshotPath).then(() => true, () => false); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(await fs.stat(screenshotPath).then(() => true, () => false), false);
+    await manager.open({ name: "live", cwd: process.cwd(), url: "data:text/html,<title>Reopened</title>", timeoutMs: 15_000 });
+    assert.equal(await manager.close("live"), true);
+
+    // Probe helpers (ported from GenericAgent simphtml.py): extract('probe')
+    // returns token-optimized simplified HTML, snapshot/diff detect changes,
+    // monitorStart/Stop capture transient text.
+    await manager.open({ name: "probe", cwd: process.cwd(), url: "data:text/html,<title>Probe</title><ul id='list'><li>Product 0: " + "x".repeat(210) + "</li><li>Product 1: " + "x".repeat(210) + "</li><li>Product 2: " + "x".repeat(210) + "</li><li>Product 3: " + "x".repeat(210) + "</li><li>Product 4: " + "x".repeat(210) + "</li><li>Product 5: target match</li><li>Product 6: " + "x".repeat(210) + "</li><li>Product 7: " + "x".repeat(210) + "</li><li>Product 8: " + "x".repeat(210) + "</li><li>Product 9: " + "x".repeat(210) + "</li><li>Product 10: " + "x".repeat(210) + "</li><li>Product 11: " + "x".repeat(210) + "</li></ul><button id='add'>Add</button>", timeoutMs: 15_000 });
+    try {
+      const probed = await manager.run("probe", `
+        const probeHtml = await tab.extract('probe');
+        const lists = await tab.extract('list');
+        const folded = await tab.extract('probe', { fold: 'target' });
+        const before = await tab.snapshot();
+        await tab.click('#add');
+        await tab.evaluate(() => new Promise(r => setTimeout(r, 50)));
+        const diff = await tab.diff(before);
+        await tab.monitorStart();
+        await tab.evaluate(() => { const t = document.createElement('div'); t.textContent = 'Toast message here'; document.body.appendChild(t); });
+        await tab.evaluate(() => new Promise(r => setTimeout(r, 500)));
+        const transients = await tab.monitorStop();
+        return { probeLen: probeHtml.length, foldedLen: folded.length, foldedHasHint: folded.includes('[FAKE ELEMENT]'), listCount: lists.length, diffChanged: diff.changed, transients };
+      `, process.cwd(), undefined, 15_000);
+      const rv = probed.returnValue as { probeLen: number; foldedLen: number; foldedHasHint: boolean; listCount: number; diffChanged: number; transients: string[] };
+      assert.ok(rv.probeLen > 0, 'extract("probe") must return HTML');
+      assert.ok(rv.foldedLen < rv.probeLen || rv.foldedHasHint, 'folded probe should be smaller or contain a FAKE ELEMENT hint');
+      assert.ok(rv.foldedHasHint, 'extract("probe", {fold}) must emit [FAKE ELEMENT] hint for the long list');
+      assert.ok(rv.listCount >= 0, 'extract("list") must return an array');
+      assert.ok(typeof rv.diffChanged === 'number', 'diff must return a numeric changed count');
+      assert.ok(Array.isArray(rv.transients), 'monitorStop must return an array');
+    } finally {
+      await manager.close("probe");
+    }
+
+    // Navigation / new-tab detection: run output reports when the page URL
+    // changed and when new tabs opened during execution.
+    await manager.open({ name: "nav", cwd: process.cwd(), url: "data:text/html,<title>Nav</title>", timeoutMs: 15_000 });
+    try {
+      const navOut = await manager.run("nav", `await tab.goto('data:text/html,<title>Navigated</title>'); const tabs = await tab.tabs(); return { tabs: tabs.length, hasNavigatedTab: tabs.some(t => /Navigated/.test(t.title || '')) };`, process.cwd(), undefined, 15_000);
+      assert.equal(navOut.navigated, true, 'run must report navigated=true after a goto changes the URL');
+      assert.ok(/Navigated/.test(navOut.url), 'run output url should reflect the navigated page');
+      const rv = navOut.returnValue as { tabs: number; hasNavigatedTab: boolean };
+      assert.ok(rv.tabs >= 1, 'tab.tabs() must list at least one page');
+      assert.equal(rv.hasNavigatedTab, true, 'tab.tabs() must include the navigated page by title');
+    } finally {
+      await manager.close("nav");
+    }
+    await manager.open({ name: "pop", cwd: process.cwd(), url: "data:text/html,<title>Pop</title>", timeoutMs: 15_000 });
+    try {
+      const popOut = await manager.run("pop", `const p = await browser.newPage(); await p.goto('data:text/html,<title>Spawned</title>'); await new Promise(r => setTimeout(r, 200)); return true;`, process.cwd(), undefined, 15_000);
+      assert.ok(Array.isArray(popOut.newTabs) && popOut.newTabs.length >= 1, 'run must report new tabs opened during execution');
+    } finally {
+      await manager.closeAll();
+    }
+
+    // Negative paths: navigated=false on same URL, newTabs undefined when a spawned
+    // tab is closed before the run ends, monitorStop returns [] without a prior start.
+    await manager.open({ name: "neg", cwd: process.cwd(), url: "data:text/html,<title>Neg</title>", timeoutMs: 15_000 });
+    try {
+      const negOut = await manager.run("neg", `
+        const sameUrl = page.url();
+        await tab.goto(sameUrl);
+        const tabsAfterSame = await tab.tabs();
+        const monitorWithoutStart = await tab.monitorStop();
+        return { sameUrl, tabsAfterSame, monitorWithoutStart };
+      `, process.cwd(), undefined, 15_000);
+      assert.notEqual(negOut.navigated, true, 'navigated must be falsy when the URL did not change');
+      const rv = negOut.returnValue as { tabsAfterSame: Array<{ url: string }>; monitorWithoutStart: string[] };
+      assert.ok(Array.isArray(rv.tabsAfterSame) && rv.tabsAfterSame.length >= 1, 'tab.tabs() lists the page');
+      assert.deepEqual(rv.monitorWithoutStart, [], 'monitorStop without monitorStart returns []');
+      // A spawned tab closed within the run should not be reported as a new tab.
+      const closeOut = await manager.run("neg", `const p = await browser.newPage(); await p.close(); return true;`, process.cwd(), undefined, 15_000);
+      assert.equal(closeOut.newTabs, undefined, 'newTabs is undefined when a spawned tab is closed before run ends');
+    } finally {
+      await manager.close("neg");
+    }
+
+    // Wave 0/1 capabilities: stealth (webdriver undefined), tab.cdp, tab.cookies, tab.uploadFile.
+    await manager.open({ name: "wave01", cwd: process.cwd(), url: "data:text/html,<title>Wave01</title><input type='file' id='f'><input id='name'>", timeoutMs: 15_000 });
+    try {
+      const waveOut = await manager.run("wave01", `
+        const webdriver = await tab.evaluate(() => navigator.webdriver);
+        const pluginsLen = await tab.evaluate(() => navigator.plugins.length);
+        const cdpVal = await tab.cdp('Runtime.evaluate', { expression: '1 + 2' });
+        const cdpSum = cdpVal && cdpVal.result && cdpVal.result.value;
+        // Cookie round-trip on a real origin.
+        await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+        await tab.cookies.set({ name: 'pi_test', value: 'v1', domain: 'example.com', path: '/' });
+        const beforeDelete = await tab.cookies.get({ name: 'pi_test' });
+        await tab.cookies.delete({ name: 'pi_test' });
+        const afterDelete = await tab.cookies.get({ name: 'pi_test' });
+        return { webdriver, pluginsLen, cdpSum, beforeDelete, afterDelete };
+      `, process.cwd(), undefined, 20_000);
+      const w = waveOut.returnValue as { webdriver: unknown; pluginsLen: number; cdpSum: number; beforeDelete: unknown[]; afterDelete: unknown[] };
+      assert.notEqual(w.webdriver, true, 'stealth must not leave navigator.webdriver === true');
+      assert.ok(w.pluginsLen > 0, 'stealth must fake navigator.plugins so length > 0');
+      assert.equal(w.cdpSum, 3, 'tab.cdp(Runtime.evaluate) must return the evaluated value');
+      assert.ok(Array.isArray(w.beforeDelete) && w.beforeDelete.length > 0, 'tab.cookies.set then get must return the cookie');
+      assert.deepEqual(w.afterDelete, [], 'tab.cookies.delete must remove the cookie');
+    } finally {
+      await manager.close("wave01");
+    }
+
+    // Wave 2: evalInFrame (cross-origin iframe), pierce (closed shadow),
+    // cdpClick (physical coords), cdpBatch ($N references), setDownloadBehavior.
+    // All use data: URLs so no network is required; attach mode is out of scope here.
+    await manager.open({
+      name: "wave2",
+      cwd: process.cwd(),
+      url: "data:text/html," + encodeURIComponent("<title>Wave2</title><iframe id='f' src='data:text/html,<button id=bt>Cross</button>'></iframe><div id=host></div><button id=btn>X</button>"),
+      timeoutMs: 15_000,
+    });
+    try {
+      const wave2Out = await manager.run("wave2", `
+        // Open shadow root + a button inside it (open=true). pi's pierce() uses
+        // puppeteer's pierce/<selector> engine which crosses OPEN shadow boundaries;
+        // closed shadow is a known Chrome limitation (documented in the guide).
+        await tab.evaluate(() => {
+          const host = document.getElementById('host');
+          const root = host.attachShadow({ mode: 'open' });
+          const b = document.createElement('button'); b.id = 'shadow-btn'; b.textContent = 'Shadow'; root.appendChild(b);
+        });
+        const pierced = await tab.pierce('#shadow-btn');
+        // evalInFrame: find the iframe by url substring, read its button text.
+        const frameText = await tab.evalInFrame('data:text/html', () => document.getElementById('bt').textContent);
+        // cdpBatch: getDocument depth 0, then querySelector referencing $0.root.nodeId.
+        const batch = await tab.cdpBatch([
+          { method: 'DOM.getDocument', params: { depth: 0 } },
+          { method: 'DOM.querySelector', params: { nodeId: '$0.root.nodeId', selector: '#btn' } },
+        ]);
+        // cdpClick on #btn center, then read its clicked flag.
+        await tab.evaluate(() => { document.getElementById('btn').addEventListener('click', () => { window.__clicked = true; }, { once: true }); });
+        const btnBox = await tab.evaluate(() => { const r = document.getElementById('btn').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; });
+        await tab.cdpClick(btnBox.x, btnBox.y, { hoverMs: 50 });
+        const clicked = await tab.evaluate(() => window.__clicked === true);
+        // setDownloadBehavior: set an allow path (creates the dir).
+        const dl = await tab.setDownloadBehavior('./downloads-test');
+        return { piercedHasCoords: typeof pierced.x === 'number' && typeof pierced.y === 'number', frameText, batchLen: batch.length, batchSecondOk: batch[1] && batch[1].ok === true, clicked, dl };
+      `, process.cwd(), undefined, 20_000);
+      const w2 = wave2Out.returnValue as { piercedHasCoords: boolean; frameText: string; batchLen: number; batchSecondOk: boolean; clicked: boolean; dl: unknown };
+      assert.ok(w2.piercedHasCoords, 'tab.pierce must return numeric center coords for a closed shadow button');
+      assert.equal(w2.frameText, 'Cross', 'tab.evalInFrame must evaluate JS inside the matched iframe');
+      assert.equal(w2.batchLen, 2, 'tab.cdpBatch must return one result per command');
+      assert.equal(w2.batchSecondOk, true, 'tab.cdpBatch $0.root.nodeId reference must resolve and the second command must succeed');
+      assert.equal(w2.clicked, true, 'tab.cdpClick must dispatch a real click that the page listener observes');
+      assert.equal(w2.dl, undefined, 'tab.setDownloadBehavior resolves without a return value');
+      // Clean up the test download dir.
+      await fs.rm(path.join(process.cwd(), 'downloads-test'), { recursive: true, force: true }).catch(() => {});
+    } finally {
+      await manager.close("wave2");
+    }
+  } finally {
+    await manager.close("live");
+  }
+});
+
+test("browser manager scopes request interception listeners to one run", async (t) => {
+  const requestedPaths: string[] = [];
+  const server = http.createServer((request, response) => {
+    requestedPaths.push(request.url ?? "");
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end("<!doctype html><title>Interception</title>");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const manager = new BrowserManager();
+  const baseUrl = `http://127.0.0.1:${address.port}/`;
+  try {
+    try {
+      await manager.open({ name: "interception", cwd: process.cwd(), url: `${baseUrl}initial`, timeoutMs: 15_000 });
+    } catch (error) {
+      if (error instanceof Error && /No Chromium browser found/.test(error.message)) {
+        t.skip("No local Chromium executable is available.");
+        return;
+      }
+      throw error;
+    }
+    await assert.rejects(
+      () => manager.run("interception", `
+        await page.setRequestInterception(true);
+        page.on("request", () => {});
+        throw new Error("expected run failure");
+      `, process.cwd(), undefined, 15_000),
+      /expected run failure/,
+    );
+    await assert.rejects(
+      () => manager.run("interception", `
+        page.on("request", (request) => { request.continue(); });
+        try { await page.goto(${JSON.stringify(`${baseUrl}disabled`)}); } catch (error) { print(error.message); }
+        await wait(75);
+        await page.goto(${JSON.stringify(`${baseUrl}late-from-failed-run`)});
+      `, process.cwd(), undefined, 15_000),
+      /Request Interception is not enabled![\s\S]*named binding was retired[\s\S]*Owned resources were closed[\s\S]*borrowed profile\/CDP page may still execute/,
+    );
+    assert.equal(await manager.close("interception"), false, "failed run must already have closed its tab");
+    await manager.open({ name: "interception", cwd: process.cwd(), url: `${baseUrl}reopened`, timeoutMs: 15_000 });
+    await assert.rejects(
+      () => manager.run("interception", `
+        await page.setRequestInterception(true);
+        page.once("request", async () => { throw new Error("expected async handler failure"); });
+        await page.goto(${JSON.stringify(`${baseUrl}callback-failure`)});
+      `, process.cwd(), undefined, 15_000),
+      /expected async handler failure/,
+    );
+    assert.equal(await manager.close("interception"), false, "failed run must already have closed its tab");
+    await manager.open({ name: "interception", cwd: process.cwd(), url: `${baseUrl}reopened-again`, timeoutMs: 15_000 });
+    const first = await manager.run("interception", `
+      const baseline = page.listenerCount("request");
+      const requestHandler = (request) => { request.continue(); };
+      await page.setRequestInterception(true);
+      page.on("request", requestHandler);
+      page.on("request", requestHandler);
+      page.off("request", requestHandler);
+      page.once("request", () => {});
+      await page.goto(${JSON.stringify(`${baseUrl}intercepted`)});
+      return { baseline, listenersDuringRun: page.listenerCount("request") };
+    `, process.cwd(), undefined, 15_000);
+    const firstResult = first.returnValue as { baseline: number; listenersDuringRun: number };
+    assert.ok(firstResult.baseline > 0, "Puppeteer internal request listener should remain installed");
+    assert.equal(firstResult.listenersDuringRun, firstResult.baseline + 1);
+    const second = await manager.run("interception", `
+      await page.setRequestInterception(false);
+      await page.goto(${JSON.stringify(`${baseUrl}normal`)});
+      return { title: await page.title(), requestListeners: page.listenerCount("request") };
+    `, process.cwd(), undefined, 15_000);
+    assert.deepEqual(second.returnValue, { title: "Interception", requestListeners: firstResult.baseline });
+    assert.equal(requestedPaths.includes("/late-from-failed-run"), false);
+  } finally {
+    await manager.closeAll();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("browser AX helpers, CDP event wait, output spill, and navigation policy on a real Chromium", async (t) => {
+  // Serve a real http page so the framenavigated guard sees a committed navigation.
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end("<!doctype html><title>Denied Host</title>");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const deniedUrl = `http://127.0.0.1:${address.port}/denied`;
+  const manager = new BrowserManager();
+  try {
+    try {
+      await manager.open({
+        name: "ax",
+        cwd: process.cwd(),
+        url: "data:text/html," + encodeURIComponent("<title>AX</title><input id='name' value='old'><button id='btn' onclick='this.dataset.hit=\"1\"'>Go</button>"),
+        timeoutMs: 15_000,
+      });
+    } catch (error) {
+      if (error instanceof Error && /No Chromium browser found/.test(error.message)) {
+        t.skip("No local Chromium executable is available.");
+        return;
+      }
+      throw error;
+    }
+    const axOut = await manager.run("ax", `
+      const tree = await tab.axTree();
+      const input = tree.nodes.find(n => n.role === 'textbox');
+      const button = tree.nodes.find(n => n.role === 'button' && /Go/.test(n.name));
+      assert(input, 'textbox node missing in axTree');
+      assert(button, 'button node missing in axTree');
+      await tab.typeNode(input.id, 'Hello 世界', { replace: true });
+      await tab.clickNode(button.id);
+      const value = await tab.evaluate(() => document.getElementById('name').value);
+      const hit = await tab.evaluate(() => document.getElementById('btn').dataset.hit);
+      // One-shot CDP event waiter: subscribe BEFORE the triggering action.
+      await tab.cdp('Page.enable');
+      const nav = tab.waitForCdp('Page.loadEventFired', { timeout: 10000 });
+      await tab.goto('data:text/html,<title>After</title>');
+      await nav;
+      return { value, hit, nodeCount: tree.nodes.length, title: await page.title() };
+    `, process.cwd(), undefined, 20_000);
+    const ax = axOut.returnValue as { value: string; hit: string; nodeCount: number; title: string };
+    assert.equal(ax.value, "Hello 世界", "typeNode(replace:true) must overwrite the input value via the CDP input pipeline");
+    assert.equal(ax.hit, "1", "clickNode must dispatch a real click at the node's box-model centroid");
+    assert.ok(ax.nodeCount > 0, "axTree must return nodes");
+    assert.equal(ax.title, "After", "waitForCdp must resolve on the awaited event and navigation must complete");
+    // Timeout path of the waiter.
+    await assert.rejects(
+      manager.run("ax", "await tab.waitForCdp('Page.neverFiredEvent', { timeout: 200 });", process.cwd(), undefined, 15_000),
+      /CDP event Page\.neverFiredEvent exceeded 200 ms/,
+    );
+    await manager.close("ax");
+
+    // Navigation policy: denied goto throws pre-flight; a committed denied
+    // navigation (link click) is bounced to about:blank and reported.
+    await manager.open({
+      name: "pol",
+      cwd: process.cwd(),
+      url: "data:text/html,<title>Pol</title>",
+      timeoutMs: 15_000,
+      policy: { deny: ["127.0.0.1"] },
+    });
+    try {
+      await assert.rejects(
+        manager.run("pol", `await tab.goto(${JSON.stringify(deniedUrl)});`, process.cwd(), undefined, 15_000),
+        /Browser navigation blocked by domain policy/,
+      );
+      const allowed = await manager.run("pol", "await tab.goto('data:text/html,<title>Allowed</title>'); return page.url();", process.cwd(), undefined, 15_000);
+      assert.ok(String(allowed.returnValue).startsWith("data:"), "data: navigations stay allowed under a deny-only policy");
+      const clicked = await manager.run("pol", `
+        await tab.evaluate((href) => { const a = document.createElement('a'); a.href = href; a.textContent = 'x'; document.body.appendChild(a); a.click(); }, ${JSON.stringify(deniedUrl)});
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline && page.url() !== 'about:blank') await new Promise(r => setTimeout(r, 100));
+        return page.url();
+      `, process.cwd(), undefined, 15_000);
+      assert.equal(clicked.returnValue, "about:blank", "denied in-page navigation must bounce to about:blank");
+      assert.ok(
+        clicked.displays.some((item) => item.type === "text" && item.text.includes("[policy] blocked")),
+        "run output must surface the policy violation",
+      );
+      // Re-opening without policy clears the guard.
+      await manager.open({ name: "pol", cwd: process.cwd(), timeoutMs: 15_000 });
+      const cleared = await manager.run("pol", `await tab.goto(${JSON.stringify(deniedUrl)}); return page.url();`, process.cwd(), undefined, 15_000);
+      assert.ok(String(cleared.returnValue).startsWith("http://127.0.0.1:"), "re-open without policy must clear the guard");
+    } finally {
+      await manager.close("pol");
+    }
+
+    // Output overflow preserves captured text to a spill file.
+    await manager.open({ name: "spill", cwd: process.cwd(), url: "data:text/html,<title>Spill</title>", timeoutMs: 15_000 });
+    try {
+      let spillPath = "";
+      await assert.rejects(
+        manager.run("spill", "print('x'.repeat(512)); return true;", process.cwd(), undefined, 15_000, 128),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          const match = /Captured output \(pre-limit\): (.+)$/.exec(error.message);
+          assert.ok(match, `overflow error must carry the spill file path: ${error.message}`);
+          spillPath = match[1]!.trim();
+          return true;
+        },
+      );
+      const spilled = await fs.readFile(spillPath, "utf8");
+      assert.ok(spilled.includes("x".repeat(64)), "spill file must contain the captured pre-limit output");
+      await fs.rm(spillPath, { force: true });
+    } finally {
+      await manager.close("spill");
+    }
+  } finally {
+    await manager.closeAll();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("browser manager aborts a live run and tears down the named tab", async (t) => {
+  const manager = new BrowserManager();
+  try {
+    await manager.open({ name: "abort", cwd: process.cwd(), url: "data:text/html,<title>Abort</title>", timeoutMs: 15_000 });
+  } catch (error) {
+    if (error instanceof Error && /No Chromium browser found/.test(error.message)) { t.skip("No local Chromium executable is available."); return; }
+    throw error;
+  }
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  await assert.rejects(() => manager.run("abort", "await wait(10000)", process.cwd(), controller.signal, 15_000), { name: "AbortError" });
+  assert.equal(manager.has("abort"), false);
+});
+
+test("browser manager fails closed when an explicit target does not match", async (t) => {
+  const manager = new BrowserManager();
+  try {
+    await assert.rejects(() => manager.open({ name: "target", cwd: process.cwd(), target: "definitely-missing-target", timeoutMs: 15_000 }), /No browser page matched target/);
+  } catch (error) {
+    if (error instanceof Error && /No Chromium browser found/.test(error.message)) { t.skip("No local Chromium executable is available."); return; }
+    throw error;
+  } finally {
+    await manager.closeAll();
+  }
+});
+
+test("browser CDP connect obeys AbortSignal while endpoint discovery is stalled", async () => {
+  const server = http.createServer((_request, _response) => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const manager = new BrowserManager();
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const started = Date.now();
+  try {
+    await assert.rejects(() => manager.open({
+      name: "cdp-abort",
+      cwd: process.cwd(),
+      cdpUrl: `http://127.0.0.1:${address.port}`,
+      signal: controller.signal,
+      timeoutMs: 5_000,
+    }), { name: "AbortError" });
+    assert.ok(Date.now() - started < 2_000);
+  } finally {
+    await manager.closeAll();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("browser closeAll cancels an in-flight open before it can register a tab", async () => {
+  const server = http.createServer((_request, _response) => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const manager = new BrowserManager();
+  const opening = manager.open({
+    name: "pending",
+    cwd: process.cwd(),
+    cdpUrl: `http://127.0.0.1:${address.port}`,
+    timeoutMs: 5_000,
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const closed = manager.closeAll();
+    await assert.rejects(opening, { name: "AbortError" });
+    assert.equal(await closed, 0);
+    assert.equal(manager.has("pending"), false);
+  } finally {
+    await manager.closeAll();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("browser run wrapper lets top-level declarations reuse helper names without a redeclaration error", async () => {
+  const displays: string[] = [];
+  const mockTab = { name: "main", observe: async () => ({ n: 1 }) };
+  const mockAssert = (condition: unknown, message?: string) => { if (!condition) throw new Error(message ?? "assert"); };
+  const mockWait = async () => { displays.push("helper-wait-called"); };
+  const mockDisplay = (value: unknown) => { displays.push(`display:${String(value)}`); };
+  const fn = compileRunCode(`
+    const wait = "user-wait";
+    const page = "user-page";
+    const assert = "user-assert";
+    const display = "user-display";
+    return { shadowed: [wait, page, assert, display].join("|"), tabName: tab.name, observed: (await tab.observe()).n, browserType: typeof browser };
+  `);
+  const returnValue = await fn({ tag: "PAGE" }, {}, mockTab, mockAssert, mockWait, mockDisplay, () => {}, undefined, console) as { shadowed: string; tabName: string; observed: number; browserType: string };
+  assert.equal(returnValue.shadowed, "user-wait|user-page|user-assert|user-display");
+  assert.equal(returnValue.tabName, "main");
+  assert.equal(returnValue.observed, 1);
+  assert.equal(returnValue.browserType, "object");
+  assert.deepEqual(displays, []);
+});
+
+test("browser run wrapper exposes every helper when the user does not shadow it", async () => {
+  const displays: string[] = [];
+  let waited = false;
+  const mockTab = { name: "t" };
+  const mockAssert = (condition: unknown, message?: string) => { if (!condition) throw new Error(message ?? "assert"); };
+  const mockWait = async () => { waited = true; };
+  const mockDisplay = (value: unknown) => { displays.push(String(value)); };
+  const mockPrint = (...values: unknown[]) => { displays.push(values.join(" ")); };
+  const fn = compileRunCode(`
+    assert(1 + 1 === 2, "math");
+    await wait(0);
+    display(page.tag);
+    print("hello", tab.name);
+    return signal === undefined ? "no-signal" : "has-signal";
+  `);
+  const returnValue = await fn({ tag: "P" }, {}, mockTab, mockAssert, mockWait, mockDisplay, mockPrint, undefined, console);
+  assert.equal(waited, true);
+  assert.deepEqual(displays, ["P", "hello t"]);
+  assert.equal(returnValue, "no-signal");
+});
+
+test("browser pick pastes captures into the user editor and reports status", async () => {
+  const manager = new FakeBrowserManager();
+  manager.pickResult = {
+    status: "sent",
+    errorCount: 2,
+    captures: [
+      { kind: "element", tagName: "button", id: "save", selector: "body > div > button", outerHtml: "<button id=\"save\">Save</button>", text: "Save", reactComponentName: "SaveButton", vueComponentName: null, filePath: "src/Save.tsx", line: 42 },
+      { kind: "console", errors: ["TypeError: boom"] },
+    ],
+  };
+  const tool = createBrowserTool(manager);
+  const pasted: string[] = [];
+  const ctx = { cwd: "D:/workspace", ui: { pasteToEditor: (text: string) => pasted.push(text) } } as never;
+  const result = await tool.execute("pick", { action: "pick", name: "docs", timeout: 60 }, undefined, undefined, ctx);
+  assert.equal(manager.pickCalls.length, 1);
+  assert.equal(manager.pickCalls[0].name, "docs");
+  assert.equal(manager.pickCalls[0].hadCallback, true, "pick must receive an onCapture callback when an editor exists");
+  assert.equal(pasted.length, 1, "one paste per drained batch");
+  assert.match(pasted[0], /\[Browser capture #1: <button> <SaveButton \/> src\/Save\.tsx:42\]/);
+  assert.match(pasted[0], /<button id="save">Save<\/button>/);
+  assert.match(pasted[0], /\[Browser console errors \(1\)\]\nTypeError: boom/);
+  assert.equal(result.details?.action, "pick");
+  assert.equal(result.details?.pick?.status, "sent");
+  assert.match(result.details?.result ?? "", /pasted into the user's input box/);
+});
+
+test("browser pick without an editor returns captures inline instead of pasting", async () => {
+  const manager = new FakeBrowserManager();
+  manager.pickResult = {
+    status: "escape",
+    errorCount: 0,
+    captures: [
+      { kind: "element", tagName: "div", id: null, selector: "body > div", outerHtml: "<div>x</div>", text: "x", reactComponentName: null, vueComponentName: "Panel", filePath: null, line: null },
+    ],
+  };
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const result = await tool.execute("pick", { action: "pick" }, undefined, undefined, ctx);
+  assert.equal(manager.pickCalls[0].hadCallback, false, "no editor means no onCapture callback");
+  const text = result.details?.result ?? "";
+  assert.match(text, /status: escape/);
+  assert.match(text, /returned inline/);
+  assert.match(text, /\[Browser capture #1: <div> <Panel \/>\]/);
+});
+
+test("browser picker scripts parse as valid JavaScript", () => {
+  for (const [name, source] of [["PICKER_INJECT_JS", PICKER_INJECT_JS], ["PICKER_POLL_JS", PICKER_POLL_JS], ["PICKER_TEARDOWN_JS", PICKER_TEARDOWN_JS]] as const) {
+    assert.doesNotThrow(() => new Function(source), `${name} must parse`);
+  }
+  // The poll must not drain the live console.error buffer — that belongs to the
+  // in-page Send errors button.
+  assert.doesNotMatch(PICKER_POLL_JS, /errors\.splice/);
+  assert.match(PICKER_INJECT_JS, /__piElementPick/);
+  assert.match(PICKER_INJECT_JS, /__reactFiber\$|__reactInternalInstance\$/);
+  assert.match(PICKER_INJECT_JS, /_debugSource|__source|_debugStack/);
+  assert.match(PICKER_INJECT_JS, /__vueParentComponent/);
+  assert.match(PICKER_INJECT_JS, /console\.error/);
+});

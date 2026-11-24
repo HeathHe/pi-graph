@@ -1,0 +1,1024 @@
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { SupportedSettingsLocale } from "pi-graph-shared-settings/v1";
+import { getTuiLocale } from "../tui/locale.ts";
+import { createPanelKeys, type PanelKeybindings, type PanelKeys } from "./panel-keys.ts";
+import { isToolExcluded } from "./types.ts";
+import type { McpConfig, McpPanelCallbacks, McpPanelResult, ServerProvenance } from "./types.ts";
+import { resourceNameToToolName } from "./resource-tools.ts";
+import type { MetadataCache, ServerCacheEntry, CachedTool } from "./metadata-cache.ts";
+
+interface PanelTheme {
+  border: string;
+  title: string;
+  selected: string;
+  direct: string;
+  needsAuth: string;
+  placeholder: string;
+  description: string;
+  hint: string;
+  confirm: string;
+  cancel: string;
+}
+
+const DEFAULT_THEME: PanelTheme = {
+  border: "2",
+  title: "2",
+  selected: "36",
+  direct: "32",
+  needsAuth: "33",
+  placeholder: "2;3",
+  description: "2",
+  hint: "2",
+  confirm: "32",
+  cancel: "31",
+};
+
+const CATALOGS = {
+  en: {
+    "resource.read": "Read resource: {uri}",
+    "notice.imported": "Imported from {source} · will copy to user config on save",
+    "notice.reconnectFailed": "Reconnect failed for {name}: {message}",
+    "notice.noOAuth": "{name} does not use OAuth authentication.",
+    "notice.authenticating": "Authenticating {name}...",
+    "notice.authFinished": "OAuth finished for {name}. Run reconnect if it is still idle.",
+    "notice.authFailed": "OAuth failed for {name}{message}",
+    "notice.authFailureHint": ". Check the notification for details.",
+    "title.oauth": " MCP OAuth ",
+    "title.servers": " MCP Servers ",
+    "search.description": "desc:",
+    "search.placeholder": "search...",
+    "empty.oauth": "No OAuth-capable MCP servers configured.",
+    "empty.servers": "No MCP servers configured.",
+    "discard.button": "  Discard  ",
+    "discard.keep": "  Keep & Close  ",
+    "discard.question": "Discard unsaved changes?",
+    "auth.select": "select a server to authenticate",
+    "stats.direct": "{count} direct  ~{tokens} tokens",
+    "stats.none": "no direct tools",
+    "stats.unsaved": "  (unsaved)",
+    "hint.navigate": "navigate",
+    "hint.auth": "auth",
+    "hint.clearClose": "clear/close",
+    "hint.quit": "quit",
+    "hint.toggle": "toggle",
+    "hint.expandAuth": "expand/auth",
+    "hint.reconnect": "reconnect",
+    "hint.descSearch": "desc search",
+    "hint.save": "save",
+    "value.import": "import",
+    "value.external": "external",
+    "value.notCached": "(not cached)",
+    "status.authenticating": "authenticating",
+    "status.needsAuth": "needs auth",
+    "status.connecting": "connecting",
+    "status.failed": "failed",
+    "status.connected": "connected",
+    "status.idle": "idle",
+  },
+  "zh-CN": {
+    "resource.read": "读取资源：{uri}",
+    "notice.imported": "从 {source} 导入 · 保存时将复制到用户配置",
+    "notice.reconnectFailed": "重连 {name} 失败：{message}",
+    "notice.noOAuth": "{name} 未使用 OAuth 认证。",
+    "notice.authenticating": "正在认证 {name}...",
+    "notice.authFinished": "{name} 的 OAuth 已完成；若仍为空闲状态请重连。",
+    "notice.authFailed": "{name} 的 OAuth 失败{message}",
+    "notice.authFailureHint": "。详情请查看通知。",
+    "title.oauth": " MCP OAuth ",
+    "title.servers": " MCP 服务 ",
+    "search.description": "描述：",
+    "search.placeholder": "搜索...",
+    "empty.oauth": "未配置支持 OAuth 的 MCP 服务。",
+    "empty.servers": "未配置 MCP 服务。",
+    "discard.button": "  放弃  ",
+    "discard.keep": "  保留并关闭  ",
+    "discard.question": "放弃未保存的修改？",
+    "auth.select": "选择要认证的服务",
+    "stats.direct": "{count} 个直连  ~{tokens} Token",
+    "stats.none": "没有直连工具",
+    "stats.unsaved": "  （未保存）",
+    "hint.navigate": "移动",
+    "hint.auth": "认证",
+    "hint.clearClose": "清除/关闭",
+    "hint.quit": "退出",
+    "hint.toggle": "切换",
+    "hint.expandAuth": "展开/认证",
+    "hint.reconnect": "重连",
+    "hint.descSearch": "描述搜索",
+    "hint.save": "保存",
+    "value.import": "导入",
+    "value.external": "外部",
+    "value.notCached": "（无缓存）",
+    "status.authenticating": "认证中",
+    "status.needsAuth": "需要认证",
+    "status.connecting": "连接中",
+    "status.failed": "失败",
+    "status.connected": "已连接",
+    "status.idle": "空闲",
+  },
+} as const;
+
+type CatalogKey = keyof (typeof CATALOGS)["en"];
+
+export interface McpPanelOptions {
+  noticeLines?: string[];
+  authOnly?: boolean;
+  keybindings?: PanelKeybindings;
+  /** Terminal rows from the host; absent keeps the legacy fixed cap. */
+  getTerminalRows?: () => number | undefined;
+  /** Explicit UI language; otherwise follows the shared runtime TUI locale. */
+  locale?: SupportedSettingsLocale;
+}
+
+function fg(code: string, text: string): string {
+  if (!code) return text;
+  return `\x1b[${code}m${text}\x1b[0m`;
+}
+
+const RAINBOW_COLORS = [
+  "38;2;178;129;214",
+  "38;2;215;135;175",
+  "38;2;254;188;56",
+  "38;2;228;192;15",
+  "38;2;137;210;129",
+  "38;2;0;175;175",
+  "38;2;23;143;185",
+];
+
+function rainbowProgress(filled: number, total: number): string {
+  const dots: string[] = [];
+  for (let i = 0; i < total; i++) {
+    const color = RAINBOW_COLORS[i % RAINBOW_COLORS.length];
+    dots.push(fg(color, i < filled ? "●" : "○"));
+  }
+  return dots.join(" ");
+}
+
+function fuzzyScore(query: string, text: string): number {
+  const lq = query.toLowerCase();
+  const lt = text.toLowerCase();
+  if (lt.includes(lq)) return 100 + (lq.length / lt.length) * 50;
+  let score = 0;
+  let qi = 0;
+  let consecutive = 0;
+  for (let i = 0; i < lt.length && qi < lq.length; i++) {
+    if (lt[i] === lq[qi]) {
+      score += 10 + consecutive;
+      consecutive += 5;
+      qi++;
+    } else {
+      consecutive = 0;
+    }
+  }
+  return qi === lq.length ? score : 0;
+}
+
+function sanitizeDisplayText(text: string | null | undefined): string {
+  return (text ?? "")
+    .replace(/(?:\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c))/g, "")
+    .replace(/(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_])/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sanitizeRowContent(content: string): string {
+  let result = "";
+  let pendingSpace = false;
+  for (let i = 0; i < content.length; i++) {
+    const rest = content.slice(i);
+    const osc = rest.match(/^(?:\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c))/);
+    if (osc) {
+      i += osc[0].length - 1;
+      continue;
+    }
+
+    const ansi = rest.match(/^(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_])/);
+    if (ansi) {
+      result += ansi[0];
+      i += ansi[0].length - 1;
+      continue;
+    }
+
+    const code = content.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      pendingSpace = true;
+      continue;
+    }
+
+    if (pendingSpace && result && !result.endsWith(" ")) {
+      result += " ";
+    }
+    pendingSpace = false;
+    result += content[i];
+  }
+  return result;
+}
+
+function estimateTokens(tool: CachedTool): number {
+  const schemaLen = JSON.stringify(tool.inputSchema ?? {}).length;
+  const descLen = tool.description?.length ?? 0;
+  return Math.ceil((tool.name.length + descLen + schemaLen) / 4) + 10;
+}
+
+type ConnectionStatus = "connected" | "idle" | "failed" | "needs-auth" | "connecting";
+
+interface ToolState {
+  name: string;
+  description: string;
+  isDirect: boolean;
+  wasDirect: boolean;
+  estimatedTokens: number;
+}
+
+interface ServerState {
+  name: string;
+  expanded: boolean;
+  source: "user" | "project" | "import";
+  importKind?: string;
+  excludeTools?: string[];
+  exposeResources: boolean;
+  connectionStatus: ConnectionStatus;
+  tools: ToolState[];
+  hasCachedData: boolean;
+}
+
+interface VisibleItem {
+  type: "server" | "tool";
+  serverIndex: number;
+  toolIndex?: number;
+}
+
+class McpPanel {
+  private noticeLines: string[];
+  private prefix: "server" | "none" | "short";
+  private servers: ServerState[] = [];
+  private cursorIndex = 0;
+  private nameQuery = "";
+  private descSearchActive = false;
+  private descQuery = "";
+  private dirty = false;
+  private confirmingDiscard = false;
+  private discardSelected = 1;
+  private importNotice: string | null = null;
+  private authNotice: string | null = null;
+  private authInFlight: string | null = null;
+  private inactivityTimeout: ReturnType<typeof setTimeout> | null = null;
+  private visibleItems: VisibleItem[] = [];
+  private tui: { requestRender(): void };
+  private t = DEFAULT_THEME;
+  private authOnly: boolean;
+  private readonly locale: SupportedSettingsLocale;
+  private readonly getTerminalRows: (() => number | undefined) | undefined;
+  private keys: PanelKeys;
+
+  private static readonly FALLBACK_MAX_VISIBLE = 12;
+  private static readonly INACTIVITY_MS = 60_000;
+
+  constructor(
+    config: McpConfig,
+    cache: MetadataCache | null,
+    provenance: Map<string, ServerProvenance>,
+    private callbacks: McpPanelCallbacks,
+    tui: { requestRender(): void },
+    private done: (result: McpPanelResult) => void,
+    options: McpPanelOptions = {},
+  ) {
+    this.locale = getTuiLocale(options.locale);
+    this.tui = tui;
+    this.noticeLines = options.noticeLines ?? [];
+    this.authOnly = options.authOnly === true;
+    this.getTerminalRows = options.getTerminalRows;
+    this.keys = createPanelKeys(options.keybindings);
+    this.prefix = config.settings?.toolPrefix ?? "server";
+
+    for (const [serverName, definition] of Object.entries(config.mcpServers)) {
+      if (this.authOnly && !callbacks.canAuthenticate(serverName)) continue;
+      const prov = provenance.get(serverName);
+      const serverCache = cache?.servers?.[serverName];
+
+      const globalDirect = config.settings?.directTools;
+      let toolFilter: true | string[] | false = false;
+      if (definition.directTools !== undefined) {
+        toolFilter = definition.directTools;
+      } else if (globalDirect) {
+        toolFilter = globalDirect;
+      }
+
+      const tools: ToolState[] = [];
+      if (serverCache && !this.authOnly) {
+        for (const tool of serverCache.tools ?? []) {
+          if (isToolExcluded(tool.name, serverName, this.prefix, definition.excludeTools)) {
+            continue;
+          }
+
+          const isDirect = toolFilter === true || (Array.isArray(toolFilter) && toolFilter.includes(tool.name));
+          tools.push({
+            name: tool.name,
+            description: tool.description ?? "",
+            isDirect,
+            wasDirect: isDirect,
+            estimatedTokens: estimateTokens(tool),
+          });
+        }
+        if (definition.exposeResources !== false) {
+          for (const resource of serverCache.resources ?? []) {
+            const baseName = `get_${resourceNameToToolName(resource.name)}`;
+            if (isToolExcluded(baseName, serverName, this.prefix, definition.excludeTools)) {
+              continue;
+            }
+
+            const isDirect = toolFilter === true || (Array.isArray(toolFilter) && toolFilter.includes(baseName));
+            const ct: CachedTool = { name: baseName, description: resource.description };
+            tools.push({
+              name: baseName,
+              description: resource.description ?? this.text("resource.read", { uri: resource.uri }),
+              isDirect,
+              wasDirect: isDirect,
+              estimatedTokens: estimateTokens(ct),
+            });
+          }
+        }
+      }
+
+      const status = callbacks.getConnectionStatus(serverName);
+
+      this.servers.push({
+        name: serverName,
+        expanded: false,
+        source: prov?.kind ?? "user",
+        importKind: prov?.importKind,
+        excludeTools: definition.excludeTools,
+        exposeResources: definition.exposeResources !== false,
+        connectionStatus: status,
+        tools,
+        hasCachedData: !!serverCache,
+      });
+    }
+
+    this.rebuildVisibleItems();
+    this.resetInactivityTimeout();
+  }
+
+  private text(key: CatalogKey, vars?: Readonly<Record<string, string | number>>): string {
+    const template = CATALOGS[this.locale]?.[key] ?? CATALOGS.en[key];
+    if (!vars) return template;
+    return template.replace(/\{(\w+)\}/g, (_match, name: string) =>
+      vars[name] !== undefined ? String(vars[name]) : `{${name}}`);
+  }
+
+  private resetInactivityTimeout(): void {
+    if (this.inactivityTimeout) clearTimeout(this.inactivityTimeout);
+    this.inactivityTimeout = setTimeout(() => {
+      this.cleanup();
+      this.done({ cancelled: true, changes: new Map() });
+    }, McpPanel.INACTIVITY_MS);
+  }
+
+  private cleanup(): void {
+    if (this.inactivityTimeout) {
+      clearTimeout(this.inactivityTimeout);
+      this.inactivityTimeout = null;
+    }
+  }
+
+  private rebuildVisibleItems(): void {
+    const query = this.descSearchActive ? this.descQuery : this.nameQuery;
+    const mode = this.descSearchActive ? "desc" : "name";
+
+    this.visibleItems = [];
+    for (let si = 0; si < this.servers.length; si++) {
+      const server = this.servers[si];
+      if (query && this.authOnly) {
+        const score = mode === "name" ? fuzzyScore(query, server.name) : 0;
+        if (score > 0) {
+          this.visibleItems.push({ type: "server", serverIndex: si });
+        }
+        continue;
+      }
+
+      this.visibleItems.push({ type: "server", serverIndex: si });
+      if (server.expanded || query) {
+        for (let ti = 0; ti < server.tools.length; ti++) {
+          const tool = server.tools[ti];
+          if (query) {
+            const score = mode === "name"
+              ? Math.max(
+                  fuzzyScore(query, tool.name),
+                  fuzzyScore(query, server.name) * 0.6,
+                )
+              : fuzzyScore(query, tool.description);
+            if (score === 0) continue;
+          }
+          this.visibleItems.push({ type: "tool", serverIndex: si, toolIndex: ti });
+        }
+      }
+    }
+
+    if (query && !this.authOnly) {
+      this.visibleItems = this.visibleItems.filter((item) => {
+        if (item.type === "server") {
+          return this.visibleItems.some(
+            (other) => other.type === "tool" && other.serverIndex === item.serverIndex,
+          );
+        }
+        return true;
+      });
+    }
+  }
+
+  private updateDirty(): void {
+    this.dirty = this.servers.some((s) => s.tools.some((t) => t.isDirect !== t.wasDirect));
+  }
+
+  private buildResult(): McpPanelResult {
+    const changes = new Map<string, true | string[] | false>();
+    for (const server of this.servers) {
+      const changed = server.tools.some((t) => t.isDirect !== t.wasDirect);
+      if (!changed) continue;
+      const directTools = server.tools.filter((t) => t.isDirect);
+      if (directTools.length === server.tools.length && server.tools.length > 0) {
+        changes.set(server.name, true);
+      } else if (directTools.length === 0) {
+        changes.set(server.name, false);
+      } else {
+        changes.set(server.name, directTools.map((t) => t.name));
+      }
+    }
+    return { changes, cancelled: false };
+  }
+
+  handleInput(data: string): void {
+    this.resetInactivityTimeout();
+    this.importNotice = null;
+    if (!this.authInFlight) this.authNotice = null;
+
+    if (this.confirmingDiscard) {
+      this.handleDiscardInput(data);
+      return;
+    }
+
+    // Global shortcuts — always work, even during desc search
+    if (matchesKey(data, "ctrl+c")) {
+      this.cleanup();
+      this.done({ cancelled: true, changes: new Map() });
+      return;
+    }
+
+    if (matchesKey(data, "ctrl+s")) {
+      this.cleanup();
+      this.done(this.buildResult());
+      return;
+    }
+
+    // Modal description search mode
+    if (this.descSearchActive) {
+      if (matchesKey(data, "escape") || this.keys.selectConfirm(data)) {
+        this.descSearchActive = false;
+        this.descQuery = "";
+        this.rebuildVisibleItems();
+        this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+        return;
+      }
+      if (matchesKey(data, "backspace")) {
+        if (this.descQuery.length > 0) {
+          this.descQuery = this.descQuery.slice(0, -1);
+          this.rebuildVisibleItems();
+          this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+        }
+        return;
+      }
+      if (this.keys.selectUp(data)) { this.moveCursor(-1); return; }
+      if (this.keys.selectDown(data)) { this.moveCursor(1); return; }
+      if (matchesKey(data, "space")) {
+        // Toggle even while in desc search
+        const item = this.visibleItems[this.cursorIndex];
+        if (item) this.toggleItem(item);
+        return;
+      }
+      if (data.length === 1 && data.charCodeAt(0) >= 32) {
+        this.descQuery += data;
+        this.rebuildVisibleItems();
+        this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+        return;
+      }
+      return;
+    }
+
+    if (matchesKey(data, "escape")) {
+      if (this.nameQuery) {
+        this.nameQuery = "";
+        this.rebuildVisibleItems();
+        this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+        return;
+      }
+      if (this.dirty) {
+        this.confirmingDiscard = true;
+        this.discardSelected = 1;
+        return;
+      }
+      this.cleanup();
+      this.done({ cancelled: true, changes: new Map() });
+      return;
+    }
+
+    if (this.keys.selectUp(data)) { this.moveCursor(-1); return; }
+    if (this.keys.selectDown(data)) { this.moveCursor(1); return; }
+
+    if (matchesKey(data, "space")) {
+      const item = this.visibleItems[this.cursorIndex];
+      if (item && !this.authOnly) this.toggleItem(item);
+      return;
+    }
+
+    if (this.keys.selectConfirm(data)) {
+      const item = this.visibleItems[this.cursorIndex];
+      if (!item) return;
+      const server = this.servers[item.serverIndex];
+      if (item.type === "server") {
+        if (this.authOnly || server.connectionStatus === "needs-auth") {
+          this.authenticateServer(server);
+          return;
+        }
+        server.expanded = !server.expanded;
+        this.rebuildVisibleItems();
+        this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+      } else if (item.toolIndex !== undefined) {
+        const tool = server.tools[item.toolIndex];
+        tool.isDirect = !tool.isDirect;
+        if (tool.isDirect && server.source === "import") {
+          this.importNotice = this.text("notice.imported", {
+            source: sanitizeDisplayText(server.importKind ?? this.text("value.external")),
+          });
+        }
+        this.updateDirty();
+      }
+      return;
+    }
+
+    if (matchesKey(data, "ctrl+a")) {
+      const item = this.visibleItems[this.cursorIndex];
+      if (item) this.authenticateSelectedServer(item);
+      return;
+    }
+
+    if (matchesKey(data, "ctrl+r")) {
+      const item = this.visibleItems[this.cursorIndex];
+      if (!item) return;
+      const server = this.servers[item.serverIndex];
+      if (server.connectionStatus === "connecting") return;
+      server.connectionStatus = "connecting";
+      this.callbacks.reconnect(server.name).then(() => {
+        server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
+        if (server.connectionStatus === "connected") {
+          const entry = this.callbacks.refreshCacheAfterReconnect(server.name);
+          if (entry) {
+            this.rebuildServerTools(server, entry);
+          }
+          server.hasCachedData = true;
+        }
+        this.tui.requestRender();
+      }).catch((error) => {
+        server.connectionStatus = "failed";
+        const message = sanitizeDisplayText(error instanceof Error ? error.message : String(error));
+        const serverName = sanitizeDisplayText(server.name);
+        this.authNotice = this.text("notice.reconnectFailed", { name: serverName, message });
+        this.tui.requestRender();
+      });
+      return;
+    }
+
+    if (data === "?") {
+      if (this.authOnly) return;
+      this.descSearchActive = true;
+      this.descQuery = "";
+      this.rebuildVisibleItems();
+      this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+      return;
+    }
+
+    // Backspace removes from name query
+    if (matchesKey(data, "backspace")) {
+      if (this.nameQuery.length > 0) {
+        this.nameQuery = this.nameQuery.slice(0, -1);
+        this.rebuildVisibleItems();
+        this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+      }
+      return;
+    }
+
+    // All other printable chars → always-on name search
+    if (data.length === 1 && data.charCodeAt(0) >= 32) {
+      this.nameQuery += data;
+      this.rebuildVisibleItems();
+      this.cursorIndex = Math.min(this.cursorIndex, Math.max(0, this.visibleItems.length - 1));
+      return;
+    }
+  }
+
+  private authenticateSelectedServer(item: VisibleItem): void {
+    this.authenticateServer(this.servers[item.serverIndex]);
+  }
+
+  private authenticateServer(server: ServerState): void {
+    if (this.authInFlight) return;
+    const serverName = sanitizeDisplayText(server.name);
+    if (!this.callbacks.canAuthenticate(server.name)) {
+      this.authNotice = this.text("notice.noOAuth", { name: serverName });
+      return;
+    }
+
+    this.authInFlight = server.name;
+    this.authNotice = this.text("notice.authenticating", { name: serverName });
+    this.tui.requestRender();
+
+    this.callbacks.authenticate(server.name).then((result) => {
+      server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
+      const message = sanitizeDisplayText(result.message);
+      this.authNotice = result.ok
+        ? this.text("notice.authFinished", { name: serverName })
+        : this.text("notice.authFailed", {
+            name: serverName,
+            message: message ? `: ${message}` : this.text("notice.authFailureHint"),
+          });
+      this.authInFlight = null;
+      this.tui.requestRender();
+    }).catch((error) => {
+      const message = sanitizeDisplayText(error instanceof Error ? error.message : String(error));
+      server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
+      this.authNotice = this.text("notice.authFailed", { name: serverName, message: `: ${message}` });
+      this.authInFlight = null;
+      this.tui.requestRender();
+    });
+  }
+
+  private toggleItem(item: VisibleItem): void {
+    if (this.authOnly) return;
+    const server = this.servers[item.serverIndex];
+    if (item.type === "server") {
+      const newState = !server.tools.every((t) => t.isDirect);
+      if (server.source === "import" && newState) {
+        this.importNotice = this.text("notice.imported", {
+          source: sanitizeDisplayText(server.importKind ?? this.text("value.external")),
+        });
+      }
+      for (const t of server.tools) t.isDirect = newState;
+    } else if (item.toolIndex !== undefined) {
+      const tool = server.tools[item.toolIndex];
+      tool.isDirect = !tool.isDirect;
+      if (tool.isDirect && server.source === "import") {
+        this.importNotice = this.text("notice.imported", {
+          source: sanitizeDisplayText(server.importKind ?? this.text("value.external")),
+        });
+      }
+    }
+    this.updateDirty();
+  }
+
+  private handleDiscardInput(data: string): void {
+    if (matchesKey(data, "ctrl+c")) {
+      this.cleanup();
+      this.done({ cancelled: true, changes: new Map() });
+      return;
+    }
+    if (matchesKey(data, "escape") || data === "n" || data === "N") {
+      this.confirmingDiscard = false;
+      return;
+    }
+    if (this.keys.selectConfirm(data)) {
+      this.cleanup();
+      if (this.discardSelected === 0) {
+        this.done({ cancelled: true, changes: new Map() });
+      } else {
+        this.done(this.buildResult());
+      }
+      return;
+    }
+    if (data === "y" || data === "Y") {
+      this.cleanup();
+      this.done({ cancelled: true, changes: new Map() });
+      return;
+    }
+    if (matchesKey(data, "left") || matchesKey(data, "right") || matchesKey(data, "tab")) {
+      this.discardSelected = this.discardSelected === 0 ? 1 : 0;
+    }
+  }
+
+  private moveCursor(delta: number): void {
+    if (this.visibleItems.length === 0) return;
+    this.cursorIndex = Math.max(0, Math.min(this.visibleItems.length - 1, this.cursorIndex + delta));
+  }
+
+  private rebuildServerTools(server: ServerState, entry: ServerCacheEntry): void {
+    const existingState = new Map<string, boolean>();
+    for (const t of server.tools) existingState.set(t.name, t.isDirect);
+
+    const newTools: ToolState[] = [];
+    for (const tool of entry.tools ?? []) {
+      if (isToolExcluded(tool.name, server.name, this.prefix, server.excludeTools)) {
+        continue;
+      }
+
+      const prev = existingState.get(tool.name);
+      const isDirect = prev !== undefined ? prev : false;
+      newTools.push({
+        name: tool.name,
+        description: tool.description ?? "",
+        isDirect,
+        wasDirect: prev !== undefined ? server.tools.find((t) => t.name === tool.name)?.wasDirect ?? false : false,
+        estimatedTokens: estimateTokens(tool),
+      });
+    }
+
+    if (server.exposeResources) {
+      for (const resource of entry.resources ?? []) {
+        const baseName = `get_${resourceNameToToolName(resource.name)}`;
+        if (isToolExcluded(baseName, server.name, this.prefix, server.excludeTools)) {
+          continue;
+        }
+
+        const prev = existingState.get(baseName);
+        const isDirect = prev !== undefined ? prev : false;
+        const ct: CachedTool = { name: baseName, description: resource.description };
+        newTools.push({
+          name: baseName,
+          description: resource.description ?? this.text("resource.read", { uri: resource.uri }),
+          isDirect,
+          wasDirect: prev !== undefined ? server.tools.find((t) => t.name === baseName)?.wasDirect ?? false : false,
+          estimatedTokens: estimateTokens(ct),
+        });
+      }
+    }
+
+    server.tools = newTools;
+    this.rebuildVisibleItems();
+    this.updateDirty();
+  }
+
+  render(width: number): string[] {
+    const innerW = width - 2;
+    const lines: string[] = [];
+    const t = this.t;
+    const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
+    const italic = (s: string) => `\x1b[3m${s}\x1b[23m`;
+    const inverse = (s: string) => `\x1b[7m${s}\x1b[27m`;
+
+    const row = (content: string) =>
+      fg(t.border, "│") + truncateToWidth(" " + sanitizeRowContent(content), innerW, "…", true) + fg(t.border, "│");
+    const emptyRow = () => fg(t.border, "│") + " ".repeat(innerW) + fg(t.border, "│");
+    const divider = () => fg(t.border, "├" + "─".repeat(innerW) + "┤");
+
+    const titleText = truncateToWidth(this.authOnly ? this.text("title.oauth") : this.text("title.servers"), innerW, "…", true);
+    const borderLen = Math.max(0, innerW - visibleWidth(titleText));
+    const leftB = Math.floor(borderLen / 2);
+    const rightB = borderLen - leftB;
+    lines.push(fg(t.border, "╭" + "─".repeat(leftB)) + fg(t.title, titleText) + fg(t.border, "─".repeat(rightB) + "╮"));
+
+    lines.push(emptyRow());
+
+    const cursor = fg(t.selected, "│");
+    const searchIcon = fg(t.border, "◎");
+    if (this.descSearchActive) {
+      lines.push(row(`${searchIcon}  ${fg(t.needsAuth, this.text("search.description"))} ${this.descQuery}${cursor}`));
+    } else if (this.nameQuery) {
+      lines.push(row(`${searchIcon}  ${this.nameQuery}${cursor}`));
+    } else {
+      lines.push(row(`${searchIcon}  ${fg(t.placeholder, italic(this.text("search.placeholder")))}`));
+    }
+
+    lines.push(emptyRow());
+    if (this.noticeLines.length > 0) {
+      for (const notice of this.noticeLines) {
+        lines.push(row(fg(t.hint, italic(sanitizeDisplayText(notice)))));
+      }
+      lines.push(emptyRow());
+    }
+    lines.push(divider());
+
+    if (this.servers.length === 0) {
+      lines.push(emptyRow());
+      lines.push(row(fg(t.hint, italic(this.authOnly ? this.text("empty.oauth") : this.text("empty.servers")))));
+      lines.push(emptyRow());
+    } else {
+      const maxVis = this.visibleItemBudget(innerW);
+      const total = this.visibleItems.length;
+      const visibleLimit = total > maxVis ? Math.max(1, maxVis - 2) : maxVis;
+      const startIdx = Math.max(0, Math.min(this.cursorIndex - Math.floor(visibleLimit / 2), total - visibleLimit));
+      const endIdx = Math.min(startIdx + visibleLimit, total);
+
+      lines.push(emptyRow());
+
+      for (let i = startIdx; i < endIdx; i++) {
+        const item = this.visibleItems[i];
+        const isCursor = i === this.cursorIndex;
+        const server = this.servers[item.serverIndex];
+
+        if (item.type === "server") {
+          lines.push(row(this.renderServerRow(server, isCursor)));
+        } else if (item.toolIndex !== undefined) {
+          lines.push(row(this.renderToolRow(server.tools[item.toolIndex], isCursor, innerW)));
+        }
+      }
+
+      lines.push(emptyRow());
+
+      if (total > visibleLimit) {
+        const prog = Math.round(((this.cursorIndex + 1) / total) * 10);
+        lines.push(row(`${rainbowProgress(prog, 10)}  ${fg(t.hint, `${this.cursorIndex + 1}/${total}`)}`));
+        lines.push(emptyRow());
+      }
+
+      if (this.importNotice) {
+        lines.push(row(fg(t.needsAuth, italic(sanitizeDisplayText(this.importNotice)))));
+        lines.push(emptyRow());
+      }
+      if (this.authNotice) {
+        lines.push(row(fg(t.needsAuth, italic(sanitizeDisplayText(this.authNotice)))));
+        lines.push(emptyRow());
+      }
+    }
+
+    lines.push(divider());
+    lines.push(emptyRow());
+
+    if (this.confirmingDiscard) {
+      const discardBtn = this.discardSelected === 0
+        ? inverse(bold(fg(t.cancel, this.text("discard.button"))))
+        : fg(t.hint, this.text("discard.button"));
+      const keepBtn = this.discardSelected === 1
+        ? inverse(bold(fg(t.confirm, this.text("discard.keep"))))
+        : fg(t.hint, this.text("discard.keep"));
+      lines.push(row(`${this.text("discard.question")}  ${discardBtn}   ${keepBtn}`));
+    } else {
+      if (this.authOnly) {
+        lines.push(row(fg(t.description, this.text("auth.select"))));
+      } else {
+        const directCount = this.servers.reduce((sum, s) => sum + s.tools.filter((t) => t.isDirect).length, 0);
+        const totalTokens = this.servers.reduce(
+          (sum, s) => sum + s.tools.filter((t) => t.isDirect).reduce((ts, t) => ts + t.estimatedTokens, 0),
+          0,
+        );
+        const stats = directCount > 0
+          ? this.text("stats.direct", { count: directCount, tokens: totalTokens.toLocaleString(this.locale) })
+          : this.text("stats.none");
+        lines.push(row(fg(t.description, stats + (this.dirty ? fg(t.needsAuth, this.text("stats.unsaved")) : ""))));
+      }
+    }
+
+    lines.push(emptyRow());
+    const hints = this.authOnly
+      ? [
+          italic("↑↓") + ` ${this.text("hint.navigate")}`,
+          italic("⏎") + ` ${this.text("hint.auth")}`,
+          italic("ctrl+a") + ` ${this.text("hint.auth")}`,
+          italic("esc") + ` ${this.text("hint.clearClose")}`,
+          italic("ctrl+c") + ` ${this.text("hint.quit")}`,
+        ]
+      : [
+          italic("↑↓") + ` ${this.text("hint.navigate")}`,
+          italic("space") + ` ${this.text("hint.toggle")}`,
+          italic("⏎") + ` ${this.text("hint.expandAuth")}`,
+          italic("ctrl+a") + ` ${this.text("hint.auth")}`,
+          italic("ctrl+r") + ` ${this.text("hint.reconnect")}`,
+          italic("?") + ` ${this.text("hint.descSearch")}`,
+          italic("ctrl+s") + ` ${this.text("hint.save")}`,
+          italic("esc") + ` ${this.text("hint.clearClose")}`,
+          italic("ctrl+c") + ` ${this.text("hint.quit")}`,
+        ];
+    const gap = "  ";
+    const gapW = 2;
+    const maxW = innerW - 2;
+    let curLine = "";
+    let curW = 0;
+    for (const hint of hints) {
+      const hw = visibleWidth(hint);
+      const needed = curW === 0 ? hw : gapW + hw;
+      if (curW > 0 && curW + needed > maxW) {
+        lines.push(row(fg(t.hint, curLine)));
+        curLine = hint;
+        curW = hw;
+      } else {
+        curLine += (curW > 0 ? gap : "") + hint;
+        curW += needed;
+      }
+    }
+    if (curLine) lines.push(row(fg(t.hint, curLine)));
+
+    lines.push(fg(t.border, "╰" + "─".repeat(innerW) + "╯"));
+
+    return lines;
+  }
+
+  private visibleItemBudget(innerW: number): number {
+    const terminalRows = this.getTerminalRows?.();
+    if (!terminalRows || terminalRows <= 0) return McpPanel.FALLBACK_MAX_VISIBLE;
+    const overlayRows = Math.max(3, Math.floor(terminalRows * 0.92));
+    const noticeRows = this.noticeLines.length > 0 ? this.noticeLines.length + 1 : 0;
+    const transientRows = (this.importNotice ? 2 : 0) + (this.authNotice ? 2 : 0);
+    const hintRows = this.authOnly ? 1 : Math.max(1, Math.ceil(visibleWidth("↑↓ navigate  space toggle  ⏎ expand/auth  ctrl+a auth  ctrl+r reconnect  ? desc search  ctrl+s save  esc clear/close  ctrl+c quit") / Math.max(1, innerW - 2)));
+    const fixedRows = 1 // top border
+      + 1 // top spacer
+      + 1 // search
+      + 1 // search spacer
+      + noticeRows
+      + 1 // divider before list
+      + 1 // spacer before list
+      + 1 // spacer after list
+      + transientRows
+      + 1 // footer divider
+      + 1 // footer spacer
+      + 1 // stats/auth row
+      + 1 // hint spacer
+      + hintRows
+      + 1; // bottom border
+    return Math.max(3, overlayRows - fixedRows);
+  }
+
+  private renderServerRow(server: ServerState, isCursor: boolean): string {
+    const t = this.t;
+    const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
+
+    const expandIcon = server.expanded ? "▾" : "▸";
+    const prefix = isCursor ? fg(t.selected, expandIcon) : fg(t.border, server.expanded ? expandIcon : "·");
+
+    const serverName = sanitizeDisplayText(server.name);
+    const importKind = sanitizeDisplayText(server.importKind ?? this.text("value.import"));
+    const nameStr = isCursor ? bold(fg(t.selected, serverName)) : serverName;
+    const importLabel = server.source === "import" ? fg(t.description, ` (${importKind})`) : "";
+    const statusLabel = this.renderConnectionStatus(server);
+
+    if (!server.hasCachedData && !this.authOnly) {
+      return `${prefix}   ${nameStr}${importLabel}  ${fg(t.description, this.text("value.notCached"))}${statusLabel}`;
+    }
+
+    const directCount = server.tools.filter((t) => t.isDirect).length;
+    const totalCount = server.tools.length;
+    let toggleIcon = fg(t.description, "○");
+    if (directCount === totalCount && totalCount > 0) {
+      toggleIcon = fg(t.direct, "●");
+    } else if (directCount > 0) {
+      toggleIcon = fg(t.needsAuth, "◐");
+    }
+
+    let toolInfo = "";
+    if (totalCount > 0) {
+      toolInfo = `${directCount}/${totalCount}`;
+      if (directCount > 0) {
+        const tokens = server.tools.filter((t) => t.isDirect).reduce((s, t) => s + t.estimatedTokens, 0);
+        toolInfo += `  ~${tokens.toLocaleString(this.locale)}`;
+      }
+      toolInfo = fg(t.description, toolInfo);
+    }
+
+    return `${prefix} ${toggleIcon} ${nameStr}${importLabel}  ${toolInfo}${statusLabel}`;
+  }
+
+  private renderConnectionStatus(server: ServerState): string {
+    const t = this.t;
+    if (this.authInFlight === server.name) return `  ${fg(t.needsAuth, this.text("status.authenticating"))}`;
+    if (server.connectionStatus === "needs-auth") return `  ${fg(t.needsAuth, this.text("status.needsAuth"))}`;
+    if (server.connectionStatus === "connecting") return `  ${fg(t.needsAuth, this.text("status.connecting"))}`;
+    if (server.connectionStatus === "failed") return `  ${fg(t.cancel, this.text("status.failed"))}`;
+    if (this.authOnly && server.connectionStatus === "connected") return `  ${fg(t.direct, this.text("status.connected"))}`;
+    if (this.authOnly) return `  ${fg(t.description, this.text("status.idle"))}`;
+    return "";
+  }
+
+  private renderToolRow(tool: ToolState, isCursor: boolean, innerW: number): string {
+    const t = this.t;
+    const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
+
+    const toggleIcon = tool.isDirect ? fg(t.direct, "●") : fg(t.description, "○");
+    const cursor = isCursor ? fg(t.selected, "▸") : " ";
+    const toolName = sanitizeDisplayText(tool.name);
+    const description = sanitizeDisplayText(tool.description);
+    const nameStr = isCursor ? bold(fg(t.selected, toolName)) : toolName;
+
+    const prefixLen = 7 + visibleWidth(toolName);
+    const maxDescLen = Math.max(0, innerW - prefixLen - 8);
+    const descStr =
+      maxDescLen > 5 && description
+        ? fg(t.description, "— " + truncateToWidth(description, maxDescLen, "…"))
+        : "";
+
+    return `  ${cursor} ${toggleIcon} ${nameStr} ${descStr}`;
+  }
+
+  invalidate(): void {}
+
+  dispose(): void {
+    this.cleanup();
+  }
+}
+
+export function createMcpPanel(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  provenance: Map<string, ServerProvenance>,
+  callbacks: McpPanelCallbacks,
+  tui: { requestRender(): void },
+  done: (result: McpPanelResult) => void,
+  options?: McpPanelOptions,
+): McpPanel & { dispose(): void } {
+  return new McpPanel(config, cache, provenance, callbacks, tui, done, options ?? {});
+}

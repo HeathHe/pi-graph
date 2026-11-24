@@ -1,0 +1,3475 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { PassThrough } from "node:stream";
+import test from "node:test";
+import { spawn as nodeSpawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
+import type { AgentConfig } from "../src/agents/agents.ts";
+import {
+  AGENT_BUFFER_LIMITS,
+  buildWatchOutput,
+  createProgressFlushGate,
+  enforceWakeableAgentBudget,
+  flushProgressBatch,
+  hasTeammateWidgetWork,
+  killAgentTree,
+  nextWakeableAgentExpiryDelay,
+  retainBoundedAgentHistory,
+  runWithProgressFlushCleanup,
+  WAKEABLE_AGENT_BUDGET,
+} from "../src/extension/index.ts";
+import {
+  EXECUTION_BUFFER_LIMITS,
+  acquireRetryPersistenceGuard,
+  appendBoundedTranscriptMessage,
+  buildPiArgs,
+  createUtf8LineDecoder,
+  getInteractiveTerminalLaunchSpec,
+  getPiSpawnCommand,
+  isPiResultReadyTurn,
+  piLaunchDiagnostic,
+  resolvePiLaunchSpec,
+  releasePublishedTurnHistory,
+  resolveModelSpecifier,
+  runGraph,
+  runSingleTeammate,
+  runTeammate,
+  terminateProcessTreeByPid,
+  validateModelSpecifier,
+} from "../src/runs/execution.ts";
+import { resultReadyGraceMsFor } from "../src/runs/execution-infra.ts";
+import { ModelCircuitBreaker } from "../src/models/model-circuit-breaker.ts";
+import { NETWORK_RETRY_POLICY, classifyRetryError, retryDelayMs } from "../src/runs/retry.ts";
+import type {
+  ActiveAgent,
+  AgentProgress,
+  AgentProgressSnapshot,
+  AgentTerminalStatus,
+  SingleResult,
+  TeammateState,
+  Usage,
+} from "../src/shared/types.ts";
+import { AttachOverlay } from "../src/tui/attach-overlay.ts";
+import { OBSERVATION_TEXT_MAX_BYTES } from "../src/public/v1/observation.ts";
+
+const baseAgentConfig: AgentConfig = {
+  name: "general",
+  description: "Delegate",
+  tools: ["read"],
+  systemPromptMode: "append",
+  inheritProjectContext: true,
+  inheritSkills: false,
+  systemPrompt: "Delegate prompt",
+  source: "builtin",
+  filePath: "general.md",
+};
+
+export type SpawnChildProcess = NonNullable<Parameters<typeof runSingleTeammate>[1]["spawnChildProcess"]>;
+export type MutableFakeProcess = Omit<ChildProcess, "exitCode"> & { exitCode: number | null };
+export type FakeSpawn = (command: string, args: readonly string[], options: SpawnOptions) => MutableFakeProcess;
+
+export function createFakeProcess(): MutableFakeProcess {
+  return new EventEmitter() as MutableFakeProcess;
+}
+
+export function reclaimFakeProcess(child: MutableFakeProcess): boolean {
+  if (child.exitCode !== null) return true;
+  child.exitCode = 0;
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  return true;
+}
+
+function isArgumentList(value: readonly string[] | SpawnOptions): value is readonly string[] {
+  return Array.isArray(value);
+}
+
+export function adaptFakeSpawn(factory: FakeSpawn): SpawnChildProcess {
+  function spawn(command: string, options: SpawnOptions): ChildProcess;
+  function spawn(command: string, args?: readonly string[], options?: SpawnOptions): ChildProcess;
+  function spawn(
+    command: string,
+    argsOrOptions: readonly string[] | SpawnOptions = [],
+    options: SpawnOptions = {},
+  ): ChildProcess {
+    return isArgumentList(argsOrOptions)
+      ? factory(command, argsOrOptions, options)
+      : factory(command, [], argsOrOptions);
+  }
+
+  return Object.assign(spawn, { spawn: nodeSpawn, sync: spawnSync });
+}
+
+function activeAgent(): ActiveAgent {
+  const now = Date.now();
+  return {
+    agent: "general",
+    name: "bounded",
+    correlationId: "agent-bounded",
+    startedAt: now,
+    abortController: new AbortController(),
+    inbox: [],
+    outputLog: [],
+    lastActivityAt: now,
+    status: "running",
+    depth: 0,
+    sleepMs: 0,
+  };
+}
+
+function sleepingAgent(id: string, lastActivityAt: number, name?: string): ActiveAgent {
+  const agent = activeAgent();
+  agent.correlationId = id;
+  if (name) agent.name = name;
+  else delete agent.name;
+  agent.status = "sleeping";
+  agent.sleptAt = lastActivityAt;
+  agent.lastActivityAt = lastActivityAt;
+  return agent;
+}
+
+function pendingAgent(id: string, lastActivityAt: number): ActiveAgent {
+  const agent = activeAgent();
+  agent.correlationId = id;
+  delete agent.name;
+  agent.status = "pending";
+  agent.lastActivityAt = lastActivityAt;
+  return agent;
+}
+
+function teammateState(agents: ActiveAgent[]): TeammateState {
+  return {
+    baseCwd: process.cwd(),
+    currentSessionId: "test-session",
+    activeRuns: new Map(agents.map((agent) => [agent.correlationId, agent])),
+    namedAgents: new Map(agents
+      .filter((agent): agent is ActiveAgent & { name: string } => Boolean(agent.name))
+      .map((agent) => [agent.name, agent.correlationId])),
+  };
+}
+
+test("progress generation fencing drops late timer flushes and dispose clears pending work", () => {
+  let owns = true;
+  let flushes = 0;
+  const gate = createProgressFlushGate(() => { flushes += 1; }, 60_000, () => owns);
+  gate.mark();
+  assert.equal(flushes, 1);
+  gate.mark();
+  owns = false;
+  gate.flush();
+  assert.equal(flushes, 1, "a late callback from the outgoing generation is discarded");
+  owns = true;
+  gate.mark();
+  gate.dispose();
+  gate.flush();
+  assert.equal(flushes, 1, "teardown disposal cancels and clears pending progress");
+});
+
+test("progress bursts coalesce before expensive flush and terminal state flushes immediately", () => {
+  let expensiveFlushes = 0;
+  const gate = createProgressFlushGate(() => { expensiveFlushes += 1; }, 10_000);
+  try {
+    gate.mark();
+    assert.equal(expensiveFlushes, 1);
+    for (let index = 0; index < 100; index += 1) gate.mark();
+    assert.equal(expensiveFlushes, 1, "running burst must not trigger graph sort/broadcast/render work");
+    gate.mark(true);
+    assert.equal(expensiveFlushes, 2, "terminal progress must synchronously flush the coalesced state");
+  } finally {
+    gate.dispose();
+  }
+});
+
+test("one progress flush applies every task delta but publishes one full graph snapshot", () => {
+  const pending = new Map<number, number>();
+  let latest: number | undefined;
+  for (let index = 0; index < 5_000; index += 1) {
+    pending.set(index % 8, index);
+    latest = index;
+  }
+  const applied: number[] = [];
+  const published: number[] = [];
+  flushProgressBatch(pending, latest, (value) => applied.push(value), (value) => published.push(value));
+  assert.equal(applied.length, 8, "only the latest delta per task should be applied");
+  assert.deepEqual(published, [4_999], "the batch must project and broadcast exactly once");
+  assert.equal(pending.size, 0);
+});
+
+test("root graph progress wiring projects and broadcasts only after the batch is applied", () => {
+  const source = fs.readFileSync(new URL("../src/extension/index.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-helpers.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-proxy.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-core.ts", import.meta.url), "utf-8");
+  const rootStart = source.indexOf("const pendingByTask = new Map<number, AgentProgress>();");
+  const rootEnd = source.indexOf("onChildRequest:", rootStart);
+  assert.ok(rootStart >= 0 && rootEnd > rootStart);
+  const rootProgress = source.slice(rootStart, rootEnd);
+  assert.match(rootProgress, /flushProgressBatch\(pendingByTask, latest, processProgress, publishProgress\)/);
+  const applyStart = rootProgress.indexOf("const processProgress");
+  const publishStart = rootProgress.indexOf("const publishProgress");
+  assert.ok(applyStart >= 0 && publishStart > applyStart);
+  assert.doesNotMatch(rootProgress.slice(applyStart, publishStart), /progressSnapshot\(\)|TEAMMATE_MESSAGE_EVENT|onUpdate\?\./);
+  const publishBody = rootProgress.slice(publishStart);
+  assert.equal(publishBody.match(/progressSnapshot\(\)/g)?.length, 1);
+  assert.equal(publishBody.match(/TEAMMATE_MESSAGE_EVENT/g)?.length, 1);
+  assert.equal(publishBody.match(/onUpdate\?\./g)?.length, 1);
+  assert.match(publishBody, /if \(foregroundUpdateOpen\) \{\s*onUpdate\?\./);
+
+  const childStatusStart = source.indexOf("const publishChildCallStatus");
+  const childStatusEnd = source.indexOf("normalizedTasks.forEach((task, index) => {", childStatusStart);
+  assert.ok(childStatusStart >= 0 && childStatusEnd > childStatusStart);
+  assert.match(
+    source.slice(childStatusStart, childStatusEnd),
+    /if \(foregroundUpdateOpen\) \{\s*onUpdate\?\./,
+  );
+});
+
+test("wakeable sleeping budget evicts anonymous LRU agents before named agents and aborts before registry cleanup", () => {
+  const now = Date.now();
+  const named = sleepingAgent("named", now - 10_000, "reviewer");
+  const anonymous = Array.from(
+    { length: WAKEABLE_AGENT_BUDGET.maxSleepingAgents + 2 },
+    (_, index) => sleepingAgent(`anon-${index}`, now - 20_000 + index),
+  );
+  const state = teammateState([named, ...anonymous]);
+  const registryVisibleAtAbort = new Map<string, boolean>();
+  for (const agent of state.activeRuns.values()) {
+    agent.abortController.signal.addEventListener("abort", () => {
+      registryVisibleAtAbort.set(agent.correlationId, state.activeRuns.has(agent.correlationId));
+    });
+  }
+
+  const evicted = enforceWakeableAgentBudget(state, now);
+  assert.equal(state.activeRuns.size, WAKEABLE_AGENT_BUDGET.maxSleepingAgents);
+  assert.ok(state.activeRuns.has(named.correlationId), "named wakeable agents are protected before anonymous agents");
+  assert.equal(state.namedAgents.get("reviewer"), named.correlationId);
+  assert.ok(evicted.includes("anon-0"));
+  assert.ok(evicted.every((id) => registryVisibleAtAbort.get(id) === true));
+});
+
+test("wakeable TTL is longer for named agents and shared running cohorts are never evicted", () => {
+  const now = Date.now();
+  const anonymous = sleepingAgent("anonymous", now - WAKEABLE_AGENT_BUDGET.anonymousTtlMs - 1);
+  const named = sleepingAgent("named", anonymous.lastActivityAt, "pinned-by-name");
+  const sharedController = new AbortController();
+  const sharedSleeping = sleepingAgent("shared-sleeping", now - WAKEABLE_AGENT_BUDGET.namedTtlMs - 1);
+  const sharedRunning = activeAgent();
+  sharedSleeping.abortController = sharedController;
+  sharedRunning.abortController = sharedController;
+  sharedRunning.correlationId = "shared-running";
+  const state = teammateState([anonymous, named, sharedSleeping, sharedRunning]);
+
+  assert.deepEqual(enforceWakeableAgentBudget(state, now), [anonymous.correlationId]);
+  assert.ok(state.activeRuns.has(named.correlationId));
+  assert.ok(state.activeRuns.has(sharedSleeping.correlationId));
+  assert.equal(sharedController.signal.aborted, false);
+  assert.equal(hasTeammateWidgetWork(state, now), true);
+
+  sharedRunning.status = "sleeping";
+  sharedRunning.sleptAt = now - WAKEABLE_AGENT_BUDGET.namedTtlMs - 1;
+  sharedRunning.lastActivityAt = sharedRunning.sleptAt;
+  const expired = enforceWakeableAgentBudget(state, now + WAKEABLE_AGENT_BUDGET.namedTtlMs);
+  assert.ok(expired.includes(named.correlationId));
+  assert.ok(expired.includes(sharedSleeping.correlationId));
+  assert.ok(expired.includes(sharedRunning.correlationId));
+  assert.equal(sharedController.signal.aborted, true);
+  assert.equal(state.namedAgents.has("pinned-by-name"), false);
+  assert.equal(nextWakeableAgentExpiryDelay(state, now), undefined);
+});
+
+test("widget work ignores sleeping agents after the visible grace period", () => {
+  const now = Date.now();
+  const oldSleeping = sleepingAgent("old", now - 60_001);
+  const state = teammateState([oldSleeping]);
+  assert.equal(hasTeammateWidgetWork(state, now), false);
+  oldSleeping.sleptAt = now - 59_999;
+  assert.equal(hasTeammateWidgetWork(state, now), true);
+  oldSleeping.status = "running";
+  oldSleeping.sleptAt = now - 120_000;
+  assert.equal(hasTeammateWidgetWork(state, now), true);
+});
+
+test("widget work ignores pending agents after the grace period measured from last work", () => {
+  const now = Date.now();
+  const stalePending = pendingAgent("pending-old", now - 60_001);
+  const state = teammateState([stalePending]);
+  assert.equal(hasTeammateWidgetWork(state, now), false);
+  stalePending.lastActivityAt = now - 59_999;
+  assert.equal(hasTeammateWidgetWork(state, now), true);
+  stalePending.status = "running";
+  stalePending.lastActivityAt = now - 120_000;
+  assert.equal(hasTeammateWidgetWork(state, now), true);
+});
+
+test("root progress cleanup flushes then disposes on success, error, and termination", async () => {
+  const source = fs.readFileSync(new URL("../src/extension/index.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-helpers.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-proxy.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-core.ts", import.meta.url), "utf-8");
+  const teammateToolStart = source.indexOf("const tool: ToolDefinition<typeof TeammateParams");
+  const executeStart = source.indexOf("async execute(", teammateToolStart);
+  const executeEnd = source.indexOf("renderCall(args", executeStart);
+  assert.ok(teammateToolStart >= 0 && executeStart > teammateToolStart && executeEnd > executeStart);
+  const rootExecute = source.slice(executeStart, executeEnd);
+  assert.equal(
+    rootExecute.match(/runWithProgressFlushCleanup\(/g)?.length,
+    4,
+    "foreground, background, graph, and cold-restart runs share flush/dispose cleanup",
+  );
+  assert.doesNotMatch(rootExecute, /runSingleTeammate\(params, makeOptions\(\)\)/);
+
+  for (const outcome of ["success", "error", "termination"] as const) {
+    const lifecycle: string[] = [];
+    const gate = {
+      mark() {},
+      flush() { lifecycle.push("flush"); },
+      dispose() { lifecycle.push("dispose"); },
+    };
+    const run = async () => {
+      if (outcome === "success") return outcome;
+      const error = new Error(outcome);
+      if (outcome === "termination") error.name = "AbortError";
+      throw error;
+    };
+
+    if (outcome === "success") {
+      assert.equal(await runWithProgressFlushCleanup(run, gate), outcome);
+    } else {
+      await assert.rejects(runWithProgressFlushCleanup(run, gate), { name: outcome === "termination" ? "AbortError" : "Error" });
+    }
+    assert.deepEqual(lifecycle, ["flush", "dispose"]);
+  }
+
+  let renders = 0;
+  const terminalGate = createProgressFlushGate(() => { renders += 1; }, 60_000);
+  terminalGate.mark(true);
+  assert.equal(renders, 1);
+  await runWithProgressFlushCleanup(async () => undefined, terminalGate);
+  assert.equal(renders, 1, "cleanup after a terminal flush must not render twice");
+});
+
+test("proxy graph progress batches burst snapshots and synchronously publishes terminal state", () => {
+  const source = fs.readFileSync(new URL("../src/extension/index.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-helpers.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-proxy.ts", import.meta.url), "utf-8") + fs.readFileSync(new URL("../src/extension/teammate-core.ts", import.meta.url), "utf-8");
+  const proxyStart = source.indexOf("const pendingProgressByTask = new Map<number, AgentProgress>();");
+  const proxyEnd = source.indexOf("onChildRequest:", proxyStart);
+  assert.ok(proxyStart >= 0 && proxyEnd > proxyStart);
+  const proxyProgress = source.slice(proxyStart, proxyEnd);
+  assert.match(proxyProgress, /createProgressFlushGate\(/);
+  assert.match(proxyProgress, /pendingProgressByTask\.set\(taskIndex, data\)/);
+  assert.match(proxyProgress, /\.mark\(data\.status === "completed" \|\| data\.status === "failed"\)/);
+  const callbackStart = proxyProgress.indexOf("onProgress: (data) =>");
+  assert.ok(callbackStart >= 0);
+  assert.doesNotMatch(proxyProgress.slice(callbackStart), /progressSnapshot\(\)/);
+
+  const pending = new Map<number, number>();
+  const snapshots: number[][] = [];
+  const gate = createProgressFlushGate(() => {
+    snapshots.push([...pending.values()].sort((left, right) => left - right));
+    pending.clear();
+  }, 60_000);
+  try {
+    pending.set(0, 0);
+    gate.mark();
+    for (let index = 1; index <= 5_000; index += 1) {
+      pending.set(index % 8, index);
+      gate.mark();
+    }
+    assert.equal(snapshots.length, 1, "non-terminal burst must not sort a full snapshot per event");
+    pending.set(7, 5_001);
+    gate.mark(true);
+    assert.equal(snapshots.length, 2, "terminal progress must publish synchronously");
+    assert.ok(snapshots[1].includes(5_001));
+  } finally {
+    gate.dispose();
+  }
+});
+
+test("one overlay progress event requests at most one render", () => {
+  const agent = activeAgent();
+  const overlay = new AttachOverlay(agent, () => {}, () => new Map([[agent.correlationId, agent]]));
+  let renders = 0;
+  overlay.setRequestRender(() => { renders += 1; });
+  const progress: AgentProgressSnapshot[] = [{
+    agent: "general",
+    correlationId: agent.correlationId,
+    taskIndex: 0,
+    dependencies: [],
+    status: "running",
+  }];
+  try {
+    overlay.applyProgressEvent(agent.correlationId, {
+      progress,
+      activeTools: [{ name: "read", status: "running", startedAt: Date.now() }],
+      streamingText: "working",
+      lines: [{ text: "read complete", kind: "tool" }],
+    });
+    assert.equal(renders, 1);
+  } finally {
+    overlay.dispose();
+  }
+});
+
+test("sleeping agent history has byte and count bounds while watch retains last result", () => {
+  const agent = activeAgent();
+  agent.status = "sleeping";
+  agent.sleptAt = Date.now();
+  agent.inbox = Array.from({ length: 100 }, (_, index) => ({
+    id: String(index),
+    from: "caller",
+    to: "bounded",
+    kind: "task" as const,
+    payload: `message-${index}-${"界".repeat(10_000)}`,
+    timestamp: index,
+  }));
+  agent.outputLog = Array.from({ length: 250 }, (_, index) => `line-${index}-${"界".repeat(10_000)}`);
+  agent.lastResult = `final-${"界".repeat(200_000)}\nretained result sentinel`;
+
+  retainBoundedAgentHistory(agent, true);
+
+  assert.ok(agent.inbox.length <= AGENT_BUFFER_LIMITS.sleepingInboxItems);
+  assert.ok(agent.outputLog.length <= AGENT_BUFFER_LIMITS.sleepingLogLines);
+  assert.ok(
+    agent.inbox.reduce((total, entry) => total + Buffer.byteLength(entry.payload), 0)
+      <= AGENT_BUFFER_LIMITS.inboxBytes,
+  );
+  assert.ok(
+    agent.outputLog.reduce((total, line) => total + Buffer.byteLength(line), 0)
+      <= AGENT_BUFFER_LIMITS.logBytes,
+  );
+  assert.ok(Buffer.byteLength(agent.lastResult ?? "") <= AGENT_BUFFER_LIMITS.lastResultBytes);
+  const retainedResult = agent.lastResult;
+  const watch = buildWatchOutput({ kind: "agent", agent }, 20).join("\n");
+  assert.ok(Buffer.byteLength(watch) <= OBSERVATION_TEXT_MAX_BYTES);
+  assert.match(watch, /observation text truncated; canonical result unchanged/);
+  assert.match(watch, /sleeping/);
+  assert.equal(agent.lastResult, retainedResult, "display truncation must not alter the retained result");
+
+  // A narrower view leaves room for the result instead of exhausting the display budget on activity.
+  const narrowWatch = buildWatchOutput({ kind: "agent", agent }, 1).join("\n");
+  assert.match(narrowWatch, /--- last result ---\nretained result sentinel/);
+  assert.ok(Buffer.byteLength(narrowWatch) <= OBSERVATION_TEXT_MAX_BYTES);
+  assert.equal(agent.lastResult, retainedResult);
+});
+
+test("agent history compacts sparse output logs without throwing", () => {
+  const agent = activeAgent();
+  agent.outputLog = ["first", "second"];
+  agent.outputLog[10] = "latest";
+
+  retainBoundedAgentHistory(agent);
+
+  assert.deepEqual(agent.outputLog, ["first", "second", "latest"]);
+});
+
+test("transcript, decoder, stderr-adjacent stream limits are byte bounded", () => {
+  const transcript: Array<{ role: string; content: string }> = [];
+  for (let index = 0; index < EXECUTION_BUFFER_LIMITS.transcriptMessages + 20; index += 1) {
+    appendBoundedTranscriptMessage(transcript, { role: "tool", content: "界".repeat(30_000) });
+  }
+  assert.ok(transcript.length <= EXECUTION_BUFFER_LIMITS.transcriptMessages);
+  assert.ok(
+    transcript.reduce((total, entry) => total + Buffer.byteLength(entry.content), 0)
+      <= EXECUTION_BUFFER_LIMITS.transcriptBytes,
+  );
+  assert.ok(transcript.every(
+    (entry) => Buffer.byteLength(entry.content) <= EXECUTION_BUFFER_LIMITS.transcriptMessageBytes,
+  ));
+
+  const decoder = createUtf8LineDecoder(8);
+  assert.deepEqual(decoder.write(Buffer.from("abcdefghijk")), []);
+  const [tail] = decoder.end();
+  assert.equal(Buffer.byteLength(tail), 8);
+  assert.equal(tail, "defghijk");
+});
+
+test("decoder preserves complete lifecycle lines before an oversized stdout line", () => {
+  const decoder = createUtf8LineDecoder(16);
+  const text = 'turn_end\r\n' + 'x'.repeat(32) + '\nagent_end\n' + '界'.repeat(8);
+  const encoded = Buffer.from(text);
+  const split = encoded.length - 1;
+  assert.deepEqual(decoder.write(encoded.subarray(0, split)), ["turn_end", "x".repeat(16), "agent_end"]);
+  assert.deepEqual(decoder.write(encoded.subarray(split)), []);
+  assert.deepEqual(decoder.end(), ["界".repeat(5)]);
+});
+
+test("published turn result can survive while disposable transcript and tool history is released", () => {
+  const messages = [{ role: "assistant", content: "published result" }];
+  const published = [...messages];
+  const progress: AgentProgress = {
+    agent: "general",
+    status: "completed",
+    startedAt: Date.now(),
+    durationMs: 1,
+    toolCount: 1,
+    recentTools: [{ name: "read", status: "completed" }],
+    tokens: 10,
+    lastActivityAt: Date.now(),
+  };
+  const usage: Usage = {
+    inputTokens: 5,
+    outputTokens: 5,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    turns: 1,
+  };
+
+  releasePublishedTurnHistory(messages, progress, usage);
+
+  assert.deepEqual(published, [{ role: "assistant", content: "published result" }]);
+  assert.deepEqual(messages, []);
+  assert.deepEqual(progress.recentTools, []);
+  assert.equal(usage.turns, 0);
+  assert.equal(usage.inputTokens + usage.outputTokens, 0);
+});
+
+test("Pi launcher resolution is ordered, shell-free, and rejects a Gateway argv probe", () => {
+  const shim = path.normalize("C:/shim/pi.cmd");
+  const posixShim = path.normalize("C:/shim/pi");
+  const shimPackage = path.normalize("C:/shim/node_modules/@earendil-works/pi-coding-agent");
+  const shimEntry = path.join(shimPackage, "dist/bundle/cli.js");
+  const shimManifest = path.join(shimPackage, "package.json");
+  const files = new Set([
+    path.normalize("C:/native/pi.exe"),
+    shim,
+    posixShim,
+    path.normalize(shimEntry),
+    path.normalize(shimManifest),
+  ]);
+  const isFile = (candidate: string): boolean => files.has(path.normalize(candidate));
+  const readTextFile = (candidate: string): string => {
+    const normalized = path.normalize(candidate);
+    if (normalized === shim) return `"%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*`;
+    if (normalized === path.normalize(shimManifest)) return JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      bin: { pi: "dist/bundle/cli.js" },
+    });
+    throw new Error(`unexpected read: ${candidate}`);
+  };
+
+  assert.deepEqual(resolvePiLaunchSpec({
+    envBinary: "C:/configured/pi-custom.exe",
+    platform: "win32",
+    pathValue: "C:/native;C:/shim",
+    isFile,
+  }), {
+    command: "C:/configured/pi-custom.exe",
+    argsPrefix: [],
+    source: "override",
+  });
+
+  const native = resolvePiLaunchSpec({
+    envBinary: null,
+    platform: "win32",
+    pathValue: "C:/native",
+    entryPoint: null,
+    appData: null,
+    isFile,
+  });
+  assert.equal(native.source, "path-native", "a native binary remains usable without a verified Node entry");
+  assert.equal(path.normalize(native.command), path.normalize("C:/native/pi.exe"));
+
+  const shimSpec = resolvePiLaunchSpec({
+    envBinary: null,
+    platform: "win32",
+    pathValue: "C:/native;C:/shim",
+    entryPoint: null,
+    appData: null,
+    execPath: "C:/node.exe",
+    isFile,
+    readTextFile,
+  });
+  assert.equal(shimSpec.source, "windows-shim", "a verified Node entry beats a PATH launcher that may forward IPC");
+  assert.equal(path.normalize(shimSpec.command), path.normalize("C:/node.exe"));
+  assert.deepEqual(shimSpec.argsPrefix.map(path.normalize), [path.normalize(shimEntry)]);
+
+  const hostSpec = resolvePiLaunchSpec({
+    envBinary: null,
+    platform: "win32",
+    pathValue: "C:/native;C:/shim",
+    entryPoint: shimEntry,
+    appData: null,
+    execPath: "C:/node.exe",
+    isFile,
+    readTextFile,
+  });
+  assert.deepEqual(hostSpec, {
+    command: "C:/node.exe",
+    argsPrefix: [path.resolve(shimEntry)],
+    source: "host-entry",
+  });
+
+  const appDataSpec = resolvePiLaunchSpec({
+    envBinary: null,
+    platform: "win32",
+    pathValue: "C:/native",
+    entryPoint: null,
+    appData: "C:/shim/..",
+    execPath: "C:/node.exe",
+    isFile,
+    readTextFile,
+  });
+  assert.equal(appDataSpec.source, "path-native");
+
+  const gatewayEntry = path.resolve("C:/gateway/pi-maestro-gateway.mjs");
+  const gateway = resolvePiLaunchSpec({
+    envBinary: null,
+    platform: "linux",
+    pathValue: null,
+    argv: [process.execPath, gatewayEntry],
+    isFile: (candidate) => candidate === gatewayEntry,
+    readTextFile: () => "{}",
+  });
+  assert.equal(gateway.source, "path-fallback");
+  assert.equal(gateway.command, "pi");
+  assert.deepEqual(gateway.argsPrefix, []);
+});
+
+test("compiled Pi and pi-bolt hosts launch themselves before consulting PATH or JS entries", () => {
+  for (const [platform, execPath] of [
+    ["win32", "C:/pi-bolt/pi-bolt.exe"],
+    ["win32", "C:/pi/pi.exe"],
+    ["linux", "/opt/pi-bolt/pi-bolt"],
+    ["darwin", "/opt/pi/pi"],
+  ] as const) {
+    const options = {
+      envBinary: null,
+      platform,
+      execPath,
+      bunVersion: "1.4.3",
+      pathValue: "C:/shim",
+      argv: [execPath, "/$bunfs/root/cli.js"],
+      isFile: (candidate: string) => candidate === execPath,
+      readTextFile: () => { throw new Error("compiled host must not read JS entries or shims"); },
+    };
+    const spec = getPiSpawnCommand(["--mode", "rpc"], options);
+    assert.deepEqual(spec, {
+      command: execPath,
+      argsPrefix: [],
+      source: "host-native",
+      args: ["--mode", "rpc"],
+      shell: false,
+    });
+    assert.deepEqual(resolvePiLaunchSpec({ ...options, envBinary: "C:/configured/pi-custom.exe" }), {
+      command: "C:/configured/pi-custom.exe",
+      argsPrefix: [],
+      source: "override",
+    });
+  }
+});
+
+test("native host detection excludes Node, generic Bun, Gateways and missing executables", () => {
+  for (const [execPath, bunVersion, exists] of [
+    ["C:/pi-bolt/pi-bolt.exe", null, true],
+    ["C:/bun/bun.exe", "1.4.3", true],
+    ["C:/node/node.exe", "1.4.3", true],
+    ["C:/gateway/pi-maestro-gateway.exe", "1.4.3", true],
+    ["C:/pi-bolt/pi-bolt.exe", "1.4.3", false],
+  ] as const) {
+    assert.deepEqual(resolvePiLaunchSpec({
+      envBinary: null,
+      platform: "win32",
+      execPath,
+      bunVersion,
+      entryPoint: null,
+      pathValue: null,
+      appData: null,
+      isFile: (candidate) => exists && candidate === execPath,
+    }), { command: "pi", argsPrefix: [], source: "path-fallback" });
+  }
+});
+
+test("verified host Pi entry is accepted only through its package bin declaration", () => {
+  const root = path.resolve("C:/pkg/node_modules/@earendil-works/pi-coding-agent");
+  const entry = path.join(root, "dist/bundle/cli.js");
+  const manifest = path.join(root, "package.json");
+  const files = new Set([entry, manifest].map((candidate) => path.normalize(candidate)));
+  const spec = resolvePiLaunchSpec({
+    envBinary: null,
+    platform: "linux",
+    pathValue: null,
+    entryPoint: entry,
+    execPath: "/usr/bin/node",
+    isFile: (candidate) => files.has(path.normalize(candidate)),
+    readTextFile: () => JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      bin: { pi: "dist/bundle/cli.js" },
+    }),
+  });
+  assert.deepEqual(spec, {
+    command: "/usr/bin/node",
+    argsPrefix: [path.resolve(entry)],
+    source: "host-entry",
+  });
+});
+
+test("Windows Pi fallback is shell-free and preserves hostile-looking argv as one item", () => {
+  const argv = ["--model", "openai/gpt-5&whoami", "--mode", "rpc"];
+  const spec = getPiSpawnCommand(argv, {
+    platform: "win32",
+    envBinary: null,
+    entryPoint: null,
+    pathValue: null,
+    appData: null,
+  });
+  assert.equal(spec.command, "pi");
+  assert.equal(spec.source, "path-fallback");
+  assert.equal(spec.shell, false);
+  assert.deepEqual(spec.args, argv);
+  assert.notEqual(spec.command, "pi.cmd");
+
+  const diagnostic = piLaunchDiagnostic(spec, "close", 1, "SIGTERM", "x".repeat(70_000));
+  assert.equal(diagnostic.source, "path-fallback");
+  assert.equal(diagnostic.phase, "close");
+  assert.equal(diagnostic.exitCode, 1);
+  assert.equal(diagnostic.signal, "SIGTERM");
+  assert.ok(Buffer.byteLength(diagnostic.stderrTail) <= EXECUTION_BUFFER_LIMITS.stderrBytes);
+
+  assert.equal(validateModelSpecifier("openai/gpt-5.1-mini:latest"), "openai/gpt-5.1-mini:latest");
+  for (const invalid of ["openai/gpt-5&whoami", "--help", "openai/gpt 5", "a//c", "x\n--tools"]) {
+    assert.throws(() => validateModelSpecifier(invalid), /Invalid teammate model specifier/);
+    assert.throws(
+      () => buildPiArgs(baseAgentConfig, { agent: "general", model: invalid }, "prompt.md"),
+      /Invalid teammate model specifier/,
+    );
+  }
+});
+
+test("interactive terminal specs preserve Pi argv across supported platforms", () => {
+  const piCommand = {
+    command: "C:/Program Files/nodejs/node.exe",
+    args: ["C:/pi entry.ts", "-p", "build api & tests", "--name", "backend"],
+  };
+  const windows = getInteractiveTerminalLaunchSpec(piCommand, "C:/work tree", {
+    platform: "win32",
+    title: "Pi worker · backend",
+  });
+  assert.equal(windows.command, "wt.exe");
+  assert.deepEqual(windows.args, [
+    "--window",
+    "new",
+    "new-tab",
+    "--title",
+    "Pi worker · backend",
+    "--startingDirectory",
+    "C:/work tree",
+    piCommand.command,
+    ...piCommand.args,
+  ]);
+
+  const linux = getInteractiveTerminalLaunchSpec(piCommand, "/tmp/work tree", {
+    platform: "linux",
+    terminalCommand: "konsole",
+  });
+  assert.equal(linux.command, "konsole");
+  assert.deepEqual(linux.args, ["-e", piCommand.command, ...piCommand.args]);
+
+  const mac = getInteractiveTerminalLaunchSpec(
+    { command: "/usr/bin/pi", args: ["-p", "quote ' and & stay data"] },
+    "/tmp/work tree",
+    { platform: "darwin" },
+  );
+  assert.equal(mac.command, "/usr/bin/osascript");
+  assert.equal(mac.args[0], "-e");
+  assert.match(mac.args.at(-1) ?? "", /tell application "Terminal" to do script/);
+  assert.match(mac.args.at(-1) ?? "", /exec '\/usr\/bin\/pi'/);
+  assert.match(mac.args.at(-1) ?? "", /quote/);
+});
+
+test("owned PID tree termination uses taskkill on Windows and a process group on POSIX", async () => {
+  let windowsCall: { command: string; args: readonly string[]; timeout: number | undefined; killSignal: string | undefined } | undefined;
+  const windowsStatus = await terminateProcessTreeByPid(4321, {
+    platform: "win32",
+    spawnProcess: ((command: string, args: readonly string[], options: SpawnOptions) => {
+      windowsCall = {
+        command,
+        args,
+        timeout: options.timeout,
+        killSignal: options.killSignal as string | undefined,
+      };
+      const child = createFakeProcess();
+      queueMicrotask(() => child.emit("close", 0, null));
+      return child;
+    }) as never,
+  });
+  assert.equal(windowsStatus, "stopped");
+  assert.deepEqual(windowsCall, {
+    command: "taskkill",
+    args: ["/PID", "4321", "/T", "/F"],
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+  });
+
+  const alreadyExited = await terminateProcessTreeByPid(4321, {
+    platform: "win32",
+    spawnProcess: (() => {
+      const child = createFakeProcess();
+      queueMicrotask(() => child.emit("close", 128, null));
+      return child;
+    }) as never,
+  });
+  assert.equal(alreadyExited, "already-exited");
+
+  await assert.rejects(() => terminateProcessTreeByPid(4321, {
+    platform: "win32",
+    spawnProcess: (() => {
+      const child = createFakeProcess();
+      queueMicrotask(() => child.emit("close", 5, null));
+      return child;
+    }) as never,
+  }), /taskkill exited with code 5/);
+
+  await assert.rejects(() => terminateProcessTreeByPid(4321, {
+    platform: "win32",
+    taskkillTimeoutMs: 5,
+    spawnProcess: (() => createFakeProcess()) as never,
+  }), /taskkill timed out after 5ms/);
+
+  const signals: Array<[number, NodeJS.Signals | number | undefined]> = [];
+  const linuxStatus = await terminateProcessTreeByPid(77, {
+    platform: "linux",
+    killProcess: ((pid: number, signal?: NodeJS.Signals | number) => {
+      signals.push([pid, signal]);
+      return true;
+    }) as typeof process.kill,
+    isProcessAlive: () => false,
+  });
+  assert.equal(linuxStatus, "stopped");
+  assert.deepEqual(signals, [[-77, "SIGTERM"]]);
+
+  const fallbackSignals: number[] = [];
+  const fallbackStatus = await terminateProcessTreeByPid(88, {
+    platform: "linux",
+    killProcess: ((pid: number) => {
+      fallbackSignals.push(pid);
+      if (pid < 0) throw Object.assign(new Error("missing group"), { code: "ESRCH" });
+      return true;
+    }) as typeof process.kill,
+    isProcessAlive: () => false,
+  });
+  assert.equal(fallbackStatus, "stopped");
+  assert.deepEqual(fallbackSignals, [-88, 88]);
+
+  const missingStatus = await terminateProcessTreeByPid(89, {
+    platform: "linux",
+    killProcess: (() => {
+      throw Object.assign(new Error("missing tree"), { code: "ESRCH" });
+    }) as typeof process.kill,
+    isProcessAlive: () => {
+      throw new Error("liveness must not be consulted after both signal targets are absent");
+    },
+  });
+  assert.equal(missingStatus, "already-exited");
+
+  const escalated: NodeJS.Signals[] = [];
+  const escalatedStatus = await terminateProcessTreeByPid(99, {
+    platform: "linux",
+    graceMs: 1,
+    pollMs: 1,
+    sleep: async () => undefined,
+    killProcess: ((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (typeof signal === "string") escalated.push(signal);
+      return true;
+    }) as typeof process.kill,
+    isProcessAlive: () => !escalated.includes("SIGKILL"),
+  });
+  assert.equal(escalatedStatus, "stopped");
+  assert.deepEqual(escalated, ["SIGTERM", "SIGKILL"]);
+});
+
+test("cold restart loads the persisted session instead of forking it", () => {
+  const args = buildPiArgs(
+    baseAgentConfig,
+    { agent: "general" },
+    "prompt.md",
+    undefined,
+    "C:/sessions/agent",
+    "C:/sessions/parent.jsonl",
+    undefined,
+    [],
+    "C:/sessions/agent/session.jsonl",
+  );
+  const sessionIndex = args.indexOf("--session");
+  assert.notEqual(sessionIndex, -1);
+  assert.equal(args[sessionIndex + 1], "C:/sessions/agent/session.jsonl");
+  assert.equal(args.includes("--fork"), false);
+  assert.equal(args[args.indexOf("--session-dir") + 1], "C:/sessions/agent");
+});
+
+test("teammate child processes are hidden on Windows", async () => {
+  let windowsHide: boolean | undefined;
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    windowsHide = options.windowsHide;
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      child.emit("exit", 0, null);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Do work", timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(windowsHide, true);
+});
+
+test("invalid model input is rejected before a child process is spawned", async () => {
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Do work", model: "openai/gpt-5&whoami" },
+    { baseCwd: process.cwd() },
+  );
+  assert.equal(result.exitCode, 1);
+  assert.match(result.messages[0]?.content ?? "", /Invalid teammate model specifier/);
+});
+
+test("a backend dispatch carries its own model namespace past host validation", async () => {
+  // The host's `provider/model` pattern refuses brackets, but an ACP agent's
+  // catalogue is made of them. Whoever executes the task owns the namespace, so
+  // a dispatch named for a backend must reach that backend rather than being
+  // refused for a shape the host does not define.
+  const routed = await runSingleTeammate(
+    { agent: "general", task: "Do work", backend: "not-registered", model: "composer-2.5[fast=true]" },
+    { baseCwd: process.cwd() },
+  );
+  assert.equal(routed.exitCode, 1);
+  const routedMessage = routed.messages[0]?.content ?? "";
+  assert.doesNotMatch(routedMessage, /Invalid teammate model specifier/, routedMessage);
+  // It reached routing, which is the next authority, and legacy mode refused it
+  // there by name rather than running the pi subprocess under another name.
+  assert.match(routedMessage, /backend "not-registered"/, routedMessage);
+
+  // The same specifier with no backend still belongs to the host, and the host
+  // still refuses it. The exemption is the backend's, not the bracket's.
+  const hostOwned = await runSingleTeammate(
+    { agent: "general", task: "Do work", model: "composer-2.5[fast=true]" },
+    { baseCwd: process.cwd() },
+  );
+  assert.equal(hostOwned.exitCode, 1);
+  assert.match(hostOwned.messages[0]?.content ?? "", /Invalid teammate model specifier/);
+});
+
+test("a backend dispatch still refuses a specifier that would corrupt host machinery", async () => {
+  // Format is the backend's to define; these strings become breaker keys, log
+  // lines, and some backends' process arguments, which stays the host's problem.
+  const injected = await runSingleTeammate(
+    { agent: "general", task: "Do work", backend: "not-registered", model: "composer\n--tools" },
+    { baseCwd: process.cwd() },
+  );
+  assert.equal(injected.exitCode, 1);
+  assert.match(injected.messages[0]?.content ?? "", /control characters/);
+
+  const oversized = await runSingleTeammate(
+    { agent: "general", task: "Do work", backend: "not-registered", model: "m".repeat(300) },
+    { baseCwd: process.cwd() },
+  );
+  assert.equal(oversized.exitCode, 1);
+  assert.match(oversized.messages[0]?.content ?? "", /exceeds 256 bytes/);
+});
+
+test("model specifiers resolve provider shorthand and reject unavailable exact routes", () => {
+  const models = [
+    { id: "maestro-qwen/qwen3.8-max" },
+    { id: "deepseek/deepseek-v4-pro" },
+    { id: "openrouter/ai21/jamba-large-1.7" },
+  ];
+  assert.equal(
+    resolveModelSpecifier("maestro-qwen", models),
+    "maestro-qwen/qwen3.8-max",
+  );
+  assert.equal(
+    resolveModelSpecifier("deepseek-v4-pro", models),
+    "deepseek/deepseek-v4-pro",
+  );
+  assert.equal(
+    resolveModelSpecifier("openrouter/ai21/jamba-large-1.7", models),
+    "openrouter/ai21/jamba-large-1.7",
+  );
+  assert.throws(
+    () => resolveModelSpecifier("anthropic/claude-sonnet", models),
+    /Unknown teammate model specifier/,
+  );
+});
+
+test("network retry policy is bounded, progressive, and rejects permanent failures", () => {
+  assert.equal(NETWORK_RETRY_POLICY.maxRetries, 10);
+  assert.deepEqual(
+    Array.from({ length: NETWORK_RETRY_POLICY.maxRetries }, (_, index) => retryDelayMs(index + 1)),
+    [1_000, 2_000, 4_000, 8_000, 16_000, 16_000, 16_000, 16_000, 16_000, 16_000],
+  );
+  assert.equal(classifyRetryError("fetch failed: ECONNRESET"), "network");
+  assert.equal(classifyRetryError("Error: Connection error."), "network");
+  assert.equal(classifyRetryError("Provider returned error: 503"), "provider");
+  assert.equal(classifyRetryError("402: Insufficient Balance"), "fallback-only");
+  assert.equal(
+    classifyRetryError("Teammate runtime error (phase=message_end): 402: Insufficient Balance"),
+    "fallback-only",
+  );
+  assert.equal(classifyRetryError("Invalid API key"), "auth");
+  assert.equal(classifyRetryError("Authentication failed: token expired"), "auth");
+  assert.equal(classifyRetryError("context length exceeded"), "non-retryable");
+  assert.equal(
+    classifyRetryError("Timed out waiting for the first child agent event (agent=general, model=qwen, correlationId=abc, phase=first-activity); the child process started but did not report model activity."),
+    "network",
+    "first-activity timeout must be retryable",
+  );
+  assert.equal(
+    classifyRetryError("Teammate runtime error (phase=message_end, agent=planner, model=qwen, correlationId=abc): some provider issue"),
+    "provider",
+    "wrapped diagnostics classify by their inner error; an unknown inner stays retryable",
+  );
+  assert.equal(
+    classifyRetryError("Teammate child process exited abnormally (agent=general, correlationId=abc, exit=1, signal=SIGKILL, elapsed=5000ms, tools=3)."),
+    "non-retryable",
+    "a local process exit is not itself a network failure",
+  );
+  assert.equal(
+    classifyRetryError("Teammate child process error (agent=general, model=qwen, correlationId=abc, phase=child-error): read EPIPE"),
+    "network",
+    "the underlying transport code remains retryable",
+  );
+  assert.equal(
+    classifyRetryError("Failed to spawn pi subprocess (agent=general, model=qwen, correlationId=abc, phase=spawn): ENOENT"),
+    "non-retryable",
+    "spawn failure must stay non-retryable",
+  );
+});
+
+test("Pi result-ready marker accepts only a final assistant turn with no tool work", () => {
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "completed analysis" }],
+    },
+    toolResults: [],
+  }), true);
+  assert.equal(isPiResultReadyTurn({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "not terminal" }] },
+  }), false);
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "toolCall", id: "call-1", name: "read" }],
+    },
+    toolResults: [],
+  }), false);
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "answer" }],
+    },
+    toolResults: [{ toolCallId: "call-1" }],
+  }), false);
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      errorMessage: "provider failed after producing partial text",
+      content: [{ type: "text", text: "partial answer" }],
+    },
+    toolResults: [],
+  }), false);
+});
+
+test("C1: a text-only turn with tools in flight is interim, not result-ready", () => {
+  // A narration turn emitted while tool calls are still outstanding must not
+  // trip result-ready — the agent is still mid-task.
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "starting the read-only scan..." }],
+    },
+    toolResults: [],
+  }, { inFlightToolCount: 2, completedToolCount: 2 }), false);
+});
+
+test("C1: a text-only turn with no tools in flight is still result-ready", () => {
+  // All previous tools completed; this text-only turn is the final answer.
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "final analysis" }],
+    },
+    toolResults: [],
+  }, { inFlightToolCount: 0, completedToolCount: 4 }), true);
+});
+
+test("C1: a text-only turn with no prior tool work is still result-ready", () => {
+  // Pure Q&A: completedToolCount === 0, inFlightToolCount === 0.
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "answer" }],
+    },
+    toolResults: [],
+  }, { inFlightToolCount: 0, completedToolCount: 0 }), true);
+});
+
+test("C1: omitting context preserves the original strict shape check", () => {
+  // Backward compatibility: callers that don't supply context get the legacy
+  // behavior (text-only turn with no tool results = result-ready).
+  assert.equal(isPiResultReadyTurn({
+    type: "turn_end",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "answer" }],
+    },
+    toolResults: [],
+  }), true);
+});
+
+test("C2: lifecycle grace expands after tool work and preserves explicit overrides", () => {
+  assert.equal(resultReadyGraceMsFor(0), 60_000);
+  assert.equal(resultReadyGraceMsFor(1), 120_000);
+  assert.equal(resultReadyGraceMsFor(4, 25), 25);
+});
+
+test("final turn_end publishes a wakeable result before agent_end settles lifecycle", async () => {
+  const completions: string[] = [];
+  const progress: AgentProgress[] = [];
+  let stdout: PassThrough | undefined;
+  let killed = false;
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const childStdout = new PassThrough();
+    stdout = childStdout;
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout: childStdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { killed = true; return true; },
+    });
+    queueMicrotask(() => {
+      childStdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ready answer" }] },
+      })}\n`);
+      childStdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "ready answer" }],
+        },
+        toolResults: [],
+      })}\n`);
+    });
+    return child;
+  });
+
+  const result = await Promise.race([
+    runSingleTeammate(
+      { agent: "general", task: "Return before lifecycle confirmation", context: "fresh", timeoutMs: 2_000 },
+      {
+        baseCwd: process.cwd(),
+        spawnChildProcess,
+        onProgress: (entry) => progress.push({ ...entry, recentTools: [...entry.recentTools] }),
+        onTurnComplete: (entry) => completions.push(entry.messages.at(-1)?.content ?? ""),
+      },
+    ),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("result-ready publication timed out")), 500)),
+  ]);
+
+  assert.equal(result.messages.at(-1)?.content, "ready answer");
+  assert.equal(result.lifecyclePending, true);
+  assert.equal(result.wakeable, true);
+  assert.equal(killed, false);
+  assert.deepEqual(completions, []);
+  assert.equal(progress.at(-1)?.status, "running");
+  assert.notEqual(progress.at(-1)?.resultReadyAt, undefined);
+
+  if (!stdout) throw new Error("fake child stdout was not initialized");
+  stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(completions, ["ready answer"]);
+  assert.equal(progress.at(-1)?.status, "completed");
+  assert.equal(progress.at(-1)?.resultReadyAt, undefined);
+  assert.equal(killed, false, "fresh teammate must remain wakeable after lifecycle confirmation");
+});
+
+test("large valid agent_end history does not turn a published result into failure", async () => {
+  let stdout: PassThrough | undefined;
+  let resolveTerminal!: (result: SingleResult) => void;
+  const terminalResult = new Promise<SingleResult>((resolve) => { resolveTerminal = resolve; });
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const childStdout = new PassThrough();
+    stdout = childStdout;
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout: childStdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => {
+      childStdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "large-history answer" }] },
+      })}\n`);
+      childStdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "large-history answer" }],
+        },
+        toolResults: [],
+      })}\n`);
+    });
+    return child;
+  });
+
+  const published = await runSingleTeammate(
+    { agent: "general", task: "Return after a large history", context: "fresh", timeoutMs: 2_000 },
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess,
+      onTurnComplete: resolveTerminal,
+    },
+  );
+  assert.equal(published.lifecyclePending, true);
+  assert.equal(published.messages.at(-1)?.content, "large-history answer");
+
+  const agentEndLine = `${JSON.stringify({
+    type: "agent_end",
+    messages: [
+      { role: "tool", content: "x".repeat(EXECUTION_BUFFER_LIMITS.lineBytes + 1_024) },
+      {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "large-history answer" }],
+      },
+    ],
+  })}\n`;
+  assert.ok(Buffer.byteLength(agentEndLine) > EXECUTION_BUFFER_LIMITS.lineBytes);
+  if (!stdout) throw new Error("fake child stdout was not initialized");
+  stdout.write(agentEndLine);
+
+  const terminal = await Promise.race([
+    terminalResult,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("large agent_end did not settle")), 500)),
+  ]);
+  assert.equal(terminal.exitCode, 0);
+  assert.equal(terminal.terminalStatus, "completed");
+  assert.equal(terminal.messages.at(-1)?.content, "large-history answer");
+});
+
+test("parallel graph settles at result publication and keeps lifecycle running", async () => {
+  const stdoutStreams: PassThrough[] = [];
+  let killed = 0;
+  let spawnIndex = 0;
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const index = spawnIndex++;
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    stdoutStreams.push(stdout);
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { killed++; return true; },
+    });
+    queueMicrotask(() => {
+      const answer = `parallel-${index}`;
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: answer }] },
+      })}\n`);
+      stdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: answer }],
+        },
+        toolResults: [],
+      })}\n`);
+    });
+    return child;
+  });
+
+  const completions: Array<{ result: SingleResult; status?: AgentTerminalStatus }> = [];
+  let graphSettled = false;
+  const graphPromise = runGraph(
+    Array.from({ length: 4 }, (_, index) => ({
+      agent: "general",
+      prompt: `parallel task ${index}`,
+      name: `parallel_${index}`,
+      context: "fresh" as const,
+      timeoutMs: 2_000,
+    })),
+    4,
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess,
+      resultReadyGraceMs: 60_000,
+      onTurnComplete(result, status) { completions.push({ result, status }); },
+    },
+  ).then((results) => {
+    graphSettled = true;
+    return results;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(spawnIndex, 4);
+  // Result publication — not lifecycle confirmation — is the graph's release
+  // boundary (debug-notes-002): the call returns while every child is still
+  // awaiting its agent_end.
+  assert.equal(graphSettled, true, "result publication must settle the graph");
+  assert.equal(completions.length, 0, "no lifecycle confirmation has arrived yet");
+  assert.equal(killed, 0, "publication must not kill the children");
+
+  const results = await graphPromise;
+  assert.deepEqual(
+    results.map((result) => result.messages.at(-1)?.content).sort(),
+    ["parallel-0", "parallel-1", "parallel-2", "parallel-3"],
+  );
+  assert.equal(results.every((result) => result.lifecyclePending === true), true);
+  assert.equal(killed, 0);
+
+  for (const stream of stdoutStreams) stream.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(completions.length, 4, "lifecycle confirmation still settles every child");
+  assert.equal(completions.every(({ status }) => status === "completed"), true);
+  assert.equal(killed, 0);
+});
+
+test("runGraph forwards each task model and thinking level to child CLI arguments", async () => {
+  const capturedArgs: string[][] = [];
+  const stdoutStreams: PassThrough[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    capturedArgs.push([...args]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    stdoutStreams.push(stdout);
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "done" }],
+        },
+        toolResults: [],
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  await runGraph([
+    {
+      agent: "general",
+      prompt: "fast task",
+      model: "provider/fast",
+      thinking: "low",
+      context: "fresh",
+      timeoutMs: 2_000,
+    },
+    {
+      agent: "analyst",
+      prompt: "deep task",
+      model: "provider/deep",
+      thinking: "high",
+      context: "fresh",
+      timeoutMs: 2_000,
+    },
+  ], 2, { baseCwd: process.cwd(), spawnChildProcess });
+
+  const selections = capturedArgs.map((args) => ({
+    model: args[args.indexOf("--model") + 1],
+    thinking: args[args.indexOf("--thinking") + 1],
+  })).sort((left, right) => left.model.localeCompare(right.model));
+  assert.deepEqual(selections, [
+    { model: "provider/deep", thinking: "high" },
+    { model: "provider/fast", thinking: "low" },
+  ]);
+
+  for (const stream of stdoutStreams) stream.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+});
+
+test("public runTeammate rejects unavailable configured models before child launch", async () => {
+  const cwd = fs.mkdtempSync(path.join(process.cwd(), ".tmp-routing-"));
+  const configDir = path.join(cwd, ".pi");
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(path.join(configDir, "teammate-models.json"), JSON.stringify({
+    version: 2,
+    mappings: { analysis: "missing/model" },
+    thinkingLevels: {},
+  }));
+  const capturedArgs: string[][] = [];
+  const stdoutStreams: PassThrough[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    capturedArgs.push([...args]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    stdoutStreams.push(stdout);
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        toolResults: [],
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  try {
+    await runTeammate({
+      taskType: "analysis",
+      tasks: [{ agent: "general", prompt: "Analyze" }],
+    }, {
+      baseCwd: cwd,
+      modelCapabilities: [{ id: "provider/available", reasoning: true, thinkingLevels: ["low"] }],
+      spawnChildProcess,
+    });
+    assert.equal(capturedArgs.length, 1);
+    assert.equal(capturedArgs[0].includes("missing/model"), false);
+  } finally {
+    for (const stream of stdoutStreams) stream.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("DAG dependencies release at upstream result publication", async () => {
+  const stdoutStreams: PassThrough[] = [];
+  let spawnIndex = 0;
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const index = spawnIndex++;
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    stdoutStreams.push(stdout);
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined, kill() { return true; },
+    });
+    queueMicrotask(() => {
+      const answer = index === 0 ? "seed result" : "dependent result";
+      stdout.write(`${JSON.stringify({ type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: answer }],
+      } })}\n`);
+      stdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: answer }] },
+        toolResults: [],
+      })}\n`);
+    });
+    return child;
+  });
+
+  const graph = runGraph([
+    { agent: "general", prompt: "produce seed", name: "seed", context: "fresh", timeoutMs: 2_000 },
+    { agent: "general", prompt: "consume {seed}", name: "dependent", dependsOn: ["seed"], context: "fresh", timeoutMs: 2_000 },
+  ], 2, { baseCwd: process.cwd(), spawnChildProcess, resultReadyGraceMs: 60_000 });
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // The upstream publication releases the dependent and its {seed} variable;
+  // no agent_end is required (debug-notes-002).
+  assert.equal(spawnIndex, 2, "dependent releases at upstream publication");
+  const results = await graph;
+  assert.deepEqual(results.map((result) => result.messages.at(-1)?.content), ["seed result", "dependent result"]);
+  stdoutStreams[0].write(`${JSON.stringify({ type: "agent_end" })}\n`);
+  stdoutStreams[1].write(`${JSON.stringify({ type: "agent_end" })}\n`);
+});
+
+test("process close after result publication confirms lifecycle exactly once", async () => {
+  const completions: SingleResult[] = [];
+  let child: MutableFakeProcess | undefined;
+  let stdout: PassThrough | undefined;
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const spawnedChild = createFakeProcess();
+    const childStdout = new PassThrough();
+    child = spawnedChild;
+    stdout = childStdout;
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout: childStdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => {
+      childStdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "close-ready" }],
+        },
+        toolResults: [],
+      })}\n`);
+    });
+    return spawnedChild;
+  });
+
+  const result = await Promise.race([
+    runSingleTeammate(
+      { agent: "general", task: "Close after result", context: "fresh", timeoutMs: 2_000 },
+      {
+        baseCwd: process.cwd(),
+        spawnChildProcess,
+        onTurnComplete: (entry) => completions.push(entry),
+      },
+    ),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("close-race publication timed out")), 500)),
+  ]);
+  assert.equal(result.lifecyclePending, true);
+
+  if (!child) throw new Error("fake child was not initialized");
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].wakeable, false);
+  assert.equal(completions[0].lifecyclePending, undefined);
+});
+
+test("process error after result publication fails lifecycle without retracting the result", async () => {
+  const completions: SingleResult[] = [];
+  let child: MutableFakeProcess | undefined;
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const spawnedChild = createFakeProcess();
+    child = spawnedChild;
+    const stdout = new PassThrough();
+    Object.assign(spawnedChild, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() {
+        spawnedChild.exitCode = 1;
+        spawnedChild.emit("exit", 1, null);
+        spawnedChild.emit("close", 1, null);
+        return true;
+      },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "result survives lifecycle error" }],
+        },
+        toolResults: [],
+      })}\n`);
+    });
+    return spawnedChild;
+  });
+
+  const result = await Promise.race([
+    runSingleTeammate(
+      { agent: "general", task: "Error after result", context: "fresh", timeoutMs: 2_000 },
+      {
+        baseCwd: process.cwd(),
+        spawnChildProcess,
+        onTurnComplete: (entry) => completions.push(entry),
+      },
+    ),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("error-race publication timed out")), 500)),
+  ]);
+  assert.equal(result.messages.at(-1)?.content, "result survives lifecycle error");
+  assert.equal(result.lifecyclePending, true);
+
+  if (!child) throw new Error("fake child was not initialized");
+  child.emit("error", new Error("late transport failure"));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].exitCode, 1);
+  assert.equal(completions[0].wakeable, false);
+  assert.match(completions[0].messages.at(-1)?.content ?? "", /late transport failure/);
+});
+
+test("child RPC sends the prompt without disabling Pi auto-retry", async () => {
+  let written = "";
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdin.on("data", (chunk) => { written += chunk.toString(); });
+    Object.assign(child, {
+      stdin, stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Do the work", context: "fork" },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+  assert.equal(result.exitCode, 0);
+  const commands = written.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(commands.some((c: Record<string, unknown>) => c.type === "set_auto_retry"), false,
+    "Pi auto-retry must stay enabled; the parent no longer disables it");
+  assert.deepEqual(commands[0], { type: "prompt", message: "Do the work" });
+});
+
+test("concurrent child retry overrides restore the original global setting once", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-retry-guard-"));
+  try {
+    const settingsPath = path.join(tempDir, "settings.json");
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      theme: "custom",
+      retry: { enabled: true, maxRetries: 10, provider: { maxRetries: 0 } },
+    }));
+    const releaseFirst = acquireRetryPersistenceGuard(settingsPath);
+    const releaseSecond = acquireRetryPersistenceGuard(settingsPath);
+
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      theme: "custom",
+      retry: { enabled: false, maxRetries: 10, provider: { maxRetries: 0 } },
+    }));
+    releaseFirst();
+    assert.equal(JSON.parse(fs.readFileSync(settingsPath, "utf8")).retry.enabled, false);
+    releaseSecond();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const restored = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.equal(restored.theme, "custom");
+    assert.deepEqual(restored.retry, {
+      enabled: true,
+      maxRetries: 10,
+      provider: { maxRetries: 0 },
+    });
+    releaseSecond();
+    assert.equal(JSON.parse(fs.readFileSync(settingsPath, "utf8")).retry.enabled, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("teammate leaves transient provider retry inside the child Pi process", async () => {
+  let attempts = 0;
+  const retryDelays: number[] = [];
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    attempts++;
+    const child = createFakeProcess();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => child.emit("error", new Error("fetch failed: ECONNRESET")));
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Let Pi retry in process", context: "fork" },
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess,
+      onRetry(retry) { retryDelays.push(retry.delayMs); },
+      async waitForRetry() { return true; },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(attempts, 1);
+  assert.deepEqual(retryDelays, []);
+  assert.match(result.messages.at(-1)?.content ?? "", /authoritative settlement/);
+});
+
+test("first-activity timeout remains a failure when the terminated child closes cleanly", async () => {
+  let retries = 0;
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() {
+        queueMicrotask(() => child.emit("close", 0, null));
+        return true;
+      },
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Detect a silent child", context: "fork" },
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess,
+      firstActivityTimeoutMs: 5,
+      onRetry() { retries += 1; },
+      async waitForRetry() { return false; },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(retries, 0);
+  assert.ok(result.messages.some((message) => /first child agent event/i.test(message.content)));
+});
+
+test("teammate leaves an exhausted modern candidate once, falls back, and skips its open circuit", async () => {
+  const breaker = new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 });
+  let breakerCharges = 0;
+  const recordRetryableFailure = breaker.recordRetryableFailure.bind(breaker);
+  breaker.recordRetryableFailure = (acquisition) => {
+    breakerCharges += 1;
+    recordRetryableFailure(acquisition);
+  };
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    const model = modelIndex >= 0 ? args[modelIndex + 1] : "unknown";
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      if (model === "provider/primary") {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+        return;
+      }
+      stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fallback recovered" }] } })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+  const params = {
+    agent: "general",
+    task: "Use a healthy model",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork" as const,
+  };
+  const options = {
+    baseCwd: process.cwd(),
+    modelCircuitBreaker: breaker,
+    modelCapabilities: [
+      { id: "provider/primary" },
+      { id: "provider/backup" },
+    ],
+    spawnChildProcess,
+    async waitForRetry() { return true; },
+  };
+
+  const first = await runSingleTeammate(params, options);
+  assert.equal(first.exitCode, 0);
+  assert.deepEqual(first.attemptedModels, ["provider/primary", "provider/backup"]);
+  assert.deepEqual(launchedModels, ["provider/primary", "provider/backup"]);
+  assert.equal(breakerCharges, 1);
+  assert.equal(breaker.snapshot().find((entry) => entry.model === "provider/primary")?.state, "OPEN");
+
+  launchedModels.length = 0;
+  const second = await runSingleTeammate(params, options);
+  assert.equal(second.exitCode, 0);
+  assert.deepEqual(launchedModels, ["provider/backup"]);
+  assert.equal(breakerCharges, 1);
+});
+
+test("quota failures still fallback after replay-neutral session identity IPC", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const model = args[args.indexOf("--model") + 1];
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      child.emit("message", {
+        type: "teammate_session_ready",
+        sessionId: `session-${model}`,
+        sessionFile: `session-${model}.jsonl`,
+      });
+      if (model === "provider/qwen") {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: '429: {"message":"Your token-plan 1-week quota has been exhausted.","type":"insufficient_quota","code":"insufficient_quota"}',
+          },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      } else {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "openai recovered" }] },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      }
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Recover across providers",
+    model: "provider/qwen",
+    fallbackModels: ["provider/openai"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/qwen" }, { id: "provider/openai" }],
+    modelCircuitBreaker: new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 }),
+    spawnChildProcess,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.messages.at(-1)?.content, "openai recovered");
+  assert.deepEqual(result.attemptedModels, ["provider/qwen", "provider/openai"]);
+  assert.deepEqual(launchedModels, ["provider/qwen", "provider/openai"]);
+});
+
+test("billing failures advance to fallback only after authoritative settlement", async () => {
+  const breaker = new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 });
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    const model = args[modelIndex + 1];
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      if (model === "provider/primary") {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "error", errorMessage: "402: Insufficient Balance" },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      } else {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "fallback recovered" }] },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      }
+    });
+    return child;
+  });
+
+  const options = {
+    baseCwd: process.cwd(),
+    modelCircuitBreaker: breaker,
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+  };
+  const params = {
+    agent: "general",
+    task: "Use a funded model",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork" as const,
+  };
+
+  const result = await runSingleTeammate(params, options);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.messages.at(-1)?.content, "fallback recovered");
+  assert.deepEqual(result.attemptedModels, ["provider/primary", "provider/backup"]);
+  assert.deepEqual(launchedModels, ["provider/primary", "provider/backup"]);
+  assert.equal(breaker.snapshot().find((entry) => entry.model === "provider/primary")?.state, "OPEN");
+
+  launchedModels.length = 0;
+  const second = await runSingleTeammate(params, options);
+  assert.equal(second.exitCode, 0);
+  assert.deepEqual(launchedModels, ["provider/backup"]);
+});
+
+test("upstream model_not_found advances to a configured candidate and opens only that model circuit", async () => {
+  const breaker = new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 });
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    const model = args[modelIndex + 1];
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      if (model === "provider/retired") {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: 'OpenAI API error (404): {"message":"Model \\"retired\\" is not supported by any configured account in this group","type":"model_not_found"}',
+          },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      } else {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "supported model recovered" }] },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      }
+    });
+    return child;
+  });
+
+  const params = {
+    agent: "general",
+    task: "Use an upstream-supported model",
+    model: "provider/retired",
+    fallbackModels: ["provider/supported"],
+    context: "fork" as const,
+  };
+  const options = {
+    baseCwd: process.cwd(),
+    modelCircuitBreaker: breaker,
+    modelCapabilities: [{ id: "provider/retired" }, { id: "provider/supported" }],
+    spawnChildProcess,
+  };
+
+  const first = await runSingleTeammate(params, options);
+  assert.equal(first.exitCode, 0);
+  assert.equal(first.messages.at(-1)?.content, "supported model recovered");
+  assert.deepEqual(first.attemptedModels, ["provider/retired", "provider/supported"]);
+  assert.deepEqual(launchedModels, ["provider/retired", "provider/supported"]);
+  assert.equal(breaker.snapshot().find((entry) => entry.model === "provider/retired")?.state, "OPEN");
+  assert.equal(breaker.snapshot().find((entry) => entry.model === "provider/supported")?.state, "CLOSED");
+
+  launchedModels.length = 0;
+  const second = await runSingleTeammate(params, options);
+  assert.equal(second.exitCode, 0);
+  assert.deepEqual(launchedModels, ["provider/supported"]);
+});
+
+test("authoritative candidate failure stays buffered until fallback completes", async () => {
+  const launchedModels: string[] = [];
+  const completions: SingleResult[] = [];
+  const controller = new AbortController();
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    const model = args[modelIndex + 1];
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      if (model === "provider/primary") {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "error", errorMessage: "402: Insufficient Balance" },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      } else {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "fallback recovered" }] },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      }
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    {
+      agent: "general",
+      task: "Use a funded model",
+      model: "provider/primary",
+      fallbackModels: ["provider/backup"],
+      context: "fork",
+    },
+    {
+      baseCwd: process.cwd(),
+      modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+      spawnChildProcess,
+      signal: controller.signal,
+      onTurnComplete(result) {
+        completions.push(result);
+        if (result.exitCode !== 0) controller.abort();
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(launchedModels, ["provider/primary", "provider/backup"]);
+  assert.deepEqual(result.attemptedModels, ["provider/primary", "provider/backup"]);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].exitCode, 0);
+  assert.equal(controller.signal.aborted, false);
+});
+
+test("permanent provider failures override overlapping billing fallback markers", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    launchedModels.push(args[modelIndex + 1]);
+    const child = createFakeProcess();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => child.emit(
+      "error",
+      new Error("402 Unauthorized: invalid API key; Insufficient Balance"),
+    ));
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Do not reroute permanent failures",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+    async waitForRetry() { return true; },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.equal(result.attemptedModels, undefined);
+});
+
+test("provider-qualified default resolution skips the same implicit candidate when model ids are ambiguous and contain slashes", async () => {
+  const breaker = new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 });
+  const acquiredModels: string[] = [];
+  const chargedModels: string[] = [];
+  const acquireCandidate = breaker.acquireCandidate.bind(breaker);
+  const recordRetryableFailure = breaker.recordRetryableFailure.bind(breaker);
+  breaker.acquireCandidate = (model) => {
+    acquiredModels.push(model);
+    return acquireCandidate(model);
+  };
+  breaker.recordRetryableFailure = (acquisition) => {
+    chargedModels.push(acquisition.model);
+    recordRetryableFailure(acquisition);
+  };
+
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    const model = modelIndex >= 0 ? args[modelIndex + 1] : "provider-a/org/model-x";
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      if (model === "provider-a/org/model-x") {
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            provider: "provider-a",
+            model: "org/model-x",
+            stopReason: "error",
+            errorMessage: "Provider returned error: 503 unavailable",
+          },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+        return;
+      }
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          provider: "provider-b",
+          model: "org/model-x",
+          content: [{ type: "text", text: "second provider recovered" }],
+        },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Skip only the provider-qualified default duplicate",
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider-a/org/model-x" }, { id: "provider-b/org/model-x" }],
+    modelCircuitBreaker: breaker,
+    spawnChildProcess,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.messages.at(-1)?.content, "second provider recovered");
+  assert.deepEqual(launchedModels, ["provider-a/org/model-x", "provider-b/org/model-x"]);
+  assert.deepEqual(result.attemptedModels, ["provider-a/org/model-x", "provider-b/org/model-x"]);
+  assert.deepEqual(acquiredModels, ["provider-b/org/model-x"]);
+  assert.deepEqual(chargedModels, []);
+  assert.equal(breaker.snapshot().some((entry) => entry.model === "provider-a/org/model-x"), false);
+});
+
+test("resolved model aliases are deduplicated before fallback and breaker accounting", async () => {
+  let attempts = 0;
+  const breaker = new ModelCircuitBreaker({ threshold: 2 });
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    attempts += 1;
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    });
+    return child;
+  });
+
+  await runSingleTeammate({
+    agent: "general",
+    task: "Deduplicate aliases",
+    model: "provider",
+    fallbackModels: ["provider/model"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/model" }],
+    modelCircuitBreaker: breaker,
+    spawnChildProcess,
+    async waitForRetry() { return true; },
+  });
+
+  assert.equal(attempts, 1);
+  assert.deepEqual(breaker.snapshot().find((entry) => entry.model === "provider/model"), {
+    model: "provider/model",
+    state: "CLOSED",
+    consecutiveFailures: 1,
+    halfOpenTrialInProgress: false,
+  });
+});
+
+test("teammate does not multiply Pi provider retries with process restarts", async () => {
+  let attempts = 0;
+  const retries: number[] = [];
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    attempts++;
+    const child = createFakeProcess();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => child.emit("error", new Error("fetch failed: ECONNRESET")));
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Do not multiply retries", context: "fork" },
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess,
+      onRetry(retry) { retries.push(retry.attempt); },
+      async waitForRetry() { return true; },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(attempts, 1);
+  assert.deepEqual(retries, []);
+});
+
+test("fallback candidates each receive one process attempt after authoritative failure", async () => {
+  const launchedModels: string[] = [];
+  const retries: number[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    launchedModels.push(args[modelIndex + 1]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Try bounded fallbacks",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+    onRetry(retry) { retries.push(retry.attempt); },
+    async waitForRetry() { return true; },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(retries, []);
+  assert.deepEqual(launchedModels, ["provider/primary", "provider/backup"]);
+  assert.deepEqual(result.attemptedModels, ["provider/primary", "provider/backup"]);
+});
+
+test("completed tools fence fresh cross-model fallback", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const modelIndex = args.indexOf("--model");
+    launchedModels.push(args[modelIndex + 1]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "write", isError: false })}\n`);
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Do not repeat side effects",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.toolCount, 1);
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.match(result.messages.at(-1)?.content ?? "", /side-effect replay fence/);
+  assert.match(result.messages.at(-1)?.content ?? "", /completedTools=1/);
+});
+
+test("in-flight tool effects fence fresh cross-model fallback", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    launchedModels.push(args[args.indexOf("--model") + 1]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolName: "write" })}\n`);
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general", task: "Fence unknown effects", model: "provider/primary",
+    fallbackModels: ["provider/backup"], context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+  });
+
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.match(result.messages.at(-1)?.content ?? "", /inFlightTools=1/);
+  assert.match(result.messages.at(-1)?.content ?? "", /effect is unknown/);
+});
+
+test("legacy child failure reports degraded capability and does not fresh-replay fallback", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    launchedModels.push(args[args.indexOf("--model") + 1]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage: "402: Insufficient Balance" },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general", task: "Fence legacy replay", model: "provider/primary",
+    fallbackModels: ["provider/backup"], context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+  });
+
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.match(result.messages.at(-1)?.content ?? "", /settlementAuthority=inferred/);
+  assert.match(result.messages.at(-1)?.content ?? "", /degraded recovery capability/);
+});
+
+test("silent pre-activity abnormal close advances to a configured fallback", async () => {
+  const launchedModels: string[] = [];
+  const releasedModels: string[] = [];
+  const chargedModels: string[] = [];
+  const breaker = new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 });
+  const releaseCandidate = breaker.releaseCandidate.bind(breaker);
+  const recordRetryableFailure = breaker.recordRetryableFailure.bind(breaker);
+  breaker.releaseCandidate = (acquisition) => {
+    releasedModels.push(acquisition.model);
+    releaseCandidate(acquisition);
+  };
+  breaker.recordRetryableFailure = (acquisition) => {
+    chargedModels.push(acquisition.model);
+    recordRetryableFailure(acquisition);
+  };
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    const model = args[args.indexOf("--model") + 1];
+    launchedModels.push(model);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      if (model === "provider/primary") {
+        child.emit("close", 1, null);
+        return;
+      }
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "fallback recovered" }] },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Recover a child that exited before startup",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    modelCircuitBreaker: breaker,
+    spawnChildProcess,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.messages.at(-1)?.content, "fallback recovered");
+  assert.deepEqual(launchedModels, ["provider/primary", "provider/backup"]);
+  assert.deepEqual(result.attemptedModels, ["provider/primary", "provider/backup"]);
+  assert.deepEqual(releasedModels, ["provider/primary"]);
+  assert.deepEqual(chargedModels, []);
+});
+
+test("stderr-bearing pre-activity failure does not replay a fallback", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    launchedModels.push(args[args.indexOf("--model") + 1]);
+    const child = createFakeProcess();
+    const stderr = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr, connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stderr.write("failed to load child extension");
+      child.emit("close", 1, null);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Do not hide a deterministic startup error",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.match(result.messages.map((message) => message.content).join("\n"), /failed to load child extension/);
+});
+
+test("non-JSON stdout startup diagnostics do not replay a fallback", async () => {
+  const launchedModels: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    launchedModels.push(args[args.indexOf("--model") + 1]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write("failed to initialize child runtime\n");
+      child.emit("close", 1, null);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Preserve stdout startup diagnostics",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.match(result.messages.map((message) => message.content).join("\n"), /stdout JSONL protocol violation[\s\S]*malformed JSON, receivedBytes=34/);
+});
+
+test("whitespace stdout and signal termination do not qualify as silent nonzero exits", async () => {
+  for (const scenario of ["whitespace", "signal"] as const) {
+    const launchedModels: string[] = [];
+    const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+      launchedModels.push(args[args.indexOf("--model") + 1]);
+      const child = createFakeProcess();
+      const stdout = new PassThrough();
+      Object.assign(child, {
+        stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+        exitCode: null, signalCode: null, pid: undefined,
+        kill() { return reclaimFakeProcess(child); },
+      });
+      queueMicrotask(() => {
+        if (scenario === "whitespace") {
+          stdout.write("\n");
+          child.emit("close", 1, null);
+        } else {
+          child.emit("close", null, "SIGTERM");
+        }
+      });
+      return child;
+    });
+
+    const result = await runSingleTeammate({
+      agent: "general",
+      task: `Fence ${scenario} startup exit`,
+      model: "provider/primary",
+      fallbackModels: ["provider/backup"],
+      context: "fork",
+    }, {
+      baseCwd: process.cwd(),
+      modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+      modelCircuitBreaker: new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 }),
+      spawnChildProcess,
+    });
+
+    assert.equal(result.exitCode, 1, scenario);
+    assert.deepEqual(launchedModels, ["provider/primary"], scenario);
+  }
+});
+
+test("child IPC activity fences a silent abnormal close from fallback replay", async () => {
+  const launchedModels: string[] = [];
+  let childRequests = 0;
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    launchedModels.push(args[args.indexOf("--model") + 1]);
+    const child = createFakeProcess();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      child.emit("message", {
+        type: "teammate_proxy_request",
+        requestId: "already-dispatched",
+        tool: "teammate",
+        params: {},
+      });
+      child.emit("close", 1, null);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Do not replay dispatched child work",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    spawnChildProcess,
+    onChildRequest() { childRequests += 1; },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(childRequests, 1);
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+});
+
+test("authoritative settlement cannot bypass child IPC replay risk", async () => {
+  const launchedModels: string[] = [];
+  let childRequests = 0;
+  const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+    launchedModels.push(args[args.indexOf("--model") + 1]);
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      child.emit("message", {
+        type: "teammate_proxy_request",
+        requestId: "already-dispatched-authoritative",
+        tool: "teammate",
+        params: {},
+      });
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "Do not replay dispatched child work after settlement",
+    model: "provider/primary",
+    fallbackModels: ["provider/backup"],
+    context: "fork",
+  }, {
+    baseCwd: process.cwd(),
+    modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+    modelCircuitBreaker: new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 }),
+    spawnChildProcess,
+    onChildRequest() { childRequests += 1; },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(childRequests, 1);
+  assert.deepEqual(launchedModels, ["provider/primary"]);
+  assert.match(result.messages.at(-1)?.content ?? "", /externalReplayRisk=true/);
+});
+
+test("runtime diagnostic channels fence authoritative fallback replay", async () => {
+  for (const diagnosticChannel of ["stdout", "stderr"] as const) {
+    const launchedModels: string[] = [];
+    const spawnChildProcess = adaptFakeSpawn((_command, args) => {
+      launchedModels.push(args[args.indexOf("--model") + 1]);
+      const child = createFakeProcess();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, {
+        stdin: new PassThrough(), stdout, stderr, connected: false,
+        exitCode: null, signalCode: null, pid: undefined,
+        kill() { return reclaimFakeProcess(child); },
+      });
+      queueMicrotask(() => {
+        if (diagnosticChannel === "stdout") stdout.write("runtime diagnostic before settlement\n");
+        else stderr.write("runtime diagnostic before settlement\n");
+        stdout.write(`${JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "error", errorMessage: "Provider returned error: 503 unavailable" },
+        })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_end", willRetry: false })}\n`);
+        stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      });
+      return child;
+    });
+
+    const result = await runSingleTeammate({
+      agent: "general",
+      task: `Preserve ${diagnosticChannel} replay risk`,
+      model: "provider/primary",
+      fallbackModels: ["provider/backup"],
+      context: "fork",
+    }, {
+      baseCwd: process.cwd(),
+      modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+      modelCircuitBreaker: new ModelCircuitBreaker({ threshold: 1, cooldownMs: 60_000 }),
+      spawnChildProcess,
+    });
+
+    assert.equal(result.exitCode, 1, diagnosticChannel);
+    assert.deepEqual(launchedModels, ["provider/primary"], diagnosticChannel);
+    if (diagnosticChannel === "stdout") {
+      assert.match(result.messages.map((message) => message.content).join("\n"), /stdout JSONL protocol violation[\s\S]*malformed JSON/);
+      assert.match(result.messages.at(-1)?.content ?? "", /settlementAuthority=unknown/, diagnosticChannel);
+    } else {
+      assert.match(result.messages.at(-1)?.content ?? "", /externalReplayRisk=true/, diagnosticChannel);
+    }
+  }
+});
+
+test("abnormal child exit cannot fresh-replay fallback without authoritative settlement", async () => {
+  let attempts = 0;
+  const retryErrors: string[] = [];
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    attempts += 1;
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return reclaimFakeProcess(child); },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({ type: "error", errorMessage: "Error: Connection error." })}\n`);
+      child.emit("close", 1, null);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    {
+      agent: "general",
+      task: "Fence unknown child exit",
+      model: "provider/primary",
+      fallbackModels: ["provider/backup"],
+      context: "fork",
+    },
+    {
+      baseCwd: process.cwd(),
+      modelCapabilities: [{ id: "provider/primary" }, { id: "provider/backup" }],
+      spawnChildProcess,
+      onRetry(retry) { retryErrors.push(retry.error); },
+    },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(attempts, 1);
+  assert.deepEqual(retryErrors, []);
+  assert.match(result.messages.at(-1)?.content ?? "", /authoritative settlement/);
+  assert.ok(result.recoveryFailureChain?.decisions.some((decision) =>
+    decision.code === "settlement-authority-insufficient"));
+});
+
+test("fresh agents publish follow-up turns while fork agents terminate after their first result", async () => {
+  const completions: string[] = [];
+  const progressUsage: Array<[number | undefined, number | undefined]> = [];
+  let freshStdout: PassThrough | undefined;
+  let freshKilled = false;
+  const spawnFresh = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const stdin = new PassThrough();
+    const childStdout = new PassThrough();
+    freshStdout = childStdout;
+    const stderr = new PassThrough();
+    Object.assign(child, {
+      stdin,
+      stdout: childStdout,
+      stderr,
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { freshKilled = true; return true; },
+    });
+    setTimeout(() => {
+      childStdout.write(`${JSON.stringify({ type: "message_end", message: { role: "user", content: "original prompt" } })}\n`);
+      childStdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "first answer" }],
+          model: "maestro-qwen/qwen3.8-max",
+          usage: { input: 12, output: 4, cacheRead: 2, cacheWrite: 1, cost: { total: 0.01 } },
+        },
+      })}\n`);
+      childStdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const first = await runSingleTeammate(
+    { agent: "general", task: "original prompt", context: "fresh", timeoutMs: 2_000 },
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess: spawnFresh,
+      onProgress(progress) {
+        progressUsage.push([progress.inputTokens, progress.outputTokens]);
+      },
+      onTurnComplete(result) {
+        completions.push(result.messages.at(-1)?.content ?? "");
+      },
+    },
+  );
+  assert.deepEqual(first.messages.map((message) => message.content), ["first answer"]);
+  assert.equal(first.model, "maestro-qwen/qwen3.8-max");
+  assert.equal(first.usage.inputTokens, 12);
+  assert.equal(first.usage.outputTokens, 4);
+  assert.equal(first.wakeable, true);
+  assert.equal(freshKilled, false);
+
+  if (!freshStdout) throw new Error("fresh fake stdout was not initialized");
+  freshStdout.write(`${JSON.stringify({ type: "turn_start" })}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(progressUsage.at(-1), [12, 4]);
+  freshStdout.write(`${JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "follow-up answer" }],
+      usage: { input: 6, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.005 } },
+    },
+  })}\n`);
+  freshStdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(completions, ["first answer", "follow-up answer"]);
+  assert.deepEqual(progressUsage.at(-1), [18, 7]);
+
+  let forkKilled = false;
+  const spawnFork = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() {
+        forkKilled = true;
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
+        return true;
+      },
+    });
+    setTimeout(() => {
+      stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fork answer" }] } })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    }, 0);
+    return child;
+  });
+  const fork = await runSingleTeammate(
+    { agent: "general", task: "fork once", context: "fork", timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess: spawnFork },
+  );
+  assert.equal(fork.wakeable, false);
+  assert.equal(forkKilled, true);
+});
+
+test("recursive abort follows descendants without expanding through controller identity", () => {
+  const root = activeAgent();
+  root.correlationId = "root";
+  const child = activeAgent();
+  child.correlationId = "child";
+  child.spawnedBy = "root";
+  const shared = activeAgent();
+  shared.correlationId = "shared";
+  shared.abortController = child.abortController;
+  const grandchild = activeAgent();
+  grandchild.correlationId = "grandchild";
+  grandchild.spawnedBy = "child";
+  const unrelated = activeAgent();
+  unrelated.correlationId = "unrelated";
+  const state = teammateState([root, child, shared, grandchild, unrelated]);
+  state.namedAgents.set("child-name", "child");
+
+  const terminated = new Set(killAgentTree(state, "root"));
+  assert.deepEqual(terminated, new Set(["root", "child", "grandchild"]));
+  assert.equal(root.abortController.signal.aborted, true);
+  assert.equal(child.abortController.signal.aborted, true);
+  assert.equal(grandchild.abortController.signal.aborted, true);
+  assert.equal(state.activeRuns.has("shared"), true);
+  assert.equal(state.activeRuns.has("unrelated"), true);
+  assert.equal(state.namedAgents.has("child-name"), false);
+});
+
+test("structured_output waits for outer settlement and absorbs late child events", async () => {
+  const payload = {
+    path: ["runtime"],
+    findings: ["settled"],
+    evidence: [{ ref: "src/runtime.ts:1", claim: "tool completed" }],
+    candidate: { summary: "done", details: "done", actions: ["ship"], risks: [] },
+    selfScore: 0.9,
+    confidence: 0.9,
+  };
+  const schema = {
+    type: "object",
+    required: ["path", "findings", "evidence", "candidate", "selfScore", "confidence"],
+    properties: {
+      path: { type: "array", items: { type: "string" } },
+      findings: { type: "array", items: { type: "string" } },
+      evidence: { type: "array" },
+      candidate: { type: "object" },
+      selfScore: { type: "number" },
+      confidence: { type: "number" },
+    },
+  };
+  const progress: AgentProgress[] = [];
+  let killed = false;
+  let completionObserverCalled = false;
+  let childStdout: PassThrough | undefined;
+  let submissionCompleted!: () => void;
+  const submissionReady = new Promise<void>((resolve) => { submissionCompleted = resolve; });
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(child, {
+      stdin,
+      stdout,
+      stderr,
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() {
+        killed = true;
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
+        return true;
+      },
+    });
+    childStdout = stdout;
+    setTimeout(() => {
+      stdout.write(`${JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "toolCall", name: "structured_output", arguments: payload }] },
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolName: "structured_output" })}\n`);
+      stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "structured_output", isError: false })}\n`);
+      submissionCompleted();
+    }, 0);
+    return child;
+  });
+
+  const abortController = new AbortController();
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const pending = runSingleTeammate(
+    { agent: "general", task: "Return structured output", context: "fork", outputSchema: schema, timeoutMs: 2_000 },
+    {
+      baseCwd: process.cwd(),
+      spawnChildProcess,
+      childPiVersion: "0.99.0",
+      signal: abortController.signal,
+      onProgress: (entry) => progress.push({ ...entry, recentTools: [...entry.recentTools] }),
+      onTurnComplete() {
+        completionObserverCalled = true;
+        throw new Error("observer failed after publication");
+      },
+    },
+  );
+  const result = await Promise.race([
+    (async () => {
+      await submissionReady;
+      assert.equal(completionObserverCalled, false, "tool completion is not outer settlement");
+      assert.equal(killed, false, "completed submissions must not reclaim an active session");
+      assert.equal(progress.some((entry) => entry.resultReadyAt !== undefined), false);
+      // Native children cannot fall back to legacy agent_end, even without
+      // willRetry. Only their authoritative idle boundary may settle the task.
+      childStdout!.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      assert.equal(completionObserverCalled, false);
+      assert.equal(killed, false);
+      childStdout!.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      // These lines model stdout already buffered when settlement terminates
+      // the child. None may restart progress or alter the published result.
+      childStdout!.write(`${JSON.stringify({ type: "tool_result", toolName: "structured_output", content: "Structured output saved." })}\n`);
+      childStdout!.write(`${JSON.stringify({ type: "turn_start" })}\n`);
+      childStdout!.write(`${JSON.stringify({ type: "message_end", content: "late assistant wake" })}\n`);
+      childStdout!.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+      return await pending;
+    })(),
+    new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error("settlement timed out")), 500); }),
+  ]).finally(() => {
+    clearTimeout(deadline);
+    abortController.abort();
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.structuredOutput, payload);
+  assert.ok(
+    progress.some((entry) => entry.resultReadyAt !== undefined),
+    "schema-valid structured_output publishes the result-ready boundary",
+  );
+  assert.equal(progress.at(-1)?.status, "completed");
+  const completedIndex = progress.findIndex((entry) => entry.status === "completed");
+  assert.ok(completedIndex >= 0);
+  assert.equal(progress.slice(completedIndex + 1).length, 0, "terminal progress must be absorbing");
+  assert.equal(result.messages.some((message) => /late assistant wake|Structured output saved/.test(message.content)), false);
+  assert.equal(completionObserverCalled, true);
+  assert.equal(killed, true, "settled child must be reclaimed after final structured output");
+});
+
+test("structured_output arguments are rejected when tool execution fails", async () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["answer"],
+    properties: { answer: { type: "string" } },
+  };
+  const spawnChildProcess = adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(), connected: false,
+      exitCode: null, signalCode: null, pid: undefined,
+      kill() { return true; },
+    });
+    queueMicrotask(() => {
+      stdout.write(`${JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{
+            type: "toolCall",
+            id: "structured-call",
+            name: "structured_output",
+            arguments: { answer: "not persisted" },
+          }],
+        },
+      })}\n`);
+      stdout.write(`${JSON.stringify({
+        type: "tool_execution_end",
+        toolName: "structured_output",
+        toolCallId: "structured-call",
+        isError: true,
+      })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    });
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.structuredOutput, undefined);
+  assert.match(result.messages.at(-1)?.content ?? "", /schema-valid value/);
+});
+
+test("parent rejects a schema-invalid structured output file", async () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["ok"],
+    properties: { ok: { type: "boolean" } },
+  };
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(child, {
+      stdin,
+      stdout,
+      stderr,
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    const outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (typeof outputFile !== "string") {
+      throw new Error("structured output path was not provided to the fake child");
+    }
+    setTimeout(() => {
+      fs.writeFileSync(outputFile, JSON.stringify({ ok: "not-a-boolean" }));
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.structuredOutput, undefined);
+  assert.ok(
+    result.messages.some((message) => /structured_output validation failed at \/ok/.test(message.content)),
+    result.messages.map((message) => message.content).join(" | "),
+  );
+  assert.match(result.messages.at(-1)?.content ?? "", /schema-valid value/);
+});
+
+test("parent rejects an oversized structured output file before reading and cleans it up", async () => {
+  const schema = {
+    type: "object",
+    required: ["ok"],
+    properties: { ok: { type: "boolean" } },
+  };
+  let outputFile: string | undefined;
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(),
+      connected: false, exitCode: null, signalCode: null, pid: undefined,
+      kill() { return true; },
+    });
+    outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (!outputFile) throw new Error("structured output path was not provided");
+    const target = outputFile;
+    setTimeout(() => {
+      // A valid tool event must not mask an oversized persisted output.
+      stdout.write(`${JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "toolCall", name: "structured_output", arguments: { ok: true } }] },
+      })}\n`);
+      // A sparse file exercises the stat guard without allocating the payload.
+      const fd = fs.openSync(target, "w");
+      try { fs.ftruncateSync(fd, 64 * 1024 * 1024); } finally { fs.closeSync(fd); }
+      stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "structured_output", isError: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.structuredOutput, undefined);
+  assert.ok(
+    result.messages.some((message) => /structured_output validation failed: output file exceeds 1048576-byte limit/.test(message.content)),
+    result.messages.map((message) => message.content).join(" | "),
+  );
+  assert.match(result.messages.at(-1)?.content ?? "", /schema-valid value/);
+  assert.ok(outputFile);
+  assert.equal(fs.existsSync(outputFile), false);
+});
+
+test("structured output above 256 KiB survives echoed JSONL arguments and result", async () => {
+  const schema = { type: "object", required: ["value"], properties: { value: { type: "string" } } };
+  const payload = { value: "x".repeat(300_000) };
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(),
+      connected: false, exitCode: null, signalCode: null, pid: undefined,
+      kill() { return true; },
+    });
+    const outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (!outputFile) throw new Error("structured output path was not provided");
+    setTimeout(() => {
+      fs.writeFileSync(outputFile, JSON.stringify(payload));
+      stdout.write(`${JSON.stringify({ type: "assistant", message: { content: [
+        { type: "toolCall", name: "structured_output", arguments: payload },
+      ] } })}\n`);
+      stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "structured_output", isError: false,
+        result: { details: payload } })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.structuredOutput, payload);
+  assert.equal(result.messages.some((message) => message.content.includes('"details":{"value"')), false);
+});
+
+test("structured output with malformed stdout cannot settle successfully at agent_settled", async () => {
+  const schema = { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } };
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(), stdout, stderr: new PassThrough(),
+      connected: false, exitCode: null, signalCode: null, pid: undefined,
+      kill() {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
+        return true;
+      },
+    });
+    const outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (!outputFile) throw new Error("structured output path was not provided");
+    setTimeout(() => {
+      fs.writeFileSync(outputFile, JSON.stringify({ ok: true }));
+      stdout.write("malformed stdout\n");
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.terminalStatus, "failed");
+  assert.ok(result.messages.some((message) => /stdout JSONL protocol violation/.test(message.content)));
+});
+
+test("parent accepts a schema-valid structured output file without an event payload", async () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["ok"],
+    properties: { ok: { type: "boolean" } },
+  };
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    const outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (typeof outputFile !== "string") throw new Error("structured output path was not provided");
+    setTimeout(() => {
+      fs.writeFileSync(outputFile, JSON.stringify({ ok: true }));
+      stdout.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.structuredOutput, { ok: true });
+  assert.equal(result.messages.some((message) => /validation failed/.test(message.content)), false);
+});
+
+test("a valid persisted output wins when the event payload is schema-invalid", async () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["ok"],
+    properties: { ok: { type: "boolean" } },
+  };
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    const outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (typeof outputFile !== "string") throw new Error("structured output path was not provided");
+    setTimeout(() => {
+      stdout.write(`${JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "toolCall", name: "structured_output", arguments: { ok: "invalid" } }] },
+      })}\n`);
+      fs.writeFileSync(outputFile, JSON.stringify({ ok: true }));
+      stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "structured_output", isError: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.structuredOutput, { ok: true });
+  assert.equal(result.messages.some((message) => /validation failed/.test(message.content)), false);
+});
+
+test("a valid event payload wins when the persisted output is schema-invalid", async () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["ok"],
+    properties: { ok: { type: "boolean" } },
+  };
+  const spawnChildProcess = adaptFakeSpawn((_command, _args, options) => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() { return true; },
+    });
+    const outputFile = options.env?.PI_TEAMMATE_STRUCTURED_OUTPUT_PATH;
+    if (typeof outputFile !== "string") throw new Error("structured output path was not provided");
+    setTimeout(() => {
+      stdout.write(`${JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "toolCall", name: "structured_output", arguments: { ok: true } }] },
+      })}\n`);
+      fs.writeFileSync(outputFile, JSON.stringify({ ok: "invalid" }));
+      stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "structured_output", isError: false })}\n`);
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+    }, 0);
+    return child;
+  });
+
+  const result = await runSingleTeammate(
+    { agent: "general", task: "Return structured output", outputSchema: schema, timeoutMs: 2_000 },
+    { baseCwd: process.cwd(), spawnChildProcess },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.structuredOutput, { ok: true });
+  assert.equal(result.messages.some((message) => /validation failed/.test(message.content)), false);
+});
+
+// --- Lane safety-net regressions: a lane must never wedge the caller forever ---
+
+function spawnScriptedChild(
+  script: (stdout: PassThrough) => void,
+  onKill?: () => void,
+): SpawnChildProcess {
+  return adaptFakeSpawn(() => {
+    const child = createFakeProcess();
+    const stdout = new PassThrough();
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout,
+      stderr: new PassThrough(),
+      connected: false,
+      exitCode: null,
+      signalCode: null,
+      pid: undefined,
+      kill() {
+        onKill?.();
+        setImmediate(() => child.emit("close", null, "SIGTERM"));
+        return true;
+      },
+    });
+    queueMicrotask(() => script(stdout));
+    return child;
+  });
+}
+
+test("outputSchema lane settles with its published result when agent_end never arrives", async () => {
+  let killed = 0;
+  const spawnChildProcess = spawnScriptedChild(
+    (stdout) => {
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ready answer" }] },
+      })}\n`);
+      stdout.write(`${JSON.stringify({
+        type: "turn_end",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ready answer" }] },
+        toolResults: [],
+      })}\n`);
+    },
+    () => { killed++; },
+  );
+
+  const progress: AgentProgress[] = [];
+  const result = await Promise.race([
+    runSingleTeammate(
+      {
+        agent: "general",
+        task: "Return structured output",
+        context: "fresh",
+        outputSchema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      },
+      { baseCwd: process.cwd(), spawnChildProcess, resultReadyGraceMs: 40, structuredOutputRecoveryTimeoutMs: 100,
+        onProgress: (entry) => progress.push({ ...entry, recentTools: [...entry.recentTools] }),
+      },
+    ),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("outputSchema lane blocked past its grace period")), 1_000)),
+  ]);
+
+  assert.equal(
+    progress.some((entry) => entry.resultReadyAt !== undefined),
+    false,
+    "a prose-only schema turn must stay hidden from result-ready observers",
+  );
+  assert.equal(result.lifecyclePending ?? false, false, "grace settlement must not leave the lane lifecycle-pending");
+  assert.equal(result.exitCode, 1, "missing schema-valid structured_output settles as failed");
+  assert.ok(result.messages.some((m) => m.content.includes("ready answer")), "published transcript is preserved");
+  assert.ok(result.messages.some((m) => m.role === "system" && m.content.includes("structured_output")), "schema miss is noted");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(killed, 1, "child is terminated after grace settlement");
+});
+
+test("foreground wait settings never terminate a running child process", async () => {
+  let killed = 0;
+  let stdoutRef: PassThrough | undefined;
+  const spawnChildProcess = spawnScriptedChild(
+    (stdout) => {
+      stdoutRef = stdout;
+      stdout.write(`${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "still working" }] },
+      })}\n`);
+    },
+    () => { killed++; },
+  );
+
+  const pending = runSingleTeammate(
+    { agent: "general", task: "Long review", context: "fresh", timeoutMs: 40 },
+    { baseCwd: process.cwd(), spawnChildProcess, foregroundMaxRunMs: 40 },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(killed, 0, "foreground wait expiry must not terminate the child");
+
+  if (!stdoutRef) throw new Error("fake stdout was not initialized");
+  stdoutRef.write(`${JSON.stringify({ type: "agent_end" })}\n`);
+  const result = await pending;
+  assert.equal(result.exitCode, 0);
+  assert.ok(result.messages.some((message) => message.content.includes("still working")));
+});

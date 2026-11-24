@@ -1,0 +1,562 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type * as net from "node:net";
+import test from "node:test";
+import type { RemoteDriver, RemoteDriverContext, RemoteRunHandle } from "../src/remote/driver.ts";
+import {
+  createWorkspacePeerIdentity,
+  defaultWorkspacePeerRoot,
+  publishWorkspaceOwner,
+} from "../src/sessions/workspace-peer-core.ts";
+import {
+  REMOTE_MAX_LINE_BYTES,
+  createRemoteRequest,
+  encodeRemoteEnvelope,
+  parseRemoteEnvelopeLine,
+  type RemoteJsonRpcEnvelope,
+  type RemoteInitializeResult,
+  type RemoteRunCancelParams,
+  type RemoteRunInputParams,
+  type RemoteRunStartParams,
+} from "../src/remote/protocol.ts";
+import { connectRemoteSocket, RemoteBridgeServer } from "../src/remote/server.ts";
+import { createRemoteRunSnapshot } from "../src/remote/state.ts";
+import {
+  REMOTE_PROTOCOL_VERSION,
+  REMOTE_WINDOW_BRIDGE_PLUGIN_ID,
+  type RemoteRunCapture,
+  type RemoteRunEvent,
+  type ResolvedRemoteTarget,
+  type ResolvedRemoteWorkspace,
+} from "../src/remote/types.ts";
+
+const HOST_KEY = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+function target(): ResolvedRemoteTarget {
+  return {
+    id: "linux-a/pi",
+    host: "linux-a",
+    cwd: "/srv/project",
+    driver: "pi-rpc",
+    command: ["/usr/bin/pi", "--mode", "rpc"],
+    hostConfig: {
+      host: "linux-a.example",
+      user: "dev",
+      port: 22,
+      hostKeySha256: HOST_KEY,
+    },
+  };
+}
+
+class EventFeed implements AsyncIterable<RemoteRunEvent> {
+  readonly #values: RemoteRunEvent[] = [];
+  readonly #waiters: Array<(value: IteratorResult<RemoteRunEvent>) => void> = [];
+  #closed = false;
+
+  push(event: RemoteRunEvent): void {
+    const waiter = this.#waiters.shift();
+    if (waiter) waiter({ value: event, done: false });
+    else this.#values.push(event);
+  }
+
+  close(): void {
+    this.#closed = true;
+    for (const waiter of this.#waiters.splice(0)) waiter({ value: undefined, done: true });
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<RemoteRunEvent> {
+    return {
+      next: () => {
+        const value = this.#values.shift();
+        if (value) return Promise.resolve({ value, done: false });
+        if (this.#closed) return Promise.resolve({ value: undefined, done: true });
+        return new Promise((resolve) => this.#waiters.push(resolve));
+      },
+    };
+  }
+}
+
+class TestHandle implements RemoteRunHandle {
+  readonly feed = new EventFeed();
+  readonly capture;
+  cancelled = false;
+
+  constructor(request: RemoteRunStartParams, context: RemoteDriverContext) {
+    this.capture = {
+      workerId: context.workerId,
+      instanceNonce: context.instanceNonce,
+      runId: `run-${request.commandId}`,
+      generation: 1,
+      monitorOwnerNonce: request.monitorOwnerNonce,
+      targetId: request.targetId,
+    };
+  }
+
+  snapshot() {
+    return createRemoteRunSnapshot(this.capture, this.cancelled ? "cancelled" : "running");
+  }
+
+  events(): AsyncIterable<RemoteRunEvent> {
+    return this.feed;
+  }
+
+  async input(request: RemoteRunInputParams) {
+    if (this.cancelled) throw new Error("Input rejected after cancellation started");
+    return {
+      accepted: true,
+      effectiveMode: request.mode,
+      receipt: request.mode === "steer" ? "injected" as const : "queued" as const,
+    };
+  }
+
+  async cancel(_request: RemoteRunCancelParams) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    this.cancelled = true;
+    return { accepted: true, status: "cancelled" as const };
+  }
+
+  async close(): Promise<void> {
+    this.feed.close();
+  }
+}
+
+class TestDriver implements RemoteDriver {
+  readonly id = "pi-rpc" as const;
+  readonly handles: TestHandle[] = [];
+  failure?: string;
+
+  async start(request: RemoteRunStartParams, context: RemoteDriverContext): Promise<RemoteRunHandle> {
+    if (this.failure) throw new Error(this.failure);
+    const handle = new TestHandle(request, context);
+    this.handles.push(handle);
+    return handle;
+  }
+
+  async close(): Promise<void> {
+    await Promise.all(this.handles.map((handle) => handle.close()));
+  }
+}
+
+function initialize(owner: string, id = "initialize") {
+  return createRemoteRequest(id, "remote/initialize", {
+    commandId: id,
+    protocolVersions: [REMOTE_PROTOCOL_VERSION],
+    monitorOwnerNonce: owner,
+  });
+}
+
+function start(owner: string, id = "start") {
+  return createRemoteRequest(id, "run/start", {
+    commandId: id,
+    targetId: "linux-a/pi",
+    monitorOwnerNonce: owner,
+    name: "ordered run",
+    objective: "verify server ordering",
+    cwd: "/srv/project",
+    driver: "pi-rpc",
+    command: ["/usr/bin/pi", "--mode", "rpc"],
+  });
+}
+
+function readEnvelopes(socket: net.Socket, count: number): Promise<RemoteJsonRpcEnvelope[]> {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const envelopes: RemoteJsonRpcEnvelope[] = [];
+    const cleanup = () => {
+      socket.off("data", onData);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+    };
+    const onData = (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      while (true) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline + 1);
+        buffer = buffer.slice(newline + 1);
+        envelopes.push(parseRemoteEnvelopeLine(line));
+        if (envelopes.length === count) {
+          cleanup();
+          resolve(envelopes);
+          return;
+        }
+      }
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error(`Socket closed after ${envelopes.length} of ${count} envelopes`));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.on("data", onData);
+    socket.on("close", onClose);
+    socket.on("error", onError);
+  });
+}
+
+async function openServer(
+  root: string,
+  driver: TestDriver,
+  options: {
+    clientEgressBytes?: number;
+    windowBridge?: false;
+    workspaces?: readonly ResolvedRemoteWorkspace[];
+  } = {},
+) {
+  const server = new RemoteBridgeServer({
+    stateDirectory: path.join(root, "state"),
+    targets: [target()],
+    drivers: [driver],
+    heartbeatMs: 60_000,
+    ...options,
+  });
+  await server.listen();
+  const socket = await connectRemoteSocket(path.join(root, "state"));
+  return { server, socket };
+}
+
+test("bridge serializes same-chunk initialize/start and cancel/input in wire order", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-order-"));
+  const driver = new TestDriver();
+  const { server, socket } = await openServer(root, driver);
+  const owner = "owner-order";
+  try {
+    const firstResponses = readEnvelopes(socket, 2);
+    socket.write(`${encodeRemoteEnvelope(initialize(owner))}${encodeRemoteEnvelope(start(owner))}`);
+    const [initialized, started] = await firstResponses;
+    assert.equal("result" in initialized, true);
+    assert.equal("result" in started, true);
+    assert.equal(driver.handles.length, 1);
+
+    const capture = driver.handles[0].capture;
+    const cancel = createRemoteRequest("cancel", "run/cancel", {
+      commandId: "cancel",
+      runId: capture.runId,
+      generation: capture.generation,
+      monitorOwnerNonce: owner,
+      reason: "stop",
+    });
+    const input = createRemoteRequest("input", "run/input", {
+      commandId: "input",
+      runId: capture.runId,
+      generation: capture.generation,
+      monitorOwnerNonce: owner,
+      mode: "follow_up",
+      message: "must be rejected",
+    });
+    const secondResponses = readEnvelopes(socket, 2);
+    socket.write(`${encodeRemoteEnvelope(cancel)}${encodeRemoteEnvelope(input)}`);
+    const [cancelled, rejectedInput] = await secondResponses;
+    assert.equal("result" in cancelled, true);
+    assert.equal("error" in rejectedInput, true);
+    assert.match("error" in rejectedInput ? rejectedInput.error.message : "", /after cancellation/i);
+  } finally {
+    socket.destroy();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge disconnects a non-reading client when queued egress exceeds the byte budget", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-egress-"));
+  const driver = new TestDriver();
+  const { server, socket } = await openServer(root, driver, { clientEgressBytes: REMOTE_MAX_LINE_BYTES });
+  const owner = "owner-egress";
+  try {
+    let response = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(initialize(owner)));
+    await response;
+    response = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(start(owner)));
+    await response;
+
+    socket.pause();
+    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    const handle = driver.handles[0];
+    for (let sequence = 1; sequence <= 3; sequence += 1) {
+      handle.feed.push({
+        type: "run/event",
+        workerId: handle.capture.workerId,
+        instanceNonce: handle.capture.instanceNonce,
+        runId: handle.capture.runId,
+        generation: handle.capture.generation,
+        sequence,
+        updatedAt: sequence,
+        event: { type: "text", text: `${sequence}:${"x".repeat(600 * 1024)}` },
+      });
+    }
+    // The bridge charges every queued envelope before any write drains, so the budget is already
+    // blown by the time the loop above returns. Resume only to observe the teardown: a paused
+    // socket never reads the peer's EOF, so it would stay open no matter how long the wait is.
+    socket.resume();
+    await Promise.race([
+      closed,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Slow client was not disconnected")), 2_000)),
+    ]);
+    assert.equal(socket.destroyed, true);
+  } finally {
+    socket.destroy();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge redacts remote failures before transmission and command journaling", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-redact-"));
+  const name = "PI_REMOTE_SERVER_SECRET_TOKEN";
+  const marker = `server-marker-${Date.now()}`;
+  const previous = process.env[name];
+  process.env[name] = marker;
+  const driver = new TestDriver();
+  driver.failure = `authorization=${marker}`;
+  const { server, socket } = await openServer(root, driver);
+  try {
+    let response = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(initialize("owner-redact")));
+    await response;
+    response = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(start("owner-redact", "failing-start")));
+    const [failure] = await response;
+    assert.equal("error" in failure, true);
+    assert.equal(JSON.stringify(failure).includes(marker), false);
+
+    const commandsDirectory = path.join(root, "state", "commands");
+    const journalText = fs.readdirSync(commandsDirectory)
+      .map((entry) => fs.readFileSync(path.join(commandsDirectory, entry), "utf8"))
+      .join("\n");
+    assert.equal(journalText.includes(marker), false);
+  } finally {
+    socket.destroy();
+    await server.close();
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("initialize advertises the optional window bridge without requiring new client params", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-window-bridge-"));
+  const driver = new TestDriver();
+  const { server, socket } = await openServer(root, driver);
+  try {
+    const responses = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(initialize("legacy-client")));
+    const [response] = await responses;
+    assert.equal("result" in response, true);
+    const result = "result" in response ? response.result as RemoteInitializeResult : undefined;
+    assert.equal(result?.windowBridge?.pluginId, REMOTE_WINDOW_BRIDGE_PLUGIN_ID);
+    assert.match(result?.windowBridge?.pluginVersion ?? "", /^\d+\.\d+\.\d+/);
+    assert.deepEqual(result?.windowBridge?.workspacePeerVersions, [1]);
+    assert.deepEqual(result?.windowBridge?.relayVersions, [1]);
+    assert.deepEqual(result?.windowBridge?.runtimeVersions, [1]);
+  } finally {
+    socket.destroy();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a run-only legacy daemon can omit windowBridge without changing initialize", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-legacy-init-"));
+  const driver = new TestDriver();
+  const { server, socket } = await openServer(root, driver, { windowBridge: false });
+  try {
+    const responses = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(initialize("legacy-daemon")));
+    const [response] = await responses;
+    assert.equal("result" in response, true);
+    const result = "result" in response ? response.result as RemoteInitializeResult : undefined;
+    assert.equal(result?.protocolVersion, REMOTE_PROTOCOL_VERSION);
+    assert.equal(result?.windowBridge, undefined);
+  } finally {
+    socket.destroy();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a remote/1 client is refused and the error names both protocol versions", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-version-"));
+  const driver = new TestDriver();
+  const { server, socket } = await openServer(root, driver);
+  const owner = "owner-version";
+  try {
+    const responses = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(createRemoteRequest("stale", "remote/initialize", {
+      commandId: "stale",
+      protocolVersions: ["remote/1" as unknown as typeof REMOTE_PROTOCOL_VERSION],
+      monitorOwnerNonce: owner,
+    })));
+    const [refusal] = await responses;
+
+    assert.equal("error" in refusal, true);
+    // Read back off the socket rather than from the throw site: the message
+    // passes through redaction on its way out, and an operator only ever sees
+    // what survives that.
+    assert.equal("error" in refusal ? refusal.error.code : 0, -32002);
+    const message = "error" in refusal ? refusal.error.message : "";
+    assert.ok(message.includes("remote/2"), `the daemon's own version is missing from: ${message}`);
+    assert.ok(message.includes("remote/1"), `the client's offer is missing from: ${message}`);
+  } finally {
+    socket.destroy();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Create one run through a server's own journal, then corrupt it so the next read condemns it.
+ *
+ * @param server - the server whose journal owns the run.
+ * @param runId - the run to create and condemn.
+ * @returns the absolute run directory the journal will quarantine.
+ */
+function condemnRun(server: RemoteBridgeServer, runId: string): string {
+  const capture: RemoteRunCapture = {
+    ...server.journal.identity,
+    runId,
+    generation: 1,
+    monitorOwnerNonce: "owner-quarantine",
+    targetId: "linux-a/pi",
+  };
+  server.journal.createRun(capture, {
+    commandId: `start-${runId}`,
+    targetId: "linux-a/pi",
+    monitorOwnerNonce: capture.monitorOwnerNonce,
+    name: runId,
+    objective: "exercise daemon quarantine reporting",
+    cwd: "/srv/project",
+    driver: "pi-rpc",
+    command: ["/usr/bin/pi", "--mode", "rpc"],
+  });
+  const runs = path.join(server.journal.stateDirectory, "runs");
+  const entry = fs.readdirSync(runs).find((name) => {
+    const metadata = path.join(runs, name, "metadata.json");
+    return fs.existsSync(metadata)
+      && (JSON.parse(fs.readFileSync(metadata, "utf8")) as { capture?: { runId?: string } }).capture?.runId === runId;
+  });
+  assert.ok(entry, `the journal never stored a directory for ${runId}`);
+  const directory = path.join(runs, entry);
+  const metadataPath = path.join(directory, "metadata.json");
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as { version: number };
+  // A record version the current journal refuses, so loading it throws where quarantine catches.
+  metadata.version = 1;
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata), "utf8");
+  return directory;
+}
+
+test("a journal the server builds itself reports quarantine to the server's observer", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-srv-qobs-"));
+  try {
+    const observed: { directory: string; error: unknown }[] = [];
+    // No `journal` option: this is the shape `pi-teammate-remote serve` constructs, so the wiring
+    // under test is the server's own, not one a caller supplied along with a ready-made journal.
+    const server = new RemoteBridgeServer({
+      stateDirectory: path.join(root, "state"),
+      targets: [target()],
+      onQuarantine: (directory, error) => observed.push({ directory, error }),
+    });
+    const directory = condemnRun(server, "observed-run");
+
+    assert.deepEqual(server.journal.listRuns(), []);
+
+    assert.equal(observed.length, 1, "the run was quarantined without the server's observer hearing about it");
+    assert.equal(observed[0]?.directory, directory);
+    assert.ok(observed[0]?.error instanceof Error, "the observer was told which run but not what condemned it");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("remote window list is Monitor-gated and dispatched through the bridge", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-server-window-list-"));
+  const cwd = path.join(root, "project");
+  fs.mkdirSync(cwd, { recursive: true });
+  const runtimeRoot = defaultWorkspacePeerRoot(cwd);
+  const peer = createWorkspacePeerIdentity(cwd, { ownerId: "1".repeat(32), ownerNonce: "2".repeat(32) });
+  await publishWorkspaceOwner(peer, { agents: [], settled: [], sessionName: "remote-window" });
+  const workspace: ResolvedRemoteWorkspace = {
+    workspaceRef: "prod/app",
+    host: "prod",
+    cwd,
+    requiredPlugin: REMOTE_WINDOW_BRIDGE_PLUGIN_ID,
+    minimumWindowProtocol: 1,
+    hostConfig: {
+      host: "prod.example",
+      user: "dev",
+      port: 22,
+      hostKeySha256: HOST_KEY,
+    },
+  };
+  const driver = new TestDriver();
+  const { server, socket } = await openServer(root, driver, { workspaces: [workspace] });
+  try {
+    const deniedResponse = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(createRemoteRequest("list-before-init", "window/list", {
+      commandId: "list-before-init",
+      monitorOwnerNonce: "monitor-window",
+      workspaceRef: "prod/app",
+      authorityId: "prod",
+      transportVersion: 1,
+    })));
+    const [denied] = await deniedResponse;
+    assert.equal("error" in denied ? denied.error.code : undefined, -32001);
+
+    const initializedResponse = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(initialize("monitor-window", "initialize-window")));
+    assert.equal("result" in (await initializedResponse)[0]!, true);
+
+    const listedResponse = readEnvelopes(socket, 1);
+    socket.write(encodeRemoteEnvelope(createRemoteRequest("list-window", "window/list", {
+      commandId: "list-window",
+      monitorOwnerNonce: "monitor-window",
+      workspaceRef: "prod/app",
+      authorityId: "prod",
+      transportVersion: 1,
+    })));
+    const [listed] = await listedResponse;
+    assert.equal("result" in listed, true);
+    const windows = "result" in listed
+      ? (listed.result as { windows?: Array<{ capture?: { ownerId?: string; cancel?: boolean } }> }).windows
+      : undefined;
+    assert.equal(windows?.[0]?.capture?.ownerId, peer.ownerId);
+    assert.equal(windows?.[0]?.capture?.cancel, false);
+  } finally {
+    socket.destroy();
+    await server.close();
+    fs.rmSync(runtimeRoot, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a daemon given no observer still reports a quarantined run on stderr", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-srv-qerr-"));
+  const write = process.stderr.write;
+  try {
+    // Exactly what cli.ts serve constructs. This is the only configuration that ships, so a default
+    // that reports nowhere leaves the released daemon's quarantine as silent as it was before.
+    const server = new RemoteBridgeServer({ stateDirectory: path.join(root, "state"), targets: [target()] });
+    const directory = condemnRun(server, "unwatched-run");
+    const written: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      written.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      assert.deepEqual(server.journal.listRuns(), []);
+    } finally {
+      process.stderr.write = write;
+    }
+
+    const reported = written.join("");
+    assert.ok(reported.includes(directory), `the quarantined run directory is missing from: ${reported || "(nothing)"}`);
+    assert.match(reported, /Unsupported remote run metadata version 1/);
+  } finally {
+    process.stderr.write = write;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

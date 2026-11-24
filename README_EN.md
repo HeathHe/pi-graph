@@ -1,0 +1,143 @@
+# pi-graph
+
+<p align="center">
+  <strong>🎼 Multi-Agent Orchestration for Pi Coding Agent</strong><br />
+  <em>Turn a single coding agent into a coordinated engineering team.</em>
+</p>
+
+<p align="center">
+  <a href="README.md">中文</a> | <strong>English</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/pi-graph"><img alt="npm" src="https://img.shields.io/npm/v/pi-graph?color=cb3837&logo=npm&logoColor=white" /></a>
+  <a href="https://www.npmjs.com/package/pi-graph-agent-runtime"><img alt="npm" src="https://img.shields.io/npm/v/pi-graph-agent-runtime?color=cb3837&logo=npm&logoColor=white&label=teammate" /></a>
+  <a href="https://www.npmjs.com/package/pi-graph-dashboard"><img alt="npm" src="https://img.shields.io/npm/v/pi-graph-dashboard?color=cb3837&logo=npm&logoColor=white&label=cockpit" /></a>
+  <a href="https://github.com/catlog22/pi-maestro-flow"><img alt="Upstream source" src="https://img.shields.io/badge/GitHub-upstream_src-blue?logo=github" /></a>
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" /></a>
+</p>
+
+---
+
+## What It Is
+
+**pi-graph** is a multi-agent orchestration plugin for the [Pi coding agent](https://github.com/earendil-works/pi). It turns an agent that can only do one thing at a time into an engineering team that **dispatches work in parallel, runs autonomously over the long haul, plans before it acts, and stays fully visible** — with a persistent knowledge system that survives across sessions.
+
+It ships as three plugins (install one, get all three):
+
+| Plugin | In one line |
+|--------|-------------|
+| **pi-graph** | Orchestration layer & install entry: goals/tasks/plans, knowledge system, MCP/LSP/browser/search |
+| **pi-graph-agent-runtime** | Execution engine: parallel subprocess agents, DAG dependency graphs, model routing |
+| **pi-graph-dashboard** | Visual status: a live status stack above the editor + a Starship-style footer |
+
+> In short: **flow handles "orchestration & knowledge", teammate handles "parallel execution", cockpit handles "visibility".**
+
+## Core Features
+
+- 🔀 **Parallel multi-agent dispatch** — spawn multiple subprocess agents at once, with DAG dependency graphs and structured output
+- 🖥️ **pi-teammate-models CLI** — maintain `.pi/teammate-backends.json` from the terminal: static route table, field-level edit, and a guided registration wizard with compile validation before every write and undoable `.bak`/`.bak.1` backup rotation
+- 🌐 **DSH direct-SSH deployments** — `mode: ssh` launches the DeepSeek Harness runtime on a remote host over OpenSSH: BatchMode prompt-free auth, pre-flight host-key fingerprint pinning, and per-request timeout guidance
+- 🎯 **Goal — autonomous long-running objectives** — set an objective and token budget, loop autonomously across turns, audited by an independent verifier
+- 📝 **Plan — approve before you change** — read-only Markdown drafts, a dedicated Plan model, and default-off, human-TUI session Plan-auto preauthorization (switch retained across cycles, task authority refreshed per cycle) (`/plan-auto`)
+- 🛰️ **Pi Graph Cockpit visualization** — live view of running teammates and the todo plan, with 9 built-in themes; Quiet mode compresses tool output and folds thinking blocks
+- ⏱️ **bash_bg adaptive shell** — long commands auto-background on timeout and notify on completion, without blocking the conversation
+- 🧠 **Persistent knowledge system** — semantic search, spec & knowhow capture, survives across sessions
+- 🔄 **Compaction capacity management** — proactive compaction threshold, linked threshold derivation, summary output budgeting against context-window overflow
+- 🔁 **Model circuit breaker & failover** — circuit breaker protects API calls with automatic failover to backup models; configurable API retry policy (up to 12 attempts)
+- 📤 **Session export** — export current session context for debugging and auditing
+- 🔌 **Full protocol connectivity** — MCP client (with OAuth auto-auth) · LSP · browser control (CDP) · web search / deep research
+- 🔒 **Permission control** — 5 modes (YOLO enabled by default), fine-grained allow/ask/deny, child-process permission relay
+- 🪝 **Codex-compatible Hooks** — project-level hook system with a built-in installer and trust review
+- ⌨️ **Shortcut conflict manager** — automatically detect and resolve Shift+Tab and other keybinding conflicts
+- 👥 **32 agent roles** (7 built-in + 25 project-level) · 💡 **per-task thinking depth** (`off`→`xhigh`) · 🔌 **custom API Providers**
+
+```javascript
+// Flagship: parallel dispatch + DAG dependencies in a single call
+teammate({
+  tasks: [
+    { name: "defs", agent: "explorer", prompt: "FIND: Auth exports\nSCOPE: src/auth/" },
+    { name: "calls", agent: "explorer", prompt: "FIND: Auth imports\nSCOPE: src/" },
+    { name: "report", agent: "general", prompt: "Merge {defs} + {calls} into a gap report" }
+  ]
+})
+```
+
+---
+
+## Installation
+
+pi-graph is a **Pi plugin** — install it with `pi install` (not a regular npm dependency). A single command installs the whole suite: Flow acts as the install entry and automatically pulls in and registers the remaining extensions and dependencies.
+
+> **Source checkout:** Pi Graph starts from upstream Flow 0.35.1, Teammate 2.10.2, and Cockpit 0.24.5. The Graph npm install examples apply only after publication. See [source setup and package mapping](docs/GRAPH-PACKAGING.md).
+
+> **v0.34.0 baseline:** browser WebM recording/presentation, compaction summary optimization/progress, Teammate routing and Monitor lifecycle subscriptions, Cockpit viewport/terminal stability, and bounded retries/output. Suite: Flow 0.34.0, Backends 0.1.7, Teammate 2.10.0, Cockpit 0.24.4; all other packages unchanged. The engine remains `maestro-flow >=0.5.91`; latest upstream/local version is 0.5.92, not an exact pin. Recording requires FFmpeg with VP8/WebM support; video artifacts survive tab closure. See the historical [upstream releases](RELEASE.md) for the four original `@dyw1234` forks, licensing, and verification scope. Native checks cover Windows x64 / Node 22.22 only; minimum Node and macOS/Linux remain unverified. No cross-platform or whole-graph vulnerability-free claim is made.
+
+**Prerequisites:** [Node.js](https://nodejs.org) ≥ 22.19.0 · [Pi Coding Agent](https://github.com/earendil-works/pi) 0.99.0 (validation baseline; 0.87–0.98 uses version-gated legacy compatibility)
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent   # host runtime
+pi install npm:pi-graph@0.2.7                              # install or upgrade the plugin (single entry)
+pi list                                                            # confirm Flow, Teammate, and Cockpit are listed
+```
+
+**Single-entry routing:** install only `pi-graph`; its postinstall handles the rest —
+
+- **Auto-registered companion extensions**: `pi-graph-agent-runtime` and `pi-graph-dashboard` (written into `~/.pi/agent/settings.json`); upgrades migrate Flow-managed companion paths, and a same-name local development override is preserved and reported in the startup log, so update or remove that override explicitly.
+- **Installed as regular npm dependencies** (not Pi extensions): the core engine `maestro-flow`, the contract package `pi-graph-execution-api`, and the implementation package `pi-graph-executors` — they land in `node_modules` alongside Flow and are not registered separately.
+- **Bundled into each package tarball**: `pi-graph-shared-settings` (not installed standalone).
+
+Restart Pi or reload extensions before retrying model-sensitive work.
+
+## Quick Start
+
+```bash
+pi   # start, then just describe your task in natural language
+```
+
+Pi Graph classifies intent and routes automatically: **simple tasks** run directly · **multi-step engineering** is decomposed into chained plans and verified step by step · **long-running objectives** loop autonomously with independent completion verification. `/maestro-help` lists all commands.
+
+---
+
+## Tools & Skills
+
+- **19 always-on tools + 5 dynamic Plan tools**
+  - Dispatch: `teammate` · `teammate-send/list/watch/wait`
+  - Orchestration: `maestro` · `goal` · `todo` · `run-control` · `plan-*`
+  - Connectivity: `mcp` · `lsp` · `browser` · `smart_search` · `search`/`fffind`
+  - Other: `bash_bg` · `ask-user-question` · `search_tool_bm25`
+- **63 skills** (maintained by [Maestro Flow](https://github.com/catlog22/maestro-flow)) — spanning workflow orchestration, knowledge management, team coordination, UI design, academic writing, and skill tooling. Full catalog: [Maestro Flow skills directory](https://github.com/catlog22/maestro-flow/tree/main/skills)
+- **32 agent roles** — 7 built-in (explorer, planner, analyst, research, general, verifier, workflow) + 25 project-level (executor, reviewer, debugger, roadmapper…)
+
+Full tool parameters and workflow definitions live in the **[Usage Guide](docs/USAGE_EN.md)**.
+
+---
+
+## 📖 Documentation
+
+| Document | Description |
+|----------|-------------|
+| **[Usage Guide](docs/USAGE_EN.md)** / **[中文](docs/USAGE.md)** | Complete feature documentation — all tools, MCP, permissions, thinking depth, agents, workflows |
+| **[User Guide](GUIDE.md)** | In-depth tutorial with examples for every subsystem |
+| **[Smart Search Provider Config](docs/smart-search-provider-config.md)** | Search provider setup — dual-path architecture, API keys, credential syntax, TUI config, sync |
+| **[Release Notes](RELEASE.md)** | Upstream release history |
+| **[Browser Bridge Setup](packages/pi-graph/optional/BROWSER-BRIDGE-SETUP.md)** | Multiple listeners, NONE/paired auth, explicit channels, shared login state, and troubleshooting |
+| Per-plugin READMEs | [flow](packages/pi-graph/README.md) · [teammate](packages/pi-graph-agent-runtime/README.md) · [cockpit](packages/pi-graph-dashboard/README.md) |
+
+---
+
+## Credits
+
+- **[Maestro-Flow](https://github.com/catlog22/maestro-flow)** — intent-driven workflow orchestration by [@catlog22](https://github.com/catlog22)
+- **[Pi Coding Agent](https://github.com/earendil-works/pi)** — terminal coding harness (host runtime) by [@earendil-works](https://github.com/earendil-works)
+- Upstream libraries powering built-in tools: [@modelcontextprotocol/sdk](https://modelcontextprotocol.io) (`mcp`; SDK `1.32.1`) · [Puppeteer](https://github.com/puppeteer/puppeteer) (`browser`; `puppeteer-core 25.12.0`) · [@ff-labs/fff-node](https://github.com/dmtrKovalenko/fff) (`search`/`fffind`) · [@konbakuyomu/smart-search](https://github.com/konbakuyomu/smartsearch) (`smart_search`) · [pi-web-access](https://github.com/nicobailon/pi-web-access) (native web search/extraction/curator)
+
+## License
+
+[MIT](LICENSE) © 2026 HeathHe
+
+---
+
+## Friendly Links
+
+- **[Linux DO](https://linux.do/)** — Learn AI on Linux DO!

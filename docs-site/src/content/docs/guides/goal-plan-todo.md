@@ -1,0 +1,261 @@
+---
+title: "Goal 目标 · Plan 计划 · todo 任务"
+icon: "🎯"
+---
+
+编排生命周期的三个核心：**goal**（长时目标，自主循环）、**plan**（先批准再动手）、**todo**（任务分解与跟踪）。
+
+---
+
+## 1. Goal — 长时目标生命周期
+
+为多轮自主工作提供持久化引擎：自动续行、Token 预算、压缩存活、独立验证。
+
+### 模型侧操作
+
+```javascript
+goal({ action: "create", objective: "实现 JWT 认证模块" })
+goal({ action: "create", objective: "实现 JWT 认证模块", tokenBudget: "100k" })
+goal({ action: "get" })
+goal({ action: "update", objective: "实现 JWT 认证 + 刷新令牌" })
+goal({ action: "complete", summary: "所有模块已实现并通过测试" })
+```
+
+### 用户侧命令
+
+| 命令 | 效果 |
+|------|------|
+| `/goal status` | 查看当前 Goal |
+| `/goal create [--tokens 100k] <目标>` | 创建 Goal 并启动代理循环 |
+| `/goal stop` | 暂停，保存状态 |
+| `/goal resume [--tokens 200k]` | 恢复；可提高预算 |
+| `/goal clear` | 放弃并删除 Goal |
+
+### 验证机制
+
+- 正常 `agent_end` 后自动触发独立验证；
+- `pass` → 标记完成，清除 Goal；
+- `fail` → 保持活跃，携带未满足需求启动下一轮；
+- `inconclusive` → 保持活跃，等待用户 `/goal resume`。
+
+> 有 acceptance commands 时优先运行它们判定结果；未声明 commands 时才调用 `verifier` 角色独立审计。
+
+### 精确完成证据（v0.32.0）
+
+`goal complete` 可带最多 16 个 `evidenceRefs`，每项用 `requirement` 绑定一条需求，并且只能选 `path` 或 `uri` 之一：
+
+```javascript
+goal({ action: "complete", summary: "实现完成，提交精确证据", evidenceRefs: [
+  { requirement: "测试覆盖认证模块", path: "test/auth.test.ts", offset: 1, limit: 100 },
+  { requirement: "独立审查结论", uri: "agent://<publication-id>/verification/0", limit: 100 }
+] })
+```
+
+URI 只接受精确 `session://<id>/entry/<id>` 或 `agent://<exact-id>[/subpath]`；任务名称不是精确证据 ID。行 offset 为 1-based、limit 最多 2000；URI 可用 0-based UTF-16 `charOffset` 恢复超长行。有界输出附 `nextPage`，后续 agent 页使用 pinned immutable publication URI。显式 path 应直接 read，不用 workspace 搜索替代。缺失、未授权、歧义或未读证据不能被 verifier 声明通过；fallback verifier 受宿主只读调用预算约束。
+
+### Goal 面板
+
+Goal 存在时，输入编辑器上方渲染 `goal-panel`：状态（ACTIVE / WAITING / VERIFYING / VERIFIED / STOPPED / BUDGET / BLOCKED）、目标描述、已用时间、循环次数、Token 预算（未配置时不显示）。
+
+## 2. Plan — 先批准再动手
+
+只读起草 Markdown 计划，用户批准后才放行编辑。
+
+### 计划模式行为
+
+- 编辑/写入工具和文件变更命令被**阻止**；
+- 读取/搜索/探索工具保持可用；
+- 通过 `plan-update` 起草 Markdown 计划；
+- `plan-status` 检查计划状态；
+- `plan-confirm`（或 `/plan approve`）提交计划并恢复 Act 工具；
+- `plan-exit` 放弃计划返回 Act 模式。
+
+### 真人范围化 Plan-auto（v0.33.0）
+
+默认关闭。在 Act 或 Plan 模式的**父会话 TUI**手动输入 `/plan-auto on` 或按 `Alt+Shift+A`；`off` 关闭，`status` 查看，无参数切换。只有物理 TUI 提交/快捷键可开启，RPC、模型注入、子代理或历史审计记录不能授予权限。
+
+每个 Plan cycle 的 `plan-confirm` 都通过正常 archive/manifest 事务批准精确草稿，并立即执行 **standalone/current**：不继承 Workflow/New Context/decision-document 权限。启用不是立即批准，`plan-update` 仍仅保存，`plan-review` 仍人工。
+
+会话级开关跨 Plan cycle、exit/clear、修订、普通压缩和同会话 `new_context` 保留，但**任务授权不沿用**：新 cycle 绑定新的有界任务材料，手动 exit/clear 使旧任务授权失效。Footer 分别显示 `PLAN-AUTO on`（等待 Plan）、`confirm+ask`（规划）或 `ask`（授权执行）。off、session/cwd 切换、fork、历史导航、reload/restart/shutdown 撤销 grant，绝不从磁盘恢复。关闭不终止已开始执行；若批准已提交但 handoff 尚未开始，保留批准并停止自动执行、不静默重试。
+
+### 建议性 decision policy（v0.32.0）
+
+人工调用 `/skill:decision-policy` 配置 `.pi/decision-policy.json`，用 host UI 确认精确 staged draft 并 CAS 保存；不能自动调用 Skill 或直接写 policy 代替确认。Ask 与 self-evolve 域支持 `off`、`shadow`（诊断，不抑制人工）、`enforce`（仅已确认规则内的内部建议）。
+
+`backend:auto` 可从可用且 jev 模式的 classifier 回退到预算内 LLM；`classifier` 严格模式没有 classification LLM fallback，`llm` 绕过 classifier。Advice 是另一个有界 LLM 阶段。Plan-auto 不启用 classifier、不改项目 policy；已有项目规则只增加限制。可逆、code/spec 有依据且在授权任务内的内部选择可返回 `decisions`，与真正人工 `answers` 分开并保留 questionIndex；**不是用户答案或批准**。不确定/外部/低置信/模型不可用/预算耗尽、敏感操作、权限、配置、发布、支付、凭证与知识晋升仍交人工。
+
+### Ask-auto 超时建议（v0.33.0）
+
+真人可用 `/auto ask on [seconds]` 开启会话 grant（默认 60 秒）。超时后，尚未回答的安全选项题可采用明确标记 `recommended: true` 的选项：单选须恰好一个，多选采用所有标记项。结果进入 `recommendations`，标记 `source: timeout`，**不是人工 `answers`，也不是批准**；混合批次保留原 `questionIndex`。
+
+Policy classification 优先；外部/不确定/降级决策、human-only 问题、缺失或歧义推荐以及敏感审批不自动确认。开放题无可采用选项，不用此路径代替人工。该建议不授予 Plan、权限、支付、发布或知识晋升授权。
+
+### 可选远程 Ask / Plan transport（v0.31.3）
+
+宿主集成可通过 `pi-graph/ask-transport` 与 `pi-graph/plan-transport` 注册外部交互面。未注册或 transport 返回 undefined 时仍由本地 TUI 控制；它们不是用户开启即可得到的完整 Desktop/Mobile Plan UI。
+
+- Ask 本地/远程竞速只结算一次；回答后取消另一端，本地取消会关闭远程请求，Mobile 取消也关闭本地向导；abort 清理所有 surface。v0.32.0 中远程 promise 失败不等于人工取消：本地 TUI 保持可用、远程 pending request 留给重连。
+- Plan seam 用于 confirm/review，携带当前 revision、可用 action、draft 与模型切换信息；远程 edit 要提交 expectedRevision，避免覆盖更新的计划。
+- Plan 本地/远程 decision/edit/cancel 竞速；v0.32.0 中 transport promise 失败保留本地界面与重连请求，明确取消/中止才清理剩余 surface。集成不能绕过批准与 revision 边界。
+
+### 可选 Refine 远程呈现镜像（v0.35.0）
+
+Refine 新增独立的可选 transport registry，镜像状态/轮次并回传 run、apply、discard、cancel 等意图；不附带远程客户端 UI。**本地 TUI 面板仍是唯一权威**，拥有子代理、轮次和结束决策；镜像不运行第二个子代理，连接失败不关闭本地面板。
+
+优化角色的完整草稿只有经 PlanStore 提交后才报告 `applied`；保存失败不能由远程层宣告应用成功。Reviewer/decomposer/brainstormer 的反馈仍返回 Plan 讨论，不报告草稿已应用；Refine Apply 也不是 Plan 批准。取消/丢弃会同步结束状态，abort 不重新打开已中止 turn 的确认面板。
+
+### 切换方式
+
+`Alt+Shift+P` 或 `/plan` 切换 Plan/Act 模式。`ask` / `plan-confirm` / `plan-editor` / `plan-review` 等交互工具支持取消透传：中止信号会沿权限提示与 teammate 交互中继向前传递，ask 按顺序执行。
+
+```javascript
+plan-enter()                 // 进入计划模式，加载 current.md 草稿
+plan-update({ markdown })    // 起草完整计划
+plan-confirm()               // 提交，用户批准后恢复编辑
+plan-exit()                  // 放弃并返回
+```
+
+> Plan 模式支持独立 Plan 模型：规划与执行可分别使用不同模型；Execute 或 Exit 会恢复进入 Plan 前的 Act 模型，并在确认界面显示模型切换。见[模型路由与思考深度](/guides/model-routing)。
+
+### plan-decompose — 批准后的分解（v0.22+）
+
+批准后对复杂工作，调用 `plan-decompose` 把已批准 Plan 转成执行计划。给定批准时的 handoff key，它返回一份自包含分解 prompt，由**当前主流程**（不委托子智能体）转成一份完整、拓扑有序的 Todo batch——这份 batch 本身就是执行计划与权威持久记录（简化版的 Maestro `decomposition.goals`，不另写 plan.json）。
+
+```javascript
+plan-decompose({ planHandoffKey: "<approved-handoff-key>" })
+// 返回分解 prompt → 主流程据此调用 todo({ action: "create", tasks: [...] }) 铺开 DAG
+```
+
+要点：
+
+- `planHandoffKey` 必须是批准时返回的精确 key；
+- 分解步骤不委托给 planner/decomposer/teammate，只由主流程自己产出；
+- 每条 task 的 `subject` 是结果标题（动词+对象），`blockedBy` 用同批下标表达依赖、形成 DAG。
+
+## 3. todo — 任务管理
+
+8 个操作，支持纯文本上下文和可选的 Pi Skill 执行。
+
+```javascript
+// 创建任务
+todo({ action: "create", subject: "实现用户认证", description: "JWT + 刷新令牌" })
+
+// 带 Skill 绑定的任务（执行时自动加载该 Skill）
+todo({
+  action: "create",
+  subject: "代码审查",
+  skills: [{ name: "quality-review", role: "primary", args: "--level deep" }]
+})
+
+// 首次激活调用者自己的下一个可运行任务
+todo({ action: "advance" })
+
+// 当前任务完成后立即完成并推进调用者自己的下一任务
+todo({ action: "advance", id: "abc123", summary: "已完成认证模块" })
+
+// 只完成当前任务，不激活下一项
+todo({ action: "update", id: "abc123", status: "completed", summary: "已完成认证模块" })
+
+// 列出任务
+todo({ action: "list", filter: { status: "pending" } })
+
+// 兼容入口：仅激活下一个待办任务
+todo({ action: "next" })
+```
+
+| 操作 | 说明 |
+|------|------|
+| `create` | 创建任务（subject 必填；支持 batch 一次性铺开整个计划，原子提交） |
+| `update` | 更新状态/摘要/上下文/技能；可只完成而不继续；`updates[]` 支持一次原子批量更新多项 |
+| `delete` | 删除单个任务（`id`）或原子批量删除（`ids[]`，不可与 `id` 同用） |
+| `advance` | 无活动任务时激活下一项；有活动任务时完成当前项并推进下一项 |
+| `list` | 按状态/成员过滤列出 |
+| `get` | 获取单个任务详情 |
+| `delete` | 删除任务 |
+| `clear` | 清除所有任务 |
+| `next` | 兼容操作：只激活下一个可运行任务，返回解析后的上下文 |
+
+`advance` 按调用 actor 隔离：它只能完成或激活分配给调用者的任务，但完成仍会全局解除跨角色依赖。一个逻辑目标需要多个角色时，使用一个父任务和多个分别分配的角色子任务，不让多个角色共同写一个 Todo 的终态。Canonical Workflow Session/Run 的镜像 Todo 仍由 Run lifecycle 驱动；同 generation mirror 对账会保留本地计时元数据与 skill 激活状态。
+
+任务携带 `resourceUris` 持久化资源引用（如 `agent://<publication-id>`）与计时元数据（开始/完成时间、耗时）；todo 结果渲染为任务卡片并附耗时图，可在 Cockpit 状态堆栈中查看。
+
+`handoff` 可持久化最多 3 条有序 `nextSteps`，并为后续阶段标注文件加载价值：`required`、`conditional`（必须带 `when`）、`skip` 或 `unknown`。它属于任务状态，不是临时聊天摘要：
+
+```javascript
+todo({
+  action: "advance",
+  id: "abc123",
+  summary: "实现阶段完成并通过聚焦测试",
+  handoff: {
+    nextSteps: ["运行集成测试并核对输出"],
+    files: [{
+      path: "src/auth.ts",
+      value: "conditional",
+      reason: "仅在集成测试失败时排查认证边界",
+      when: "测试报告认证失败"
+    }]
+  }
+})
+```
+
+### Todo 阶段切换到 New Context
+
+启用 `compaction.newContext.enabled` 后，completion-form `advance` 可通过 `transition: "new_context"` 在任务提交后调度确定性上下文重置：
+
+```javascript
+todo({
+  action: "advance",
+  id: "abc123",
+  summary: "实现阶段完成并通过聚焦测试",
+  resourceUris: ["agent://<publication-id>"],
+  handoff: { nextSteps: ["加载集成证据并继续下一阶段"] },
+  transition: "new_context"
+})
+```
+
+只在当前阶段已经完整持久化、下一阶段弱耦合时使用；普通 token 压力仍由 automatic compact 处理。完整决策表、recovery capsule 和失败语义见 [New Context 确定性上下文重置](/guides/new-context)。
+
+### 批量创建（DAG 依赖）
+
+```javascript
+todo({
+  action: "create",
+  tasks: [
+    { subject: "调研", blockedBy: [] },
+    { subject: "设计", blockedBy: [0] },
+    { subject: "实现", blockedBy: [1] }
+  ]
+})
+```
+
+`blockedBy` 用数组下标引用更早的任务，构成依赖链；完成的任务摘要会作为上下文注入后续任务。
+
+### 绑定给 Teammate 执行（v0.16.0+）
+
+todo 任务可通过 `tasks[].todo` 绑定给被派发的 Agent（`teammate` 工具）：Agent 接管归属并自动激活首个可运行任务；每项完成时由该 Agent 立即调用 actor-scoped `advance` 推进自己的队列（详见 [并行多智能体调度](/guides/teammate-dispatch)）。
+
+## 4. run-control — Maestro CLI 透传壳
+
+通过 argv 透传调用 canonical Maestro CLI，是 **Session/Run 生命周期的唯一 LLM 工具面**：
+
+| 命令分类 | 说明 |
+|---------|------|
+| 读命令 | `status`/`brief`/`prepare`/`check`/`recall`/`evidence`/`list`/`show`/`graph`/`skills`/`search`/`load`/`review` —— 无需 mutation lease |
+| 写命令 | `next`/`done`/`decide`/`seal`/`edit`/`meta`/`recover`/`accept-reuse`/… —— 需当前 Pi session 持有 mutation lease；Plan 模式阻断 |
+| 入口命令 | `session/run create|start` —— 无 lease 时可建新 Session |
+
+```javascript
+run-control({ argv: ["session", "status"] })
+run-control({ argv: ["session", "next"] })
+run-control({ argv: ["run", "done", "run-123", "--verdict", "done", "--summary", "完成"] })
+run-control({ argv: ["run", "edit", "quality-review", "--after", "current"] })
+```
+
+> Run 绑定发起它的 Pi session；其他会话只读，防止误操作。
+
+## 下一步
+
+- [New Context 确定性上下文重置](/guides/new-context) — Todo 阶段边界的确定性 reset
+- [并行多智能体调度](/guides/teammate-dispatch) — 与 todo 配合的执行引擎
+- [权限系统](/guides/permissions) — Plan 模式与权限的关系
+- [知识系统](/guides/knowledge) — 目标驱动的知识沉淀

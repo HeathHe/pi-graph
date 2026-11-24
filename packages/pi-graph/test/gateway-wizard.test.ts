@@ -1,0 +1,302 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { _gatewayWizardInternals, type GatewayConfigChanges } from "../src/tui/gateway-wizard.ts";
+
+const { splitSections, parseListItems, buildGatewayChangesYaml, resolveExecutable, extractFilesBlock, parseSubList } = _gatewayWizardInternals;
+
+const SAMPLE_CONFIG = [
+  "server:",
+  "    host: 127.0.0.1",
+  "    port: 9090",
+  "auth:",
+  "    mode: open",
+  "    token: \"\"",
+  "security:",
+  "    commands:",
+  "        default: allow",
+  "        allow:",
+  "            - ^ls\\b",
+  "            - ^pwd$",
+  "        confirm:",
+  "            - ^git push",
+  "        deny:",
+  "            - ^rm -rf /",
+  "state:",
+  "    retention:",
+  "        enabled: true",
+  "workspaces:",
+  "    - name: demo",
+  "      path: D:\\demo",
+  "",
+].join("\n");
+
+test("splitSections keeps every top-level section", () => {
+  const sections = splitSections(SAMPLE_CONFIG);
+  const keys = sections.map((section) => section.key);
+  assert.deepEqual(keys, ["server", "auth", "security", "state", "workspaces"]);
+  assert.match(sections[0].raw, /host: 127\.0\.0\.1/);
+});
+
+test("parseListItems reads allow/confirm/deny lists", () => {
+  const security = splitSections(SAMPLE_CONFIG).find((section) => section.key === "security")!;
+  assert.deepEqual(parseListItems(security, "allow"), ["^ls\\b", "^pwd$"]);
+  assert.deepEqual(parseListItems(security, "confirm"), ["^git push"]);
+  assert.deepEqual(parseListItems(security, "deny"), ["^rm -rf /"]);
+});
+
+test("buildGatewayChangesYaml updates port, auth mode and preserves untouched sections", () => {
+  const changes: GatewayConfigChanges = { port: 9091, authMode: "bearer", authToken: "gateway_test" };
+  const { yaml, summary } = buildGatewayChangesYaml(SAMPLE_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /port: 9091/);
+  assert.match(yaml, /mode: bearer/);
+  assert.match(yaml, /token: "gateway_test"/);
+  // untouched sections survive verbatim
+  assert.match(yaml, /retention:/);
+  assert.match(yaml, /enabled: true/);
+  assert.match(yaml, /- name: demo/);
+  assert.match(yaml, /path: D:\\demo/);
+  assert.ok(summary.some((line) => line.includes("9091")));
+  assert.ok(summary.some((line) => line.includes("bearer")));
+});
+
+test("buildGatewayChangesYaml adds pi allow rule while keeping existing rules", () => {
+  const changes: GatewayConfigChanges = { allowPi: true, commandsDefault: "confirm" };
+  const { yaml } = buildGatewayChangesYaml(SAMPLE_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /default: confirm/);
+  assert.doesNotMatch(yaml, /default:\s+default/); // no duplicated key prefix
+  assert.match(yaml, /\^pi\\b/);
+  assert.match(yaml, /\^ls\\b/);
+  assert.match(yaml, /\^git push/);
+  assert.match(yaml, /\^rm -rf \//);
+});
+
+test("buildGatewayChangesYaml appends skill dirs without duplicates", () => {
+  const existing = SAMPLE_CONFIG + [
+    "discovery:",
+    "    skills:",
+    "        enabled: true",
+    "        dirs:",
+    "            - ~/.pi/agent/gateway/skills",
+    "",
+  ].join("\n");
+  const changes: GatewayConfigChanges = { skillDirs: ["D:/pi-graph/.pi/skills", "~/.pi/agent/gateway/skills"] };
+  const { yaml, summary } = buildGatewayChangesYaml(existing, changes, "D:/demo");
+  const dirCount = yaml.split("D:/pi-graph/.pi/skills").length - 1;
+  assert.equal(dirCount, 1);
+  assert.equal(yaml.split("~/.pi/agent/gateway/skills").length - 1, 1); // no duplicate
+  assert.ok(summary.some((line) => line.includes("D:/pi-graph/.pi/skills")));
+});
+
+test("buildGatewayChangesYaml sets oauth flags on the server section", () => {
+  const changes: GatewayConfigChanges = { authMode: "oauth", oauthPassword: "secret", oauthServerURL: "https://mcp.example.com" };
+  const { yaml } = buildGatewayChangesYaml(SAMPLE_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /mode: oauth/);
+  assert.match(yaml, /password: "secret"/);
+  assert.match(yaml, /server_url: "https:\/\/mcp\.example\.com"/);
+  assert.match(yaml, /disable_localhost_protection: true/);
+  assert.match(yaml, /trust_proxy_headers: true/);
+});
+
+test("buildGatewayChangesYaml works on an empty (first-run) config", () => {
+  const changes: GatewayConfigChanges = { port: 9090, authMode: "open", commandsDefault: "confirm", allowPi: true };
+  const { yaml } = buildGatewayChangesYaml("", changes, "D:/demo");
+  assert.match(yaml, /server:/);
+  assert.match(yaml, /port: 9090/);
+  assert.match(yaml, /auth:/);
+  assert.match(yaml, /mode: open/);
+  assert.match(yaml, /default: confirm/);
+  assert.match(yaml, /\^pi\\b/);
+});
+
+test("buildGatewayChangesYaml is idempotent on a clean config and keeps the commands header", () => {
+  const changes: GatewayConfigChanges = { commandsDefault: "confirm", allowPi: true };
+  const first = buildGatewayChangesYaml(SAMPLE_CONFIG, changes, "D:/demo").yaml;
+  // no headless residue: content lines must stay inside the commands block
+  assert.match(first, /^\s{4}commands:\s*$/m);
+  // security must not be followed by an empty line then content
+  assert.doesNotMatch(first, /^security:\s*\n\s*\n/m);
+  assert.equal((first.match(/^\s{4}commands:/gm) || []).length, 1);
+  const second = buildGatewayChangesYaml(first, changes, "D:/demo").yaml;
+  assert.equal(second, first);
+  assert.equal((second.match(/default: confirm/g) || []).length, 1);
+  assert.match(second, /^state:\s*$/m);
+  assert.match(second, /\^pi\b/);
+});
+
+test("buildGatewayChangesYaml preserves proxy flags and OAuth password when only the listener changes", () => {
+  const existing = SAMPLE_CONFIG
+    .replace("    port: 9090", [
+      "    port: 9090",
+      "    disable_localhost_protection: true",
+      "    trust_proxy_headers: true",
+    ].join("\n"))
+    .replace("    mode: open", "    mode: oauth")
+    .replace("    token: \"\"", [
+      "    token: \"\"",
+      "    oauth:",
+      "        password: \"keep-me\"",
+    ].join("\n"));
+  const { yaml } = buildGatewayChangesYaml(existing, { port: 9091, tunnelUrl: "https://new.example.com" }, "D:/demo");
+  assert.match(yaml, /port: 9091/);
+  assert.match(yaml, /disable_localhost_protection: true/);
+  assert.match(yaml, /trust_proxy_headers: true/);
+  assert.match(yaml, /password: "keep-me"/);
+});
+
+test("buildGatewayChangesYaml preserves two-space YAML indentation and OAuth password", () => {
+  const existing = [
+    "server:",
+    "  host: 127.0.0.1",
+    "  port: 9090",
+    "  disable_localhost_protection: false",
+    "auth:",
+    "  mode: oauth",
+    "  oauth:",
+    "    password: \"keep-two-space\"",
+    "    server_url: \"https://old.example.com\"",
+    "",
+  ].join("\n");
+  const { yaml } = buildGatewayChangesYaml(existing, { host: "127.0.0.2", port: 9091, tunnelUrl: "https://new.example.com" }, "D:/demo");
+  assert.equal((yaml.match(/^  port:/gm) || []).length, 1);
+  assert.match(yaml, /  port: 9091/);
+  assert.match(yaml, /  disable_localhost_protection: true/);
+  assert.match(yaml, /password: "keep-two-space"/);
+});
+
+test("buildGatewayChangesYaml quotes a custom listen host", () => {
+  const { yaml } = buildGatewayChangesYaml(SAMPLE_CONFIG, { host: "127.0.0.1:9090 & invalid" }, "D:/demo");
+  assert.match(yaml, /host: "127\.0\.0\.1:9090 & invalid"/);
+});
+
+test("buildGatewayChangesYaml enables proxy flags and upgrades open auth for a tunnel URL", () => {
+  const changes: GatewayConfigChanges = { tunnelUrl: "https://gateway.example.com" };
+  const { yaml, summary } = buildGatewayChangesYaml(SAMPLE_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /disable_localhost_protection: true/);
+  assert.match(yaml, /trust_proxy_headers: true/);
+  assert.match(yaml, /mode: oauth/);
+  assert.match(yaml, /server_url: "https:\/\/gateway\.example\.com"/);
+  assert.ok(summary.some((line) => line.includes("oauth")));
+  assert.ok(summary.some((line) => line.includes("隧道代理标志")));
+});
+
+test("buildGatewayChangesYaml keeps an explicit oauth server_url over the tunnel URL", () => {
+  const changes: GatewayConfigChanges = { authMode: "oauth", oauthServerURL: "https://custom.example.com", tunnelUrl: "https://tunnel.example.com" };
+  const { yaml } = buildGatewayChangesYaml(SAMPLE_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /server_url: "https:\/\/custom\.example\.com"/);
+  assert.doesNotMatch(yaml, /server_url: "https:\/\/tunnel\.example\.com"/);
+});
+
+test("resolveExecutable returns the first PATH-order match for a real command", () => {
+  // `node` is guaranteed to be on PATH in a node --test run, so this exercises
+  // the real where/which probe without mocking. It must resolve to a path whose
+  // basename is node[.exe] — the first line of the probe output (PATH order).
+  const resolved = resolveExecutable("node");
+  assert.ok(resolved, "node should resolve on PATH");
+  const base = resolved!.replace(/\\/g, "/").split("/").pop()!.toLowerCase();
+  assert.match(base, /^node(\.exe)?$/);
+});
+
+test("resolveExecutable returns undefined for a missing command", () => {
+  const resolved = resolveExecutable("this-command-does-not-exist-anywhere-12345");
+  assert.equal(resolved, undefined);
+});
+
+test("resolveExecutable respects PATH order (first match wins)", () => {
+  // Sanity: resolution is a single path (the first where/which line), not a
+  // concatenation of all matches. Guards against a regression that might grab
+  // a later, lower-priority install.
+  const resolved = resolveExecutable("node");
+  assert.ok(resolved);
+  assert.ok(!resolved!.includes("\n"), "must be a single line, not all matches");
+});
+
+const FILES_CONFIG = [
+  "server:",
+  "    host: 127.0.0.1",
+  "    port: 9090",
+  "auth:",
+  "    mode: oauth",
+  "    token: \"\"",
+  "security:",
+  "    commands:",
+  "        default: allow",
+  "        allow:",
+  "            - ^ls\\b",
+  "        confirm: []",
+  "        deny: []",
+  "        auto_allow_readonly: null",
+  "    files:",
+  "        max_read_bytes: 1048576",
+  "        max_patch_files: 20",
+  "        allow:",
+  "            - ^~/projects\\b",
+  "        confirm:",
+  "            - ^~/secrets",
+  "        deny:",
+  "            - ^/etc",
+  "",
+].join("\n");
+
+test("buildGatewayChangesYaml writes security.files limits and rule lists", () => {
+  const changes: GatewayConfigChanges = {
+    filesMaxReadBytes: 2097152,
+    filesMaxPatchFiles: 50,
+    filesAllow: ["^~/projects\\b", "^~/docs"],
+    filesConfirm: ["^~/secrets", "^~/tmp"],
+    filesDeny: ["^/etc", "^/root"],
+  };
+  const { yaml, summary } = buildGatewayChangesYaml(FILES_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /max_read_bytes: 2097152/);
+  assert.match(yaml, /max_patch_files: 50/);
+  assert.match(yaml, /\^~\/docs/); // new allow entry added
+  assert.match(yaml, /\^~\/tmp/); // new confirm entry added
+  assert.match(yaml, /\^\/root/); // new deny entry added
+  assert.match(yaml, /\^~\/projects\\b/); // existing allow preserved
+  assert.ok(summary.some((line) => line.includes("files.max_read_bytes: 2097152")));
+  assert.ok(summary.some((line) => line.includes("files.allow: 2 条")));
+  assert.ok(summary.some((line) => line.includes("files.deny: 2 条")));
+  // commands block stays intact (not clobbered by the files rewrite).
+  assert.match(yaml, /^    commands:$/m);
+  assert.match(yaml, /default: allow/);
+});
+
+test("buildGatewayChangesYaml writes commands allow/confirm/deny lists and auto_allow_readonly", () => {
+  const changes: GatewayConfigChanges = {
+    commandsAllow: ["^ls\\b", "^git status", "^pi\\b"],
+    commandsConfirm: ["^git push", "^npm install"],
+    commandsDeny: ["^rm -rf /", "^mkfs"],
+    commandsAutoReadonly: true,
+  };
+  const { yaml, summary } = buildGatewayChangesYaml(FILES_CONFIG, changes, "D:/demo");
+  assert.match(yaml, /\^pi\\b/);
+  assert.match(yaml, /\^git push/);
+  assert.match(yaml, /\^mkfs/);
+  assert.match(yaml, /auto_allow_readonly: true/);
+  assert.ok(summary.some((line) => line.includes("commands.allow: 3 条")));
+  assert.ok(summary.some((line) => line.includes("auto_allow_readonly: true")));
+});
+
+test("buildGatewayChangesYaml auto_allow_readonly accepts null", () => {
+  const changes: GatewayConfigChanges = { commandsAutoReadonly: null };
+  const { yaml } = buildGatewayChangesYaml(FILES_CONFIG.replace("auto_allow_readonly: null", "auto_allow_readonly: true"), changes, "D:/demo");
+  assert.match(yaml, /auto_allow_readonly: null/);
+});
+
+test("buildGatewayChangesYaml explicitly sets disable_localhost_protection and trust_proxy_headers", () => {
+  const changes: GatewayConfigChanges = { disableLocalhostProtection: false, trustProxyHeaders: true };
+  const { yaml, summary } = buildGatewayChangesYaml(FILES_CONFIG, changes, "D:/demo");
+  // Inline-editor override wins over the oauth-derived default (which would set both true).
+  assert.match(yaml, /disable_localhost_protection: false/);
+  assert.match(yaml, /trust_proxy_headers: true/);
+  assert.ok(summary.some((line) => line.includes("disable_localhost_protection: false")));
+  assert.ok(summary.some((line) => line.includes("trust_proxy_headers: true")));
+});
+
+test("parseSubList + extractFilesBlock isolate files lists from commands lists", () => {
+  const sections = splitSections(FILES_CONFIG);
+  const security = sections.find((s) => s.key === "security")!;
+  const filesBlock = extractFilesBlock(security.raw);
+  assert.deepEqual(parseSubList(filesBlock, "allow"), ["^~/projects\\b"]);
+  assert.deepEqual(parseSubList(filesBlock, "confirm"), ["^~/secrets"]);
+  assert.deepEqual(parseSubList(filesBlock, "deny"), ["^/etc"]);
+});

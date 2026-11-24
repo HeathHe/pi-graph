@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pi Browser Bridge</title>
+    <style>
+      body { font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 12px; min-width: 300px; color: #111827; }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      #status { font-weight: 700; margin-bottom: 8px; }
+      .connection { padding: 8px 0; border-bottom: 1px solid #e5e7eb; }
+      .pairing { padding: 9px; border: 1px solid #f59e0b; border-radius: 6px; background: #fffbeb; overflow-wrap: anywhere; }
+      .meta { color: #6b7280; font-size: 11px; overflow-wrap: anywhere; }
+      details { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 8px; }
+      summary { cursor: pointer; color: #4b5563; }
+      label { display: block; margin-top: 8px; }
+      input { width: 100%; box-sizing: border-box; padding: 4px; margin-top: 2px; }
+      button { margin-top: 10px; padding: 6px 12px; cursor: pointer; }
+      .hint { color: #666; font-size: 11px; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Pi Browser Bridge</h1>
+    <div id="status">状态: 正在发现…</div>
+    <div id="connections"></div>
+    <div class="hint">NONE 无授权仅提供本机传输，不隔离 cookie / 登录态；无需配对。PAIRED 需在 Pi 确认配对码。标签页被占用时请等待原调用结束并释放。</div>
+
+    <details id="advanced">
+      <summary>高级设置（自定义端口 / 旧版恢复）</summary>
+      <label>自定义 WS 端口（逗号分隔，可留空）
+        <input id="port" type="text" autocomplete="off" />
+      </label>
+      <label>旧版认证 Token（可选，不回显已保存凭证）
+        <input id="token" type="password" autocomplete="off" spellcheck="false" />
+      </label>
+      <button id="save">保存端口</button>
+      <div class="hint">默认发现 19222–19231。PI_BROWSER_BRIDGE_PORT 自定义端口也需在这里填写；NONE 无需 token。留空 token 保留现有配对，更新端口不重载健康连接。仅旧版恢复时输入单个端口与 token（会重载）。</div>
+    </details>
+    <script src="popup.js"></script>
+  </body>
+</html>

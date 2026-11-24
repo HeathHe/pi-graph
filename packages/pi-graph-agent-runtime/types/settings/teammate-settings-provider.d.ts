@@ -1,0 +1,28 @@
+import { type SettingsProviderV1 } from "pi-graph-shared-settings/v1";
+import { type TeammateTaskType } from "../shared/task-types.ts";
+declare const PROVIDER_ID = "pi-graph-teammate";
+interface SettingsEventBus {
+    on(event: string, handler: (payload: unknown) => void): void | (() => void);
+    emit(event: string, payload: unknown): void;
+}
+export interface TeammateSettingsProvider extends SettingsProviderV1 {
+    readonly providerId: typeof PROVIDER_ID;
+    readonly instanceId: string;
+}
+export interface TeammateSettingsProviderOptions {
+    getGlobalPath?: () => string;
+    getProjectPath?: (cwd: string) => string;
+    discoverTaskTypes?: (cwd: string) => readonly TeammateTaskType[];
+    discoverRoles?: (cwd: string) => readonly string[];
+    discoverRoleSummaries?: (cwd: string) => {
+        name: string;
+        description: string;
+    }[];
+    applyBackgroundStatusHeartbeatMs?: (intervalMs: number) => Promise<void> | void;
+    /** False on hosts with native cache warming (pi >= 0.86): the heartbeat setting is hidden. */
+    includeBackgroundStatusHeartbeat?: boolean;
+    openLegacySettings?: () => Promise<void> | void;
+}
+export declare function createTeammateSettingsProvider(options?: TeammateSettingsProviderOptions): TeammateSettingsProvider;
+export declare function registerTeammateSettingsProvider(events: SettingsEventBus, provider: TeammateSettingsProvider): () => void;
+export {};

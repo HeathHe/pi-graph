@@ -1,0 +1,774 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import test from "node:test";
+import { packGraphDependencies } from "./pack-graph-dependencies.mjs";
+
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const localTeammateRoot = resolve(packageRoot, "..", "pi-graph-agent-runtime");
+const localSettingsCoreRoot = resolve(packageRoot, "..", "pi-graph-shared-settings");
+const localBackendCoreRoot = resolve(packageRoot, "..", "pi-graph-execution-api");
+const localBackendsRoot = resolve(packageRoot, "..", "pi-graph-executors");
+const localCockpitRoot = resolve(packageRoot, "..", "pi-graph-dashboard");
+const localFlowPackage = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+const localTeammatePackage = JSON.parse(readFileSync(join(localTeammateRoot, "package.json"), "utf8"));
+const localSettingsCorePackage = JSON.parse(readFileSync(join(localSettingsCoreRoot, "package.json"), "utf8"));
+const localBackendCorePackage = JSON.parse(readFileSync(join(localBackendCoreRoot, "package.json"), "utf8"));
+const localBackendsPackage = JSON.parse(readFileSync(join(localBackendsRoot, "package.json"), "utf8"));
+const localCockpitPackage = JSON.parse(readFileSync(join(localCockpitRoot, "package.json"), "utf8"));
+const smartSearchSource = localFlowPackage.optionalDependencies["@konbakuyomu/smart-search"];
+const piSdkVersion = localFlowPackage.devDependencies["@earendil-works/pi-coding-agent"];
+const piCodingAgentEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piCodingAgentPackage = JSON.parse(readFileSync(
+  resolve(dirname(piCodingAgentEntry), "..", "package.json"),
+  "utf8",
+));
+const ffiRsPackage = readNearestPackageJson(fileURLToPath(import.meta.resolve("ffi-rs")));
+const ffiRsPlatformSpec = resolveFfiRsPlatformSpec(ffiRsPackage.optionalDependencies);
+const packedReceiptContractVersion = 1;
+const teammatePublicSpecifiers = [
+  "pi-graph-agent-runtime",
+  "pi-graph-agent-runtime/v1",
+  "pi-graph-agent-runtime/v1/agents",
+  "pi-graph-agent-runtime/v1/child-extensions",
+  "pi-graph-agent-runtime/v1/events",
+  "pi-graph-agent-runtime/v1/workspace-projections",
+  "pi-graph-agent-runtime/v1/execution",
+  "pi-graph-agent-runtime/v1/extension",
+  "pi-graph-agent-runtime/v1/model-routing",
+  "pi-graph-agent-runtime/v1/progress-tree",
+  "pi-graph-agent-runtime/v1/retry",
+  "pi-graph-agent-runtime/v1/types",
+];
+const require = createRequire(import.meta.url);
+const npmCommand = [process.execPath, process.env.npm_execpath ?? require.resolve("npm/bin/npm-cli.js")];
+const packTimeout = 360_000;
+const installTimeout = 600_000;
+const testTimeout = packTimeout * 8 + installTimeout + 600_000;
+
+test("packed consumer installs real tarballs and loads in a fresh Pi process", { timeout: testTimeout }, () => {
+  // Prefer the caller-controlled temporary root so packed installs can avoid a
+  // full system drive (the Windows SystemDrive value is not overridable).
+  const configuredTempRoot = process.env.TMPDIR || process.env.TMP || process.env.TEMP;
+  const shortTempRoot = configuredTempRoot
+    ? resolve(configuredTempRoot)
+    : process.env.SystemDrive ? `${process.env.SystemDrive}\\tmp` : tmpdir();
+  const root = join(shortTempRoot, `pme-${process.pid}-${Date.now()}`);
+  const consumer = join(root, "consumer");
+  const workflowRoot = join(root, "workflow");
+  const maestroHome = join(root, "maestro-home");
+  const installHome = join(root, "install-home");
+  const npmPrefix = join(root, "npm-prefix");
+  mkdirSync(consumer, { recursive: true });
+  mkdirSync(workflowRoot, { recursive: true });
+  mkdirSync(maestroHome, { recursive: true });
+  mkdirSync(installHome, { recursive: true });
+  mkdirSync(npmPrefix, { recursive: true });
+
+  try {
+    const settingsCorePacked = parseTrailingJson(run(
+      npmCommand,
+      ["pack", "--json", "--pack-destination", root],
+      localSettingsCoreRoot,
+      process.env,
+      packTimeout,
+    ).stdout);
+    const backendCorePacked = parseTrailingJson(run(
+      npmCommand,
+      ["pack", "--json", "--pack-destination", root],
+      localBackendCoreRoot,
+      process.env,
+      packTimeout,
+    ).stdout);
+    const backendsPacked = parseTrailingJson(run(
+      npmCommand,
+      ["pack", "--json", "--pack-destination", root],
+      localBackendsRoot,
+      process.env,
+      packTimeout,
+    ).stdout);
+    const cockpitPacked = parseTrailingJson(run(
+      npmCommand,
+      ["pack", "--json", "--pack-destination", root],
+      localCockpitRoot,
+      process.env,
+      packTimeout,
+    ).stdout);
+    const teammatePacked = parseTrailingJson(run(
+      npmCommand,
+      ["pack", "--json", "--pack-destination", root],
+      localTeammateRoot,
+      process.env,
+      packTimeout,
+    ).stdout);
+    const flowPacked = parseTrailingJson(run(
+      npmCommand,
+      ["pack", "--json", "--pack-destination", root],
+      packageRoot,
+      process.env,
+      packTimeout,
+    ).stdout);
+    const settingsCoreTarball = join(root, settingsCorePacked[0].filename);
+    const backendCoreTarball = join(root, backendCorePacked[0].filename);
+    const backendsTarball = join(root, backendsPacked[0].filename);
+    const cockpitTarball = join(root, cockpitPacked[0].filename);
+    const teammateTarball = join(root, teammatePacked[0].filename);
+    const flowTarball = join(root, flowPacked[0].filename);
+    const additionalPacks = packGraphDependencies({
+      packagesDir: dirname(packageRoot),
+      alreadyPacked: ["pi-graph-shared-settings", "pi-graph-execution-api", "pi-graph-executors", "pi-graph-dashboard", "pi-graph-agent-runtime", "pi-graph"],
+      pack: (dir) => join(root, parseTrailingJson(run(
+        npmCommand,
+        ["pack", "--json", "--pack-destination", root],
+        dir,
+        process.env,
+        packTimeout,
+      ).stdout)[0].filename),
+    });
+    assert.equal(existsSync(settingsCoreTarball), true);
+    assert.equal(existsSync(backendCoreTarball), true);
+    assert.equal(existsSync(backendsTarball), true);
+    assert.equal(existsSync(cockpitTarball), true);
+    assert.equal(existsSync(teammateTarball), true);
+    assert.equal(existsSync(flowTarball), true);
+    assert.equal(settingsCorePacked[0].version, localSettingsCorePackage.version);
+    assert.equal(backendCorePacked[0].version, localBackendCorePackage.version);
+    assert.equal(backendsPacked[0].version, localBackendsPackage.version);
+    assert.equal(cockpitPacked[0].version, localCockpitPackage.version);
+    assert.equal(teammatePacked[0].version, localTeammatePackage.version);
+    assert.equal(flowPacked[0].version, localFlowPackage.version);
+    assert.ok(flowPacked[0].files.some(({ path }) => path === "src/gateway/public/v1/index.ts"));
+    for (const removed of ["src/mcpx-bridge.ts", "src/tui/mcpx-overlay.ts", "src/tui/mcpx-wizard.ts", "src/tui/mcpx-client.ts"]) {
+      assert.equal(flowPacked[0].files.some(({ path }) => path === removed), false, `${removed} must not be packed`);
+    }
+    assert.ok(settingsCorePacked[0].files.some(({ path }) => path === "src/public/v1/index.ts"));
+    assert.ok(teammatePacked[0].files.some(({ path }) => path === "src/index.ts"));
+    assert.ok(teammatePacked[0].files.some(({ path }) => path === "src/public/v1/execution.ts"));
+    assert.ok(teammatePacked[0].files.some(({ path }) => path === "src/public/v1/workspace-projections.ts"));
+    assert.ok(teammatePacked[0].files.some(({ path }) => path === "types/index.d.ts"));
+    assert.ok(teammatePacked[0].files.some(({ path }) => path === "types/public/v1/execution.d.ts"));
+    assert.ok(teammatePacked[0].files.some(({ path }) => path === "types/public/v1/workspace-projections.d.ts"));
+
+    // pi loads packages with separate module roots, so the shared settings-core
+    // protocol must be bundled inside each plugin tarball (packages.md). npm
+    // pack stores bundled deps under package/node_modules/...
+    for (const [label, tarball] of [
+      ["flow", flowTarball],
+      ["cockpit", cockpitTarball],
+      ["teammate", teammateTarball],
+    ]) {
+      const entries = tarList(tarball);
+      assert.ok(
+        entries.some((entry) => entry.startsWith("package/node_modules/pi-graph-shared-settings/")),
+        `${label} tarball must bundle node_modules/pi-graph-shared-settings`,
+      );
+    }
+
+    const packedReceipt = createPackedReceipt(shortTempRoot, [
+      ["settings-core", settingsCoreTarball],
+      ["backend-core", backendCoreTarball],
+      ["backends", backendsTarball],
+      ["cockpit", cockpitTarball],
+      ["teammate", teammateTarball],
+      ["flow", flowTarball],
+      ...additionalPacks,
+    ]);
+    if (hasValidPackedReceipt(packedReceipt)) return;
+
+    verifyStandaloneCockpit({
+      consumer: join(root, "cockpit-standalone"),
+      workflowRoot: join(root, "cockpit-workflow"),
+      installHome: join(root, "cockpit-home"),
+      npmPrefix: join(root, "cockpit-npm-prefix"),
+      settingsCoreTarball,
+      cockpitTarball,
+      piSdkVersion,
+      npmCommand,
+    });
+
+    writeFileSync(join(consumer, "package.json"), `${JSON.stringify({ private: true }, null, 2)}\n`);
+    const installEnv = {
+      ...process.env,
+      HOME: installHome,
+      USERPROFILE: installHome,
+      MAESTRO_HOME: maestroHome,
+      npm_config_prefix: npmPrefix,
+    };
+    run(
+      npmCommand,
+      [
+        "install",
+        settingsCoreTarball,
+        backendCoreTarball,
+        backendsTarball,
+        cockpitTarball,
+        teammateTarball,
+        flowTarball,
+        ...additionalPacks.map(([, tarball]) => tarball),
+        smartSearchSource,
+        ffiRsPlatformSpec,
+        `@earendil-works/pi-agent-core@${piSdkVersion}`,
+        `@earendil-works/pi-ai@${piSdkVersion}`,
+        `@earendil-works/pi-coding-agent@${piSdkVersion}`,
+        `@earendil-works/pi-tui@${piSdkVersion}`,
+        `@types/cross-spawn@${localFlowPackage.devDependencies["@types/cross-spawn"]}`,
+        `@types/node@${piCodingAgentPackage.devDependencies["@types/node"]}`,
+        `typescript@${localFlowPackage.devDependencies.typescript}`,
+        // Match Pi's managed installer; host SDKs above remain explicit inputs.
+        "--legacy-peer-deps",
+        "--omit=optional",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+      ],
+      consumer,
+      installEnv,
+      installTimeout,
+    );
+
+    const installed = join(consumer, "node_modules", "pi-graph");
+    const installedSmartSearch = join(consumer, "node_modules", "@konbakuyomu", "smart-search");
+    run(npmCommand, ["run", "postinstall"], installed, installEnv, installTimeout);
+    run(npmCommand, ["run", "postinstall"], installedSmartSearch, installEnv, installTimeout);
+
+    const installedPackage = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
+    assert.equal(installedPackage.version, localFlowPackage.version);
+    assert.equal(installedPackage.exports["./gateway/v1"], "./src/gateway/public/v1/index.ts");
+    assert.equal(installedPackage.exports["./src/*"], "./src/*", "the unrelated source wildcard export remains intact");
+    for (const removed of ["src/mcpx-bridge.ts", "src/tui/mcpx-overlay.ts", "src/tui/mcpx-wizard.ts", "src/tui/mcpx-client.ts"]) {
+      assert.equal(existsSync(join(installed, ...removed.split("/"))), false, `${removed} must stay absent after installation`);
+    }
+    assert.equal(
+      installedPackage.dependencies["maestro-flow"],
+      localFlowPackage.dependencies["maestro-flow"],
+    );
+    assert.equal(installedPackage.dependencies["pi-graph-shared-settings"], localSettingsCorePackage.version);
+    assert.equal(installedPackage.dependencies["pi-graph-agent-runtime"], localTeammatePackage.version);
+    const installedMaestro = join(consumer, "node_modules", "maestro-flow");
+    const installedSettingsCore = join(consumer, "node_modules", "pi-graph-shared-settings");
+    const installedCockpit = join(consumer, "node_modules", "pi-graph-dashboard");
+    const installedTeammate = join(consumer, "node_modules", "pi-graph-agent-runtime");
+    assert.equal(lstatSync(installed).isSymbolicLink(), false);
+    assert.equal(lstatSync(installedMaestro).isSymbolicLink(), false);
+    assert.equal(lstatSync(installedSettingsCore).isSymbolicLink(), false);
+    assert.equal(JSON.parse(readFileSync(join(installedSettingsCore, "package.json"), "utf8")).version, localSettingsCorePackage.version);
+    assert.equal(lstatSync(installedCockpit).isSymbolicLink(), false);
+    const installedCockpitPackage = JSON.parse(readFileSync(join(installedCockpit, "package.json"), "utf8"));
+    assert.equal(installedCockpitPackage.version, localCockpitPackage.version);
+    assert.equal(installedCockpitPackage.dependencies["pi-graph-shared-settings"], localSettingsCorePackage.version);
+    assert.equal(lstatSync(installedTeammate).isSymbolicLink(), false);
+    const installedTeammatePackage = JSON.parse(readFileSync(join(installedTeammate, "package.json"), "utf8"));
+    assert.equal(installedTeammatePackage.version, localTeammatePackage.version);
+    assert.equal(installedTeammatePackage.dependencies["cross-spawn"], "7.0.6");
+    assert.equal(installedTeammatePackage.dependencies["pi-graph-shared-settings"], localSettingsCorePackage.version);
+    assert.equal(installedTeammatePackage.types, "./types/index.d.ts");
+    assert.equal(existsSync(installedSmartSearch), true, "the source-pinned Smart Search optional dependency must install");
+    assert.match(
+      readFileSync(join(installedSmartSearch, "src", "smart_search", "config.py"), "utf8"),
+      /SMART_SEARCH_INTENT_ROUTER/,
+    );
+    const smartSearchRegressionOutput = run(
+      [process.execPath, join(installedSmartSearch, "npm", "bin", "smart-search.js")],
+      ["regression"],
+      consumer,
+      installEnv,
+      180_000,
+    ).stdout;
+    const smartSearchRegression = JSON.parse(smartSearchRegressionOutput.slice(smartSearchRegressionOutput.indexOf("{")));
+    assert.equal(smartSearchRegression.ok, true);
+    assert.equal(smartSearchRegression.mode, "mock");
+    assert.equal(existsSync(join(installed, ".pi", "skills", "workflow-skill-designer", "SKILL.md")), true);
+    assert.equal(existsSync(join(installed, "src", "extension", "index.ts")), true);
+    const extensionPath = join(installed, "src", "extension", "index.ts");
+    const piCommand = [
+      process.execPath,
+      join(consumer, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+    ];
+    const runtimeEnv = isolatedPiRuntimeEnv(installEnv, installHome, {
+      PATH: `${join(consumer, "node_modules", ".bin")}${delimiter}${process.env.PATH ?? ""}`,
+    });
+    const runtimeProbePath = join(consumer, "teammate-runtime-probe.json");
+    const runtimeVerifierPath = join(consumer, "verify-teammate-runtime.ts");
+    writeFileSync(
+      runtimeVerifierPath,
+      `${teammatePublicSpecifiers
+        .map((specifier, index) => `import * as publicApi${index} from ${JSON.stringify(specifier)};`)
+        .join("\n")}
+import { writeFileSync } from "node:fs";
+import { refreshModelRegistry } from "pi-graph-agent-runtime/v1/model-routing";
+const specifiers = ${JSON.stringify(teammatePublicSpecifiers)};
+const loaded = [${teammatePublicSpecifiers.map((_, index) => `publicApi${index}`).join(", ")}]
+  .map((publicApi) => Object.keys(publicApi).length);
+const refreshProbe = {
+  runtime: { refreshed: 0 },
+  async refresh() {
+    this.runtime.refreshed++;
+  },
+};
+export default function register(pi) {
+  pi.on("session_start", async () => {
+    await refreshModelRegistry({ modelRegistry: refreshProbe });
+    writeFileSync(${JSON.stringify(runtimeProbePath)}, JSON.stringify({
+      specifiers,
+      loaded,
+      refreshModelRegistry: typeof refreshModelRegistry,
+      refreshCalls: refreshProbe.runtime.refreshed,
+    }));
+  });
+}
+`,
+    );
+    run(
+      piCommand,
+      [
+        "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
+        "--no-context-files", "--extension", runtimeVerifierPath,
+      ],
+      workflowRoot,
+      runtimeEnv,
+      45_000,
+      `${JSON.stringify({ id: "state", type: "get_state" })}\n`,
+    );
+    const runtimeProbe = JSON.parse(readFileSync(runtimeProbePath, "utf8"));
+    assert.deepEqual(runtimeProbe.specifiers, teammatePublicSpecifiers);
+    assert.equal(runtimeProbe.loaded.length, teammatePublicSpecifiers.length);
+    assert.equal(runtimeProbe.refreshModelRegistry, "function");
+    assert.equal(runtimeProbe.refreshCalls, 1);
+    assert.match(
+      run(
+        [process.execPath],
+        [
+          "--input-type=module",
+          "--eval",
+          "console.log(import.meta.resolve('pi-graph-agent-runtime/v1/execution'))",
+        ],
+        consumer,
+        installEnv,
+      ).stdout,
+      /pi-graph-agent-runtime[\\/]src[\\/]public[\\/]v1[\\/]execution\.ts$/,
+    );
+
+    const typeFixture = join(consumer, "teammate-public-api.mts");
+    writeFileSync(
+      typeFixture,
+      `${teammatePublicSpecifiers
+        .map((specifier, index) => `import * as publicApi${index} from ${JSON.stringify(specifier)};`)
+        .join("\n")}
+import { refreshModelRegistry } from "pi-graph-agent-runtime/v1/model-routing";
+void [${teammatePublicSpecifiers.map((_, index) => `publicApi${index}`).join(", ")}, refreshModelRegistry];
+`,
+    );
+    writeFileSync(
+      join(consumer, "tsconfig.json"),
+      `${JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          target: "ESNext",
+          lib: ["ESNext", "DOM", "DOM.Iterable"],
+          module: "ESNext",
+          moduleResolution: "Bundler",
+          noEmit: true,
+          resolveJsonModule: true,
+          types: ["node"],
+        },
+        files: ["teammate-public-api.mts"],
+      }, null, 2)}\n`,
+    );
+    const typeResolution = run(
+      [process.execPath],
+      [
+        join(consumer, "node_modules", "typescript", "bin", "tsc"),
+        "-p",
+        "tsconfig.json",
+        "--noEmit",
+        "--traceResolution",
+        "--listFilesOnly",
+        "--pretty",
+        "false",
+      ],
+      consumer,
+      installEnv,
+    );
+    const normalizedTypeResolution = typeResolution.stdout.replaceAll("\\", "/").toLowerCase();
+    assert.match(normalizedTypeResolution, /pi-graph-agent-runtime\/types\/public\/v1\/execution\.d\.ts/);
+    assert.match(normalizedTypeResolution, /pi-graph-agent-runtime\/types\/public\/v1\/workspace-projections\.d\.ts/);
+    assert.doesNotMatch(normalizedTypeResolution, /pi-graph-agent-runtime\/src\/.*\.ts/);
+
+    const childToolsPath = join(consumer, "child-tools.json");
+    const childVerifierPath = join(consumer, "verify-child-tools.mjs");
+    writeFileSync(childVerifierPath, `import { writeFileSync } from "node:fs";
+export default function register(pi) {
+  pi.on("session_start", () => {
+    writeFileSync(${JSON.stringify(childToolsPath)}, JSON.stringify(pi.getAllTools().map((tool) => tool.name)));
+  });
+}
+`);
+    run(
+      piCommand,
+      [
+        "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
+        "--no-context-files", "--extension", extensionPath, "--extension", childVerifierPath,
+      ],
+      workflowRoot,
+      { ...runtimeEnv, PI_TEAMMATE_CHILD: "1" },
+      45_000,
+      `${JSON.stringify({ id: "state", type: "get_state" })}\n`,
+    );
+    const childTools = JSON.parse(readFileSync(childToolsPath, "utf8"));
+    assert.ok(childTools.includes("ask-user-question"), childTools.join(","));
+    assert.ok(childTools.includes("todo"), childTools.join(","));
+    assert.equal(
+      childTools.includes("flow-schedule"),
+      false,
+      `ordinary PI_TEAMMATE_CHILD subprocesses do not own managed-window Flow reporting: ${childTools.join(",")}`,
+    );
+    assert.equal(childTools.includes("goal"), false, childTools.join(","));
+    assert.equal(childTools.includes("run-control"), false, childTools.join(","));
+    const smoke = run(
+      piCommand,
+      [
+        "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
+        "--no-context-files", "--extension", extensionPath,
+      ],
+      workflowRoot,
+      runtimeEnv,
+      45_000,
+      `${JSON.stringify({ id: "state", type: "get_state" })}\n${JSON.stringify({ id: "messages", type: "get_messages" })}\n`,
+    );
+    const smokeMessages = smoke.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(smokeMessages.some((message) => message.id === "state" && message.type === "response"), smoke.stdout);
+    assert.ok(smokeMessages.some((message) => message.id === "messages" && message.type === "response"), smoke.stdout);
+
+    const maestroRuntimeEntry = join(installedMaestro, "dist", "src", "utils", "wasm-relaunch.js");
+    assert.equal(
+      existsSync(maestroRuntimeEntry),
+      true,
+      "the exact Maestro registry dependency must include dist/src/utils/wasm-relaunch.js before consumer installation",
+    );
+
+    const prepareDir = join(maestroHome, "prepare");
+    mkdirSync(prepareDir, { recursive: true });
+    for (const stage of ["analyze", "plan", "execute", "verify"]) {
+      writeFileSync(join(prepareDir, `${stage}.md`), prepareSource(stage));
+    }
+
+    const maestroCommand = [process.execPath, join(installedMaestro, "bin", "maestro.js")];
+    const cliEnv = { ...process.env, MAESTRO_HOME: maestroHome };
+    assert.match(run(maestroCommand, ["run", "create", "--help"], workflowRoot, cliEnv).stdout, /--workflow-root/);
+    const stages = ["analyze", "plan", "execute", "verify"];
+    const sessionId = `packed-consumer-${process.pid}-${Date.now()}`;
+    const participant = "packed-consumer-test";
+    const opened = JSON.parse(run(
+      maestroCommand,
+      [
+        "session", "open", "packed consumer lifecycle",
+        "--id", sessionId,
+        "--chain", ...stages,
+        "--participant", participant,
+        "--actor", participant,
+        "--request-id", "packed-session-open",
+        "--reason", "packed consumer lifecycle test",
+        "--workflow-root", workflowRoot,
+        "--json",
+      ],
+      workflowRoot,
+      cliEnv,
+    ).stdout);
+    assert.equal(opened.ok, true);
+    assert.equal(opened.locator.session_id, sessionId);
+    let orchestrationRevision = opened.revision.revision;
+    const createStage = (stage) => {
+      const stageIndex = stages.indexOf(stage);
+      assert.notEqual(stageIndex, -1, stage);
+      const created = JSON.parse(run(
+        maestroCommand,
+        [
+          "run", "create", stage,
+          "--session", sessionId,
+          "--participant", participant,
+          "--actor", participant,
+          "--request-id", `packed-create-${stage}`,
+          "--reason", `packed ${stage} lifecycle test`,
+          "--expected-orchestration-revision", String(orchestrationRevision),
+          "--run", `packed-run-${stage}`,
+          "--step", `s-${stageIndex + 1}`,
+          "--goal", stage,
+          "--workflow-root", workflowRoot,
+          "--json",
+        ],
+        workflowRoot,
+        cliEnv,
+      ).stdout);
+      assert.equal(created.ok, true, JSON.stringify(created));
+      orchestrationRevision = created.revision.revision;
+      const runDir = resolve(created.result.run_dir);
+      mkdirSync(join(runDir, "outputs"), { recursive: true });
+      writeFileSync(join(runDir, "outputs", `${stage}.json`), `${JSON.stringify({ stage, status: "passed" })}\n`);
+      return created;
+    };
+    const completeStage = (stage, created) => {
+      const completed = JSON.parse(run(
+        maestroCommand,
+        [
+          "run", "complete", created.locator.run_id,
+          "--session", sessionId,
+          "--participant", participant,
+          "--actor", participant,
+          "--request-id", `packed-complete-${stage}`,
+          "--reason", `packed ${stage} lifecycle test`,
+          "--expected-run-revision", "1",
+          "--expected-orchestration-revision", String(orchestrationRevision),
+          "--summary", `${stage} passed`,
+          "--advance",
+          "--workflow-root", workflowRoot,
+          "--json",
+        ],
+        workflowRoot,
+        cliEnv,
+      ).stdout);
+      assert.equal(completed.ok, true, JSON.stringify(completed));
+      assert.equal(completed.result.status, "sealed", stage);
+      orchestrationRevision = completed.revision.revision;
+    };
+    for (const stage of ["analyze", "plan"]) {
+      completeStage(stage, createStage(stage));
+    }
+
+    const executeRun = createStage("execute");
+    const rpc = run(
+      piCommand,
+      [
+        "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
+        "--no-context-files", "--extension", extensionPath,
+      ],
+      workflowRoot,
+      runtimeEnv,
+      45_000,
+      `${JSON.stringify({ id: "state", type: "get_state" })}\n${JSON.stringify({ id: "messages", type: "get_messages" })}\n`,
+    );
+    const messages = rpc.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(messages.some((message) => message.id === "state" && message.type === "response"), rpc.stdout);
+    const messageResponse = messages.find((message) => message.id === "messages" && message.type === "response");
+    assert.ok(messageResponse, rpc.stdout);
+    assert.doesNotMatch(
+      JSON.stringify(messageResponse),
+      /workflow-attach/,
+      "a fresh packed Pi session must not implicitly opt into an active Workflow",
+    );
+
+    completeStage("execute", executeRun);
+    completeStage("verify", createStage("verify"));
+    const completedSession = JSON.parse(run(
+      maestroCommand,
+      [
+        "session", "complete",
+        "--session", sessionId,
+        "--participant", participant,
+        "--actor", participant,
+        "--request-id", "packed-session-complete",
+        "--reason", "packed consumer lifecycle complete",
+        "--expected-orchestration-revision", String(orchestrationRevision),
+        "--workflow-root", workflowRoot,
+        "--json",
+      ],
+      workflowRoot,
+      cliEnv,
+    ).stdout);
+    assert.equal(completedSession.ok, true, JSON.stringify(completedSession));
+    const session = JSON.parse(readFileSync(join(workflowRoot, ".workflow", "sessions", sessionId, "session.json"), "utf8"));
+    assert.equal(session.status, "completed");
+    assert.deepEqual(session.chain.map((step) => step.status), ["completed", "completed", "completed", "completed"]);
+    writePackedReceipt(packedReceipt);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function verifyStandaloneCockpit({
+  consumer,
+  workflowRoot,
+  installHome,
+  npmPrefix,
+  settingsCoreTarball,
+  cockpitTarball,
+  piSdkVersion,
+  npmCommand,
+}) {
+  for (const directory of [consumer, workflowRoot, installHome, npmPrefix]) {
+    mkdirSync(directory, { recursive: true });
+  }
+  writeFileSync(join(consumer, "package.json"), `${JSON.stringify({ private: true }, null, 2)}\n`);
+  const env = {
+    ...process.env,
+    HOME: installHome,
+    USERPROFILE: installHome,
+    npm_config_prefix: npmPrefix,
+  };
+  run(
+    npmCommand,
+    [
+      "install",
+      settingsCoreTarball,
+      cockpitTarball,
+      `@earendil-works/pi-agent-core@${piSdkVersion}`,
+      `@earendil-works/pi-ai@${piSdkVersion}`,
+      `@earendil-works/pi-coding-agent@${piSdkVersion}`,
+      `@earendil-works/pi-tui@${piSdkVersion}`,
+      "--legacy-peer-deps",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+    ],
+    consumer,
+    env,
+    installTimeout,
+  );
+
+  const installedCockpit = join(consumer, "node_modules", "pi-graph-dashboard");
+  assert.equal(existsSync(installedCockpit), true);
+  assert.equal(
+    existsSync(join(consumer, "node_modules", "pi-graph-agent-runtime")),
+    false,
+    "standalone Cockpit must load without installing its optional Teammate peer",
+  );
+  const piCommand = [
+    process.execPath,
+    join(consumer, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+  ];
+  const smoke = run(
+    piCommand,
+    [
+      "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
+      "--no-context-files", "--extension", join(installedCockpit, "src", "extension", "index.ts"),
+    ],
+    workflowRoot,
+    isolatedPiRuntimeEnv(env, installHome, {
+      PATH: `${join(consumer, "node_modules", ".bin")}${delimiter}${process.env.PATH ?? ""}`,
+    }),
+    45_000,
+    `${JSON.stringify({ id: "state", type: "get_state" })}\n`,
+  );
+  const messages = smoke.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.ok(messages.some((message) => message.id === "state" && message.type === "response"), smoke.stdout);
+}
+
+function prepareSource(stage) {
+  return `---\nname: ${stage}\nsession-mode: run\ncontract:\n  produces:\n    - { path: outputs/${stage}.json, kind: ${stage}, alias: current-${stage}, role: primary }\ngates: []\n---\n# ${stage}\n`;
+}
+
+function parseTrailingJson(stdout) {
+  const arrayStart = stdout.lastIndexOf("\n[");
+  return JSON.parse(arrayStart >= 0 ? stdout.slice(arrayStart + 1) : stdout);
+}
+
+function tarList(tarball) {
+  const args = ["-tzf", basename(tarball)];
+  const result = spawnSync("tar", args, { cwd: dirname(tarball), encoding: "utf8" });
+  assert.equal(result.status, 0, `tar -tzf failed for ${tarball}: ${result.stderr}`);
+  return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+function readNearestPackageJson(entry) {
+  let directory = dirname(entry);
+  while (true) {
+    const packagePath = join(directory, "package.json");
+    if (existsSync(packagePath)) return JSON.parse(readFileSync(packagePath, "utf8"));
+    const parent = dirname(directory);
+    assert.notEqual(parent, directory, `package.json not found above ${entry}`);
+    directory = parent;
+  }
+}
+
+function resolveFfiRsPlatformSpec(optionalDependencies) {
+  let platformSuffix;
+  if (process.platform === "win32") {
+    platformSuffix = `win32-${process.arch}-msvc`;
+  } else if (process.platform === "darwin") {
+    platformSuffix = `darwin-${process.arch}`;
+  } else if (process.platform === "android") {
+    platformSuffix = `android-${process.arch}`;
+  } else if (process.platform === "linux") {
+    const libc = process.report.getReport().header.glibcVersionRuntime ? "gnu" : "musl";
+    platformSuffix = process.arch === "arm" ? "linux-arm-gnueabihf" : `linux-${process.arch}-${libc}`;
+  }
+  const packageName = `@yuuang/ffi-rs-${platformSuffix}`;
+  const version = optionalDependencies?.[packageName];
+  assert.equal(typeof version, "string", `ffi-rs does not declare a package for ${process.platform}/${process.arch}`);
+  return `${packageName}@${version}`;
+}
+
+function createPackedReceipt(tempRoot, tarballs) {
+  const key = {
+    contractVersion: packedReceiptContractVersion,
+    platform: process.platform,
+    arch: process.arch,
+    nodeMajor: Number(process.versions.node.split(".")[0]),
+    tarballs: tarballs.map(([name, tarball]) => ({
+      name,
+      sha256: createHash("sha256").update(readFileSync(tarball)).digest("hex"),
+    })),
+  };
+  const digest = createHash("sha256").update(JSON.stringify(key)).digest("hex");
+  return {
+    path: join(tempRoot, "pi-maestro-packed-consumer-receipts", `${digest}.json`),
+    value: { key, passed: true },
+  };
+}
+
+function hasValidPackedReceipt(receipt) {
+  if (!existsSync(receipt.path)) return false;
+  return readFileSync(receipt.path, "utf8") === `${JSON.stringify(receipt.value, null, 2)}\n`;
+}
+
+function writePackedReceipt(receipt) {
+  mkdirSync(dirname(receipt.path), { recursive: true });
+  writeFileSync(receipt.path, `${JSON.stringify(receipt.value, null, 2)}\n`);
+}
+
+function isolatedPiRuntimeEnv(baseEnv, home, overrides = {}) {
+  const env = { ...baseEnv };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PI_") || key.startsWith("MCP_")) delete env[key];
+  }
+  return {
+    ...env,
+    PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
+    PI_GUI: "0",
+    MCP_DIRECT_TOOLS: "__none__",
+    XDG_CONFIG_HOME: join(home, ".config"),
+    ...overrides,
+  };
+}
+
+function run(command, args, cwd, env = process.env, timeout = 60_000, input) {
+  const [file, ...prefix] = Array.isArray(command) ? command : [command];
+  const argv = [...prefix, ...args];
+  const result = spawnSync(file, argv, {
+    cwd,
+    env,
+    input,
+    encoding: "utf8",
+    timeout,
+    windowsHide: true,
+    shell: false,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  assert.equal(
+    result.status,
+    0,
+    `${file} ${argv.join(" ")} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\n${result.error ?? ""}`,
+  );
+  return { stdout: result.stdout.trim(), stderr: result.stderr.trim() };
+}

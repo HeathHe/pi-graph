@@ -1,0 +1,235 @@
+/**
+ * MOA (Mixture-of-Agents) action — multi-model synthesis.
+ *
+ * Phase 1: Spawn parallel teammate agents (reference profile) across
+ *          different models/endpoints for independent analysis.
+ * Phase 2: Spawn aggregator teammate with all reference outputs as
+ *          context to synthesize a unified result.
+ */
+
+import type { FlowToolResult } from "./tool-result.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { runTeammate } from "pi-graph-agent-runtime/v1/execution";
+import type { SingleResult } from "pi-graph-agent-runtime/v1/types";
+import { refreshModelRegistry } from "pi-graph-agent-runtime/v1/model-routing";
+import { createDirectTeammateRunOptions } from "./direct-teammate.ts";
+
+export interface MoaParams {
+  prompts?: string[];
+  preset?: string;
+  maxTurns?: number;
+  model?: string;
+  cwd?: string;
+}
+
+interface ReferenceOutput {
+  model: string;
+  content: string;
+  exitCode: number;
+  durationMs: number;
+}
+
+/**
+ * Get currently available models from the refreshed provider registry.
+ * MOA reference fan-out is intentionally small and prefers distinct providers
+ * so references span independent endpoints.
+ */
+async function getAvailableModels(ctx: ExtensionContext): Promise<string[]> {
+  await refreshModelRegistry(ctx);
+  const ids = ctx.modelRegistry.getAvailable().map((model) => `${model.provider}/${model.id}`);
+  const byProvider = new Map<string, string>();
+  for (const id of ids) {
+    const slash = id.indexOf("/");
+    const provider = slash >= 0 ? id.slice(0, slash) : id;
+    if (!byProvider.has(provider)) byProvider.set(provider, id);
+  }
+  return [...byProvider.values()].slice(0, 3);
+}
+
+/**
+ * Execute MOA action: parallel reference analysis + aggregator synthesis.
+ */
+export async function executeMoa(
+  params: MoaParams,
+  signal: AbortSignal,
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): Promise<FlowToolResult> {
+  const prompts = params.prompts ?? [];
+  const primaryPrompt = prompts[0];
+
+  if (!primaryPrompt) {
+    return {
+      content: [
+        { type: "text", text: "No prompts provided for MOA action." },
+      ],
+      isError: true,
+      details: {},
+    };
+  }
+
+  const models = await getAvailableModels(ctx);
+  if (models.length === 0) {
+    return {
+      content: [{ type: "text", text: "No teammate models are available for MOA; configure provider authentication first." }],
+      isError: true,
+      details: {},
+    };
+  }
+
+  // Phase 1: Spawn parallel reference agents across different models
+  const referenceOutputs: ReferenceOutput[] = [];
+  const referencePromises: Promise<void>[] = [];
+
+  for (const model of models) {
+    if (signal.aborted) break;
+
+    const promise = (async () => {
+      try {
+        const [result] = await runTeammate(
+          {
+            tasks: [{
+              agent: "analyst",
+              taskType: "analysis",
+              prompt: primaryPrompt,
+              model,
+              cwd: params.cwd,
+              context: "fresh",
+            }],
+            background: false,
+            reply_to: "caller",
+          },
+          await createDirectTeammateRunOptions(pi, ctx, { baseCwd: ctx.cwd, signal }),
+        );
+        if (!result) throw new Error("MOA reference returned no teammate result");
+
+        const lastMessage =
+          result.messages[result.messages.length - 1]?.content ?? "(no output)";
+
+        referenceOutputs.push({
+          model: result.model,
+          content: lastMessage,
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+        });
+      } catch (error) {
+        referenceOutputs.push({
+          model,
+          content: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          exitCode: 1,
+          durationMs: 0,
+        });
+      }
+    })();
+
+    referencePromises.push(promise);
+  }
+
+  // Wait for all reference agents
+  await Promise.allSettled(referencePromises);
+
+  if (signal.aborted) {
+    return {
+      content: [{ type: "text", text: "MOA operation was aborted." }],
+      isError: true,
+      details: {},
+    };
+  }
+
+  const successfulOutputs = referenceOutputs.filter((r) => r.exitCode === 0);
+
+  if (successfulOutputs.length === 0) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `All reference agents failed.\n\n${referenceOutputs.map((r) => `${r.model}: ${r.content}`).join("\n\n")}`,
+        },
+      ],
+      isError: true,
+      details: {},
+    };
+  }
+
+  // Phase 2: Aggregator synthesizes all reference outputs
+  const aggregationPrompt = buildAggregationPrompt(
+    primaryPrompt,
+    successfulOutputs,
+  );
+
+  try {
+    const [aggregatorResult] = await runTeammate(
+      {
+        tasks: [{
+          agent: "analyst",
+          taskType: "analysis",
+          prompt: aggregationPrompt,
+          model: params.model,
+          cwd: params.cwd,
+          context: "fresh",
+        }],
+        background: false,
+        reply_to: "caller",
+      },
+      await createDirectTeammateRunOptions(pi, ctx, { baseCwd: ctx.cwd, signal }),
+    );
+    if (!aggregatorResult) throw new Error("MOA aggregator returned no teammate result");
+
+    const lastMessage =
+      aggregatorResult.messages[aggregatorResult.messages.length - 1]
+        ?.content ?? "(no output)";
+
+    return {
+      content: [{ type: "text", text: lastMessage }],
+      isError: aggregatorResult.exitCode !== 0,
+      details: {},
+    };
+  } catch (error) {
+    // Fallback: return raw reference outputs if aggregation fails
+    const fallbackOutput = successfulOutputs
+      .map((r) => `## ${r.model}\n\n${r.content}`)
+      .join("\n\n---\n\n");
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Aggregation failed, returning raw reference outputs:\n\n${fallbackOutput}`,
+        },
+      ],
+      isError: false,
+      details: {},
+    };
+  }
+}
+
+function buildAggregationPrompt(
+  originalPrompt: string,
+  referenceOutputs: ReferenceOutput[],
+): string {
+  const referenceSections = referenceOutputs
+    .map(
+      (r, i) =>
+        `### Reference ${i + 1} (${r.model})\n\n${r.content}`,
+    )
+    .join("\n\n---\n\n");
+
+  return `You are synthesizing multiple independent analyses into a unified, high-quality response.
+
+## Original Question/Task
+
+${originalPrompt}
+
+## Independent Reference Analyses
+
+${referenceSections}
+
+## Your Task
+
+Synthesize these reference analyses into a single, comprehensive response:
+1. Identify areas of consensus across references
+2. Note any conflicts or divergent perspectives
+3. Produce a unified analysis that incorporates the strongest points from each reference
+4. Where references disagree, evaluate the evidence and make a reasoned judgment
+5. Ensure the final output is coherent, well-structured, and directly addresses the original question`;
+}

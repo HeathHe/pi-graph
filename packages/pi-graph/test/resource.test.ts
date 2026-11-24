@@ -1,0 +1,339 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { after, before } from "node:test";
+
+const { createResourceTool, parseResourceUri, parseGhTarget, resolveResource } = await import("../src/tools/resource.ts");
+const { persistAgentOutput, persistAgentOutputChecked } = await import("../src/teammate/agent-output-store.ts");
+const { MAX_SESSION_HISTORY_FILES } = await import("pi-graph-agent-runtime/v1/session-history");
+
+const theme = {
+	fg: (_name: string, text: string) => text,
+	bold: (text: string) => text,
+};
+
+function lines(component: { render(width: number): string[] }): string[] {
+	return component.render(200).map((line) => line.trimEnd());
+}
+
+let root: string;
+let previousCwd: string;
+let previousOutputRoot: string | undefined;
+
+before(async () => {
+  root = await mkdtemp(join(tmpdir(), "pi-resource-"));
+  previousCwd = process.cwd();
+  previousOutputRoot = process.env.PI_AGENT_OUTPUT_ROOT;
+  process.env.PI_AGENT_OUTPUT_ROOT = join(root, "agent-output");
+  await mkdir(join(root, ".pi", "skills", "demo-skill"), { recursive: true });
+  await writeFile(join(root, ".pi", "skills", "demo-skill", "SKILL.md"), "# Demo Skill\n\nBody of the demo skill.\n", "utf-8");
+  await writeFile(join(root, "AGENTS.md"), "# Project Agents\n\nWorktree conventions.\n", "utf-8");
+  await writeFile(join(root, "RULES.md"), "# Rules\n\nNever touch the lockfile.\n", "utf-8");
+  process.chdir(root);
+});
+
+after(async () => {
+  process.chdir(previousCwd);
+  if (previousOutputRoot === undefined) delete process.env.PI_AGENT_OUTPUT_ROOT;
+  else process.env.PI_AGENT_OUTPUT_ROOT = previousOutputRoot;
+  await rm(root, { recursive: true, force: true });
+});
+
+test("parseResourceUri splits scheme and segments", () => {
+  assert.deepEqual(parseResourceUri("pr://owner/repo/123"), { scheme: "pr", segments: ["owner", "repo", "123"] });
+  assert.deepEqual(parseResourceUri("pr://owner/repo/123/diff"), { scheme: "pr", segments: ["owner", "repo", "123", "diff"] });
+  assert.deepEqual(parseResourceUri("issue://123"), { scheme: "issue", segments: ["123"] });
+  assert.deepEqual(parseResourceUri("skill://my-tool"), { scheme: "skill", segments: ["my-tool"] });
+  assert.equal(parseResourceUri("not a uri"), null);
+  assert.equal(parseResourceUri("relative/path"), null);
+});
+
+test("parseGhTarget handles owner/repo and bare number forms", () => {
+  assert.deepEqual(parseGhTarget(["owner", "repo", "123"]), { target: { owner: "owner", repo: "repo", number: "123" }, sub: "" });
+  assert.deepEqual(parseGhTarget(["owner", "repo", "123", "diff"]), { target: { owner: "owner", repo: "repo", number: "123" }, sub: "diff" });
+  assert.deepEqual(parseGhTarget(["owner", "repo", "123", "files"]), { target: { owner: "owner", repo: "repo", number: "123" }, sub: "files" });
+  assert.deepEqual(parseGhTarget(["123"]), { target: { owner: "", repo: "", number: "123" }, sub: "" });
+  assert.equal(parseGhTarget(["owner", "repo", "abc"]), null);
+  assert.equal(parseGhTarget([]), null);
+  assert.equal(parseGhTarget(["owner", "repo"]), null);
+  assert.equal(parseGhTarget(["owner", "123"]), null, "two-segment owner/N form is ambiguous and rejected");
+  assert.equal(parseGhTarget(["owner", "repo", "123", "unknown"]), null, "unknown pr sub-path is rejected");
+  assert.equal(parseGhTarget(["owner", "repo", "123", "diff", "extra"]), null);
+});
+
+test("resolveResource reads skill:// from the project .pi/skills directory", async () => {
+  const result = await resolveResource("skill://demo-skill", root);
+  assert.equal(result.cached, false);
+  assert.match(result.content, /# Skill: demo-skill/);
+  assert.match(result.content, /Body of the demo skill/);
+});
+
+test("resolveResource skill:// with unknown name lists available skills", async () => {
+  await assert.rejects(
+    () => resolveResource("skill://nope", root),
+    (err: unknown) => err instanceof Error && err.message.includes("demo-skill") && err.message.includes("not found"),
+  );
+});
+
+test("resolveResource reads rule://agents and rule://rules aliases", async () => {
+  const agents = await resolveResource("rule://agents", root);
+  assert.match(agents.content, /Worktree conventions/);
+  const rules = await resolveResource("rule://rules", root);
+  assert.match(rules.content, /Never touch the lockfile/);
+});
+
+test("resolveResource rule:// with unknown name reports candidates", async () => {
+  await assert.rejects(
+    () => resolveResource("rule://missing-rule", root),
+    (err: unknown) => err instanceof Error && err.message.includes("not found") && err.message.includes("AGENTS.md"),
+  );
+});
+
+test("resource tool renders through a self shell (no host box) with compact quiet rows", () => {
+	const tool = createResourceTool();
+	assert.equal(tool.renderShell, "self");
+	assert.ok(tool.renderCall);
+	assert.ok(tool.renderResult);
+});
+
+test("resource prompt contract distinguishes agent names, correlation ids and publication ids", () => {
+  const tool = createResourceTool();
+  const description = tool.description;
+  const guidelines = (tool.promptGuidelines ?? []).join("\n");
+  assert.match(description, /Exact correlation and publication IDs resolve globally/);
+  assert.match(description, /task-name discovery remains scoped/);
+  assert.match(description, /correlation ID follows that task's latest publication/);
+  assert.match(description, /publication ID pins one immutable result/);
+  assert.match(description, /Agent resources are not cached/);
+  assert.match(description, /Obtain exact URIs from `session_history`/);
+  assert.doesNotMatch(description, /compact_history/);
+  assert.match(guidelines, /smallest required agent:\/\/<exact-id>\/key\/index subtree/);
+  assert.match(guidelines, /do not reload an unchanged immutable URI/);
+  assert.doesNotMatch(description, /publicationId remains a compatibility alias/);
+});
+
+test("resource reads an exact entry discovered from an authorized workspace session", async () => {
+  const sessions = join(root, "workspace-sessions");
+  const currentFile = join(sessions, "2026-09-03T00-00-00-000Z_resource-current.jsonl");
+  const priorFile = join(sessions, "2026-01-01T00-00-00-000Z_resource-prior.jsonl");
+  await mkdir(sessions, { recursive: true });
+  await Promise.all(Array.from({ length: MAX_SESSION_HISTORY_FILES }, (_, index) => writeFile(
+    join(sessions, `2026-09-02T00-00-00-000Z_decoy-${String(index).padStart(3, "0")}.jsonl`),
+    [
+      { type: "session", version: 3, id: `resource-decoy-${index}`, timestamp: "2026-08-01T00:00:00.000Z", cwd: root },
+      { type: "message", id: `u-decoy-${index}`, parentId: null, timestamp: "2026-08-01T00:00:01.000Z", message: { role: "user", content: "decoy", timestamp: 1 } },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+  )));
+  await writeFile(currentFile, [
+    { type: "session", version: 3, id: "resource-current", timestamp: "2026-08-01T00:00:00.000Z", cwd: root },
+    { type: "message", id: "u-current", parentId: null, timestamp: "2026-08-01T00:00:01.000Z", message: { role: "user", content: "current", timestamp: 1 } },
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  await writeFile(priorFile, [
+    { type: "session", version: 3, id: "resource-prior", timestamp: "2026-08-01T00:00:00.000Z", cwd: root },
+    { type: "message", id: "u-prior", parentId: null, timestamp: "2026-08-01T00:00:01.000Z", message: { role: "user", content: "prior workspace evidence", timestamp: 1 } },
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+
+  const tool = createResourceTool();
+  const call = tool.execute as unknown as (
+    id: string,
+    params: { uri: string },
+    signal: AbortSignal,
+    onUpdate: undefined,
+    ctx: { cwd: string; sessionManager: { getSessionFile(): string } },
+  ) => Promise<{ content: Array<{ type: string; text?: string }> }>;
+  const result = await call(
+    "workspace-entry",
+    { uri: "session://resource-prior/entry/u-prior" },
+    new AbortController().signal,
+    undefined,
+    { cwd: root, sessionManager: { getSessionFile: () => currentFile } },
+  );
+  assert.match(result.content[0]?.text ?? "", /prior workspace evidence/);
+  assert.doesNotMatch(result.content[0]?.text ?? "", /prior\.jsonl/);
+});
+
+test("resource quiet call row shows the uri and settles empty once complete", () => {
+	const tool = createResourceTool();
+	const renderCall = tool.renderCall as unknown as (
+		args: { uri: string },
+		theme: typeof theme,
+		context?: { isPartial?: boolean; args: { uri: string } },
+	) => { render(width: number): string[] };
+	assert.deepEqual(lines(renderCall({ uri: "skill://demo-skill" }, theme, { isPartial: true, args: { uri: "skill://demo-skill" } })), [
+		"  … resource skill://demo-skill",
+	]);
+	assert.deepEqual(lines(renderCall({ uri: "skill://demo-skill" }, theme, { isPartial: false, args: { uri: "skill://demo-skill" } })), []);
+});
+
+test("resource quiet result row marks success and failure", () => {
+	const tool = createResourceTool();
+	const renderResult = tool.renderResult as unknown as (
+		result: { content: Array<{ type: "text"; text: string }>; details?: unknown; isError?: boolean },
+		options: { expanded: boolean; isPartial: boolean },
+		theme: typeof theme,
+		context: { args: { uri: string } },
+	) => { render(width: number): string[] };
+
+	assert.deepEqual(lines(renderResult(
+		{
+			content: [{ type: "text", text: "# Skill: demo-skill\n\nBody." }],
+			details: { uri: "skill://demo-skill", scheme: "skill", resource: "skill://demo-skill", cached: false, bytes: 30 },
+			isError: false,
+		},
+		{ expanded: false, isPartial: false },
+		theme,
+		{ args: { uri: "skill://demo-skill" } },
+	)), ["  ✓ resource skill://demo-skill · skill://demo-skill"]);
+
+	assert.deepEqual(lines(renderResult(
+		{
+			content: [{ type: "text", text: "boom" }],
+			details: { uri: "skill://nope", scheme: "skill", resource: "skill://nope", cached: false, bytes: 4 },
+			isError: true,
+		},
+		{ expanded: false, isPartial: false },
+		theme,
+		{ args: { uri: "skill://nope" } },
+	)), ["  ✕ resource skill://nope · skill://nope"]);
+});
+
+test("resolveResource reads agent:// output by correlationId and json path", async () => {
+  await persistAgentOutput(
+    "run-agent-1",
+    "reviewer",
+    "analyst",
+    { findings: [{ path: "src/a.ts", severity: "high" }], count: 1 },
+    root,
+  );
+
+  const whole = await resolveResource("agent://run-agent-1", root);
+  assert.match(whole.content, /\"findings\"/);
+
+  const byName = await resolveResource("agent://reviewer/findings/0/path", root);
+  assert.equal(byName.content.trim(), "src/a.ts");
+
+  const byPath = await resolveResource("agent://run-agent-1/findings/0/severity", root);
+  assert.equal(byPath.content.trim(), "high");
+});
+
+test("resolveResource keeps publication ids immutable while correlation id tracks latest", async () => {
+  await persistAgentOutputChecked(
+    "resource-versioned",
+    "resource-versioned-task",
+    "general",
+    { turn: 1 },
+    root,
+    "resource-publication-1",
+  );
+  await persistAgentOutputChecked(
+    "resource-versioned",
+    "resource-versioned-task",
+    "general",
+    { turn: 2 },
+    root,
+    "resource-publication-2",
+  );
+
+  assert.match((await resolveResource("agent://resource-publication-1", root)).content, /\"turn\": 1/);
+  assert.match((await resolveResource("agent://resource-publication-2", root)).content, /\"turn\": 2/);
+  assert.match((await resolveResource("agent://resource-versioned", root)).content, /\"turn\": 2/);
+});
+
+test("resolveResource loads an exact agent id from a parent workspace bucket", async () => {
+  const child = join(root, "packages", "child-resource");
+  await mkdir(child, { recursive: true });
+  await persistAgentOutputChecked(
+    "resource-parent-correlation",
+    "resource-parent-task",
+    "explorer",
+    { scope: "parent" },
+    root,
+    "resource-parent-publication",
+  );
+
+  assert.match(
+    (await resolveResource("agent://resource-parent-publication", child)).content,
+    /"scope": "parent"/,
+  );
+  assert.match(
+    (await resolveResource("agent://resource-parent-correlation", child)).content,
+    /"scope": "parent"/,
+  );
+  await assert.rejects(
+    () => resolveResource("agent://resource-parent-task", child),
+    /No persisted teammate output/,
+  );
+});
+
+test("resolveResource agent:// name with duplicates lists ids, times and previews", async () => {
+  await persistAgentOutputChecked("res-dup-cid-1", "res-dup-agent", "explorer", { turn: 1 }, root, "res-dup-pub-1");
+  await persistAgentOutputChecked("res-dup-cid-2", "res-dup-agent", "explorer", { turn: 2 }, root, "res-dup-pub-2");
+
+  const listed = await resolveResource("agent://res-dup-agent", root);
+  assert.match(listed.content, /Multiple outputs match agent name "res-dup-agent" \(2\)/);
+  assert.match(listed.content, /agent:\/\/res-dup-cid-2/);
+  assert.match(listed.content, /agent:\/\/res-dup-cid-1/);
+  assert.match(listed.content, /\{"turn":2\}/);
+  assert.match(listed.content, /query by correlationId/);
+
+  // 按 publicationId 精确查询得到对应记录
+  assert.match((await resolveResource("agent://res-dup-pub-1", root)).content, /"turn": 1/);
+  assert.match((await resolveResource("agent://res-dup-pub-2", root)).content, /"turn": 2/);
+});
+
+test("resolveResource agent:// path miss reports a precise reason and a usage tip", async () => {
+  await persistAgentOutput("run-agent-2", "scanner", "explorer", { findings: [{ path: "a.ts" }] }, root);
+  await assert.rejects(
+    () => resolveResource("agent://run-agent-2/findings/9/path", root),
+    (err: unknown) => err instanceof Error && err.message.includes("path miss") && err.message.includes("out of bounds"),
+  );
+  await assert.rejects(
+    () => resolveResource("agent://run-agent-2/json", root),
+    (err: unknown) => err instanceof Error
+      && err.message.includes("key \"json\" not found")
+      && err.message.includes("Tip: agent://run-agent-2 (no path) returns the whole output"),
+  );
+});
+
+test("resolveResource reads agent:// text records persisted without an outputSchema", async () => {
+  await persistAgentOutput("run-agent-3", "planner", "general", "Plan: land in three steps.", root);
+  const whole = await resolveResource("agent://run-agent-3", root);
+  assert.equal(whole.content.trim(), "Plan: land in three steps.");
+  const byName = await resolveResource("agent://planner", root);
+  assert.equal(byName.content.trim(), "Plan: land in three steps.");
+});
+
+test("resolveResource rejects skill/rule name traversal", async () => {
+  await assert.rejects(
+    () => resolveResource("skill://../escape", root),
+    (err: unknown) => err instanceof Error && err.message.includes("Invalid skill:// name"),
+  );
+  await assert.rejects(
+    () => resolveResource("skill://a/../../escape", root),
+    (err: unknown) => err instanceof Error && err.message.includes("Invalid skill:// name"),
+  );
+  await assert.rejects(
+    () => resolveResource("rule://../../package.json", root),
+    (err: unknown) => err instanceof Error && err.message.includes("Invalid rule:// name"),
+  );
+});
+
+test("resolveResource rejects reserved and unsupported schemes", async () => {
+  await assert.rejects(
+    () => resolveResource("memory://xyz", root),
+    (err: unknown) => err instanceof Error && err.message.includes("reserved"),
+  );
+  await assert.rejects(
+    () => resolveResource("agent://ghost", root),
+    (err: unknown) => err instanceof Error && err.message.includes("No persisted teammate output"),
+  );
+  await assert.rejects(
+    () => resolveResource("ftp://example.com/x", root),
+    (err: unknown) => err instanceof Error && err.message.includes("Unsupported scheme"),
+  );
+  await assert.rejects(
+    () => resolveResource("plain text", root),
+    (err: unknown) => err instanceof Error && err.message.includes("Unsupported URI format"),
+  );
+});

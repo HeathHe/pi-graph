@@ -1,0 +1,13 @@
+# MaestroGraph code index ignore rules.
+# Uses gitignore syntax and is merged after .gitignore.
+
+.workflow/
+.codegraph/
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+
+# Reverse-engineering artifacts (devin.exe analysis dump)
+devin-re/

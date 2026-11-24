@@ -1,0 +1,221 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type Component, type Focusable } from "@earendil-works/pi-tui";
+import type { AgentConfig } from "../agents/agents.ts";
+import type { ModelCircuitSnapshot } from "../models/model-circuit-breaker.ts";
+import type { TeammateModelCapability } from "../models/model-catalog.ts";
+import { type ModelRoutingRoleRules, type ModelRoutingRules, type ModelRoutingState, type ModelRoutingTypeMeta, type TeammateTaskType } from "../models/model-routing.ts";
+import { type TeammateThinkingLevel } from "../shared/thinking.ts";
+import { type SupportedSettingsLocale } from "./locale.ts";
+import { type RemotePaneAction, type RemotePaneDeployments } from "./remote-config-pane.ts";
+import { type RemoteConfigState } from "../remote/config.ts";
+export type ControlCenterTab = "profiles" | "routing" | "roles" | "connections" | "active";
+export interface ControlCenterActiveAgent {
+    correlationId: string;
+    agent: string;
+    name?: string;
+    status: "pending" | "running" | "retrying" | "sleeping" | "completed" | "failed" | "terminated";
+    startedAt: number;
+    inboxCount: number;
+    taskCount: number;
+    /** Resolved working directory of the run, when known. */
+    cwd?: string;
+}
+interface ControlCenterTheme {
+    fg(role: string, text: string): string;
+    bold(text: string): string;
+}
+export type ControlCenterAction = {
+    kind: "open-agent";
+    correlationId: string;
+    tab: ControlCenterTab;
+} | {
+    kind: "reload";
+    tab: ControlCenterTab;
+} | {
+    kind: "manage-profile";
+    profileId: string;
+    profileQuery: string;
+    tab: ControlCenterTab;
+} | RemotePaneAction;
+export interface TeammateControlCenterOptions {
+    agents?: readonly AgentConfig[];
+    activeAgents?: readonly ControlCenterActiveAgent[];
+    modelHealth?: readonly ModelCircuitSnapshot[];
+    /** Tab shown when the Control Center first opens. */
+    initialTab?: ControlCenterTab;
+    onOpenAgent?: (correlationId: string) => Promise<void>;
+    /** Remote configuration state for the Connections tab. */
+    remoteState?: RemoteConfigState;
+    /** Precomputed model-registry projection for the connections pane. */
+    deployments?: RemotePaneDeployments;
+    /** Probe a remote target (SSH handshake + protocol initialize); result text is already redacted. */
+    onTestRemote?: (targetId: string, signal: AbortSignal) => Promise<string>;
+    remoteTestTimeoutMs?: number;
+    /** Reload the extension's model catalog after registry writes or explicit reloads. */
+    refreshModelCatalog?: () => readonly TeammateModelCapability[];
+    globalFilePath?: string;
+    locale?: SupportedSettingsLocale;
+}
+interface LegacyControlCenterConfig extends ModelRoutingRules {
+    version: 2 | 3 | 4;
+    profileId?: string;
+    profileName?: string;
+    projectOverridesEnabled?: boolean;
+}
+interface TeammateControlCenterParams {
+    cwd: string;
+    availableModels: readonly TeammateModelCapability[];
+    agents: readonly AgentConfig[];
+    activeAgents: readonly ControlCenterActiveAgent[];
+    state?: ModelRoutingState;
+    config?: LegacyControlCenterConfig;
+    remoteState?: RemoteConfigState;
+    deployments?: RemotePaneDeployments;
+    onTestRemote?: (targetId: string, signal: AbortSignal) => Promise<string>;
+    remoteTestTimeoutMs?: number;
+    theme: ControlCenterTheme;
+    initialTab?: ControlCenterTab;
+    initialProfileId?: string;
+    initialProfileQuery?: string;
+    initialStatusText?: string;
+    initialStatusTone?: "dim" | "success" | "error";
+    initialSaving?: boolean;
+    readOnly?: boolean;
+    globalFilePath?: string;
+    requestRender: () => void;
+    close: (action: ControlCenterAction | null) => void;
+    saveMapping?: (taskType: TeammateTaskType, model: string | null) => void;
+    saveThinking?: (taskType: TeammateTaskType, thinking: TeammateThinkingLevel | null) => void;
+    saveFast?: (taskType: TeammateTaskType, fast: boolean | null) => void;
+    saveFallbacks?: (taskType: TeammateTaskType, models: string[] | null) => void;
+    saveRoleRules?: (role: string, rules: ModelRoutingRoleRules | null) => void;
+    saveTypeRoles?: (taskType: TeammateTaskType, roles: readonly string[]) => void;
+    saveCustomType?: (taskType: TeammateTaskType, meta?: ModelRoutingTypeMeta | null) => void;
+    deleteCustomType?: (taskType: TeammateTaskType) => void;
+    saveTypeMeta?: (taskType: TeammateTaskType, meta: ModelRoutingTypeMeta | null) => void;
+    modelHealth?: readonly ModelCircuitSnapshot[];
+    locale?: SupportedSettingsLocale;
+}
+export declare class TeammateControlCenter implements Component, Focusable {
+    private readonly params;
+    focused: boolean;
+    private tab;
+    private modelTaskType;
+    private modelRole;
+    private editorKind;
+    private circuitCustomMode;
+    private readonly roleAssignmentDraft;
+    private customTypeInput;
+    private customTypeDraft;
+    private keywordsInput;
+    private keywordsDraft;
+    private readonly queries;
+    private modelQuery;
+    private readonly selected;
+    private modelSelected;
+    private saving;
+    private statusText;
+    private statusTone;
+    private readonly pasteDecoder;
+    private pasteFlushTimer;
+    private persistenceTimer;
+    private lastWidth;
+    private readonly state;
+    private config;
+    private readonly profileIds;
+    private readonly models;
+    private readonly modelCapabilities;
+    private readonly health;
+    private fallbackDraft;
+    private readonly agents;
+    private taskTypes;
+    private readonly activeAgents;
+    private readonly remotePane;
+    private readonly t;
+    private readonly localeDisposer;
+    constructor(params: TeammateControlCenterParams);
+    invalidate(): void;
+    dispose(): void;
+    handleInput(data: string): void;
+    private dispatchDecodedToken;
+    private handleDecodedInput;
+    render(width: number): string[];
+    private switchTab;
+    private moveSelection;
+    private activateSelection;
+    private activateThinkingSelection;
+    private activateFallbackSelection;
+    private activateRoleThinkingSelection;
+    private activateRoleFallbackSelection;
+    private activateRoleCircuitSelection;
+    private activateRoleTypeSelection;
+    private settingsMenuItems;
+    private assignedRoles;
+    private openSelectedSetting;
+    private returnToSettingsMenu;
+    private roleAssignmentItems;
+    private roleTypeItems;
+    private roleRules;
+    private editorTargetLabel;
+    private handleModelInput;
+    private handleRoleAssignmentInput;
+    private commitRoleAssignments;
+    private handleCircuitCustomInput;
+    private commitCircuitCustom;
+    private startCustomTypeInput;
+    private handleCustomTypeInput;
+    private commitCustomType;
+    private handleKeywordsInput;
+    private commitKeywords;
+    private startTypeMetaEdit;
+    private deleteSelectedCustomType;
+    private refreshTaskTypes;
+    private editorSaveLabel;
+    private handleFallbackInput;
+    private fallbackItems;
+    private fallbackItemDetail;
+    private circuitNote;
+    private editorLabel;
+    private toggleFallbackItem;
+    private reorderFallback;
+    private commitFallback;
+    private taskTypeMeta;
+    private filteredProfileIds;
+    private filteredTaskTypes;
+    private filteredRoles;
+    private filteredActiveAgents;
+    private currentItems;
+    private modelPickerItems;
+    private modelItems;
+    private roleModelItems;
+    private fastValue;
+    private fastPickerItems;
+    private thinkingPickerItems;
+    private thinkingItems;
+    private roleThinkingItems;
+    private circuitItems;
+    private filteredEditorItems;
+    private renderMain;
+    private renderModels;
+    private renderListRows;
+    private unavailableModels;
+    private itemLine;
+    private detailLines;
+    private emptyState;
+    private headerLine;
+    private tabLine;
+    private remoteCount;
+    private filterLine;
+    private statusLine;
+    /** Routing tab toggle row: require the root agent to consult model-availability. */
+    private smartToggleLine;
+    private toggleSmartMode;
+    /** Routing tab toggle row: ask the user to pick model provider before dispatch. */
+    private askToggleLine;
+    private toggleAskBeforeDispatch;
+    private footerLine;
+    private frame;
+    private renderCompact;
+}
+export declare function showModelMappingOverlay(ctx: ExtensionContext, availableModels: readonly TeammateModelCapability[], options?: TeammateControlCenterOptions): Promise<void>;
+export {};

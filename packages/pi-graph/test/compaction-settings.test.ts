@@ -1,0 +1,950 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import {
+  createDefaultSoftCompaction,
+  DEFAULT_KEEP_RECENT_TOKENS,
+  DEFAULT_NEW_CONTEXT_ENABLED,
+  DEFAULT_RESERVE_TOKENS,
+  DEFAULT_SOFT_COMPACTION,
+  DEFAULT_SUMMARY_THINKING_LEVEL,
+  DEFAULT_SUMMARY_TIMEOUT_MS,
+  SUMMARY_THINKING_LEVELS,
+  MAX_RESERVE_TOKENS,
+  readEffectiveCompactionSettings,
+  readScopeCompaction,
+  resolveEffectiveCompactionSettings,
+  resolveModelThresholdOverride,
+  resolveProjectSettingsPath,
+  resolveUserSettingsPath,
+  saveCompactionPatch,
+  saveCompactionScope,
+  setCompactionSettingsFileOperationsForTesting,
+  unsetCompactionField,
+  validateCompactionPatch,
+  validateEffectiveCompactionSettings,
+  type SoftCompactionSettings,
+} from "../src/compaction/compaction-settings.ts";
+
+test("compaction settings use the Pi default user path when the agent directory is unset", () => {
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  delete process.env.PI_CODING_AGENT_DIR;
+  try {
+    assert.equal(resolveUserSettingsPath(), join(homedir(), ".pi", "agent", "settings.json"));
+  } finally {
+    if (previousAgentDir !== undefined) process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("summary defaults are independent and merge per child across scopes", async () => {
+  const fixture = await createFixture();
+  try {
+    assert.deepEqual(SUMMARY_THINKING_LEVELS, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    const defaults = resolveEffectiveCompactionSettings({}, {});
+    assert.deepEqual(defaults.summary, { thinkingLevel: "off", timeoutMs: 240_000 });
+    defaults.summary.thinkingLevel = "max";
+    assert.equal(resolveEffectiveCompactionSettings({}, {}).summary.thinkingLevel, "off");
+    await writeSettings(fixture.agentDir, {
+      compaction: { summary: { thinkingLevel: "high", timeoutMs: 300_000 } },
+    });
+    let effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.deepEqual(effective.summary, { thinkingLevel: "high", timeoutMs: 300_000 });
+    assert.equal(effective.source.summary, "user");
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { summary: { timeoutMs: 2_147_483_647 } },
+    });
+    effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.deepEqual(effective.summary, { thinkingLevel: "high", timeoutMs: 2_147_483_647 });
+    assert.equal(effective.source.summary, "project");
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { summary: { thinkingLevel: "off" } },
+    });
+    assert.deepEqual(readEffectiveCompactionSettings(fixture.projectDir).summary, {
+      thinkingLevel: "off", timeoutMs: 300_000,
+    });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("summary raw reads ignore malformed groups and children without masking valid siblings", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(fixture.agentDir, {
+      compaction: { summary: { thinkingLevel: "medium", timeoutMs: 120_000 } },
+    });
+    for (const summary of [null, [], false, "high", {}, { vendor: true }]) {
+      await writeSettings(join(fixture.projectDir, ".pi"), { compaction: { summary } });
+      assert.equal(readScopeCompaction("project", fixture.projectDir).summary, undefined);
+      assert.equal(readEffectiveCompactionSettings(fixture.projectDir).source.summary, "user");
+    }
+    for (const timeoutMs of [0, -1, 1.5, "1000", null, 2_147_483_648, Number.MAX_SAFE_INTEGER + 1]) {
+      await writeSettings(join(fixture.projectDir, ".pi"), {
+        compaction: { summary: { thinkingLevel: "low", timeoutMs } },
+      });
+      assert.deepEqual(readScopeCompaction("project", fixture.projectDir).summary, { thinkingLevel: "low" });
+      assert.deepEqual(readEffectiveCompactionSettings(fixture.projectDir).summary, {
+        thinkingLevel: "low", timeoutMs: 120_000,
+      });
+    }
+    for (const thinkingLevel of ["HIGH", "", " low ", 42, null]) {
+      await writeSettings(join(fixture.projectDir, ".pi"), {
+        compaction: { summary: { thinkingLevel, timeoutMs: 1 } },
+      });
+      assert.deepEqual(readScopeCompaction("project", fixture.projectDir).summary, { timeoutMs: 1 });
+    }
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("summary validation enforces thinking levels and timer-safe positive integer timeouts", () => {
+  for (const thinkingLevel of SUMMARY_THINKING_LEVELS) {
+    for (const timeoutMs of [1, 240_000, 2_147_483_647]) {
+      assert.deepEqual(validateCompactionPatch({ summary: { thinkingLevel, timeoutMs } }).errors, []);
+    }
+  }
+  for (const summary of [null, [], "off", false]) {
+    assert.deepEqual(validateCompactionPatch({ summary: summary as never }).errors, ["summary must be an object"]);
+  }
+  assert.match(validateCompactionPatch({ summary: { thinkingLevel: "invalid" as never } }).errors[0], /summary.thinkingLevel/);
+  for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 2_147_483_648, "1000", null]) {
+    assert.match(validateCompactionPatch({ summary: { timeoutMs: timeoutMs as never } }).errors[0], /summary.timeoutMs/);
+  }
+  const invalid = resolveEffectiveCompactionSettings({}, { summary: { timeoutMs: 0 } });
+  assert.match(validateEffectiveCompactionSettings(invalid).errors[0], /summary.timeoutMs/);
+});
+
+test("summary patch, scope replacement, and unset preserve unknown keys and unrelated settings", async () => {
+  const fixture = await createFixture();
+  try {
+    const path = resolveProjectSettingsPath(fixture.projectDir);
+    await writeSettings(fixture.agentDir, { compaction: { summary: { thinkingLevel: "high", timeoutMs: 120_000 } } });
+    const unrelated = { enabled: false, model: "p/m", newContext: { enabled: false }, soft: { enabled: false }, vendor: "keep" };
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      theme: "night",
+      compaction: { ...unrelated, summary: { thinkingLevel: "low", vendor: { retained: true } } },
+    });
+    await saveCompactionPatch("project", fixture.projectDir, { summary: { timeoutMs: 60_000 } });
+    let project = await readJson(path);
+    assert.deepEqual(project, {
+      theme: "night",
+      compaction: { ...unrelated, summary: { thinkingLevel: "low", timeoutMs: 60_000, vendor: { retained: true } } },
+    });
+    await saveCompactionScope("project", fixture.projectDir, {
+      ...unrelated, summary: { thinkingLevel: "max" },
+    });
+    project = await readJson(path);
+    assert.deepEqual(project.compaction.summary, { thinkingLevel: "max", vendor: { retained: true } });
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).summary.timeoutMs, 120_000);
+    await unsetCompactionField("project", fixture.projectDir, "summary");
+    assert.deepEqual(await readJson(path), {
+      theme: "night", compaction: { ...unrelated, summary: { vendor: { retained: true } } },
+    });
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).source.summary, "user");
+    await saveCompactionPatch("project", fixture.projectDir, { summary: { timeoutMs: 1 } });
+    await saveCompactionScope("project", fixture.projectDir, unrelated);
+    assert.deepEqual((await readJson(path)).compaction.summary, { vendor: { retained: true } });
+    await saveCompactionPatch("user", fixture.projectDir, { summary: { thinkingLevel: "off" } });
+    assert.deepEqual(readScopeCompaction("user", fixture.projectDir).summary, { thinkingLevel: "off", timeoutMs: 120_000 });
+    await unsetCompactionField("user", fixture.projectDir, "summary");
+    assert.deepEqual(await readJson(resolveUserSettingsPath()), {});
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).source.summary, "default");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("new-context compaction defaults on and follows project-over-user precedence", async () => {
+  const fixture = await createFixture();
+  try {
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).newContext.enabled, DEFAULT_NEW_CONTEXT_ENABLED);
+    await writeSettings(fixture.agentDir, {
+      compaction: { newContext: { enabled: true } },
+    });
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { newContext: { enabled: false, vendorOption: "keep" } },
+    });
+
+    let effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.newContext.enabled, false);
+    assert.equal(effective.source.newContext, "project");
+
+    await saveCompactionScope("project", fixture.projectDir, { newContext: { enabled: true } });
+    let project = await readJson(resolveProjectSettingsPath(fixture.projectDir));
+    assert.deepEqual(project.compaction.newContext, { enabled: true, vendorOption: "keep" });
+
+    await saveCompactionScope("project", fixture.projectDir, {});
+    project = await readJson(resolveProjectSettingsPath(fixture.projectDir));
+    assert.deepEqual(project.compaction.newContext, { vendorOption: "keep" });
+    effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.newContext.enabled, true);
+    assert.equal(effective.source.newContext, "user");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction settings resolve paths, precedence, and field-level sources", async () => {
+  const fixture = await createFixture();
+  try {
+    assert.equal(resolveUserSettingsPath(), join(fixture.agentDir, "settings.json"));
+    assert.equal(resolveProjectSettingsPath(fixture.projectDir), join(fixture.projectDir, ".pi", "settings.json"));
+    assert.deepEqual(readEffectiveCompactionSettings(fixture.projectDir), {
+      enabled: true,
+      reserveTokens: DEFAULT_RESERVE_TOKENS,
+      keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS,
+      model: undefined,
+      modelThresholds: undefined,
+      payloadLimitBytes: undefined,
+      soft: { ...DEFAULT_SOFT_COMPACTION },
+      newContext: { enabled: DEFAULT_NEW_CONTEXT_ENABLED },
+      summary: { thinkingLevel: DEFAULT_SUMMARY_THINKING_LEVEL, timeoutMs: DEFAULT_SUMMARY_TIMEOUT_MS },
+      source: {
+        enabled: "default",
+        reserveTokens: "default",
+        keepRecentTokens: "default",
+        model: "default",
+        modelThresholds: "default",
+        soft: "default",
+        newContext: "default",
+        summary: "default",
+        payloadLimitBytes: "default",
+      },
+    });
+
+    await writeSettings(fixture.agentDir, {
+      compaction: { enabled: false, reserveTokens: 24_000 },
+    });
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { enabled: true, keepRecentTokens: 12_000 },
+    });
+
+    assert.deepEqual(readScopeCompaction("user", fixture.projectDir), {
+      enabled: false,
+      reserveTokens: 24_000,
+    });
+    assert.deepEqual(readEffectiveCompactionSettings(fixture.projectDir), {
+      enabled: true,
+      reserveTokens: 24_000,
+      keepRecentTokens: 12_000,
+      model: undefined,
+      modelThresholds: undefined,
+      payloadLimitBytes: undefined,
+      soft: { ...DEFAULT_SOFT_COMPACTION },
+      newContext: { enabled: DEFAULT_NEW_CONTEXT_ENABLED },
+      summary: { thinkingLevel: DEFAULT_SUMMARY_THINKING_LEVEL, timeoutMs: DEFAULT_SUMMARY_TIMEOUT_MS },
+      source: {
+        enabled: "project",
+        reserveTokens: "user",
+        keepRecentTokens: "project",
+        model: "default",
+        modelThresholds: "default",
+        soft: "default",
+        newContext: "default",
+        summary: "default",
+        payloadLimitBytes: "default",
+      },
+    });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction settings ignore malformed files and invalid optional fields", async () => {
+  const fixture = await createFixture();
+  try {
+    await mkdir(fixture.agentDir, { recursive: true });
+    await writeFile(join(fixture.agentDir, "settings.json"), "{ malformed", "utf8");
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: {
+        enabled: "yes",
+        reserveTokens: -1,
+        keepRecentTokens: Number.NaN,
+        soft: {
+          cache: { minRatioRange: [0.8, 0.2] },
+          timeBased: { gapThresholdMinutes: -1 },
+          relevance: { mode: "embedding" },
+        },
+      },
+    });
+
+    assert.deepEqual(readEffectiveCompactionSettings(fixture.projectDir), {
+      enabled: true,
+      reserveTokens: DEFAULT_RESERVE_TOKENS,
+      keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS,
+      model: undefined,
+      modelThresholds: undefined,
+      payloadLimitBytes: undefined,
+      soft: { ...DEFAULT_SOFT_COMPACTION },
+      newContext: { enabled: DEFAULT_NEW_CONTEXT_ENABLED },
+      summary: { thinkingLevel: DEFAULT_SUMMARY_THINKING_LEVEL, timeoutMs: DEFAULT_SUMMARY_TIMEOUT_MS },
+      source: {
+        enabled: "default",
+        reserveTokens: "default",
+        keepRecentTokens: "default",
+        model: "default",
+        modelThresholds: "default",
+        soft: "default",
+        newContext: "default",
+        summary: "default",
+        payloadLimitBytes: "default",
+      },
+    });
+    await assert.rejects(
+      saveCompactionScope("user", fixture.projectDir, { enabled: false }),
+      /Cannot safely update malformed settings file/,
+    );
+    assert.equal(await readFile(join(fixture.agentDir, "settings.json"), "utf8"), "{ malformed");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction writes preserve unknown keys and unset restores inheritance", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(fixture.agentDir, {
+      theme: "night",
+      compaction: {
+        enabled: false,
+        reserveTokens: 30_000,
+        vendorOption: { retained: true },
+      },
+    });
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      model: "test-model",
+      compaction: {
+        reserveTokens: 10_000,
+        projectOption: "keep",
+      },
+    });
+
+    await saveCompactionPatch("project", fixture.projectDir, {
+      enabled: true,
+      keepRecentTokens: 8_000,
+    });
+    let project = await readJson(resolveProjectSettingsPath(fixture.projectDir));
+    assert.deepEqual(project, {
+      model: "test-model",
+      compaction: {
+        reserveTokens: 10_000,
+        keepRecentTokens: 8_000,
+        projectOption: "keep",
+        hard: { reserveTokens: 10_000, keepRecentTokens: 8_000 },
+        enabled: true,
+      },
+    });
+
+    await unsetCompactionField("project", fixture.projectDir, "reserveTokens");
+    project = await readJson(resolveProjectSettingsPath(fixture.projectDir));
+    assert.deepEqual(project, {
+      model: "test-model",
+      compaction: {
+        keepRecentTokens: 8_000,
+        projectOption: "keep",
+        hard: { keepRecentTokens: 8_000 },
+        enabled: true,
+      },
+    });
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).reserveTokens, 30_000);
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).source.reserveTokens, "user");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction writes are atomic and serialized per settings path", async () => {
+  const fixture = await createFixture();
+  try {
+    await Promise.all([
+      saveCompactionPatch("project", fixture.projectDir, { enabled: false }),
+      saveCompactionPatch("project", fixture.projectDir, { reserveTokens: 9_000 }),
+      saveCompactionPatch("project", fixture.projectDir, { keepRecentTokens: 7_000 }),
+    ]);
+
+    const settingsPath = resolveProjectSettingsPath(fixture.projectDir);
+    assert.deepEqual(await readJson(settingsPath), {
+      compaction: {
+        enabled: false,
+        reserveTokens: 9_000,
+        keepRecentTokens: 7_000,
+        hard: { reserveTokens: 9_000, keepRecentTokens: 7_000 },
+      },
+    });
+    const siblings = await readdir(join(fixture.projectDir, ".pi"));
+    assert.deepEqual(siblings, ["settings.json"]);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
+    }
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction settings replace safely after the initial rename conflicts", async () => {
+  const fixture = await createFixture();
+  try {
+    const settingsPath = resolveProjectSettingsPath(fixture.projectDir);
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      theme: "night",
+      compaction: { enabled: false },
+    });
+    let renameCalls = 0;
+    const restore = setCompactionSettingsFileOperationsForTesting({
+      async rename(source, destination) {
+        renameCalls += 1;
+        if (renameCalls === 1) throw renameFailure("initial rename failed");
+        await rename(source, destination);
+      },
+    });
+    try {
+      await saveCompactionPatch("project", fixture.projectDir, { enabled: true });
+    } finally {
+      restore();
+    }
+
+    assert.equal(renameCalls, 3);
+    assert.deepEqual(await readJson(settingsPath), {
+      theme: "night",
+      compaction: { enabled: true },
+    });
+    assert.deepEqual(await readdir(join(fixture.projectDir, ".pi")), ["settings.json"]);
+  } finally {
+    setCompactionSettingsFileOperationsForTesting(null);
+    await fixture.dispose();
+  }
+});
+
+test("compaction settings restore the authoritative file when the replacement rename also fails", async () => {
+  const fixture = await createFixture();
+  try {
+    const settingsPath = resolveProjectSettingsPath(fixture.projectDir);
+    const original = `${JSON.stringify({ theme: "night", compaction: { enabled: false } }, null, 2)}\n`;
+    await mkdir(join(fixture.projectDir, ".pi"), { recursive: true });
+    await writeFile(settingsPath, original, "utf8");
+    let renameCalls = 0;
+    const restore = setCompactionSettingsFileOperationsForTesting({
+      async rename(source, destination) {
+        renameCalls += 1;
+        if (renameCalls === 1) throw renameFailure("initial rename failed");
+        if (renameCalls === 3) throw renameFailure("replacement rename failed");
+        await rename(source, destination);
+      },
+    });
+    try {
+      await assert.rejects(
+        saveCompactionPatch("project", fixture.projectDir, { enabled: true }),
+        /replacement rename failed/,
+      );
+    } finally {
+      restore();
+    }
+
+    assert.equal(renameCalls, 4, "the fourth rename restores the preserved settings");
+    assert.equal(await readFile(settingsPath, "utf8"), original);
+    assert.deepEqual(await readdir(join(fixture.projectDir, ".pi")), ["settings.json"]);
+  } finally {
+    setCompactionSettingsFileOperationsForTesting(null);
+    await fixture.dispose();
+  }
+});
+
+test("compaction settings recover an interrupted backup before the next read", async () => {
+  const fixture = await createFixture();
+  try {
+    const settingsPath = resolveProjectSettingsPath(fixture.projectDir);
+    const backupPath = `${settingsPath}.backup`;
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      theme: "night",
+      compaction: { enabled: false },
+    });
+    await rename(settingsPath, backupPath);
+
+    await saveCompactionPatch("project", fixture.projectDir, { reserveTokens: 9_000 });
+
+    assert.deepEqual(await readJson(settingsPath), {
+      theme: "night",
+      compaction: {
+        enabled: false,
+        reserveTokens: 9_000,
+        hard: { reserveTokens: 9_000 },
+      },
+    });
+    assert.deepEqual(await readdir(join(fixture.projectDir, ".pi")), ["settings.json"]);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction validation separates hard errors from warnings", () => {
+  assert.deepEqual(validateCompactionPatch({
+    reserveTokens: 0,
+    keepRecentTokens: 1.5,
+  }, 100_000, 20_000), {
+    errors: [
+      "reserveTokens must be a positive safe integer",
+      "keepRecentTokens must be a positive safe integer",
+    ],
+    warnings: [],
+  });
+
+  assert.deepEqual(validateCompactionPatch({
+    reserveTokens: 100_000,
+    keepRecentTokens: 20_000,
+  }, 100_000, 20_000), {
+    errors: ["reserveTokens (100000) must be less than contextWindow (100000)"],
+    warnings: [],
+  });
+
+  const result = validateCompactionPatch({
+    reserveTokens: 10_000,
+    keepRecentTokens: 95_000,
+  }, 100_000, 20_000);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0] ?? "", /little compressible history/);
+
+  const runtimeFloor = validateCompactionPatch({
+    reserveTokens: 16_384,
+    keepRecentTokens: 381_000,
+  }, 400_000, 128_000);
+  assert.match(runtimeFloor.warnings[0] ?? "", /thresholdTokens \(380000\)/,
+    "validation must use the same five-percent floor as the displayed/runtime threshold");
+
+  assert.match(validateCompactionPatch({ reserveTokens: 10_000 }).warnings[0] ?? "", /validation skipped/);
+});
+
+test("compaction settings read legacy flat config without migration and default the soft group", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { reserveTokens: 18_000, keepRecentTokens: 15_000 },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.reserveTokens, 18_000);
+    assert.equal(effective.keepRecentTokens, 15_000);
+    assert.deepEqual(effective.soft, { ...DEFAULT_SOFT_COMPACTION });
+    assert.equal(effective.source.soft, "default");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction load rejects oversized reserveTokens so it cannot silently disable compaction", async () => {
+  const fixture = await createFixture();
+  try {
+    // A value above MAX_RESERVE_TOKENS would exceed every real model's context
+    // window and turn off all context management; it must fall back to default.
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { reserveTokens: MAX_RESERVE_TOKENS + 1, keepRecentTokens: 15_000 },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.reserveTokens, DEFAULT_RESERVE_TOKENS);
+    assert.equal(effective.source.reserveTokens, "default");
+    // Sibling fields on the same patch are unaffected.
+    assert.equal(effective.keepRecentTokens, 15_000);
+    assert.equal(effective.source.keepRecentTokens, "project");
+
+    // The oversized value is dropped from the parsed patch entirely.
+    assert.deepEqual(readScopeCompaction("project", fixture.projectDir), { keepRecentTokens: 15_000 });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction load accepts a large-but-plausible reserveTokens unchanged", async () => {
+  const fixture = await createFixture();
+  try {
+    // Large-context models (~1M+) legitimately reserve six figures of tokens.
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { reserveTokens: 500_000 },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.reserveTokens, 500_000);
+    assert.equal(effective.source.reserveTokens, "project");
+
+    // The ceiling itself is inclusive and still loads unchanged.
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { reserveTokens: MAX_RESERVE_TOKENS },
+    });
+    assert.equal(readEffectiveCompactionSettings(fixture.projectDir).reserveTokens, MAX_RESERVE_TOKENS);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction validation flags reserveTokens above the absolute ceiling", () => {
+  const result = validateCompactionPatch({ reserveTokens: MAX_RESERVE_TOKENS + 1 });
+  assert.ok(result.errors.includes(`reserveTokens (${MAX_RESERVE_TOKENS + 1}) must be <= ${MAX_RESERVE_TOKENS}`));
+
+  // The ceiling is inclusive: exactly MAX_RESERVE_TOKENS is not flagged by the ceiling rule.
+  const atCeiling = validateCompactionPatch({ reserveTokens: MAX_RESERVE_TOKENS });
+  assert.ok(!atCeiling.errors.some((e) => e.includes("must be <=")));
+});
+
+test("compaction settings read nested hard and soft groups with soft sourced per scope", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: {
+        hard: { reserveTokens: 22_000, keepRecentTokens: 17_000 },
+        soft: {
+          nudgeRatio: 0.6,
+          pruneRatio: 0.75,
+          pruneTargetRatio: 0.55,
+          cache: { minRatioRange: [0.2, 0.45] },
+          timeBased: { enabled: true, gapThresholdMinutes: 30 },
+          relevance: { enabled: true, mode: "keyword" },
+        },
+      },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.reserveTokens, 22_000);
+    assert.equal(effective.keepRecentTokens, 17_000);
+    assert.deepEqual(effective.soft, {
+      ...DEFAULT_SOFT_COMPACTION,
+      nudgeRatio: 0.6,
+      pruneRatio: 0.75,
+      pruneTargetRatio: 0.55,
+      cache: { enabled: true, minRatioRange: [0.2, 0.45] },
+      timeBased: { enabled: true, gapThresholdMinutes: 30 },
+      relevance: { enabled: true, mode: "keyword" },
+    });
+    assert.equal(effective.source.soft, "project");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction scope writes persist the soft group and preserve it when absent", async () => {
+  const fixture = await createFixture();
+  try {
+    await saveCompactionScope("project", fixture.projectDir, {
+      reserveTokens: 12_000,
+      soft: { enabled: true, nudgeRatio: 0.5, pruneRatio: 0.7, pruneTargetRatio: 0.5 },
+    });
+    let project = await readJson(resolveProjectSettingsPath(fixture.projectDir));
+    assert.deepEqual(project, {
+      compaction: {
+        reserveTokens: 12_000,
+        hard: { reserveTokens: 12_000 },
+        soft: { enabled: true, nudgeRatio: 0.5, pruneRatio: 0.7, pruneTargetRatio: 0.5 },
+      },
+    });
+    await saveCompactionScope("project", fixture.projectDir, { reserveTokens: 13_000 });
+    project = await readJson(resolveProjectSettingsPath(fixture.projectDir));
+    assert.deepEqual(project, {
+      compaction: {
+        reserveTokens: 13_000,
+        hard: { reserveTokens: 13_000 },
+        soft: { enabled: true, nudgeRatio: 0.5, pruneRatio: 0.7, pruneTargetRatio: 0.5 },
+      },
+    });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction validation rejects invalid soft ratios and ordering", () => {
+  const invalid = validateCompactionPatch({
+    soft: { nudgeRatio: 1.5, pruneRatio: 0.5, pruneTargetRatio: 0.9 },
+  }, 100_000, 20_000);
+  assert.ok(invalid.errors.includes("soft.nudgeRatio must be a number in (0, 1)"));
+  assert.ok(invalid.errors.includes("soft.pruneTargetRatio (0.9) must be less than soft.pruneRatio (0.5)"));
+
+  const ordering = validateCompactionPatch({
+    soft: { nudgeRatio: 0.8, pruneRatio: 0.7 },
+  }, 100_000, 20_000);
+  assert.ok(ordering.errors.includes("soft.nudgeRatio (0.8) must be less than soft.pruneRatio (0.7)"));
+
+  const valid = validateCompactionPatch({
+    soft: { nudgeRatio: 0.6, pruneRatio: 0.8, pruneTargetRatio: 0.6 },
+  }, 100_000, 20_000);
+  assert.equal(valid.errors.length, 0);
+});
+
+test("velocity defaults off so unresolved settings never compact earlier than ratio-only", () => {
+  const effective = resolveEffectiveCompactionSettings({}, {});
+  assert.deepEqual(effective.soft.velocity, { enabled: false, epochsToCritical: 3, minFullness: 0.7 });
+});
+
+test("cache defaults on because it can only decline prunes, never trigger them", () => {
+  // Asymmetry with velocity: velocity escalates compaction (risk of surprise),
+  // the cache gate only skips prune runs whose savings cannot pay for the
+  // cached prefix they invalidate (risk of a slightly fuller context).
+  const effective = resolveEffectiveCompactionSettings({}, {});
+  assert.deepEqual(effective.soft.cache, { enabled: true, minRatioRange: [0.1, 0.5] });
+  assert.deepEqual(effective.soft.timeBased, { enabled: false, gapThresholdMinutes: 60 });
+  assert.deepEqual(effective.soft.relevance, { enabled: false, mode: "bm25" });
+});
+
+test("cache gate remains explicitly disablable", () => {
+  const effective = resolveEffectiveCompactionSettings({}, { soft: { cache: { enabled: false } } });
+  assert.deepEqual(effective.soft.cache, { enabled: false, minRatioRange: [0.1, 0.5] });
+});
+
+test("soft signal criteria deep-merge across user and project scopes field by field", () => {
+  const effective = resolveEffectiveCompactionSettings(
+    { soft: { velocity: { enabled: true } } },
+    { soft: { velocity: { minFullness: 0.5 }, cache: { enabled: true } } },
+  );
+  // project minFullness must not clobber user-level enabled
+  assert.deepEqual(effective.soft.velocity, { enabled: true, epochsToCritical: 3, minFullness: 0.5 });
+  assert.deepEqual(effective.soft.cache, { enabled: true, minRatioRange: [0.1, 0.5] });
+});
+
+test("legacy full soft settings shape remains source compatible", () => {
+  const legacy: SoftCompactionSettings = {
+    enabled: true,
+    nudgeRatio: 0.7,
+    pruneRatio: 0.8,
+    pruneTargetRatio: 0.7,
+    velocity: { enabled: false, epochsToCritical: 3, minFullness: 0.7 },
+    cache: { enabled: true },
+    lossless: { enabled: true },
+  };
+  assert.equal(legacy.timeBased, undefined);
+  assert.equal(legacy.cache.minRatioRange, undefined);
+});
+
+test("createDefaultSoftCompaction returns independent nested objects", () => {
+  const a = createDefaultSoftCompaction();
+  a.velocity.enabled = true;
+  a.velocity.minFullness = 0.99;
+  a.cache.enabled = false;
+  a.cache.minRatioRange![0] = 0.3;
+  if (a.timeBased) a.timeBased.enabled = true;
+  const b = createDefaultSoftCompaction();
+  assert.equal(b.velocity.enabled, false);
+  assert.equal(b.velocity.minFullness, 0.7);
+  assert.equal(b.cache.enabled, true);
+  assert.deepEqual(b.cache.minRatioRange, [0.1, 0.5]);
+  assert.equal(b.timeBased?.enabled, false);
+  assert.deepEqual(b.relevance, { enabled: false, mode: "bm25" });
+  assert.equal(DEFAULT_SOFT_COMPACTION.velocity.enabled, false);
+  assert.deepEqual(DEFAULT_SOFT_COMPACTION.cache.minRatioRange, [0.1, 0.5]);
+});
+
+test("validateEffectiveCompactionSettings accepts defaults and rejects invalid merged invariants", () => {
+  const ok = resolveEffectiveCompactionSettings({}, {});
+  assert.equal(validateEffectiveCompactionSettings(ok).errors.length, 0);
+
+  const bad = resolveEffectiveCompactionSettings(
+    { soft: { nudgeRatio: 0.9, pruneRatio: 0.8 } },
+    {},
+  );
+  const errors = validateEffectiveCompactionSettings(bad).errors;
+  assert.ok(errors.includes("soft.nudgeRatio (0.9) must be less than soft.pruneRatio (0.8)"));
+});
+
+test("compaction validation rejects invalid velocity signal fields", () => {
+  const invalid = validateCompactionPatch({
+    soft: { velocity: { epochsToCritical: 0, minFullness: 1.5 } },
+  });
+  assert.ok(invalid.errors.includes("soft.velocity.epochsToCritical must be a positive safe integer"));
+  assert.ok(invalid.errors.includes("soft.velocity.minFullness must be a number in (0, 1)"));
+
+  const valid = validateCompactionPatch({
+    soft: { velocity: { enabled: true, epochsToCritical: 3, minFullness: 0.7 } },
+  });
+  assert.equal(valid.errors.length, 0);
+});
+
+test("compaction validation covers cache ratio, time-based, and relevance settings", () => {
+  const invalid = validateCompactionPatch({
+    soft: {
+      cache: { minRatioRange: [0.8, 0.2] },
+      timeBased: { gapThresholdMinutes: 0 },
+      relevance: { mode: "embedding" as never },
+    },
+  });
+  assert.ok(invalid.errors.includes("soft.cache.minRatioRange must be [lo, hi] with 0 <= lo < hi <= 1"));
+  assert.ok(invalid.errors.includes("soft.timeBased.gapThresholdMinutes must be a positive finite number"));
+  assert.ok(invalid.errors.includes(`soft.relevance.mode must be "bm25" or "keyword"`));
+
+  const valid = validateCompactionPatch({
+    soft: {
+      cache: { minRatioRange: [0.1, 0.5] },
+      timeBased: { enabled: true, gapThresholdMinutes: 30 },
+      relevance: { enabled: true, mode: "keyword" },
+    },
+  });
+  assert.equal(valid.errors.length, 0);
+});
+
+test("compaction summary model layers across scopes with field-level sources", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(fixture.agentDir, {
+      compaction: { model: "maestro-qwen/qwen3.8-max" },
+    });
+
+    assert.deepEqual(readScopeCompaction("user", fixture.projectDir), {
+      model: "maestro-qwen/qwen3.8-max",
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.model, "maestro-qwen/qwen3.8-max");
+    assert.equal(effective.source.model, "user");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction settings ignore malformed summary model values", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { model: 42, endpoint: "compact" },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.equal(effective.model, undefined);
+    assert.equal(effective.source.model, "default");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction validation covers summary model references", () => {
+  const invalid = validateCompactionPatch({ model: "no-provider-slash" });
+  assert.ok(invalid.errors.includes(`model must be a "provider/id" reference`));
+
+  const valid = validateCompactionPatch({ model: "maestro-openai/gpt-5.6-sol" });
+  assert.equal(valid.errors.length, 0);
+});
+
+test("saveCompactionScope persists the summary model and clears retired endpoint settings", async () => {
+  const fixture = await createFixture();
+  try {
+    const path = resolveProjectSettingsPath(fixture.projectDir);
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { endpoint: "compact" },
+    });
+    await saveCompactionScope("project", fixture.projectDir, {
+      model: "maestro-qwen/qwen3.8-max",
+    });
+    assert.deepEqual(await readJson(path), {
+      compaction: { model: "maestro-qwen/qwen3.8-max" },
+    });
+
+    await saveCompactionScope("project", fixture.projectDir, {});
+    assert.deepEqual(await readJson(path), {});
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction modelThresholds parse, resolve per model, and track source", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: {
+        modelThresholds: {
+          "cpa-responses/deepseek-v4-flash": 216_000,
+          "glm-5.3": 216_000,
+          "bad-negative": -5,
+          "bad-fraction": 1.5,
+          "": 100_000,
+        },
+      },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.deepEqual(effective.modelThresholds, {
+      "cpa-responses/deepseek-v4-flash": 216_000,
+      "glm-5.3": 216_000,
+    });
+    assert.equal(effective.source.modelThresholds, "project");
+    assert.equal(
+      resolveModelThresholdOverride(effective, { provider: "cpa-responses", id: "deepseek-v4-flash" }),
+      216_000,
+    );
+    assert.equal(resolveModelThresholdOverride(effective, { reference: "cpa-responses/deepseek-v4-flash" }), 216_000);
+    assert.equal(resolveModelThresholdOverride(effective, { id: "glm-5.3" }), 216_000);
+    assert.equal(
+      resolveModelThresholdOverride(effective, { provider: "other", id: "glm-5.3" }),
+      216_000,
+      "a bare id resolves when the provider-qualified reference misses",
+    );
+    assert.equal(resolveModelThresholdOverride(effective, { provider: "x", id: "unknown" }), undefined);
+    assert.equal(resolveModelThresholdOverride(effective, undefined), undefined);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction modelThresholds follow project-over-user precedence", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(fixture.agentDir, {
+      compaction: { modelThresholds: { "p/m": 100_000 } },
+    });
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { modelThresholds: { "p/m": 216_000 } },
+    });
+    const effective = readEffectiveCompactionSettings(fixture.projectDir);
+    assert.deepEqual(effective.modelThresholds, { "p/m": 216_000 });
+    assert.equal(effective.source.modelThresholds, "project");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("compaction validation rejects unusable modelThresholds entries", () => {
+  const invalid = validateCompactionPatch(
+    { modelThresholds: { "p/zero": 0, "p/fraction": 1.5, "p/huge": 500_000, "  ": 100_000 } },
+    400_000,
+  );
+  assert.equal(invalid.errors.length, 4);
+  assert.match(invalid.errors.join("\n"), /modelThresholds\.p\/huge \(500000\) must be less than contextWindow \(400000\)/);
+  const valid = validateCompactionPatch({ modelThresholds: { "p/m": 216_000 } }, 400_000);
+  assert.equal(valid.errors.length, 0);
+});
+
+async function createFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pi-compaction-settings-"));
+  const projectDir = join(root, "project");
+  const agentDir = join(root, "agent");
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  return {
+    projectDir,
+    agentDir,
+    async dispose() {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function renameFailure(message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code: "EPERM" });
+}
+
+async function writeSettings(directory: string, value: unknown): Promise<void> {
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "settings.json"), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function readJson(path: string): Promise<unknown> {
+  return JSON.parse(await readFile(path, "utf8"));
+}
+
+test("fractional token budgets are treated as absent and fall back to defaults", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeSettings(join(fixture.projectDir, ".pi"), {
+      compaction: { hard: { reserveTokens: 1.5 }, keepRecentTokens: 1000.5 },
+    });
+    const scoped = readScopeCompaction("project", fixture.projectDir);
+    assert.equal(scoped.reserveTokens, undefined);
+    assert.equal(scoped.keepRecentTokens, undefined);
+    const effective = resolveEffectiveCompactionSettings({}, scoped);
+    assert.equal(effective.reserveTokens, DEFAULT_RESERVE_TOKENS);
+    assert.equal(effective.keepRecentTokens, DEFAULT_KEEP_RECENT_TOKENS);
+  } finally {
+    await fixture.dispose();
+  }
+});

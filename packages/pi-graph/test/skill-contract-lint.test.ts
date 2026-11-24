@@ -1,0 +1,248 @@
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { SKILL_SESSION_MODES } from "../src/skills/skill-loader.ts";
+import { transformPiContent } from "../../../convert-pi.mjs";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const skillsRoot = join(repoRoot, ".pi", "skills");
+const coreSkills = new Set([
+  "maestro-next",
+  "maestro-ralph",
+  "maestro",
+]);
+const piCoordinatorSkills = ["maestro-next", "maestro-ralph", "maestro"] as const;
+
+interface ContractFinding {
+  file: string;
+  rule: string;
+  detail: string;
+}
+
+test("core Session/Run skills satisfy the host mirror contract", () => {
+  const findings = [...coreSkills].flatMap((name) => {
+    const file = join(skillsRoot, name, "SKILL.md");
+    return auditSkill(file, true);
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("Pi coordinators consume the read-only Topic Session reuse contract", () => {
+  for (const name of piCoordinatorSkills) {
+    const file = join(skillsRoot, name, "SKILL.md");
+    const content = readFileSync(file, "utf8");
+
+    assert.match(content, /Topic Session resolution/, `${name}: missing Topic Session resolution`);
+    assert.match(content, /ReuseAssessment/, `${name}: missing ReuseAssessment`);
+    assert.match(content, /same-Session sealed|同 Session sealed|Same-Session sealed/i, `${name}: missing sealed same-Session output fence`);
+    assert.match(content, /argument_requirements/, `${name}: missing structured argument requirements`);
+    for (const field of ["required", "missing", "type", "source", "default", "question"]) {
+      assert.match(content, new RegExp(`\\b${field}\\b`), `${name}: argument requirement field ${field} is undocumented`);
+    }
+    assert.match(content, /brief\.command/, `${name}: compact birth packet must point to brief.command`);
+    assert.match(content, /suggest_only=true|suggest_only === true/, `${name}: completion next must be suggest-only`);
+
+    assert.doesNotMatch(content, /maestro\s+run\s+(?:recall-confirm|fork|import|new|rebind)\b/i, `${name}: legacy Run mutation is recommended`);
+    assert.doesNotMatch(content, /maestro\s+session\s+resume(?!-view)\b/i, `${name}: historical Session mutation is recommended`);
+    assert.doesNotMatch(
+      content,
+      /cat\s+\.workflow[\\/]state\.json|active_session_id[^\n]*state\.json|Latest artifact[^\n]*state\.json/i,
+      `${name}: local projection must not drive Topic Session resolution`,
+    );
+  }
+
+  const ralph = readFileSync(join(skillsRoot, "maestro-ralph", "SKILL.md"), "utf8");
+  assert.doesNotMatch(ralph, /`--(?:from|dir)\b/i, "maestro-ralph must consume selected artifact refs instead of composing source/path args");
+});
+
+test("core Pi conversion routes lifecycle authority through run-control", () => {
+  const sourceBody = `<required_reading>
+~/.maestro/workflows/run-mode.md
+</required_reading>
+<purpose>Coordinator</purpose>
+maestro session open "goal" --id demo --actor actor-1 --json
+maestro session chain insert --session demo --step-id analyze --command analyze --arg "goal" --actor actor-1 --expected-orchestration-revision 0 --json
+maestro session chain update --session demo --step-id analyze --stage analysis --arg "scope" --actor actor-1 --expected-orchestration-revision 1 --json
+maestro run next --session demo --actor actor-1 --expected-orchestration-revision 2 --json
+`;
+
+  for (const name of piCoordinatorSkills) {
+    const source = `---\nname: ${name}\nallowed-tools: Read Bash\n---\n${sourceBody}`;
+    const output = transformPiContent(source, join("D:/fixture/skills", name, "SKILL.md"));
+    const { frontmatter } = parseFrontmatter<Record<string, unknown>>(output);
+    const tools = normalizeToolList(frontmatter["allowed-tools"]);
+
+    assert.ok(tools.includes("run-control"), `${name}: run-control missing from allowed-tools`);
+    assert.equal(output.match(/<pi_run_control>/g)?.length, 1, `${name}: Pi routing block must be unique`);
+    assert.match(output, /Never execute lifecycle mutation through Bash/, `${name}: bash mutation ban missing`);
+    assert.match(output, /human syntax references/, `${name}: CLI reference label missing`);
+    assert.match(output, /session chain insert[^\n]*--arg "goal"/, `${name}: insert args changed`);
+    assert.match(output, /session chain update[^\n]*--arg "scope"/, `${name}: update args changed`);
+    assert.ok(output.indexOf("maestro session open") < output.indexOf("maestro session chain insert"));
+    assert.ok(output.indexOf("maestro session chain update") < output.indexOf("maestro run next"));
+    assert.doesNotMatch(output, /maestro run start|maestro run edit|maestro run prepare|session open[^\n]*--chain-file/);
+  }
+});
+
+test("Pi skills using teammate expose observe and the wait contract", () => {
+  const findings: ContractFinding[] = [];
+  for (const file of listSkillFiles(skillsRoot)) {
+    const content = readFileSync(file, "utf8");
+    const { frontmatter } = parseFrontmatter<Record<string, unknown>>(content);
+    const tools = normalizeToolList(frontmatter["allowed-tools"]);
+    const usesTeammate = tools.includes("teammate") || /\bteammate\s*\(/.test(content);
+    if (!usesTeammate) continue;
+
+    const displayPath = relative(repoRoot, file).replaceAll("\\", "/");
+    if (!tools.includes("observe")) {
+      findings.push({ file: displayPath, rule: "teammate-observe", detail: "teammate requires observe in allowed-tools" });
+    }
+    const contracts = [...content.matchAll(/<teammate_contract>([\s\S]*?)<\/teammate_contract>/gi)];
+    if (contracts.length !== 1) {
+      findings.push({ file: displayPath, rule: "teammate-contract", detail: `expected one block, found ${contracts.length}` });
+      continue;
+    }
+    const contract = contracts[0]?.[1] ?? "";
+    if (!/background: false/.test(contract)
+      || !/\bobserve\b/.test(contract)
+      || !/action: "wait"/.test(contract)
+      || !/teammate-complete/.test(contract)
+      || !/never continue independently/i.test(contract)) {
+      findings.push({ file: displayPath, rule: "teammate-wait", detail: "wait contract is incomplete" });
+    }
+  }
+  assert.deepEqual(findings, []);
+});
+
+function normalizeToolList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (typeof value === "string") return value.split(/\s+/).filter(Boolean);
+  return [];
+}
+
+test("generated Pi prompts use the current Run/Session human CLI", () => {
+  const generatedRoot = join(repoRoot, ".pi");
+  const findings = listPromptFiles(generatedRoot).flatMap((file) => auditRunSessionPrompt(file));
+  assert.deepEqual(findings, []);
+});
+
+test("non-core skill contract drift is absent", (t) => {
+  const findings = listSkillFiles(skillsRoot)
+    .filter((file) => !coreSkills.has(relative(skillsRoot, dirname(file)).split(/[\\/]/)[0] ?? ""))
+    .flatMap((file) => auditSkill(file, false));
+
+  t.diagnostic(`non-core skill contract findings: ${findings.length}`);
+  for (const finding of findings.slice(0, 20)) {
+    t.diagnostic(`${finding.file}: ${finding.rule} — ${finding.detail}`);
+  }
+  assert.deepEqual(findings, []);
+});
+
+function auditSkill(file: string, core: boolean): ContractFinding[] {
+  const content = readFileSync(file, "utf8");
+  const { frontmatter } = parseFrontmatter<Record<string, unknown>>(content);
+  const displayPath = relative(repoRoot, file).replaceAll("\\", "/");
+  const findings: ContractFinding[] = [];
+  const sessionMode = frontmatter["session-mode"];
+
+  if (typeof sessionMode !== "string" || !(SKILL_SESSION_MODES as readonly string[]).includes(sessionMode)) {
+    findings.push({
+      file: displayPath,
+      rule: "session-mode",
+      detail: `expected ${SKILL_SESSION_MODES.join("|")}, received ${JSON.stringify(sessionMode)}`,
+    });
+  }
+
+  const mirrorBlocks = [...content.matchAll(/<host_mirror>([\s\S]*?)<\/host_mirror>/gi)];
+  if (core && mirrorBlocks.length !== 1) {
+    findings.push({ file: displayPath, rule: "host-mirror", detail: `expected one block, found ${mirrorBlocks.length}` });
+  }
+
+  const todoCalls = [...content.matchAll(/todo\s*\(\s*\{[\s\S]*?\}\s*\)/gi)];
+  for (const match of todoCalls) {
+    const call = match[0];
+    const callLine = sourceLineAt(content, match.index ?? 0);
+    const negated = /禁止|不得|do not|must not|never/i.test(callLine);
+    const action = /action\s*:\s*["']([^"']+)["']/i.exec(call)?.[1];
+    if (core && !negated && action !== "next") {
+      findings.push({ file: displayPath, rule: "todo-action", detail: `core mirror call must use action=next: ${oneLine(call)}` });
+    }
+    if (!negated && /\btaskId\b|\bactiveForm\b|status\s*:\s*["']failed["']/i.test(call)) {
+      findings.push({ file: displayPath, rule: "todo-schema", detail: oneLine(call) });
+    }
+  }
+
+  if (core) {
+    for (const [index, line] of content.split(/\r?\n/).entries()) {
+      if (!isDirectCanonicalWrite(line)) continue;
+      findings.push({ file: displayPath, rule: "canonical-writer", detail: `line ${index + 1}: ${line.trim()}` });
+    }
+  }
+
+  return findings;
+}
+
+function isDirectCanonicalWrite(line: string): boolean {
+  const canonicalFile = /\b(?:state|session|run|artifacts)\.json\b/i;
+  const writeVerb = /(?:\bwrite\b|\bedit\b|\brecord\b|\bpersist\b|\bupdate\b|写入|修改|记录|更新)/i;
+  if (!canonicalFile.test(line) || !writeVerb.test(line)) return false;
+  if (/(?:\bCLI\b|maestro run|禁止|不得|do not|must not|never|只读|读取|\bread\b|由[^。；]*CLI)/i.test(line)) return false;
+  const fileIndex = line.search(canonicalFile);
+  const verbIndex = line.search(writeVerb);
+  return Math.abs(fileIndex - verbIndex) <= 36;
+}
+
+function listSkillFiles(root: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...listSkillFiles(path));
+    else if (entry.isFile() && entry.name === "SKILL.md") files.push(path);
+  }
+  return files;
+}
+
+function listPromptFiles(root: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...listPromptFiles(path));
+    else if (entry.isFile() && (entry.name.endsWith(".md") || entry.name.endsWith(".json"))) files.push(path);
+  }
+  return files;
+}
+
+function auditRunSessionPrompt(file: string): ContractFinding[] {
+  const content = readFileSync(file, "utf8");
+  const displayPath = relative(repoRoot, file).replaceAll("\\", "/");
+  const findings: ContractFinding[] = [];
+
+  for (const [index, line] of content.split(/\r?\n/).entries()) {
+    // v3 surface: run prepare is gone, but run create is a legal self-start command.
+    if (/\bmaestro\s+run\s+prepare\b/i.test(line) && !isNegativeExample(line)) {
+      findings.push({ file: displayPath, rule: "legacy-run-entry", detail: `line ${index + 1}: ${line.trim()}` });
+    }
+    if (/\bmaestro\s+session\s+create\b[^\n]*--chain-file\b/i.test(line)
+      && !/(?:advanced|高级|internal|machine|decision_points|decomposition|argument_requirements|retry|deprecated|compatibility|legacy)/i.test(line)) {
+      findings.push({ file: displayPath, rule: "chain-file-default", detail: `line ${index + 1}: ${line.trim()}` });
+    }
+  }
+  return findings;
+}
+
+function isNegativeExample(line: string): boolean {
+  return /(?:禁止|不得|do not|must not|never|avoid|不要|不调用|不重复)/i.test(line);
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
+function sourceLineAt(content: string, index: number): string {
+  const start = content.lastIndexOf("\n", index) + 1;
+  const end = content.indexOf("\n", index);
+  return content.slice(start, end < 0 ? content.length : end);
+}

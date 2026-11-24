@@ -1,0 +1,67 @@
+/**
+ * Core teammate execution engine.
+ *
+ * Spawns a pi subprocess for agent execution, parses JSON lines from
+ * stdout, tracks usage and progress, handles abort signals, and returns
+ * a SingleResult.
+ *
+ * Supports single, parallel (tasks[]), and chain (chain[]) execution modes.
+ */
+import type { SingleResult, AgentProgress, AgentTerminalStatus, TeammateExecutionProvenance } from "../shared/types.ts";
+export * from "./execution-infra.ts";
+import type { NormalizedTask, RunSingleTeammateParams, RunTeammateOptions, RunTeammateParams } from "./execution-infra.ts";
+import type { AttemptOutcome, BackendCapabilities, BackendRun } from "pi-graph-execution-api/v1/backend";
+import type { BackendRegistry } from "pi-graph-execution-api/v1/registry";
+import type { TeammateRunSpec } from "pi-graph-execution-api/v1/spec";
+export { TOOL_EXECUTION_HEARTBEAT_MS, resolveAgentCacheRetention, hasRpcTurnSidecar, sendRpcMessage, sendRpcMessageWithReceipt, sendChildIpcMessage, dispatchChildIpcMessage, } from "./pi-subprocess-attempt.ts";
+export type { RpcMessageMode, RpcInputDisposition, RpcReceipt } from "./pi-subprocess-attempt.ts";
+export declare function hostRegistryResultProvenance(result: SingleResult): TeammateExecutionProvenance | undefined;
+/**
+ * Convert a backend's progress payload into the host's progress record.
+ *
+ * A backend reports whatever its runtime knows, so this is a real conversion
+ * rather than a cast: the host supplies the identity and timing it owns, the
+ * payload supplies what the runtime observed, and anything the backend cannot
+ * report falls back to a value that reads as "not observed" instead of as a
+ * measurement. Validation belongs here because the payload crosses a module
+ * boundary untyped.
+ *
+ * @param data - the backend's payload.
+ * @param agent - the agent this attempt runs, known to the host.
+ * @param startedAt - attempt start, known to the host.
+ * @returns the host-shaped progress record.
+ *
+ * @internal Exported for backend-seam regression tests.
+ */
+export declare function projectBackendProgress(data: Record<string, unknown>, agent: string, startedAt: number): AgentProgress;
+interface FabricSourceRuntimeOptions {
+    readonly backendRegistry?: BackendRegistry;
+}
+/**
+ * Start one source-local backend attempt for the public Fabric runtime port.
+ * This path deliberately omits orchestration, fallback, publication and any
+ * remote/Fabric backend wiring.
+ *
+ * @internal Public consumers use createFabricTeammateRuntimePort().
+ */
+export declare function startFabricSourceBackendAttempt(input: {
+    placement: import("pi-graph-device-api/v1/placement").TeammatePlacementV1;
+    spec: TeammateRunSpec;
+    correlationId: string;
+    baseCwd: string;
+    signal: AbortSignal;
+    onChildEvent?: (event: Record<string, unknown>) => void;
+    onTurnComplete?: (result: SingleResult, terminalStatus?: AgentTerminalStatus) => void;
+}, runtimeOptions?: FabricSourceRuntimeOptions): Promise<{
+    acceptedBackend: string;
+    acceptedModel?: string;
+    acceptedCapabilities: BackendCapabilities;
+    outcome: Promise<AttemptOutcome>;
+    send: BackendRun["send"];
+    abort: BackendRun["abort"];
+}>;
+export declare function runSingleTeammate(params: RunSingleTeammateParams, options: RunTeammateOptions): Promise<SingleResult>;
+export declare function normalizeGraphConcurrency(concurrency: number, taskCount: number): number;
+export declare function runGraph(tasks: NormalizedTask[], concurrency: number, options: RunTeammateOptions): Promise<SingleResult[]>;
+/** Programmatic tasks-only entry point matching the public teammate schema. */
+export declare function runTeammate(params: RunTeammateParams, options: RunTeammateOptions): Promise<SingleResult[]>;

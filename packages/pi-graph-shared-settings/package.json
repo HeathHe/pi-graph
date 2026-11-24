@@ -1,0 +1,33 @@
+{
+  "name": "pi-graph-shared-settings",
+  "version": "0.2.3",
+  "description": "Versioned Settings and i18n contracts shared by Pi Graph plugins.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./v1": "./src/public/v1/index.ts",
+    "./v1/events": "./src/public/v1/events.ts",
+    "./v1/provider": "./src/public/v1/provider.ts",
+    "./v1/schema": "./src/public/v1/schema.ts",
+    "./v1/i18n": "./src/public/v1/i18n.ts",
+    "./ui": "./src/ui/index.ts"
+  },
+  "files": [
+    "src/**/*.ts"
+  ],
+  "keywords": [
+    "pi",
+    "maestro",
+    "settings",
+    "i18n"
+  ],
+  "license": "MIT"
+}

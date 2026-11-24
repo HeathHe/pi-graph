@@ -1,0 +1,869 @@
+---
+title: "Architecture Constraints"
+readMode: required
+priority: high
+category: arch
+keywords:
+  - architecture
+  - module
+  - layer
+  - boundary
+  - dependency
+  - structure
+---
+
+# Architecture Constraints
+
+## Module Structure
+
+## Layer Boundaries
+
+## Dependency Rules
+
+## Technology Constraints
+
+## Entries
+
+
+
+<spec-entry category="arch" keywords="todo,skill-loader,defaultresourceloader,state-transition" date="2026-07-10" sid="S-20260710-kwdz" title="Pi todo 的原生 skill 控制边界" description="定义 todo、Pi 原生 skill loader 与未来 Ralph 控制迁移的模块边界" source="planex-odyssey">
+
+### Pi todo 的原生 skill 控制边界
+
+Pi todo MUST 将 skill 作为可空任务配置并通过独立的 Pi 原生 loader 延迟加载。Discovery MUST 复用 DefaultResourceLoader，feature code MUST NOT 复制 skill 目录扫描，也 MUST NOT 依赖 Maestro/Ralph runtime。任何 skill/config/required-reading/budget 失败 MUST 发生在任务状态切换为 in_progress 之前。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="teammate session handoff lease epoch nonce switchsession" date="2026-07-11" sid="S-20260711-j1kq" title="Pi teammate session 单所有者接管协议" description="Pi teammate session 接管、回交与恢复的唯一 owner 约束" source="master@fe067a5">
+
+### Pi teammate session 单所有者接管协议
+
+Teammate session handoff MUST maintain exactly one writer. Handoff MUST wait for accepted prompt sequence, corresponding agent_end completion, and stable idle before transfer. Every RPC user message MUST carry epoch/nonce lease metadata and child input MUST reject stale tokens. Timeout recovery MUST send the old transaction cancel before publishing the new fenced lease. switchSession invalidates old extension context; handback MUST reload the child session and validate nonce, sessionId, and canonical sessionFile before restoring child ownership.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="依赖漂移,源码锁定,tarball,packed-consumer,runtime" date="2026-07-15" sid="S-20260715-j486" title="同版本依赖内容漂移的源码锁定" description="registry 与源码同版本异内容时的可复现集成和真实运行验收规则" source="odyssey:20260715-004-odyssey">
+
+### 同版本依赖内容漂移的源码锁定
+
+当 npm registry 包与目标源码具有相同 version 但命令或行为合同不一致时，禁止继续按 semver 或该 registry version 集成。必须锁定到可复现的 HTTPS source tarball + commit SHA，通过 package-local wrapper 调用，并在 packed consumer 中启用 install scripts 后实际执行至少一个代表性命令；仅 require.resolve、npm ls 或 --ignore-scripts 安装不足以证明 runtime 可用。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-key,login,provider,base-url,reasoning,deepseek" date="2026-07-17" sid="S-20260717-nxld" title="Custom API Provider 必须使用单入口 API-key 登录" description="Custom API provider 使用 /login 单入口并隔离其他 provider" source="master@3b0379dd" supersedes="S-20260717-bvo9" status="deprecated" superseded-by="S-20260717-wl3q">
+
+### Custom API Provider 必须使用单入口 API-key 登录
+
+OpenAI Responses 与 Anthropic custom provider MUST 位于 /login 的 API-key 分组，并通过 provider-specific apiKeyLogin 在同一流程采集 Base URL、model ID、reasoning capability 与 API key。公开连接配置 MUST 原子写入 models.json，secret MUST 仅由 Pi credential store 写入 auth.json。MUST NOT 注册额外 /api-provider 命令，MUST NOT 使用 OAuth modifyModels 模拟配置，且更新 MUST 保留 DeepSeek 等其他 provider。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-manager models.json provider api-key base-url reasoning deepseek crud" date="2026-07-17" sid="S-20260717-wl3q" title="Custom API Provider 统一由 API Manager 管理" description="通过 /api-manager 和 models.json 管理自定义 API provider CRUD" source="user:2026-07-17" supersedes="S-20260717-nxld" status="deprecated" superseded-by="S-20260717-en4p">
+
+### Custom API Provider 统一由 API Manager 管理
+
+OpenAI Responses 与 Anthropic custom provider MUST 由 Maestro 的 /api-manager 管理，并以 Pi 官方 models.json 作为持久化入口。命令 MUST 支持 list/show/set/delete/logout/reset；literal API key 或环境变量占位符与 Base URL、model ID、reasoning capability 一并保存在对应 provider 内。新增、更新和删除后 MUST 刷新 ModelRegistry，删除只移除目标 provider，且所有写入 MUST 原子化并保留 DeepSeek 等其他 provider。MUST NOT 依赖 Pi host patch、OAuth modifyModels 或未公开 apiKeyLogin hook。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-manager models.json settings.json defaultthinkinglevel thinkinglevelmap reasoning deepseek" date="2026-07-17" sid="S-20260717-en4p" title="API Manager 分层管理推理能力与默认思考强度" description="区分模型推理能力与 Pi 全局默认思考强度的持久化边界" source="user:2026-07-17" supersedes="S-20260717-wl3q" status="deprecated" superseded-by="S-20260717-s3f9">
+
+### API Manager 分层管理推理能力与默认思考强度
+
+OpenAI Responses 与 Anthropic custom provider MUST 由 /api-manager 管理。模型是否支持 reasoning 及 thinkingLevelMap MUST 写入 models.json；Pi 全局默认思考强度 MUST 通过公开 SettingsManager.setDefaultThinkingLevel() 写入 agent settings.json 的 defaultThinkingLevel，不得向 models.json 写入非官方 default 字段。set 流程 MUST 只展示目标模型支持的档位，list/show MUST 显示当前 Pi 全局默认值，reset MUST 恢复 medium；目标 provider 正在使用时 MAY 同步当前 session。Provider CRUD 写入仍须原子化并保留 DeepSeek 等其他 provider。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-manager max xhigh thinkinglevelmap defaultthinkinglevel compatibility deepseek" date="2026-07-17" sid="S-20260717-s3f9" title="API Manager 支持 Pi max 思考强度" description="将 max 作为独立且 capability-gated 的 Pi 思考强度" source="user:2026-07-17" supersedes="S-20260717-en4p" status="deprecated" superseded-by="S-20260719-qbpp">
+
+### API Manager 支持 Pi max 思考强度
+
+在支持 Pi max thinking level 的运行时，/api-manager MUST 将 max 作为独立档位展示和持久化，不得归一化为 xhigh。models.json 的 thinkingLevelMap MUST 显式写入 max: max，因为 xhigh 与 max 都是 opt-in extended levels；settings.json.defaultThinkingLevel MUST 允许 max。为兼容不识别 max 的旧 Pi，UI 与 models.json 写入 MUST 由当前 ModelRegistry 中的 max capability 门控。OpenAI Responses 与 Anthropic 的 max provider 映射均为 max；其他 CRUD、原子写入及 DeepSeek 隔离约束保持不变。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-manager multiple-models models.json upsert provider deepseek" date="2026-07-19" sid="S-20260719-qbpp" title="API Manager 支持同 Provider 多模型" description="同一 API provider 下的多模型增删查改契约" source="user:2026-07-19" supersedes="S-20260717-s3f9">
+
+### API Manager 支持同 Provider 多模型
+
+OpenAI Responses 与 Anthropic 的 Base URL、API 类型和 API key 属于 provider 级配置；models.json.models MUST 是按 model ID upsert 的多模型集合。新增不同 ID MUST 追加，更新相同 ID MUST 原位替换且保留其他 model；list/show MUST 展示全部 model，delete MUST 删除所选 model，只有删除最后一个 model 时才删除 provider。reset 默认 model 时 MUST 保留已有自定义 model。所有写入继续保持原子化并隔离 DeepSeek 等其他 provider。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-manager model-select per-model defaultthinkinglevel thinkinglevelmap" date="2026-07-19" sid="S-20260719-3czo" title="API Manager 每模型默认思考强度" description="每模型默认思考强度的持久化与切模应用契约" source="user:2026-07-19">
+
+### API Manager 每模型默认思考强度
+
+API Manager MUST 以 provider/modelId 为键持久化每模型 defaultThinkingLevel，并在 Pi model_select 完成后调用 setThinkingLevel 应用。settings.json.defaultThinkingLevel 仅作为全局 fallback。即时应用 MUST 同时匹配 provider 与 model ID，禁止配置同 provider 的其他模型时改变当前模型。删除模型 MUST 同步删除其默认强度。thinkingLevelMap 仍只表达 capability，不承载默认值。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="effort thinking-level provider model-defaults atomic" date="2026-07-22" sid="S-20260722-hxna" title="统一 /effort 的模型级思考强度边界" description="锁定 /effort 的统一 Provider 覆盖、canonical level 与原子提交语义" source="analyze:20260722-001-analyze" status="deprecated" superseded-by="S-20260802-kxvv">
+
+### 统一 /effort 的模型级思考强度边界
+
+单一 /effort 命令 MUST 以当前 ctx.model 的 provider/modelId 为键复用 modelDefaults，覆盖 API Manager 与 Pi 系统原生 provider；UI MUST 只展示当前模型支持的 Pi canonical levels（off/minimal/low/medium/high/xhigh），Provider wire value（如 max）只能由 thinkingLevelMap 映射，MUST NOT 作为 level 传给 setThinkingLevel。选择提交 MUST 先原子持久化再应用 runtime，取消或失败不得改变当前状态。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="effort selector thinking current" date="2026-07-22" sid="S-20260722-rkyp" title="标准 /effort selector 的当前值表达" description="记录用户 Choice A：canonical 顺序优先，当前值使用文本标记。" source="master@03709e70">
+
+### 标准 /effort selector 的当前值表达
+
+在 ExtensionAPI 的标准 ctx.ui.select 不提供 selectedIndex 时，/effort MUST 保持 capability-filtered canonical level 顺序；当前有效级别 MUST 通过 label 中的（当前）标记表达，MUST NOT 通过把当前项移动到首位来伪造预选，也不要求真正预选。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="provider retry teammate pi-core waiter" date="2026-07-23" sid="S-20260723-3tih" title="Provider 重试执行所有权与状态投影" description="统一重试策略，同时保持 Pi core 与 teammate 的执行所有权边界" source="master@a218c49e">
+
+### Provider 重试执行所有权与状态投影
+
+teammate 子进程的网络/Provider 重试由 teammate 执行器负责；Pi 主 Agent 的 provider 重试由 Pi core 负责。两端必须复用同一纯错误分类、重试上限与退避策略；Flow 只能投影主 Agent 的 retrying 状态，不得绕过或重复 Pi core 重试器。等待 teammate 终态必须使用事件驱动 waiter，禁止循环调用 teammate-watch。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="api-manager,contextwindow,models.json,provider" date="2026-07-23" sid="S-20260723-nsgh" title="API Manager 管理模型上下文窗口" description="API Manager 的模型上下文窗口编辑与兼容规则" source="run:20260723-001-maestro-impeccable">
+
+### API Manager 管理模型上下文窗口
+
+自定义 Provider 的 contextWindow 必须作为模型级正整数由 API Manager 显式查看和修改，并写入 models.json；更新已有模型时若调用方未提供该值，必须保留已有 contextWindow，避免兼容调用静默回退默认值。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="compaction,prune-invariant,cache-prefix,control-tool" date="2026-07-24" sid="S-20260724-cbhh" title="压缩剪除的三项不变量" source="master@d8c8ca96">
+
+### 压缩剪除的三项不变量
+
+pi-maestro-flow 压缩剪除必须保持：(1) isError 的 tool result 永不剪除；(2) 控制类工具(如 todo)输出永不驱逐——驱逐集合用 allowlist(REPLAYABLE + EVICTABLE_BULK)而非'所有非可重放'；(3) 剪除顺序保持 latest-first（先剪靠近 frontier 的安全输出）以保留更长的 prompt cache 前缀。recent keepRecentTokens 窗口受保护。冗余惩罚不能用作剪除排序（与 latest-first 缓存不变量冲突），只能作为遥测/重要性信号。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="cockpit ownership todo teammate shortcut" date="2026-07-26" sid="S-20260726-4t37" title="Cockpit 跨扩展 UI 所有权协议" description="Cockpit 完全替换原生 Todo 与 teammate 状态面板的单所有者事件协议" source="master@69b23ebf">
+
+### Cockpit 跨扩展 UI 所有权协议
+
+当 pi-cockpit 启用时，必须通过 cockpit:ui-ownership 事件让 pi-maestro-flow 与 pi-maestro-teammate 主动撤下原生 todo-panel 和 teammate-agents；不得由 Cockpit 跨扩展强删。Alt+T 仍由 Flow 唯一注册，并通过 cockpit:toggle-todo 将展开态同步给 Cockpit。Cockpit 禁用时原生面板必须恢复。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="cockpit,projection,spawnedby,blockedby,dependencies" date="2026-07-26" sid="S-20260726-t8pi" title="Cockpit 关系投影不得压平" description="Cockpit Todo 与 teammate 树投影的关系语义和降级规则" source="master@69b23ebf">
+
+### Cockpit 关系投影不得压平
+
+跨扩展 UI 投影必须保留源事件中的关系与生命周期字段。Agent 父子结构只由 spawnedBy/parentCorrelationId 建立；graph dependencies 只表示结果流，必须单独用依赖箭头显示，不能伪装成父子层级。Todo 投影必须保留 blockedBy、createdBy、assignee、skills；缺失或循环父引用必须降级为可见 root 且禁止无限递归；父 agent 完成时递归清理所有后代行。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="background,snapshot,event,cockpit" date="2026-07-26" sid="S-20260726-wdwp" title="后台工具状态通过权威快照事件投影" description="后台工具与 Cockpit 之间采用全量快照和 query 事件的解耦模式" source="master@69b23ebf">
+
+### 后台工具状态通过权威快照事件投影
+
+长生命周期工具由进程所有者维护唯一状态机，并通过稳定事件发布完整不可变快照；UI 插件只校验、排序和渲染快照，启动或手动刷新时发送 query 事件，不直接 import 工具内部注册表，也不通过轮询工具调用复制状态。终态必须保留 status、exitCode、finishedAt、输出尾部和完整日志路径；消费者按 id 保持选中项，避免实时重排导致详情跳转。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="prompt-cache,context-transform,prune,compaction,cache-invalidation,cost-model" date="2026-07-26" sid="S-20260726-8laz" title="Context transform 改写消息前必须核算 prompt cache 作废代价" description="剪枝/改写类 context transform 的收益门控：算清作废前缀的一次性成本，且必须两阶段而非贪心" source="odyssey:20260726-odyssey-improve-compact-cache">
+
+### Context transform 改写消息前必须核算 prompt cache 作废代价
+
+任何在"每次 provider 请求前应用、但不写回 session"的 context transform（剪枝、重写、注入位置变更），替换索引 N 处的消息会让 provider 的缓存前缀从 N 到结尾全部失效。只算"省了多少 token"是错的。
+
+定价（Anthropic）：cache read ≈ 0.1× input，cache write ≈ 1.25× input。作废 T 个 token 一次性花 ~1.15T，省下 S 个 token 每轮回收 ~0.1S，因此盈亏平衡约在 11.5·T/S 轮之后。实测最坏形态（一次旧文件读取 + 12 轮大对话）省 2.2K / 作废 81K = 0.027，净亏约 37:1，而且剪完压力根本没解除。
+
+关键：门控不能贪心。单条候选的边际收益是**递增**的——第一条候选独自承担整条后缀的作废成本，得分永远最差（实测 0.122），整段跑完才转正（0.664）。逐条判断会在第一条上就否掉整段本来盈利的操作。
+
+正确形状是两阶段：
+1. collect —— 按原有顺序只收集候选、不改写（遍历顺序保持与历史一致，便于证明等价）
+2. trim —— 用后缀和一次 O(n) 求出 suffixTokens，取**累计**收益首次覆盖 `suffix[index] × minRatio` 的**最深**位置，只应用到该深度
+
+实现见 packages/pi-maestro-flow/src/compaction/auto-compaction.ts 的 cacheWorthwhileDepth / suffixTokenSums / runPrunePass。门控关闭或压力已 critical 时跳过阶段 2，输出与历史逐字节一致——这条退化路径是安全边界，务必保留并测试。
+
+推论：此类门控默认可以开，因为它只会**拒绝**操作、不会**触发**操作，失败模式是"上下文略满"而不是"意外压缩"。这与"提前触发压缩"类信号（如 velocity）的默认值取向相反。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="扩展,主题,settheme,所有权,pi,settings" date="2026-07-26" sid="S-20260726-sqp1" title="扩展 setTheme 写穿宿主设置，主题所有权归 pi" description="setTheme 写穿宿主设置，扩展不得自行持久化与重放主题" source="master@25cd8ea1" status="deprecated" superseded-by="S-20260726-cztp">
+
+### 扩展 setTheme 写穿宿主设置，主题所有权归 pi
+
+扩展 MUST NOT 自行持久化主题并在 session_start 重放。ctx.ui.setTheme(name) 不是会话级的——实现里在成功后调用 settingsManager.setTheme(name) 写回 pi 自己的设置，因此 pi 下次启动会自行恢复；扩展再放一次只会覆盖用户此后通过 /settings 做的修改。
+
+pi 的主题设置有两种形态：单个主题名，或 Automatic 模式下的 "light/dark" 配对字符串（settings-selector.js getAutomaticThemeSetting）。扩展写入单个名字会把配对整体替换掉，而 ExtensionUIContext 只有 getAllThemes / getTheme / setTheme，**没有读取当前主题设置的方法**，因此扩展无法判断自己是否正在破坏一个配对，也无法把配对还给用户。
+
+结论：主题的权威是 pi 的 settings，扩展至多提供一个快捷入口，并且 MUST 指向 /settings（内置选择器有实时预览、取消回滚 originalThemeSetting、明暗自动配对，扩展侧单键循环三样都没有）。内置斜杠命令中没有 /theme，主题在 /settings 子菜单下。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="嵌套,代理路径,handleproxyrequest,双实现,状态维护,teammate" date="2026-07-26" sid="S-20260726-5e59" title="嵌套派发的代理路径必须与 root execute 共享状态维护" description="嵌套 teammate 走 IPC 回根由 handleProxyRequest 执行，execute 里的状态维护必须在两处都做" source="run:20260726-001-odyssey-improve">
+
+### 嵌套派发的代理路径必须与 root execute 共享状态维护
+
+@
+pi-maestro-teammate 的嵌套 teammate 调用**不是**"再走一遍 tool.execute"：子进程只注册 proxy 工具，嵌套调用经 IPC 回根进程，由 `handleProxyRequest` 执行。两条路径是两份独立的调度/状态实现。
+
+因此：凡是在 root `execute` 里对 `ActiveAgent` 做的状态维护，MUST 同时在代理路径做，否则只在嵌套场景暴露。已实测的 4 类漂移后果：
+
+- 不刷新 `lastActivityAt` → 嵌套 agent 30s 后被误判 stalled（ARCH-2）
+- 不发 `TEAMMATE_COMPLETE_EVENT` → 跨扩展留永久幽灵行（ARCH-3）
+- 不更新 `childCall` 快照 → 父级 TUI 恒显示 stalled（OBS-8）
+- 不校验自报身份 → 子进程可伪造 parentCid、越权 send/abort（SEC-1/SEC-5）
+
+新增任何"派发一个 agent 时要做的事"时，MUST 检查两处；只改一处即为缺陷。合并两份实现前，此约束是唯一防线（ISS-20260726-012）。
+@
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="env,子进程,pi_teammate_depth,深度守卫,身份,准入闸门" date="2026-07-26" sid="S-20260726-nqlg" title="读子进程作用域的 env 前必须先门控进程身份" description="根子进程共用同一份代码时，读子进程作用域 env 必须先门控进程身份；层级预算沿派发链传递而非读 env" source="run:20260726-001-odyssey-improve">
+
+### 读子进程作用域的 env 前必须先门控进程身份
+
+@
+把身份或预算寄存在环境变量（`PI_TEAMMATE_DEPTH`、`PI_TEAMMATE_CORRELATION_ID`），而扩展代码在**根进程与子进程都会加载同一份**时，无条件读取该 env 是失效的：根进程里它根本不存在。
+
+`checkDepthGuard()` 曾在根进程读 `PI_TEAMMATE_DEPTH`（未定义 → 0），而每次 spawn 都写 `DEPTH = current + 1` = 恒为 1，于是 `MAX_DEFAULT_DEPTH = 3` **从未生效**；叠加"并发上限只按单次调用的任务数计"，最坏 15³ = 3375 个 Pi 进程。
+
+规则：
+- 读子进程作用域 env 的代码 MUST 先证明自己就是那个进程 —— `if (isChild)`（`PI_TEAMMATE_CHILD === "1"`）或 `isTeammateChild()`（并检 `typeof process.send === "function"`）。
+- 层级/预算这类**由派发者决定**的量，SHOULD 沿派发链在进程内数据结构上传递（`ActiveAgent.depth = parent.depth + 1`），env 只作为子进程的初始值，不作为守卫的读取源。
+- 准入闸门 MUST 同时约束深度与跨层级总量，只有其中之一等于没有。
+
+仓库现状（已扫描确认）：`PI_TEAMMATE_CORRELATION_ID` 的 6 个读取点全部被显式门控，深度守卫是唯一违例且已修。
+@
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="准入,并发闸门,live_agent_statuses,墓碑,失败保留,预算" date="2026-07-26" sid="S-20260726-r8dg" title="准入闸门的存活集合按持有活资源定义，墓碑不占预算" description="并发/嵌套预算按存活状态集合计数，终端态墓碑不占槽位，故无需为可见性另建侧表" source="run:20260726-001-odyssey-improve">
+
+### 准入闸门的存活集合按持有活资源定义，墓碑不占预算
+
+@
+终端状态需要保留一段可见期（见 `ui-conventions` 的"失败状态不得与产生它的事件同帧消失"，那条管**渲染**），本条管**准入**：保留期内的墓碑 MUST NOT 消耗并发/嵌套预算。
+
+做法：闸门计数不遍历整个注册表，而是按一个显式的存活状态集合过滤 —— `LIVE_AGENT_STATUSES = {pending, running, retrying, sleeping}`。`failed` 墓碑不在其中，因为它不持有子进程。
+
+由此，"保留失败记录"与"占用槽位"这两件事解耦，不需要为可见性另建侧表（`recentFailures` 之类）。ISS-20260726-008 原本建议侧表，理由是"留在 activeRuns 会占槽位"——在存活集合已收窄的前提下该顾虑不成立，真实 `status: "failed"` 墓碑是更简单且让既有失败渲染分支真正生效的做法。
+
+推论：任何新增的"注册表里存在即计入"式闸门都是缺陷；预算的语义 MUST 是"持有活资源",不是"在表里"。
+@
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="settheme,主题,预览,扩展,持久化,setthemeinstance,pi" date="2026-07-26" sid="S-20260726-cztp" title="扩展 setTheme 双形态：名字持久化，实例仅内存" description="setTheme 字符串形态写穿 settings，实例形态仅内存——扩展做预览/取消的前提" source="master@02a0c507" supersedes="S-20260726-sqp1" status="deprecated" superseded-by="S-20260726-n05d">
+
+### 扩展 setTheme 双形态：名字持久化，实例仅内存
+
+ctx.ui.setTheme 的两个重载走不同代码路径，持久化语义相反，这是扩展能否做主题预览的唯一决定因素：
+
+- setTheme(name: string) -> setThemeName：成功后扩展包装层额外调用 settingsManager.setTheme(name)，**写回 pi 自己的设置**（持久）。
+- setTheme(theme: Theme) -> setThemeInstance：仅内存生效，activeThemeName 置为 "<in-memory>"，**不写 settings**（会话级）。
+
+由此推出扩展侧主题选择器的正确形状：用 getTheme(name) 取实例、用实例形态预览，滚多少个主题都不碰用户已存设置；取消时把打开选择器那一刻的 Theme 实例再 set 回去即可还原；只有确认键走字符串形态落盘。参考实现 packages/pi-cockpit/src/theme-picker.ts。
+
+两个无法回避的限制，按「是否造成用户可见的永久损失」分级处理：
+1. ExtensionUIContext 只有 getAllThemes/getTheme/setTheme，**没有读取当前主题设置的方法**，所以显式确认写入单个名字时，无法判断自己是否正在把 Automatic 模式的 "light/dark" 配对压平成单名，也无法把配对还回去。这是永久损失且扩展无法补救，MUST 在 UI 上写明并指向 /settings，MUST NOT 猜测或静默。
+2. setThemeInstance 会调用 setAutoSync(false)，预览一旦发生，本会话不再跟随终端明暗（OSC 11）；重启后由 applyFromSettings 自愈。会话级且自愈，记录在此即可，不必占用 UI 行。
+
+仍然成立：扩展 MUST NOT 自行持久化主题并在 session_start 重放（会覆盖用户此后经 /settings 做的修改）。pi 内置斜杠命令中没有 /theme，主题在 /settings 子菜单下。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="theme,proxy,settheme,setthemeinstance,预览,扩展,爆栈,pi" date="2026-07-26" sid="S-20260726-n05d" title="pi theme 是 Proxy：读取靠 .name，回写禁止传 Proxy" description="pi theme 是 Proxy：.name 可读当前主题，回传 Proxy 会自引用爆栈" source="master@3ad8ce24" supersedes="S-20260726-cztp">
+
+### pi theme 是 Proxy：读取靠 .name，回写禁止传 Proxy
+
+pi 导出的 theme 不是快照，是常驻 Proxy（modes/interactive/theme/theme.js）：
+
+    export const theme = new Proxy({}, { get: (_t, prop) => globalThis[THEME_KEY][prop] })
+
+三条推论，扩展写主题相关 UI 时全部适用：
+
+一、setTheme 的两个重载持久化语义相反
+- setTheme(name: string) -> setThemeName：成功后扩展包装层额外调用 settingsManager.setTheme(name)，**写回 pi 设置**（持久）。
+- setTheme(theme: Theme) -> setThemeInstance：仅 setGlobalTheme，currentThemeName 置 "<in-memory>"，**不写 settings**（会话级）。
+因此预览用实例形态、确认才用字符串形态，是扩展侧做「可预览可取消」选择器的唯一正确形状。参考 packages/pi-cockpit/src/theme-picker.ts。
+
+二、**MUST NOT 把 theme 本身当快照回传给 setTheme**
+setThemeInstance(proxy) 会执行 globalThis[THEME_KEY] = proxy，proxy 从此读自己，下一次取色无限递归爆栈。取消目标 MUST 是 getTheme(name) 解析出的真实 Theme 实例。拿不到实例时 MUST 完全不预览（预览了就回不去，唯一回退路径是会落盘的字符串形态），并把 UI 提示词一并降级——承诺一个做不到的 revert 比缺这个功能更糟。
+
+三、当前主题**可以**读：`theme.name`
+Theme 类有 name 字段，createTheme 从 themeJson.name 赋值，内置 dark.json/light.json 也带 name。透过 Proxy 读 .name 即当前生效主题名，这是扩展 API 唯一的当前主题读取口（getAllThemes/getTheme/setTheme 之外）。读取 MUST 包 try：initTheme() 之前 Proxy 直接抛错；并校验为非空字符串。
+
+仍然成立的限制：
+- 可读的是当前生效主题，不是**存储的设置**。Automatic 模式下设置是 "light/dark" 配对字符串（settings-selector.js getAutomaticThemeSetting），扩展写入单名会把配对压平且无法还原 —— 这是永久损失，MUST 在 UI 上写明并指向 /settings。
+- setThemeInstance 会调用 stopThemeWatcher/setAutoSync(false)，预览一旦发生本会话不再跟随终端明暗（OSC 11），重启由 applyFromSettings 自愈；会话级且自愈，不必占用 UI 行。
+- 扩展 MUST NOT 自行持久化主题并在 session_start 重放。
+- pi 内置斜杠命令中没有 /theme，主题在 /settings 子菜单下。
+
+副产物：theme 是活 Proxy 意味着任何已捕获 theme 的组件都会随主题变化自动重绘，预览对宿主全部 UI 同时生效——嵌套子视图无需自行传递主题。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="teammate graph abortcontroller settlement cohort" date="2026-07-27" sid="S-20260727-wrad" title="Graph task 自然结算不得取消共享 cohort" description="约束 graph task settlement 与 cohort cancellation 的 controller ownership" source="fix/tpg-critical-high-gaps@95f57a0c">
+
+### Graph task 自然结算不得取消共享 cohort
+
+graph task 与 graph 容器共享 AbortController 时，task 的自然成功、non-wakeable 结算或失败状态收敛不得 abort 共享 controller；cohort cancellation 只能由 graph 容器结算或显式 killAgentTree 发起。root execute 与 handleProxyRequest 两条调度路径必须同步遵守，并以能响应 abort 的公开路径行为测试覆盖依赖 task。
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="effort,thinking-level,max,canonical,modeldefaults" date="2026-08-02" sid="S-20260802-kxvv" title="统一 /effort 的模型级思考强度边界（含 max canonical level）" description="锁定 /effort 的统一 Provider 覆盖、canonical level（含 max）与原子提交语义" source="master@d4ce62f0" supersedes="S-20260722-hxna">
+
+### 统一 /effort 的模型级思考强度边界（含 max canonical level）
+
+单一 /effort 命令 MUST 以当前 ctx.model 的 provider/modelId 为键复用 modelDefaults，覆盖 API Manager 与 Pi 系统原生 provider；UI MUST 只展示当前模型支持的 Pi canonical levels（off/minimal/low/medium/high/xhigh/max）。max 仅在模型 thinkingLevelMap 声明 max wire（xhigh→"max" 或 max→"max"）时展示，并作为正式 level 持久化与传给 setThinkingLevel；不支持 max 的模型由 Pi runtime clamp 到 xhigh。thinkingLevelMap 内的 Provider wire value 仍只作映射，不得与 canonical level 混淆。选择提交 MUST 先原子持久化再应用 runtime，取消或失败不得改变当前状态。
+
+</spec-entry>
+<spec-entry category="arch" keywords="compaction,压缩,阈值,摘要预留,自举,裁剪,prompt-too-long,ptl,估算" date="2026-08-02" sid="S-20260802-mpct" title="压缩触发阈值预留摘要输出；摘要请求发前裁剪 + 发后 PTL 重试（runtime state 不精简）" description="锁定压缩触发阈值语义、摘要请求容量策略与 runtime-state 全量注入约束" source="workflow: compression optimization plan (approved)">
+
+### 压缩触发阈值预留摘要输出；摘要请求发前裁剪 + 发后 PTL 重试（runtime state 不精简）
+
+背景实测：`CTX CRITICAL 371482/353400 prune-insufficient` 后强制压缩失败 `estimated request 740833/372000`。摘要请求估算 740833 ≈ 会话估算 371482 的 2 倍（JSON 转义 + 保守比率 + runtime-state JSON）；Pi 原生兜底无本地守卫能成功，证明 Maestro 本地估算虚高误杀。
+
+**触发阈值（compaction-threshold.ts）**
+1. 摘要输出预留：`thresholdTokens = 窗口 − effectiveReserve − summaryReserve`，`summaryReserve = min(20_000, modelMaxTokens)`（Claude Code 实测 p99.99 摘要输出 17,387）；模型输出上限未知时预留为 0（纯推导/小窗口退化，避免阈值塌缩）。
+2. 压缩模型自举：配置压缩模型窗口 < 会话窗口时，触发 = `floor(压缩窗口 × 0.5) − summaryReserve − 4096`（reason "self-hosted"），使摘要请求（≈2× 会话估算）能装进压缩模型自身窗口，避免每次执行 fallback 到会话模型。372K 压缩模型 → ~169K 触发；120K → ~48K。
+3. runtime 策略 MUST 消费派生阈值（applyContextPressurePolicy 的 thresholdOverrideTokens），critical 判定、prune target、escalate 窗口不得回退到 `窗口 − reserve` 旧公式。
+
+**摘要请求容量（maestro-compaction.ts）**
+1. 发前估算贴近真实：折叠 JSON 转义序列（`\\n`/`\\"`/`\\\\` 按内容字符计）、CJK 按 1 token/char（原 1.5 误杀中文会话）、空白密集按 6 chars/token；`fitSummaryOutputBudget` 输入以 `estimatedRequestTokens` 为准（`tokensBefore` 仅 fallback，消除图片含入虚高）。
+2. 发前预算裁剪：按 API round 分组（assistant 轮次 + 其 toolResults 成组）从最旧丢弃，至少保留一组；runtime state 每轮原样重建。裁剪后仍超窗才抛 `CompactionCapacityError`（fail-closed 语义不变，见 debug-notes S-20260727-7vnv）。
+3. 发后 PTL 反应式重试：provider 返回 prompt-too-long 时按 20% 最旧分组裁剪重试 ≤2 次，仍失败走 native fallback。
+4. 配置模型容量/认证失败 MUST 从原始输入回退会话模型，不得继承配置模型的裁剪结果。
+
+**锁定约束**
+- runtime-state JSON（todo/goal/plan/activeSkills/references）全量注入 checkpoint prompt，**不做精简**。
+- prune 跨 turn 稳定、cache gate 语义不变（本文件 S-20260724-cbhh 与 coding-conventions 同款规则）。
+
+</spec-entry>
+
+
+
+
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260731-119aac78bd6819c0" title="Treat spill-retry prefix mutation, dead spill restoration, and shutdown tombstoning as the primary confirmed finding clu" description="Promoted from run:20260731-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260731-team-swarm-cache-hit-audit:KDC-119aac78bd6819c0">
+
+### Treat spill-retry prefix mutation, dead spill restoration, and shutdown tombstoning as the primary confirmed finding clu
+
+Treat spill-retry prefix mutation, dead spill restoration, and shutdown tombstoning as the primary confirmed finding cluster.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260731-510f3266859dfbee" title="Scope web-config invalidation to memoized provider credentials/routing; SSRF/domain-policy loaders remain live reads." description="Promoted from run:20260731-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260731-team-swarm-cache-hit-audit:KDC-510f3266859dfbee">
+
+### Scope web-config invalidation to memoized provider credentials/routing; SSRF/domain-policy loaders remain live reads.
+
+Scope web-config invalidation to memoized provider credentials/routing; SSRF/domain-policy loaders remain live reads.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260731-8c29a8220aaa1483" title="ACO script owns selection, update, scoring, and convergence." description="Promoted from run:20260731-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260731-team-swarm-cache-hit-audit:KDC-8c29a8220aaa1483">
+
+### ACO script owns selection, update, scoring, and convergence.
+
+ACO script owns selection, update, scoring, and convergence.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260731-e8458fc50528ec35" title="Implement in dependency order: freeze retry replacement bytes; validate/downgrade restored resources; then preserve mani" description="Promoted from run:20260731-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260731-team-swarm-cache-hit-audit:KDC-e8458fc50528ec35">
+
+### Implement in dependency order: freeze retry replacement bytes; validate/downgrade restored resources; then preserve mani
+
+Implement in dependency order: freeze retry replacement bytes; validate/downgrade restored resources; then preserve manifests across normal shutdown.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260801-368fbefa12e38825" title="aco.py encoding 补丁属 swarm 基础设施（trails 读 UTF-8），非审查对象" description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260801-team-swarm-cockpit-review:KDC-368fbefa12e38825">
+
+### aco.py encoding 补丁属 swarm 基础设施（trails 读 UTF-8），非审查对象
+
+aco.py encoding 补丁属 swarm 基础设施（trails 读 UTF-8），非审查对象
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260801-4ebe7d05dde0106e" title="审查只读：未修改 pi-cockpit/pi-maestro-teammate 产品代码" description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260801-team-swarm-cockpit-review:KDC-4ebe7d05dde0106e">
+
+### 审查只读：未修改 pi-cockpit/pi-maestro-teammate 产品代码
+
+审查只读：未修改 pi-cockpit/pi-maestro-teammate 产品代码
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260801-7605377bc750dc4e" title="analyst 子代理因 rate_limit 停滞被中止，best-solution.md 由 coordinator 直接综合（converge.md 失败回退路径）" description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260801-team-swarm-cockpit-review:KDC-7605377bc750dc4e">
+
+### analyst 子代理因 rate_limit 停滞被中止，best-solution.md 由 coordinator 直接综合（converge.md 失败回退路径）
+
+analyst 子代理因 rate_limit 停滞被中止，best-solution.md 由 coordinator 直接综合（converge.md 失败回退路径）
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260801-a9cde0f0584232a9" title="ANT-1-4 工件 _meta 为空已修复（swarm-ant-result/1.0）；ANT-3-1 无工件未参与评分" description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012, artifact:ART-001-013, artifact:ART-001-014, artifact:ART-001-015, artifact:ART-001-016" source="session:20260801-team-swarm-cockpit-review:KDC-a9cde0f0584232a9">
+
+### ANT-1-4 工件 _meta 为空已修复（swarm-ant-result/1.0）；ANT-3-1 无工件未参与评分
+
+ANT-1-4 工件 _meta 为空已修复（swarm-ant-result/1.0）；ANT-3-1 无工件未参与评分
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260802-2d7f720204a93024" title="复用 pandoc 转换链路实现 Word/PDF" description="Promoted from run:20260802-001-odyssey-planex, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003" source="session:20260802-odyssey-planex-markdown-review-export:KDC-2d7f720204a93024">
+
+### 复用 pandoc 转换链路实现 Word/PDF
+
+复用 pandoc 转换链路实现 Word/PDF
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260802-afed0bd8ed2e6ea7" title="导出函数支持注入 spawn 以便行为测试" description="Promoted from run:20260802-001-odyssey-planex, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003" source="session:20260802-odyssey-planex-markdown-review-export:KDC-afed0bd8ed2e6ea7">
+
+### 导出函数支持注入 spawn 以便行为测试
+
+导出函数支持注入 spawn 以便行为测试
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260802-faf8faef1a514524" title="提取层保留 user 消息并多 turn 组装" description="Promoted from run:20260802-001-odyssey-planex, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003" source="session:20260802-odyssey-planex-markdown-review-export:KDC-faf8faef1a514524">
+
+### 提取层保留 user 消息并多 turn 组装
+
+提取层保留 user 消息并多 turn 组装
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260804-04a904e46fb1dff4" title="Applied completed-turn cancellation and error isolation to the teammate child surface." description="Promoted from run:20260804-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005" source="session:20260802-odyssey-review-compaction:KDC-04a904e46fb1dff4">
+
+### Applied completed-turn cancellation and error isolation to the teammate child surface.
+
+Applied completed-turn cancellation and error isolation to the teammate child surface.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260804-4bb29a5041329567" title="Native recovery is exhausted-only, has no queued work, remains arbiter-native/unowned, and uses a leading marker." description="Promoted from run:20260804-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005" source="session:20260802-odyssey-review-compaction:KDC-4bb29a5041329567">
+
+### Native recovery is exhausted-only, has no queued work, remains arbiter-native/unowned, and uses a leading marker.
+
+Native recovery is exhausted-only, has no queued work, remains arbiter-native/unowned, and uses a leading marker.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260804-98d39335d17bb885" title="Removed the tool-loop fast path because it violated the governing completed-turn preservation rule." description="Promoted from run:20260804-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005" source="session:20260802-odyssey-review-compaction:KDC-98d39335d17bb885">
+
+### Removed the tool-loop fast path because it violated the governing completed-turn preservation rule.
+
+Removed the tool-loop fast path because it violated the governing completed-turn preservation rule.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260804-d6a3d4192d6b438c" title="Normal non-exhausted completed turns defer/reassess compaction to preserve the transcript." description="Promoted from run:20260804-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005" source="session:20260802-odyssey-review-compaction:KDC-d6a3d4192d6b438c">
+
+### Normal non-exhausted completed turns defer/reassess compaction to preserve the transcript.
+
+Normal non-exhausted completed turns defer/reassess compaction to preserve the transcript.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260802-09b0cdae94fc2156" title="Preserve concurrent user-owned README.md, package.json, and embedding metadata changes." description="Promoted from run:20260802-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260802-odyssey-review-core-plugin:KDC-09b0cdae94fc2156">
+
+### Preserve concurrent user-owned README.md, package.json, and embedding metadata changes.
+
+Preserve concurrent user-owned README.md, package.json, and embedding metadata changes.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-06" sid="S-20260802-2792e41e6b75c030" title="Do not promote staged knowledge automatically; promotion remains a separate governance action." description="Promoted from run:20260802-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260802-odyssey-review-core-plugin:KDC-2792e41e6b75c030">
+
+### Do not promote staged knowledge automatically; promotion remains a separate governance action.
+
+Do not promote staged knowledge automatically; promotion remains a separate governance action.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260802-5992008f0c57a4d5" title="ARCH-002 deferred: raw external Maestro CLI mutations require a CLI/core lease or expected-revision/CAS contract." description="Promoted from run:20260802-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260802-odyssey-review-core-plugin:KDC-5992008f0c57a4d5">
+
+### ARCH-002 deferred: raw external Maestro CLI mutations require a CLI/core lease or expected-revision/CAS contract.
+
+ARCH-002 deferred: raw external Maestro CLI mutations require a CLI/core lease or expected-revision/CAS contract.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260802-7f8086ae21efd5bf" title="MED-018 deferred: Firecrawl fresh scraping fails closed until the external deployment enforces target-network policy." description="Promoted from run:20260802-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260802-odyssey-review-core-plugin:KDC-7f8086ae21efd5bf">
+
+### MED-018 deferred: Firecrawl fresh scraping fails closed until the external deployment enforces target-network policy.
+
+MED-018 deferred: Firecrawl fresh scraping fails closed until the external deployment enforces target-network policy.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260802-d7ff82c54fef1a89" title="ARCH-005 deferred: removing wildcard source exports requires packed-consumer inventory and a versioned facade migration." description="Promoted from run:20260802-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260802-odyssey-review-core-plugin:KDC-d7ff82c54fef1a89">
+
+### ARCH-005 deferred: removing wildcard source exports requires packed-consumer inventory and a versioned facade migration.
+
+ARCH-005 deferred: removing wildcard source exports requires packed-consumer inventory and a versioned facade migration.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260801-66cf4dcb387e11e7" title="Prioritize canonical post-normalization dispatch parameters, then separate published result, terminal result, and proces" description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012" source="session:20260802-team-swarm-teammate-blocking:KDC-66cf4dcb387e11e7">
+
+### Prioritize canonical post-normalization dispatch parameters, then separate published result, terminal result, and proces
+
+Prioritize canonical post-normalization dispatch parameters, then separate published result, terminal result, and process-reclamation outcome.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260801-b05504f4bb7dd6e2" title="Treat result-ready as a valid consumable boundary; report only stale output, false terminal, ownership, and projection c" description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012" source="session:20260802-team-swarm-teammate-blocking:KDC-b05504f4bb7dd6e2">
+
+### Treat result-ready as a valid consumable boundary; report only stale output, false terminal, ownership, and projection c
+
+Treat result-ready as a valid consumable boundary; report only stale output, false terminal, ownership, and projection consequences.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260801-b7b4c9250ed11e77" title="Classify failed TERM/KILL acknowledgement as a structural risk, not a confirmed real OS orphan." description="Promoted from run:20260801-001-team-swarm, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005, artifact:ART-001-006, artifact:ART-001-007, artifact:ART-001-008, artifact:ART-001-009, artifact:ART-001-010, artifact:ART-001-011, artifact:ART-001-012" source="session:20260802-team-swarm-teammate-blocking:KDC-b7b4c9250ed11e77">
+
+### Classify failed TERM/KILL acknowledgement as a structural risk, not a confirmed real OS orphan.
+
+Classify failed TERM/KILL acknowledgement as a structural risk, not a confirmed real OS orphan.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260805-2a576fc153bccfc9" title="Monitor ticks use a start-of-tick binding snapshot and exact owner revalidation after awaits." description="Promoted from run:20260805-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260804-odyssey-review-multi-agent:KDC-2a576fc153bccfc9">
+
+### Monitor ticks use a start-of-tick binding snapshot and exact owner revalidation after awaits.
+
+Monitor ticks use a start-of-tick binding snapshot and exact owner revalidation after awaits.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260805-54057244cc36dc04" title="Passive nested completion is valid only while both captured parent and current child session identities match." description="Promoted from run:20260805-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260804-odyssey-review-multi-agent:KDC-54057244cc36dc04">
+
+### Passive nested completion is valid only while both captured parent and current child session identities match.
+
+Passive nested completion is valid only while both captured parent and current child session identities match.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260805-bc5cedffcfc42ee5" title="Foreground controls must be established before deadline allocation or child work admission." description="Promoted from run:20260805-001-odyssey-review, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004" source="session:20260804-odyssey-review-multi-agent:KDC-bc5cedffcfc42ee5">
+
+### Foreground controls must be established before deadline allocation or child work admission.
+
+Foreground controls must be established before deadline allocation or child work admission.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260806-8c9b07cc5aa9d11e" title="Apply a fail-closed stable-function-identity guard to all four equivalent TUI wrapper entry points before attempting a b" description="Promoted from run:20260806-001-debug, artifact:ART-001-001, artifact:ART-001-002, artifact:ART-001-003, artifact:ART-001-004, artifact:ART-001-005" source="session:20260806-debug-pi-viewport-stack:KDC-8c9b07cc5aa9d11e">
+
+### Apply a fail-closed stable-function-identity guard to all four equivalent TUI wrapper entry points before attempting a b
+
+Apply a fail-closed stable-function-identity guard to all four equivalent TUI wrapper entry points before attempting a broader native-layout migration.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260804-59f4c1d42750a01d" title="MailboxHost 绑定从激活期改为 session_start/session_compact 惰性绑定（baseCwd 在激活期为空，workspaceId 需真实 cwd 派生）" description="Promoted from run:20260804-001-learn, artifact:ART-001-001, artifact:ART-001-002" source="session:mailbox-multi-agent-review-hardening-20260804-100833:KDC-59f4c1d42750a01d">
+
+### MailboxHost 绑定从激活期改为 session_start/session_compact 惰性绑定（baseCwd 在激活期为空，workspaceId 需真实 cwd 派生）
+
+MailboxHost 绑定从激活期改为 session_start/session_compact 惰性绑定（baseCwd 在激活期为空，workspaceId 需真实 cwd 派生）
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260804-91eab191d89982c0" title="stop() 采用 drain 语义——排空已在途 dispatch 但不再发起新 claim（post-claim/post-accept 不中止在途工作，pre-claim 复验 #stopped）" description="Promoted from run:20260804-001-learn, artifact:ART-001-001, artifact:ART-001-002" source="session:mailbox-multi-agent-review-hardening-20260804-100833:KDC-91eab191d89982c0">
+
+### stop() 采用 drain 语义——排空已在途 dispatch 但不再发起新 claim（post-claim/post-accept 不中止在途工作，pre-claim 复验 #stopped）
+
+stop() 采用 drain 语义——排空已在途 dispatch 但不再发起新 claim（post-claim/post-accept 不中止在途工作，pre-claim 复验 #stopped）
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260804-d4b7afc6a20285f9" title="去重键改为 requestId ?? correlationId，无 requestId 不写 seen（messageId 每次新 UUID 使旧去重恒不命中且 seen 无界增长）" description="Promoted from run:20260804-001-learn, artifact:ART-001-001, artifact:ART-001-002" source="session:mailbox-multi-agent-review-hardening-20260804-100833:KDC-d4b7afc6a20285f9">
+
+### 去重键改为 requestId ?? correlationId，无 requestId 不写 seen（messageId 每次新 UUID 使旧去重恒不命中且 seen 无界增长）
+
+去重键改为 requestId ?? correlationId，无 requestId 不写 seen（messageId 每次新 UUID 使旧去重恒不命中且 seen 无界增长）
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-06" sid="S-20260804-d5e7b06f58b6bd17" title="accepted 状态机由 IPC ack 改为 dispatch 成功自动 apply（生产接线无 ack 通道，auto-apply 是唯一收敛路径；外部 IPC-ack 保留为幂等 API）" description="Promoted from run:20260804-001-learn, artifact:ART-001-001, artifact:ART-001-002" source="session:mailbox-multi-agent-review-hardening-20260804-100833:KDC-d5e7b06f58b6bd17">
+
+### accepted 状态机由 IPC ack 改为 dispatch 成功自动 apply（生产接线无 ack 通道，auto-apply 是唯一收敛路径；外部 IPC-ack 保留为幂等 API）
+
+accepted 状态机由 IPC ack 改为 dispatch 成功自动 apply（生产接线无 ack 通道，auto-apply 是唯一收敛路径；外部 IPC-ack 保留为幂等 API）
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-19" sid="S-20260819-2fe4c3acd9db7939" title="Adopt business-anchor driven local slicing per the defensive-programming audit spec; no full-repo propagation graph (spe" description="Promoted from run:run-e9d93dd7c02d, report.md#decision:0" source="session:20260819-review-defensive-audit:KDC-2fe4c3acd9db7939">
+
+### Adopt business-anchor driven local slicing per the defensive-programming audit spec; no full-repo propagation graph (spe
+
+Adopt business-anchor driven local slicing per the defensive-programming audit spec; no full-repo propagation graph (spec §2 forbids it)
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-328f22b308a04dbf" title="The flow-schedule-todo-binding capability is declared by the local root endpoint when a 'todo' workspace projection prov" description="Promoted from run:run-72b75afd8709, report.md#decision:0" source="session:20260824-companion-flow-capability:KDC-328f22b308a04dbf">
+
+### The flow-schedule-todo-binding capability is declared by the local root endpoint when a 'todo' workspace projection prov
+
+The flow-schedule-todo-binding capability is declared by the local root endpoint when a 'todo' workspace projection provider is registered in-process (task #0 API reused as the signal), avoiding a reverse Flow→Teammate dependency.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-613f1306a3cfc1d8" title="Capability mismatch degrades silently to gate=none (user choice): admitNext dispatches normally when a step declares tod" description="Promoted from run:run-72b75afd8709, report.md#decision:1" source="session:20260824-companion-flow-capability:KDC-613f1306a3cfc1d8">
+
+### Capability mismatch degrades silently to gate=none (user choice): admitNext dispatches normally when a step declares tod
+
+Capability mismatch degrades silently to gate=none (user choice): admitNext dispatches normally when a step declares todoBinding but the target endpoint lacks the capability, rather than failing or blocking.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-d25c5eac3f9a1b23" title="SessionEndpointCapability union additions must be accompanied by regenerated declarations (build:declarations + check:de" description="Promoted from run:run-72b75afd8709, report.md#constraint:0" source="session:20260824-companion-flow-capability:KDC-d25c5eac3f9a1b23">
+
+### SessionEndpointCapability union additions must be accompanied by regenerated declarations (build:declarations + check:de
+
+SessionEndpointCapability union additions must be accompanied by regenerated declarations (build:declarations + check:declarations) so downstream packages compiling against the .d.ts see the new capability.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-1ab84afd2f634f49" title="FlowScheduleTodoBindingSpecSchema and FlowScheduleTodoOutcomeSchema must be strict with optional fields only; existing s" description="Promoted from run:run-c9476c2627e3, report.md#constraint:0" source="session:20260824-companion-flow-protocol:KDC-1ab84afd2f634f49">
+
+### FlowScheduleTodoBindingSpecSchema and FlowScheduleTodoOutcomeSchema must be strict with optional fields only; existing s
+
+FlowScheduleTodoBindingSpecSchema and FlowScheduleTodoOutcomeSchema must be strict with optional fields only; existing schemas (CreateStepInput, DispatchEnvelope, Result) extended with optional props, not relaxed.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-1c322057ae23b943" title="todoOutcome.todoId is required (not optional) once a binding exists; FlowScheduleTodoStatus mirrors TaskStatus plus a fa" description="Promoted from run:run-c9476c2627e3, report.md#decision:1" source="session:20260824-companion-flow-protocol:KDC-1c322057ae23b943">
+
+### todoOutcome.todoId is required (not optional) once a binding exists; FlowScheduleTodoStatus mirrors TaskStatus plus a fa
+
+todoOutcome.todoId is required (not optional) once a binding exists; FlowScheduleTodoStatus mirrors TaskStatus plus a failed terminal (TaskStatus has no failed). Review P2-2 addressed.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-6e493bad3a2d13d4" title="Gate semantics split into two independent composable flags: requireCompleted (step not completed until worker reports a " description="Promoted from run:run-c9476c2627e3, report.md#decision:0" source="session:20260824-companion-flow-protocol:KDC-6e493bad3a2d13d4">
+
+### Gate semantics split into two independent composable flags: requireCompleted (step not completed until worker reports a 
+
+Gate semantics split into two independent composable flags: requireCompleted (step not completed until worker reports a bound Todo with status completed; missing/non-terminal evidence keeps awaiting, timeout -> ambiguous) and conflictCheck (report=completed but todoStatus not completed -> ambiguous). Review P2-3 addressed.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-fd130b66b4021f56" title="Protocol extension is backward compatible: legacy envelope/result without todoBinding/todoOutcome decode unchanged via e" description="Promoted from run:run-c9476c2627e3, report.md#decision:2" source="session:20260824-companion-flow-protocol:KDC-fd130b66b4021f56">
+
+### Protocol extension is backward compatible: legacy envelope/result without todoBinding/todoOutcome decode unchanged via e
+
+Protocol extension is backward compatible: legacy envelope/result without todoBinding/todoOutcome decode unchanged via existing strict+optional schemas; no wire version bump needed for the optional fields.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-42c11f5868cd627f" title="parseFlowScheduleAction's normalizeStepInputs must preserve todoBinding when present (not drop it as an extra property)," description="Promoted from run:run-d487bce4023a, report.md#constraint:0" source="session:20260824-companion-flow-report-tool:KDC-42c11f5868cd627f">
+
+### parseFlowScheduleAction's normalizeStepInputs must preserve todoBinding when present (not drop it as an extra property),
+
+parseFlowScheduleAction's normalizeStepInputs must preserve todoBinding when present (not drop it as an extra property), since FlowScheduleCreateStepInputSchema now declares it optional.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-aef92f4f383e14ec" title="FlowScheduleStep persists todoBinding (copied from create/append input) so a restarted schedule re-issues the same bindi" description="Promoted from run:run-d487bce4023a, report.md#decision:1" source="session:20260824-companion-flow-report-tool:KDC-aef92f4f383e14ec">
+
+### FlowScheduleStep persists todoBinding (copied from create/append input) so a restarted schedule re-issues the same bindi
+
+FlowScheduleStep persists todoBinding (copied from create/append input) so a restarted schedule re-issues the same binding request; the envelope carries todoBinding structurally AND the instruction text carries a human-readable hint.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-fefb6ca5ca5a543c" title="The Todo-binding contract is a prompt-layer instruction appended to the dispatch instruction text when a step carries to" description="Promoted from run:run-d487bce4023a, report.md#decision:0" source="session:20260824-companion-flow-report-tool:KDC-fefb6ca5ca5a543c">
+
+### The Todo-binding contract is a prompt-layer instruction appended to the dispatch instruction text when a step carries to
+
+The Todo-binding contract is a prompt-layer instruction appended to the dispatch instruction text when a step carries todoBinding; the worker root session LLM creates the Todo and reports back — no host-side automatic sub-agent dispatch (review P0-4).
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-19a33aca33860922" title="WorkspaceTodoSnapshot.status mirrors the canonical TaskStatus enum (pending|in_progress|completed|blocked|deleted); no s" description="Promoted from run:run-ad7a0c4134c0, report.md#decision:0" source="session:20260824-companion-teammate-workspace-todo-snapshot:KDC-19a33aca33860922">
+
+### WorkspaceTodoSnapshot.status mirrors the canonical TaskStatus enum (pending|in_progress|completed|blocked|deleted); no s
+
+WorkspaceTodoSnapshot.status mirrors the canonical TaskStatus enum (pending|in_progress|completed|blocked|deleted); no separate 'failed' terminal here — the deleted→failed mapping is applied at the Flow acceptResult gate (task #8), not at this teammate projection layer.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-2e8dcdd5c7ae54c8" title="Control-char sanitization (CR/LF/ESC/C0 strip, LF/CR→space) is applied at the teammate projection validator (validateWor" description="Promoted from run:run-ad7a0c4134c0, report.md#decision:1" source="session:20260824-companion-teammate-workspace-todo-snapshot:KDC-2e8dcdd5c7ae54c8">
+
+### Control-char sanitization (CR/LF/ESC/C0 strip, LF/CR→space) is applied at the teammate projection validator (validateWor
+
+Control-char sanitization (CR/LF/ESC/C0 strip, LF/CR→space) is applied at the teammate projection validator (validateWorkspaceTodoSnapshot) so owner snapshots on disk are already display-safe; task #6 will additionally re-sanitize at the observe view=todos render boundary as defense-in-depth.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-ac8166494f60f50c" title="todos are capped at MAX_OWNER_TODOS (32) with earliest entries retained; the global MAX_OWNER_FILE_BYTES (256 KiB) budge" description="Promoted from run:run-ad7a0c4134c0, report.md#constraint:0" source="session:20260824-companion-teammate-workspace-todo-snapshot:KDC-ac8166494f60f50c">
+
+### todos are capped at MAX_OWNER_TODOS (32) with earliest entries retained; the global MAX_OWNER_FILE_BYTES (256 KiB) budge
+
+todos are capped at MAX_OWNER_TODOS (32) with earliest entries retained; the global MAX_OWNER_FILE_BYTES (256 KiB) budget is enforced by the existing validateWorkspaceOwnerSnapshot whole-snapshot size check, which the per-item subject truncation (MAX_TODO_FIELD_BYTES) keeps well within bounds.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-b2cb44e2ed456664" title="Reverse-binding pointers (dispatchId/scheduleId/stepId) are bounded opaque strings ≤64 chars — never parsed as free text" description="Promoted from run:run-ad7a0c4134c0, report.md#constraint:1" source="session:20260824-companion-teammate-workspace-todo-snapshot:KDC-b2cb44e2ed456664">
+
+### Reverse-binding pointers (dispatchId/scheduleId/stepId) are bounded opaque strings ≤64 chars — never parsed as free text
+
+Reverse-binding pointers (dispatchId/scheduleId/stepId) are bounded opaque strings ≤64 chars — never parsed as free text; the Flow side (task #7) populates them from durable binding records, not from todo context.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-7e7674dbc4ec52af" title="Every Todo string field must be sanitized again at the observation rendering boundary before entering page.items or deta" description="Promoted from run:run-1424ae20568f, report.md#constraint:0" source="session:20260824-companion-teammate-observe-todos:KDC-7e7674dbc4ec52af">
+
+### Every Todo string field must be sanitized again at the observation rendering boundary before entering page.items or deta
+
+Every Todo string field must be sanitized again at the observation rendering boundary before entering page.items or detail, removing CR, LF, ESC, and other C0 controls even when owner-snapshot validation was bypassed.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-8b9c37ee7b775416" title="Observe view=todos is a workspace-only projection and supports status/watch actions; other target kinds and wait/diagnos" description="Promoted from run:run-1424ae20568f, report.md#decision:0" source="session:20260824-companion-teammate-observe-todos:KDC-8b9c37ee7b775416">
+
+### Observe view=todos is a workspace-only projection and supports status/watch actions; other target kinds and wait/diagnos
+
+Observe view=todos is a workspace-only projection and supports status/watch actions; other target kinds and wait/diagnose fail validation instead of falling back to another provider view.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-dd15392ecbe85ecd" title="For view=todos, summary returns only total/active/bound counts with an empty page.items and no detail; tail/full returns" description="Promoted from run:run-1424ae20568f, report.md#decision:1" source="session:20260824-companion-teammate-observe-todos:KDC-dd15392ecbe85ecd">
+
+### For view=todos, summary returns only total/active/bound counts with an empty page.items and no detail; tail/full returns
+
+For view=todos, summary returns only total/active/bound counts with an empty page.items and no detail; tail/full returns all bounded structured items while limiting rendered detail rows by lines.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-1132660a7d86cd58" title="Todo reverse pointers (dispatchId, scheduleId, stepId) must be joined only from durable FlowScheduleTodoBinding records " description="Promoted from run:run-2a349353c78b, report.md#constraint:0" source="session:20260824-companion-flow-todo-projector:KDC-1132660a7d86cd58">
+
+### Todo reverse pointers (dispatchId, scheduleId, stepId) must be joined only from durable FlowScheduleTodoBinding records 
+
+Todo reverse pointers (dispatchId, scheduleId, stepId) must be joined only from durable FlowScheduleTodoBinding records by exact todoId; Todo context or other free text must never be parsed for binding identity.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-3b66629123773239" title="Todo workspace projection items are owned by WorkspaceOwnerSnapshot.todos and are not duplicated in the generic projecti" description="Promoted from run:run-2a349353c78b, report.md#decision:0" source="session:20260824-companion-flow-todo-projector:KDC-3b66629123773239">
+
+### Todo workspace projection items are owned by WorkspaceOwnerSnapshot.todos and are not duplicated in the generic projecti
+
+Todo workspace projection items are owned by WorkspaceOwnerSnapshot.todos and are not duplicated in the generic projections array; non-Todo provider kinds remain generic projections.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-c1b6b13b8b28df39" title="Owner snapshot budgeting admits all active binding todos first, then unrelated todos only while the complete serialized " description="Promoted from run:run-2a349353c78b, report.md#decision:2" source="session:20260824-companion-flow-todo-projector:KDC-c1b6b13b8b28df39">
+
+### Owner snapshot budgeting admits all active binding todos first, then unrelated todos only while the complete serialized 
+
+Owner snapshot budgeting admits all active binding todos first, then unrelated todos only while the complete serialized owner payload remains within MAX_OWNER_FILE_BYTES.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-d05b91d5e003a63a" title="Flow must import workspace projection APIs through the dependency-light pi-maestro-teammate/v1/workspace-projections sub" description="Promoted from run:run-2a349353c78b, report.md#constraint:1" source="session:20260824-companion-flow-todo-projector:KDC-d05b91d5e003a63a">
+
+### Flow must import workspace projection APIs through the dependency-light pi-maestro-teammate/v1/workspace-projections sub
+
+Flow must import workspace projection APIs through the dependency-light pi-maestro-teammate/v1/workspace-projections subpath so projector registration does not load the Teammate extension entry point.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-d503f1ba3288ebe4" title="The provider snapshot callback remains synchronous and disk-free: it reads Todo state plus an in-memory binding cache, w" description="Promoted from run:run-2a349353c78b, report.md#decision:1" source="session:20260824-companion-flow-todo-projector:KDC-d503f1ba3288ebe4">
+
+### The provider snapshot callback remains synchronous and disk-free: it reads Todo state plus an in-memory binding cache, w
+
+The provider snapshot callback remains synchronous and disk-free: it reads Todo state plus an in-memory binding cache, while queued asynchronous store refreshes update the cache and request a second owner publication when binding content changes.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-0a6eb34642132fbd" title="Once an outgoing dispatch exists, its envelope freezes the capability decision: a later capability change cannot add or " description="Promoted from run:run-682bc8969ce2, report.md#decision:1" source="session:20260824-companion-flow-todo-gate:KDC-0a6eb34642132fbd">
+
+### Once an outgoing dispatch exists, its envelope freezes the capability decision: a later capability change cannot add or 
+
+Once an outgoing dispatch exists, its envelope freezes the capability decision: a later capability change cannot add or remove todoBinding semantics for that dispatchId.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-56d2864011ced757" title="An ambiguous binding may omit todoId when the worker never supplied binding evidence; todoId remains required for bound," description="Promoted from run:run-682bc8969ce2, report.md#constraint:1" source="session:20260824-companion-flow-todo-gate:KDC-56d2864011ced757">
+
+### An ambiguous binding may omit todoId when the worker never supplied binding evidence; todoId remains required for bound,
+
+An ambiguous binding may omit todoId when the worker never supplied binding evidence; todoId remains required for bound, completed, and failed binding states.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-9bfd89d7578ff810" title="A durable pending FlowScheduleTodoBinding is the negotiation latch for a dispatch: acceptResult applies Todo gates only " description="Promoted from run:run-682bc8969ce2, report.md#decision:0" source="session:20260824-companion-flow-todo-gate:KDC-9bfd89d7578ff810">
+
+### A durable pending FlowScheduleTodoBinding is the negotiation latch for a dispatch: acceptResult applies Todo gates only 
+
+A durable pending FlowScheduleTodoBinding is the negotiation latch for a dispatch: acceptResult applies Todo gates only when that record exists; capability-mismatched dispatches create no binding and remain gate-none.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-bdc7a184039f77a5" title="Conflict-check is independent: an exact completed report with an explicit non-completed todoStatus becomes ambiguous imm" description="Promoted from run:run-682bc8969ce2, report.md#decision:3" source="session:20260824-companion-flow-todo-gate:KDC-bdc7a184039f77a5">
+
+### Conflict-check is independent: an exact completed report with an explicit non-completed todoStatus becomes ambiguous imm
+
+Conflict-check is independent: an exact completed report with an explicit non-completed todoStatus becomes ambiguous immediately, while missing or identity-stale evidence waits for the same deadline.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-cf287a95c61b8e6a" title="Todo gating must remain inside acceptResult; selectNextFlowScheduleStep stays pure and WorkspaceOwnerSnapshot.todos/obse" description="Promoted from run:run-682bc8969ce2, report.md#constraint:0" source="session:20260824-companion-flow-todo-gate:KDC-cf287a95c61b8e6a">
+
+### Todo gating must remain inside acceptResult; selectNextFlowScheduleStep stays pure and WorkspaceOwnerSnapshot.todos/obse
+
+Todo gating must remain inside acceptResult; selectNextFlowScheduleStep stays pure and WorkspaceOwnerSnapshot.todos/observe view=todos must never be read as completion evidence.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-f41f5a61fb5c0477" title="Require-completed treats missing todoOutcome, todoId mismatch, and non-completed status as unavailable completion eviden" description="Promoted from run:run-682bc8969ce2, report.md#decision:2" source="session:20260824-companion-flow-todo-gate:KDC-f41f5a61fb5c0477">
+
+### Require-completed treats missing todoOutcome, todoId mismatch, and non-completed status as unavailable completion eviden
+
+Require-completed treats missing todoOutcome, todoId mismatch, and non-completed status as unavailable completion evidence until a configurable deadline (30 seconds by default), then records both dispatch and binding ambiguous.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-651ee5638ac137f9" title="FlowScheduleStore.prepareRetry terminalizes the last attempt binding ambiguous under the same store lock before it write" description="Promoted from run:run-0812cf6e8ee0, report.md#decision:1" source="session:20260824-companion-flow-binding-cleanup:KDC-651ee5638ac137f9">
+
+### FlowScheduleStore.prepareRetry terminalizes the last attempt binding ambiguous under the same store lock before it write
+
+FlowScheduleStore.prepareRetry terminalizes the last attempt binding ambiguous under the same store lock before it writes the step back to pending, so a new dispatch cannot be admitted while the old binding remains active.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-6bb9a372c97625c0" title="FlowScheduleStore.recordCompletion owns dispatch/binding consistency: after completion exclusivity and current-schedule " description="Promoted from run:run-0812cf6e8ee0, report.md#decision:0" source="session:20260824-companion-flow-binding-cleanup:KDC-6bb9a372c97625c0">
+
+### FlowScheduleStore.recordCompletion owns dispatch/binding consistency: after completion exclusivity and current-schedule 
+
+FlowScheduleStore.recordCompletion owns dispatch/binding consistency: after completion exclusivity and current-schedule validation, ambiguous or retired completion terminalizes a nonterminal binding ambiguous; completed/failed completion terminalizes only from exact todoOutcome evidence.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-72a7b916b60c84c4" title="Retry and cancel retain old Todo and binding records for audit; cleanup terminalizes records but never deletes Todo stat" description="Promoted from run:run-0812cf6e8ee0, report.md#constraint:1" source="session:20260824-companion-flow-binding-cleanup:KDC-72a7b916b60c84c4">
+
+### Retry and cancel retain old Todo and binding records for audit; cleanup terminalizes records but never deletes Todo stat
+
+Retry and cancel retain old Todo and binding records for audit; cleanup terminalizes records but never deletes Todo state.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,constraint" date="2026-08-24" sid="S-20260824-913e975c512f2070" title="Completion conflicts and current-schedule validation must run before any binding mutation; a rejected divergent completi" description="Promoted from run:run-0812cf6e8ee0, report.md#constraint:0" source="session:20260824-companion-flow-binding-cleanup:KDC-913e975c512f2070">
+
+### Completion conflicts and current-schedule validation must run before any binding mutation; a rejected divergent completi
+
+Completion conflicts and current-schedule validation must run before any binding mutation; a rejected divergent completion must not alter the existing binding state or reason.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,decision" date="2026-08-24" sid="S-20260824-e1266e48b7804b76" title="A negotiated pending or bound dispatch with no exact result uses acceptedAt, then publishedAt, then binding.createdAt as" description="Promoted from run:run-0812cf6e8ee0, report.md#decision:2" source="session:20260824-companion-flow-binding-cleanup:KDC-e1266e48b7804b76">
+
+### A negotiated pending or bound dispatch with no exact result uses acceptedAt, then publishedAt, then binding.createdAt as
+
+A negotiated pending or bound dispatch with no exact result uses acceptedAt, then publishedAt, then binding.createdAt as its timeout anchor and becomes ambiguous even while the target endpoint remains live.
+
+</spec-entry>
+
+<spec-entry category="arch" keywords="session-knowledge,manual" date="2026-08-28" sid="S-20260828-e6bb0fc5d8718f25" title="Generation-owned external resource authority" description="Promoted from run:run-e890f56e14d1" source="session:20260827-odyssey-search-index:KDC-e6bb0fc5d8718f25">
+
+### Generation-owned external resource authority
+
+External processes, listeners, caches, and async builders must be generation-owned. A mutable PID, port, path, or published registry entry is not identity. Startup publishes only after an instance token and canonical scope handshake succeed; every post-await publication revalidates the generation; invalidation and shutdown revoke new publication, cancel or join all publication-capable work, then release visible ownership. Stop/status operations must fail closed when identity cannot be authenticated.
+
+</spec-entry>
