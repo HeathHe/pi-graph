@@ -17,6 +17,7 @@ import {
   type RunPlanPublishOptions,
 } from "../src/session/cli-adapter.ts";
 import { WorkflowBridge } from "../src/session/bridge.ts";
+import { resolveBundledSkills } from "../src/resources/maestro-package.ts";
 import {
   publicWorkflowErrorMessage,
   WorkflowCoordinator,
@@ -3075,16 +3076,20 @@ contract:
   }
 });
 
-test("default CLI runner advertises the Pi package root to the Maestro process", async () => {
+test("default CLI runner advertises only a resolved Graph package root or explicit override", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-cli-runner-package-root-"));
   try {
-    const execution = await defaultRunner(
-      ["-e", "process.stdout.write(process.env.MAESTRO_PI_PACKAGE_ROOT ?? '')"],
-      root,
-      { executable: process.execPath },
-    );
+    const args = ["-e", "process.stdout.write(process.env.MAESTRO_PI_PACKAGE_ROOT ?? '')"];
+    const execution = await defaultRunner(args, root, { executable: process.execPath });
     assert.equal(execution.exitCode, 0);
-    assert.match(execution.stdout.replaceAll("\\", "/"), /\/pi-graph(?:\/packages\/pi-graph)?$/);
+    assert.equal(execution.stdout, process.env.MAESTRO_PI_PACKAGE_ROOT ?? resolveBundledSkills()?.packageRoot ?? "");
+
+    const explicit = await defaultRunner(args, root, {
+      executable: process.execPath,
+      environment: { ...process.env, MAESTRO_PI_PACKAGE_ROOT: "explicit-override" },
+    });
+    assert.equal(explicit.exitCode, 0);
+    assert.equal(explicit.stdout, "explicit-override");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

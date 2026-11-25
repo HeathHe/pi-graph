@@ -1,22 +1,11 @@
-import { existsSync } from "node:fs";
-import { dirname, resolve as resolvePath } from "node:path";
-import { fileURLToPath } from "node:url";
 import crossSpawn from "cross-spawn";
 import { z } from "zod";
 import { parseRunResponse, projectPublicRunResponse } from "./run-response.ts";
 import { reclaimOwnedProcessTree } from "../process/owned-process-tree.ts";
+import { resolveBundledSkills } from "../resources/maestro-package.ts";
 
 const DEFAULT_RUN_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
-const PI_PACKAGE_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "../..");
-
-function advertisedPiPackageRoot(): string {
-  if (existsSync(resolvePath(PI_PACKAGE_ROOT, ".pi", "skills"))) return PI_PACKAGE_ROOT;
-  const sourceWorkspaceRoot = resolvePath(PI_PACKAGE_ROOT, "../..");
-  return existsSync(resolvePath(sourceWorkspaceRoot, ".pi", "skills"))
-    ? sourceWorkspaceRoot
-    : PI_PACKAGE_ROOT;
-}
 
 export interface RunCliResult {
   argv: string[];
@@ -829,16 +818,18 @@ export async function defaultRunner(
       exitCode: 1,
     };
   }
+  const environment = options.environment ?? { ...process.env };
+  if (!options.environment && environment.MAESTRO_PI_PACKAGE_ROOT === undefined) {
+    const bundled = resolveBundledSkills();
+    if (bundled) environment.MAESTRO_PI_PACKAGE_ROOT = bundled.packageRoot;
+  }
   return new Promise((resolve) => {
     const child = spawnProcess(executable, [...args], {
       cwd,
       // POSIX group isolation only: the CLI remains referenced and its group
       // is reclaimed on normal exit as well as abort/timeout/failure.
       detached: process.platform !== "win32",
-      env: options.environment ?? {
-        ...process.env,
-        MAESTRO_PI_PACKAGE_ROOT: process.env.MAESTRO_PI_PACKAGE_ROOT ?? advertisedPiPackageRoot(),
-      },
+      env: environment,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });

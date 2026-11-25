@@ -42,14 +42,12 @@ function isPackagedAgentsEntry(relative) {
   return false;
 }
 
-// Names retained for script/test compatibility; syncs the whole canonical .pi directory
-// (SYSTEM.md, agents, hooks, settings, skills, ...), not just skills.
-export function preparePackagedSkills({
-  sourceDir = resolve(packageRoot, "..", "..", ".pi"),
-  targetDir = join(packageRoot, ".pi"),
-} = {}) {
+const defaultPiTargetDir = join(packageRoot, ".pi");
+const defaultSkillsTargetDir = join(packageRoot, "skills");
+
+function prepareGeneratedTree(sourceDir, targetDir, include = () => true) {
   if (!existsSync(sourceDir)) {
-    throw new Error(`Canonical Pi directory not found: ${sourceDir}`);
+    throw new Error(`Canonical package resource directory not found: ${sourceDir}`);
   }
   const sourcePrefix = resolve(sourceDir).replaceAll("\\", "/");
   rmSync(targetDir, { recursive: true, force: true });
@@ -57,22 +55,36 @@ export function preparePackagedSkills({
     recursive: true,
     filter(source) {
       const normalized = resolve(source).replaceAll("\\", "/");
-      if (normalized.includes("/__pycache__/")
-        || normalized.endsWith("/__pycache__")
-        || normalized.endsWith(".pyc")) {
-        return false;
-      }
       const relative = normalized === sourcePrefix ? "" : normalized.slice(sourcePrefix.length + 1);
-      if (localOnlyEntries.has(relative.split("/")[0])) return false;
-      return isPackagedAgentsEntry(relative);
+      return !relative.split("/").includes("__pycache__") && !relative.endsWith(".pyc") && include(relative);
     },
   });
   return { sourceDir, targetDir };
 }
 
-export function cleanPackagedSkills({
-  targetDir = join(packageRoot, ".pi"),
+export function preparePackagedPiResources({
+  sourceDir = join(repoRoot, ".pi"),
+  targetDir = defaultPiTargetDir,
 } = {}) {
+  return prepareGeneratedTree(sourceDir, targetDir, (relative) => {
+    const entry = relative.split("/")[0];
+    return entry !== "skills" && !localOnlyEntries.has(entry) && isPackagedAgentsEntry(relative);
+  });
+}
+
+export function preparePackagedSkills({
+  sourceDir = join(repoRoot, "resources", "skills"),
+  targetDir = defaultSkillsTargetDir,
+} = {}) {
+  return prepareGeneratedTree(sourceDir, targetDir);
+}
+
+export function cleanPackagedPiResources({ targetDir = defaultPiTargetDir } = {}) {
+  rmSync(targetDir, { recursive: true, force: true });
+  return { targetDir };
+}
+
+export function cleanPackagedSkills({ targetDir = defaultSkillsTargetDir } = {}) {
   rmSync(targetDir, { recursive: true, force: true });
   return { targetDir };
 }
@@ -117,13 +129,16 @@ export function cleanPackagedOptionalSkills({
 function run() {
   if (process.argv.includes("--clean")) {
     cleanPackagedSkills();
+    cleanPackagedPiResources();
     cleanPackagedOptionalSkills();
     return;
   }
-  const piResult = preparePackagedSkills();
+  const piResult = preparePackagedPiResources();
+  const skillsResult = preparePackagedSkills();
   const optionalResult = preparePackagedOptionalSkills();
-  console.log(`[pi-graph] Prepared canonical Pi directory from ${piResult.sourceDir}`);
+  console.log(`[pi-graph] Prepared non-skill Pi resources from ${piResult.sourceDir}`);
+  console.log(`[pi-graph] Prepared bundled skills from ${skillsResult.sourceDir}`);
   console.log(`[pi-graph] Prepared optional skills from ${optionalResult.sourceDir}`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) run();
+if (import.meta.main) run();

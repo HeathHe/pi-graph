@@ -1814,7 +1814,7 @@ export function compactMetric(value: number): string {
 export function toolAction(name: string): string {
   const normalized = name.toLowerCase();
   if (normalized === "write" || normalized === "edit" || normalized.includes("patch")) return tuiT("widget.action.write");
-  if (normalized === "read" || normalized === "search" || normalized === "grep" || normalized === "ls") return tuiT("widget.action.read");
+  if (normalized === "read" || normalized === "graph_search" || normalized === "grep" || normalized === "ls") return tuiT("widget.action.read");
   if (normalized === "bash" || normalized.includes("command")) return tuiT("widget.action.command");
   return tuiT("widget.action.using", { name });
 }

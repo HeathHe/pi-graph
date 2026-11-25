@@ -246,7 +246,7 @@ test("Goal evidence T2 verifier mirrors enforce read-only budget and original ev
   const a = await readFile("../../.pi/agents/verifier.md", "utf8");
   const b = await readFile("../pi-graph-agent-runtime/agents/verifier.md", "utf8");
   assert.equal(a.replaceAll("\r\n", "\n"), b.replaceAll("\r\n", "\n"));
-  assert.match(a, /tools: read, search, find, ls, resource/);
+  assert.match(a, /tools: read, graph_search, find, ls, resource/);
   assert.doesNotMatch(a, /at most two|two-check/);
   assert.match(a, /exact original evidence refs/); assert.match(a, /outside the repository/);
   assert.match(a, /Call it exactly once as your final action/);
@@ -302,15 +302,15 @@ test("Goal evidence T2 bounded background prefers original tool results over rec
 
 test("Goal evidence T2 read-only search proxy reuses host broker without double-counting native events", async () => {
   let searches = 0;
-  const dispose = registerTeammateChildToolBroker("search", async () => {
+  const dispose = registerTeammateChildToolBroker("graph_search", async () => {
     searches++;
     return { content: [{ type: "text", text: "original source evidence" }], details: {}, isError: false };
   }, { owner: "goal-evidence-test-search" });
   try {
     await withGoal(async (_params, options) => {
       for (let i = 0; i < 4; i++) {
-        options.onChildEvent?.({ type: "tool_execution_start", toolName: "search", toolCallId: `search-${i}` });
-        const reply = await new Promise<Record<string, unknown>>((resolve) => options.onChildRequest?.({ type: "teammate_proxy_request", requestId: `search-request-${i}`, spawningToolCallId: `search-${i}`, tool: "search", params: { pattern: "evidence" } }, (message) => resolve(message as Record<string, unknown>)));
+        options.onChildEvent?.({ type: "tool_execution_start", toolName: "graph_search", toolCallId: `search-${i}` });
+        const reply = await new Promise<Record<string, unknown>>((resolve) => options.onChildRequest?.({ type: "teammate_proxy_request", requestId: `search-request-${i}`, spawningToolCallId: `search-${i}`, tool: "graph_search", params: { pattern: "evidence" } }, (message) => resolve(message as Record<string, unknown>)));
         assert.equal((reply.result as { isError: boolean }).isError, false);
       }
       assert.equal(options.signal?.aborted, false);
@@ -337,7 +337,7 @@ test("Goal verifier IPC routes read-only permissions without spending check cred
     authorized.push(toolName);
     return { action: "allow_once" };
   });
-  const disposeSearch = registerTeammateChildToolBroker("search", async () => ({ content: [{ type: "text", text: "original source" }], details: {}, isError: false }), { owner: "goal-ipc-test" });
+  const disposeSearch = registerTeammateChildToolBroker("graph_search", async () => ({ content: [{ type: "text", text: "original source" }], details: {}, isError: false }), { owner: "goal-ipc-test" });
   try {
     await withGoal(async (params, options) => {
       assert.ok(params.tasks[0]!.outputSchema);
@@ -349,13 +349,13 @@ test("Goal verifier IPC routes read-only permissions without spending check cred
       for (let i = 0; i < 4; i++) {
         const id = `authorized-search-${i}`;
         // Native start may precede the child's tool_call permission hook.
-        options.onChildEvent?.({ type: "tool_execution_start", toolName: "search", toolCallId: id });
-        const permission = await childRequest(options, permissionRequest("search", `permission-${id}`));
+        options.onChildEvent?.({ type: "tool_execution_start", toolName: "graph_search", toolCallId: id });
+        const permission = await childRequest(options, permissionRequest("graph_search", `permission-${id}`));
         assert.equal(permission.requestId, `permission-${id}`);
         assert.deepEqual(permission.result, { action: "allow_once" });
-        const proxy = await childRequest(options, { type: "teammate_proxy_request", tool: "search", requestId: id, spawningToolCallId: id, params: { pattern: "source" } });
+        const proxy = await childRequest(options, { type: "teammate_proxy_request", tool: "graph_search", requestId: id, spawningToolCallId: id, params: { pattern: "source" } });
         assert.equal((proxy.result as { isError: boolean }).isError, false);
-        options.onChildEvent?.({ type: "tool_execution_end", toolName: "search", toolCallId: id });
+        options.onChildEvent?.({ type: "tool_execution_end", toolName: "graph_search", toolCallId: id });
       }
       options.onChildEvent?.({ type: "tool_execution_start", toolName: "structured_output", toolCallId: "verdict" });
       const permission = await childRequest(options, permissionRequest("structured_output"));
@@ -369,7 +369,7 @@ test("Goal verifier IPC routes read-only permissions without spending check cred
       assert.equal(result.details?.classification, "success", result.text);
       assert.equal(getActiveGoal(), undefined);
     });
-    assert.deepEqual(authorized, ["read", "find", "ls", "resource", "search", "search", "search", "search"]);
+    assert.deepEqual(authorized, ["read", "find", "ls", "resource", "graph_search", "graph_search", "graph_search", "graph_search"]);
   } finally { disposePermission(); disposeSearch(); }
 });
 
@@ -486,12 +486,12 @@ test("Goal evidence correction native completions and unrelated proxies cannot r
   const matched = createGoalVerifierCheckGuard(0);
   for (let i = 0; i < 4; i++) {
     const id = `call-${i}`;
-    matched.observe({ type: "tool_execution_start", toolName: "search", toolCallId: id });
-    assert.equal(matched.proxyCheck("search", id), true);
-    matched.observe({ type: "tool_execution_end", toolName: "search", toolCallId: id });
+    matched.observe({ type: "tool_execution_start", toolName: "graph_search", toolCallId: id });
+    assert.equal(matched.proxyCheck("graph_search", id), true);
+    matched.observe({ type: "tool_execution_end", toolName: "graph_search", toolCallId: id });
   }
   assert.equal(matched.violation, undefined);
-  assert.equal(matched.proxyCheck("search", "another"), false);
+  assert.equal(matched.proxyCheck("graph_search", "another"), false);
   const unmatched = createGoalVerifierCheckGuard(0);
   unmatched.observe({ type: "tool_execution_start", toolName: "read", toolCallId: "still-running" });
   for (let i = 0; i < 3; i++) assert.equal(unmatched.proxyCheck("read"), true);
@@ -524,9 +524,9 @@ test("Goal evidence correction proxy call identity crosses the child authority r
     return { content: [{ type: "text", text: "source" }], details: undefined as T };
   });
   try {
-    await proxyTeammateChildTool("search", { pattern: "source" }, undefined, "native-search-id");
+    await proxyTeammateChildTool("graph_search", { pattern: "source" }, undefined, "native-search-id");
     assert.equal(callId, "native-search-id");
-    await proxyTeammateChildTool("search", { pattern: "legacy caller" });
+    await proxyTeammateChildTool("graph_search", { pattern: "legacy caller" });
     assert.equal(callId, undefined);
   } finally { dispose(); }
 });

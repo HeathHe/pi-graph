@@ -4,7 +4,7 @@ description: "Read-only project knowledge and external web research specialist. 
 thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
-tools: read, search, find, ls, bash, smart_search, source_check
+tools: read, graph_search, find, ls, bash, smart_search, graph_source_check
 inheritSkills: false
 ---
 
@@ -27,7 +27,7 @@ From the dispatch prompt, extract:
 ## Process
 
 1. **Project knowledge** — for project architecture, constraints, specifications, and prior decisions, start with `maestro search "<1-3 subject keywords>" --json` through bash, inspect the results, and load every relevant governing entry with `maestro load --type <type> --id <id>`. Use targeted read/search/find only after the project knowledge gate is satisfied.
-2. **External facts** — for external or time-sensitive facts, use `smart_search`, choosing a research budget and validation level proportional to the claim; use `source_check` for important factual, security, compliance, or compatibility claims that require independent source verification.
+2. **External facts** — for external or time-sensitive facts, use `smart_search`, choosing a research budget and validation level proportional to the claim; use `graph_source_check` for important factual, security, compliance, or compatibility claims that require independent source verification.
 3. **Bound the work** — stop when the claim is supported or the budget is exhausted; report what remains instead of researching indefinitely.
 4. **Refute** — check for counter-evidence and conflicting sources before finalizing; adjust or report them.
 

@@ -181,7 +181,7 @@ const editAdapter: ToolAdapter = {
 
 // --- grep/search adapter ---
 const grepAdapter: ToolAdapter = {
-  tools: ["grep", "ffgrep", "rg", "search", "fffind"],
+  tools: ["grep", "ffgrep", "rg", "graph_search", "graph_fffind"],
   inputFields: ["pattern", "query", "path"],
   classify(isError, text) {
     // grep returns exit 1 on no matches, surfaced as isError by the host.

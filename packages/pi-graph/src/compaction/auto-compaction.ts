@@ -75,7 +75,7 @@ const PROTECTED_THRESHOLD_CHARS = 500;
 // the paired toolCall keeps the uri argument in context and the placeholder
 // below names it explicitly, so its large outputs are the cheapest results to
 // replay (agent:// is even backed by an immutable on-disk store).
-const REPLAYABLE_TOOL_NAMES = new Set(["read", "grep", "glob", "search", "find", "resource"]);
+const REPLAYABLE_TOOL_NAMES = new Set(["read", "grep", "glob", "graph_search", "find", "resource"]);
 // Bulk data tools whose large non-error output is transient and safe to evict
 // under sustained pressure. Control tools (e.g. todo) are deliberately absent so
 // their state-bearing output is never pruned.
@@ -4890,6 +4890,7 @@ function losslessKindForTool(toolName: string | undefined): LosslessKind {
     case "grep":
     case "ripgrep":
     case "search":
+    case "graph_search":
       return "search";
     case "bash":
     case "shell":

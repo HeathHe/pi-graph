@@ -15,7 +15,7 @@ dist/
 # Ignore local script scratch directories, not the maintained source trees.
 scripts
 !/scripts/
-!/.pi/skills/team-swarm/scripts/
+!/resources/skills/team-swarm/scripts/
 !/optional/skills/scholar-thesis-docx/scripts/
 !/packages/pi-graph-terminal-ui/scripts/
 !/packages/pi-graph/scripts/
@@ -45,9 +45,9 @@ Thumbs.db
 .pi/flow-schedule/
 # Gateway runtime state (boards, jobs, sessions, tasks, and private receipts).
 .pi/gateway/
-# Materialized by prepare-package-skills/sync-pi; canonical sources live at
-# the workspace root .pi.
-packages/pi-graph/.pi/
+# Generated package mirrors of .pi (non-skill resources) and resources/skills.
+/packages/pi-graph/.pi/
+/packages/pi-graph/skills/
 
 # Sync toolchain staging dir (replaces the old tracked flow/ mirror)
 .pi-sync/

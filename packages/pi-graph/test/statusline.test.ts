@@ -462,7 +462,7 @@ test("all tools including write/edit and agent completion leave Git to the perio
   });
   try {
     await settleAsyncWork();
-    for (const toolName of ["read", "search", "fffind", "resource", "todo", "bash", "bash_bg", "custom-tool", "write", "edit"]) {
+    for (const toolName of ["read", "graph_search", "graph_fffind", "resource", "todo", "bash", "bash_bg", "custom-tool", "write", "edit"]) {
       harness.emit("tool_execution_end", { toolName, input: { command: "maestro search git --json" } });
       harness.emit("agent_end");
       t.mock.timers.tick(1_000);

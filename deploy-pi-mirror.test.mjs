@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import {
+  deployConvertedPiMirror,
   deployMirrorSubdir,
   deployPackagedAgents,
   removeRetiredPackageAgentsFile,
@@ -36,6 +37,37 @@ test('deployPackagedAgents includes role definitions and schemas but excludes ru
     const result = deployPackagedAgents(canonical, packaged);
     assert.deepEqual(result, { deployed: 2 });
     assert.deepEqual(topLevelEntryNames(packaged), ['general.md', 'general.schema.json']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('sync deploy sends skills to resources and never touches project-local skills', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-layout-deploy-'));
+  const files = {
+    '.pi-sync/skills/shared/SKILL.md': 'converted',
+    '.pi-sync/agents/mirrored.md': 'converted role',
+    'resources/skills/stale/SKILL.md': 'old converted skill',
+    'resources/skills/native/SKILL.md': 'native distributed skill',
+    '.pi/skills/stale/SKILL.md': 'local file with previously managed name',
+    '.pi/skills/shared/notes.md': 'local file with incoming name',
+    '.pi/agents/native.md': 'local role',
+  };
+  try {
+    for (const [relativePath, content] of Object.entries(files)) {
+      const path = join(root, relativePath);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, content);
+    }
+    const manifest = deployConvertedPiMirror(root, join(root, '.pi-sync'), { skills: ['stale'] });
+    assert.deepEqual(manifest, { skills: ['shared'], agents: ['mirrored.md'] });
+    assert.deepEqual(topLevelEntryNames(join(root, 'resources', 'skills')), ['native', 'shared']);
+    assert.equal(readFileSync(join(root, 'resources/skills/shared/SKILL.md'), 'utf8'), 'converted');
+    assert.equal(readFileSync(join(root, '.pi/agents/mirrored.md'), 'utf8'), 'converted role');
+    assert.equal(existsSync(join(root, '.pi/skills/shared/SKILL.md')), false);
+    for (const [path, content] of Object.entries(files)) {
+      if (path !== 'resources/skills/stale/SKILL.md') assert.equal(readFileSync(join(root, path), 'utf8'), content);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

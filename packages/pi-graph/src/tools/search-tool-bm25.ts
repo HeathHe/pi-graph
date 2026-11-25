@@ -50,7 +50,7 @@ export const DEFAULT_DEFERRED_TOOL_NAMES = new Set([
   "lsp",
   "model-availability",
   "smart_search",
-  "source_check",
+  "graph_source_check",
   "teammate-session-routing",
 ]);
 

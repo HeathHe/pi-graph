@@ -29,11 +29,11 @@ interface SourceCheckDetails {
 
 export function createSourceCheckTool(): ToolDefinition<typeof SourceCheckParams, SourceCheckDetails> {
   return {
-    name: "source_check",
+    name: "graph_source_check",
     label: "Source Check",
     description: "Verify a claim against web sources and produce a machine-readable research artifact with source quality classification and claim assessment. " +
       "Example: { claim: \"Node 22 supports native TypeScript stripping\", recency: \"month\" }.",
-    promptSnippet: "Use source_check to verify factual claims with attributed web evidence.",
+    promptSnippet: "Use graph_source_check to verify factual claims with attributed web evidence.",
     parameters: SourceCheckParams,
     async execute(_id, params, signal): Promise<AgentToolResult<SourceCheckDetails>> {
       const claim = params.claim.trim();
@@ -65,7 +65,7 @@ export function createSourceCheckTool(): ToolDefinition<typeof SourceCheckParams
     renderCall(args, theme, ctx) {
       if (ctx?.isPartial === false) return new Text("", 0, 0);
       const claim = String(args.claim ?? "").slice(0, 60);
-      return toolCallLine(theme, "source_check", `"${claim}"`);
+      return toolCallLine(theme, "graph_source_check", `"${claim}"`);
     },
     renderResult(result, opts, theme, ctx) {
       if (opts.isPartial) return new Text("", 0, 0);
@@ -76,7 +76,7 @@ export function createSourceCheckTool(): ToolDefinition<typeof SourceCheckParams
       const text = block && "text" in block ? block.text : "";
       const claim = String(ctx.args.claim ?? "").slice(0, 60);
       return toolResultLine(theme, {
-        name: "source_check",
+        name: "graph_source_check",
         ok: !isError,
         arg: `"${claim}"`,
         summary: `claim: ${status}`,

@@ -391,7 +391,7 @@ export const MAESTRO_CHILD_TOOL_NAMES = [
   "bash_bg",
   "teammate-session-routing",
   "smart_search",
-  "source_check",
+  "graph_source_check",
   "resource",
   "session_history",
   "new_context",
@@ -404,7 +404,7 @@ export const MAESTRO_CHILD_TOOL_NAMES = [
   "browser",
   "computer_use",
   "todo",
-  "search",
+  "graph_search",
 ] as const;
 
 function newContextToolsEnabled(cwd: string): boolean {
@@ -1223,7 +1223,7 @@ function renderTodoToolResult(
   });
   if (!showTerminalSummary) return card(rows.length > 0 ? [rows] : undefined);
   return {
-    render(width: number): string[] {
+    render(width: number) {
       const terminalRows = [...rows];
       if (isTodoDurationChartEnabled()) {
         terminalRows.push(...todoDurationChart(allTasks, theme, Math.max(1, width - 5)));
@@ -4670,7 +4670,7 @@ When NOT to use:
         }
         return childComputerUseBroker.execute(request, ctx);
       }, { owner: `${teammateAuthorityOwner}:computer_use` }));
-      nextDisposers.push(registerTeammateChildToolBroker("search", async (request) => {
+      nextDisposers.push(registerTeammateChildToolBroker("graph_search", async (request) => {
         if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx) {
           return {
             content: [{ type: "text", text: "Root search authority belongs to a newer session generation." }],
@@ -4678,7 +4678,7 @@ When NOT to use:
             details: {},
           };
         }
-        const blocked = await searchScopeBlockReason("search", request.input, ctx.cwd);
+        const blocked = await searchScopeBlockReason("graph_search", request.input, ctx.cwd);
         if (blocked) {
           return { content: [{ type: "text", text: blocked }], isError: true, details: {} };
         }
@@ -4691,7 +4691,7 @@ When NOT to use:
             details: {},
           };
         }
-      }, { owner: `${teammateAuthorityOwner}:search` }));
+      }, { owner: `${teammateAuthorityOwner}:graph_search` }));
       nextDisposers.push(registerTeammateChildToolBroker("ask-user-question", async (request) => {
         if (generation !== teammateRegistrationGeneration || todoRootContext !== ctx || request.actor.correlationId === "unknown") {
           return { content: [{ type: "text", text: "Root question authority is unavailable or belongs to a newer session." }], isError: true, details: {} };
@@ -5113,7 +5113,7 @@ If root delegated a task to you (spawned with todo: "<id>"), it is usually alrea
   };
   pi.registerTool(todoProxyTool);
   pi.registerTool({
-    name: "search",
+    name: "graph_search",
     label: "Search",
     description:
       "Search workspace file contents via the root session's shared index — literal, regex, or fuzzy matching with lines/files/count output. Falls back to ripgrep when the index cannot serve the query. Prefer this over the built-in grep for workspace content search.",
@@ -5124,7 +5124,7 @@ If root delegated a task to you (spawned with todo: "<id>"), it is usually alrea
       // differ from the root workspace, and the broker re-checks the absolute
       // path against the root workspace boundary.
       const forwarded = { ...params, path: resolveSearchScopePath(params.path, ctx.cwd) };
-      return proxyTeammateChildTool("search", forwarded as unknown as Record<string, unknown>, signal, id);
+      return proxyTeammateChildTool("graph_search", forwarded as unknown as Record<string, unknown>, signal, id);
     },
   });
   const permissionController = createPermissionController();

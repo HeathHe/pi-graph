@@ -1450,7 +1450,7 @@ test("Plan hooks preserve read-only discovery and block mutations before approva
     assert.match(planPrompt, /Goal creation is optional/);
     assert.match(planPrompt, /never create one solely because the Plan was approved/);
     assert.match(planPrompt, /most\s+Todos should complete without one/);
-    for (const toolName of ["Read", "search", "fffind", "smart_search", "session_history"]) {
+    for (const toolName of ["Read", "graph_search", "graph_fffind", "smart_search", "session_history"]) {
       assert.equal(onToolCallPlan({ toolName, input: {} }), undefined, toolName);
     }
     // Unknown tools are no longer blocked: the hook guards only file edits.

@@ -501,7 +501,7 @@ test("planner is the sole Plan author with an execution-ready document contract"
     assert.equal(planner.source, "builtin");
     assert.equal(planner.taskType, undefined);
     assert.equal(planner.thinking, "high");
-    assert.deepEqual(planner.tools, ["read", "search", "find", "ls"]);
+    assert.deepEqual(planner.tools, ["read", "graph_search", "find", "ls"]);
     assert.equal(planner.systemPromptMode, "replace");
     assert.equal(planner.inheritProjectContext, true);
     assert.equal(planner.inheritSkills, false);
@@ -550,7 +550,7 @@ test("planner is the sole Plan author with an execution-ready document contract"
 
     const args = buildPiArgs(planner, { agent: "planner" }, "prompt.md");
     const childTools = args[args.indexOf("--tools") + 1].split(",");
-    for (const tool of ["read", "search", "find", "ls", "teammate", "teammate-send", "teammate-list", "observe"]) {
+    for (const tool of ["read", "graph_search", "find", "ls", "teammate", "teammate-send", "teammate-list", "observe"]) {
       assert.ok(childTools.includes(tool), `planner child tool: ${tool}`);
     }
     assert.ok(!childTools.includes("grep"), "planner child must not expose built-in grep");
@@ -567,7 +567,7 @@ test("analyst is the bundled read-only analysis and review role", () => {
   try {
     const analyst = resolveAgent(project, "analyst");
     assert.equal(analyst?.source, "builtin");
-    assert.deepEqual(analyst?.tools, ["read", "search", "find", "ls"]);
+    assert.deepEqual(analyst?.tools, ["read", "graph_search", "find", "ls"]);
     assert.equal(analyst?.thinking, "high");
     assert.equal(analyst?.systemPromptMode, "replace");
     assert.equal(analyst?.inheritProjectContext, false);
@@ -587,7 +587,7 @@ test("verifier is the bundled read-only Goal fallback role", () => {
     assert.equal(verifier?.source, "builtin");
     assert.equal(verifier?.taskType, undefined);
     assert.equal(verifier?.thinking, "low");
-    assert.deepEqual(verifier?.tools, ["read", "search", "find", "ls", "resource"]);
+    assert.deepEqual(verifier?.tools, ["read", "graph_search", "find", "ls", "resource"]);
     assert.equal(verifier?.systemPromptMode, "replace");
     assert.equal(verifier?.inheritProjectContext, false);
     assert.equal(verifier?.inheritSkills, false);
@@ -607,11 +607,11 @@ test("research role exposes project knowledge and web research tools", () => {
     assert.equal(research?.source, "builtin");
     assert.equal(research?.taskType, undefined);
     assert.equal(research?.thinking, "high");
-    assert.deepEqual(research?.tools, ["read", "search", "find", "ls", "bash", "smart_search", "source_check"]);
+    assert.deepEqual(research?.tools, ["read", "graph_search", "find", "ls", "bash", "smart_search", "graph_source_check"]);
     assert.match(research?.systemPrompt ?? "", /maestro search/);
     assert.match(research?.systemPrompt ?? "", /maestro load/);
     assert.match(research?.systemPrompt ?? "", /smart_search/);
-    assert.match(research?.systemPrompt ?? "", /source_check/);
+    assert.match(research?.systemPrompt ?? "", /graph_source_check/);
     assert.match(research?.systemPrompt ?? "", /Do not edit files/);
   } finally {
     fs.rmSync(project, { recursive: true, force: true });

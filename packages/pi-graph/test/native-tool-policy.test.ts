@@ -109,7 +109,7 @@ function discoveryHarness(options: { search?: boolean; rejectSearch?: boolean } 
 
 test("session start enables host search while low-frequency tools stay deferred and discoverable", async () => {
   const h = discoveryHarness();
-  for (const name of ["browser", "computer_use", "lsp", "loop", "conflict", "smart_search", "source_check", "model-availability"]) h.native.registerTool(tool(name));
+  for (const name of ["browser", "computer_use", "lsp", "loop", "conflict", "smart_search", "graph_source_check", "model-availability"]) h.native.registerTool(tool(name));
   h.native.registerTool(tool("todo"));
   h.native.registerTool(tool("search"));
   h.api.registerTool(tool("foreign-tool"));

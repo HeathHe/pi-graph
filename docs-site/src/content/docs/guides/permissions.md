@@ -47,7 +47,7 @@ icon: "🔒"
 
 以下工具在任何模式下自动允许（只读或无副作用）：
 
-`Read`, `Grep`, `Glob`, `Ls`, `Find`, `search`, `fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
+`Read`, `Grep`, `Glob`, `Ls`, `Find`, `graph_search`, `graph_fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
 
 ## Teammate 子进程权限中继
 

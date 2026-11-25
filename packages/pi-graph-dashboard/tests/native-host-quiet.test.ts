@@ -7,14 +7,17 @@ import { deflateSync } from "node:zlib";
 import {
 	createBashToolDefinition, createPowerShellToolDefinition, createEditToolDefinition,
 	createReadToolDefinition, createWriteToolDefinition, createGrepToolDefinition,
-	createFindToolDefinition, createLsToolDefinition, type ToolDefinition,
+	createFindToolDefinition, createLsToolDefinition, initTheme, ToolExecutionComponent, type Theme, type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-// Test-only access to the installed host, not a production integration hook.
-import { ToolExecutionComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
-import { initTheme, setThemeInstance } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { decorateNativeQuietTool, registerQuietTools } from "../src/quiet-tools.ts";
 import { DEFAULT_CONFIG, type CockpitConfig } from "../src/types.ts";
+
+// The host's in-memory theme setter is not public. Resolve it relative to the
+// SDK's ESM entry so this fixture uses the same theme module as the renderer.
+type ThemeFixture = Pick<Theme, "fg" | "bg" | "bold">;
+const themeUrl = new URL("./modes/interactive/theme/theme.js", import.meta.resolve("@earendil-works/pi-coding-agent"));
+const { setThemeInstance }: { setThemeInstance(theme: ThemeFixture): void } = await import(themeUrl.href);
 
 const createAllToolDefinitions = (cwd: string) => Object.fromEntries([
 	createReadToolDefinition(cwd), createBashToolDefinition(cwd), createEditToolDefinition(cwd), createWriteToolDefinition(cwd),
@@ -136,7 +139,7 @@ test("actual host call, partial, final, errors and expansion lifecycle stays com
 test("native host supports live symbols, icon mode, quiet/enabled toggles and stable palette invalidation", () => {
 	let current = config();
 	let palette = "31";
-	const paint: any = { fg: (_role: string, value: string) => `\x1b[${palette}m${value}\x1b[0m`, bg: (_role: string, value: string) => value, bold: (value: string) => value };
+	const paint: ThemeFixture = { fg: (_role: string, value: string) => `\x1b[${palette}m${value}\x1b[0m`, bg: (_role: string, value: string) => value, bold: (value: string) => value };
 	setThemeInstance(paint);
 	try {
 		const original = createReadToolDefinition(process.cwd());
@@ -247,9 +250,20 @@ test("registration honors image settings, current model resize limits, cwd and n
 			const r = registry({ images: { autoResize } });
 			registerQuietTools(r.pi as never, config, "0.99.0", "unused-cwd");
 			const image = await r.tools.get("read").execute("image", { path: "image.png" }, undefined, undefined, ctx);
-			assert.match(image.content[0].text, /Current model does not support images/);
+			const official = createReadToolDefinition("unused-cwd", { autoResizeImages: autoResize });
+			const nativeImage = await official.execute("image", { path: "image.png" }, undefined, undefined, ctx);
+			assert.deepEqual(image, nativeImage, "quiet registration preserves the host's image result");
+			const note = image.content[0];
+			assert.ok(note?.type === "text");
+			// Pi 1.6 moved the unsupported-model notice from the text to result details.
+			if (nativeImage.details && "imageUnsupportedByModel" in nativeImage.details) {
+				assert.equal(image.details?.imageUnsupportedByModel, ctx.model.id);
+				assert.doesNotMatch(note.text, /Current model does not support images/);
+			} else {
+				assert.match(note.text, /Current model does not support images/);
+			}
 			assert.equal(image.content[1].type, "image");
-			if (autoResize) assert.match(image.content[0].text, /1x1/);
+			if (autoResize) assert.match(note.text, /1x1/);
 			else assert.equal(image.content[1].data, png().toString("base64"));
 			const read = await r.tools.get("read").execute("read", { path: "file.txt" }, undefined, undefined, ctx);
 			assert.equal(read.content[0].text, "first\nsecond\n");

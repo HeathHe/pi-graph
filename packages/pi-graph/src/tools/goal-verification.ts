@@ -385,7 +385,7 @@ async function runVerifier(
                 });
                 return;
               }
-              if (event.type !== "teammate_proxy_request" || !["read", "search", "find", "ls", "resource"].includes(String(event.tool))) {
+              if (event.type !== "teammate_proxy_request" || !["read", "graph_search", "find", "ls", "resource"].includes(String(event.tool))) {
                 guard.reject("Verifier requested a non-read-only or unsupported parent operation.");
                 respond(guard.violation!, true);
                 rejectPolicy();
@@ -603,10 +603,10 @@ export function createGoalVerifierCheckGuard(refCount: number) {
       if (tool === "structured_output") {
         if (structuredPermission || structuredFinished) reject("Verifier requested more than one structured verdict permission.");
         structuredPermission = true;
-      } else if (["read", "search", "find", "ls", "resource"].includes(tool)) {
+      } else if (["read", "graph_search", "find", "ls", "resource"].includes(tool)) {
         if (structured > 0 || structuredPermission) reject("Verifier requested a source after its final structured verdict.");
       } else {
-        reject("Verifier requested a forbidden tool permission; only read/search/find/ls/resource and structured_output are permitted.");
+        reject("Verifier requested a forbidden tool permission; only read/graph_search/find/ls/resource and structured_output are permitted.");
       }
       return !violation;
     },
@@ -626,11 +626,11 @@ export function createGoalVerifierCheckGuard(refCount: number) {
       if (event.type !== "tool_execution_start") return;
       if (event.toolName === "structured_output") {
         if (++structured > 1) reject("Verifier emitted more than one structured verdict.");
-      } else if (["read", "search", "find", "ls", "resource"].includes(String(event.toolName))) {
+      } else if (["read", "graph_search", "find", "ls", "resource"].includes(String(event.toolName))) {
         check();
         if (typeof event.toolCallId === "string") proxyStarts.set(event.toolCallId, { tool: String(event.toolName), used: false });
       } else {
-        reject("Verifier attempted a forbidden tool; only read/search/find/ls/resource are permitted.");
+        reject("Verifier attempted a forbidden tool; only read/graph_search/find/ls/resource are permitted.");
       }
     },
   };

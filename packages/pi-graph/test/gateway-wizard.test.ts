@@ -79,12 +79,12 @@ test("buildGatewayChangesYaml appends skill dirs without duplicates", () => {
     "            - ~/.pi/agent/gateway/skills",
     "",
   ].join("\n");
-  const changes: GatewayConfigChanges = { skillDirs: ["D:/pi-graph/.pi/skills", "~/.pi/agent/gateway/skills"] };
+  const bundledSkills = "D:/node_modules/pi-graph/skills";
+  const changes: GatewayConfigChanges = { skillDirs: [bundledSkills, "~/.pi/agent/gateway/skills"] };
   const { yaml, summary } = buildGatewayChangesYaml(existing, changes, "D:/demo");
-  const dirCount = yaml.split("D:/pi-graph/.pi/skills").length - 1;
-  assert.equal(dirCount, 1);
+  assert.equal(yaml.split(bundledSkills).length - 1, 1);
   assert.equal(yaml.split("~/.pi/agent/gateway/skills").length - 1, 1); // no duplicate
-  assert.ok(summary.some((line) => line.includes("D:/pi-graph/.pi/skills")));
+  assert.ok(summary.some((line) => line.includes(bundledSkills)));
 });
 
 test("buildGatewayChangesYaml sets oauth flags on the server section", () => {

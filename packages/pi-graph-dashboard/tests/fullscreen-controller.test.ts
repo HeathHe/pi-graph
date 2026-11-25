@@ -13,7 +13,7 @@ interface FakeHarness {
 	renders: number;
 	inputHandler?: (data: string) => unknown;
 	/** Render through the current (possibly wrapped) tui.render. */
-	render(): string[];
+	render(): readonly string[];
 	setRows(rows: number): void;
 	attachInput(handler: ((data: string) => unknown) | undefined): void;
 	wasForceRendered(): boolean;

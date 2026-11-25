@@ -169,7 +169,7 @@ export class TodoReviewMonitor {
       state.failureKey = fingerprint;
     } else { state.sameFailures = 0; state.failureKey = undefined; }
     // Only actual tool outcomes (not narration, Todo/context updates or token deltas) are evidence.
-    if (!isError && ["read", "search", "grep", "bash", "bash_bg", "edit", "write", "lsp"].includes(toolName) && !state.seen.has(fingerprint)) {
+    if (!isError && ["read", "graph_search", "grep", "bash", "bash_bg", "edit", "write", "lsp"].includes(toolName) && !state.seen.has(fingerprint)) {
       state.evidence++;
       state.seen.add(fingerprint);
       if (state.seen.size > 64) state.seen.delete(state.seen.values().next().value!);

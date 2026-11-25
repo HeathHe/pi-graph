@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { after, before } from "node:test";
 import ts from "typescript";
 import {
-  cleanPackagedOptionalSkills,
-  cleanPackagedSkills,
   preparePackagedOptionalSkills,
+  preparePackagedPiResources,
   preparePackagedSkills,
 } from "../scripts/prepare-package-skills.mjs";
 
@@ -15,12 +16,13 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const teammateRoot = join(root, "..", "pi-graph-agent-runtime");
 const cockpitRoot = join(root, "..", "pi-graph-dashboard");
 const settingsCoreRoot = join(root, "..", "pi-graph-shared-settings");
+const executorsRoot = join(root, "..", "pi-graph-executors");
 const exactSemver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const piCorePeerBaselines = {
-  "@earendil-works/pi-agent-core": "0.99.0",
-  "@earendil-works/pi-ai": "0.99.0",
-  "@earendil-works/pi-coding-agent": "0.99.0",
-  "@earendil-works/pi-tui": "0.99.0",
+  "@earendil-works/pi-agent-core": "1.6.0",
+  "@earendil-works/pi-ai": "1.6.0",
+  "@earendil-works/pi-coding-agent": "1.6.0",
+  "@earendil-works/pi-tui": "1.6.0",
   typebox: "1.3.27",
 };
 const smartSearchSource = "https://github.com/konbakuyomu/smartsearch/archive/667c465d0f6ea16a423f03c434f94e21505d3595.tar.gz";
@@ -38,13 +40,16 @@ const teammatePublicExports = {
   "./v1/types": ["./types/public/v1/types.d.ts", "./src/public/v1/types.ts"],
 };
 
+let stagedRoot;
 before(() => {
-  preparePackagedSkills();
-  preparePackagedOptionalSkills();
+  stagedRoot = mkdtempSync(join(tmpdir(), "pi-graph-package-resources-"));
+  copyFileSync(join(root, "package.json"), join(stagedRoot, "package.json"));
+  preparePackagedPiResources({ targetDir: join(stagedRoot, ".pi") });
+  preparePackagedSkills({ targetDir: join(stagedRoot, "skills") });
+  preparePackagedOptionalSkills({ targetDir: join(stagedRoot, "optional", "skills") });
 });
 after(() => {
-  cleanPackagedOptionalSkills();
-  cleanPackagedSkills();
+  if (stagedRoot) rmSync(stagedRoot, { recursive: true, force: true });
 });
 
 test("package manifest publishes the extension and canonical Pi skills", () => {
@@ -57,7 +62,9 @@ test("package manifest publishes the extension and canonical Pi skills", () => {
   assert.equal(pkg.files.includes("workflows/"), false);
   assert.equal(pkg.files.includes("AGENTS.md"), false, "bundled AGENTS.md injection is retired — .pi/SYSTEM.md (project-level) is the single authority");
   assert.equal(existsSync(join(root, "AGENTS.md")), false, "AGENTS.md must not be published; pi instructions live in the project .pi/SYSTEM.md");
-  assert.deepEqual(pkg.pi.skills, ["./.pi/skills"]);
+  assert.deepEqual(pkg.pi.skills, ["./skills"]);
+  assert.ok(pkg.files.includes("skills/"));
+  assert.ok(pkg.files.includes("!.pi/skills/**"));
   assert.match(pkg.scripts.postinstall, /install-workflows\.mjs/);
   assert.ok(pkg.files.includes("!.pi/**/__pycache__/**"));
   assert.ok(pkg.files.includes("!.pi/**/*.pyc"));
@@ -70,6 +77,14 @@ test("package manifest publishes the extension and canonical Pi skills", () => {
   assert.equal(cockpitPkg.dependencies["pi-graph-shared-settings"], settingsCorePkg.version);
   assert.equal(pkg.dependencies["pi-graph-agent-runtime"], teammatePkg.version);
   assert.equal(pkg.dependencies["pi-graph-dashboard"], cockpitPkg.version);
+  const workspacePkg = JSON.parse(readFileSync(join(root, "..", "..", "package.json"), "utf8"));
+  const executorsPkg = JSON.parse(readFileSync(join(executorsRoot, "package.json"), "utf8"));
+  assert.equal(workspacePkg.dependencies["pi-graph"], pkg.version);
+  assert.equal(workspacePkg.dependencies["pi-graph-agent-runtime"], teammatePkg.version);
+  assert.equal(cockpitPkg.devDependencies["pi-graph-agent-runtime"], teammatePkg.version);
+  assert.equal(pkg.dependencies["pi-graph-executors"], executorsPkg.version);
+  assert.equal(teammatePkg.dependencies["pi-graph-executors"], executorsPkg.version);
+  assert.equal(executorsPkg.dependencies.typebox, "1.3.27");
   assert.equal(pkg.dependencies["@konbakuyomu/smart-search"], undefined);
   assert.equal(pkg.optionalDependencies["@konbakuyomu/smart-search"], smartSearchSource);
   assert.equal(pkg.dependencies["puppeteer-core"], "25.12.0");
@@ -190,9 +205,9 @@ test("production import scan ignores comments and detects private teammate impor
 });
 
 test("package contains the canonical workflow skill set", () => {
-  const skillPath = join(root, ".pi", "skills", "workflow-skill-designer", "SKILL.md");
+  const skillPath = join(stagedRoot, "skills", "workflow-skill-designer", "SKILL.md");
   assert.match(readFileSync(skillPath, "utf8"), /workflow skills/i);
-  const swarmSkillPath = join(root, ".pi", "skills", "team-swarm", "SKILL.md");
+  const swarmSkillPath = join(stagedRoot, "skills", "team-swarm", "SKILL.md");
   assert.equal(
     existsSync(swarmSkillPath),
     true,
@@ -204,13 +219,52 @@ test("package contains the canonical workflow skill set", () => {
     /Hybrid coordinator/,
     "team-swarm must retain the Python ACO execution contract",
   );
-  assert.equal(existsSync(join(root, ".pi", "skills", "swarm", "SKILL.md")), false, "native swarm Skill must not be packaged");
+  assert.equal(existsSync(join(stagedRoot, "skills", "swarm", "SKILL.md")), false, "native swarm Skill must not be packaged");
+  assert.ok(existsSync(join(stagedRoot, "skills", "team-swarm", "scripts", "aco.py")));
+});
+
+test("Pi discovers bundled skills via package registration, not checkout-local discovery", () => {
+  const sandbox = mkdtempSync(join(tmpdir(), "pi-graph-skill-discovery-"));
+  try {
+    const cwd = join(sandbox, "project");
+    const agentDir = join(sandbox, "agent");
+    const localSkill = join(cwd, ".pi", "skills", "local-demo", "SKILL.md");
+    const localSourceSkill = join(cwd, "resources", "skills", "source-demo", "SKILL.md");
+    for (const [path, name] of [[localSkill, "local-demo"], [localSourceSkill, "source-demo"]]) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `---\nname: ${name}\ndescription: Discovery fixture\n---\n`);
+    }
+    mkdirSync(agentDir);
+    copyFileSync(join(root, "..", "..", ".pi", "settings.json"), join(cwd, ".pi", "settings.json"));
+    execFileSync(process.execPath, ["--input-type=module", "-e", `
+      import assert from "node:assert/strict";
+      import { realpathSync, writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      import { DefaultResourceLoader, SettingsManager } from ${JSON.stringify(import.meta.resolve("@earendil-works/pi-coding-agent"))};
+      const [cwd, agentDir, packageRoot, localSkill] = process.argv.slice(1);
+      const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+      const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true });
+      const skills = () => new Map(loader.getSkills().skills.map(skill => [skill.name, skill.filePath]));
+      await loader.reload();
+      assert.equal(realpathSync(skills().get("local-demo")), realpathSync(localSkill));
+      assert.equal(skills().has("source-demo"), false);
+      assert.equal(skills().has("workflow-skill-designer"), false);
+      writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [packageRoot] }));
+      await loader.reload();
+      assert.equal(realpathSync(skills().get("workflow-skill-designer")), realpathSync(join(packageRoot, "skills", "workflow-skill-designer", "SKILL.md")));
+      assert.equal(skills().has("source-demo"), false);
+    `, cwd, agentDir, stagedRoot, localSkill], {
+      cwd, env: { ...process.env, HOME: sandbox, USERPROFILE: sandbox, PI_CODING_AGENT_DIR: agentDir },
+    });
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
 });
 
 test("knowledge capture skills remain user-invoked and the system prompt introduces Know-how", () => {
-  const knowhowSkill = readFileSync(join(root, ".pi", "skills", "maestro-knowhow", "SKILL.md"), "utf8");
-  const specSkill = readFileSync(join(root, ".pi", "skills", "maestro-spec", "SKILL.md"), "utf8");
-  const systemPrompt = readFileSync(join(root, ".pi", "SYSTEM.md"), "utf8");
+  const knowhowSkill = readFileSync(join(stagedRoot, "skills", "maestro-knowhow", "SKILL.md"), "utf8");
+  const specSkill = readFileSync(join(stagedRoot, "skills", "maestro-spec", "SKILL.md"), "utf8");
+  const systemPrompt = readFileSync(join(stagedRoot, ".pi", "SYSTEM.md"), "utf8");
 
   assert.match(knowhowSkill, /disable-model-invocation:\s*true/);
   assert.match(specSkill, /disable-model-invocation:\s*true/);
@@ -222,22 +276,23 @@ test("knowledge capture skills remain user-invoked and the system prompt introdu
 
 test("package publishes optional skills from the repository root", () => {
   assert.equal(
-    existsSync(join(root, "optional", "skills", "scholar-writing", "SKILL.md")),
+    existsSync(join(stagedRoot, "optional", "skills", "scholar-writing", "SKILL.md")),
     true,
     "prepack must materialize optional skills inside the npm package root",
   );
 });
 
 test("package publishes the full canonical Pi directory except local-only files", () => {
-  for (const entry of ["SYSTEM.md", "agents", "hooks.json", "settings.json", "teammate-models.json", "skills"]) {
-    assert.equal(existsSync(join(root, ".pi", entry)), true, `.pi/${entry} must be packaged`);
+  for (const entry of ["SYSTEM.md", "agents", "settings.json", "teammate-models.json", "instructions/knowledge.md"]) {
+    assert.equal(existsSync(join(stagedRoot, ".pi", entry)), true, `.pi/${entry} must be packaged`);
   }
-  for (const entry of ["settings.local.json", "model-failover.json", "scratch"]) {
-    assert.equal(existsSync(join(root, ".pi", entry)), false, `.pi/${entry} is local-only and must not be packaged`);
+  assert.equal(existsSync(join(stagedRoot, ".pi", "hooks.json")), false, "the current canonical Pi resources must not stage a .pi/hooks.json placeholder");
+  for (const entry of ["settings.local.json", "model-failover.json", "scratch", "skills"]) {
+    assert.equal(existsSync(join(stagedRoot, ".pi", entry)), false, `.pi/${entry} is local-only and must not be packaged`);
   }
   // The packaged role catalog ships role definitions and their schema, but
   // never the runtime capture records (<correlationId>.json).
-  const packagedAgents = readdirSync(join(root, ".pi", "agents"));
+  const packagedAgents = readdirSync(join(stagedRoot, ".pi", "agents"));
   assert.equal(packagedAgents.includes("general-executor.md"), true, "role definitions must be packaged");
   assert.equal(packagedAgents.includes("general-executor-report.schema.json"), true, "role schema must be packaged");
   assert.equal(packagedAgents.some((name) => /^[0-9a-f-]+\.json$/.test(name)), false, "capture records must not be packaged");

@@ -17,12 +17,11 @@ test("decision policy extension and manual Skill are shipped through canonical p
   const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
   assert.ok(manifest.pi.extensions.includes("./src/decision-policy/extension.ts"));
   assert.ok(manifest.files.includes("src/**/*.ts"));
-  assert.ok(manifest.pi.skills.includes("./.pi/skills"));
-  const skill = await readFile(new URL("../../../.pi/skills/decision-policy/SKILL.md", import.meta.url), "utf8");
+  assert.deepEqual(manifest.pi.skills, ["./skills"]);
+  assert.ok(manifest.files.includes("skills/"));
+  const skill = await readFile(new URL("../../../resources/skills/decision-policy/SKILL.md", import.meta.url), "utf8");
   assert.match(skill, /disable-model-invocation: true/);
   assert.match(skill, /policy_config.*action:"commit"/);
-  const packaging = await readFile(join(root, "scripts", "prepare-package-skills.mjs"), "utf8");
-  assert.match(packaging, /\.pi.*skills|skills.*\.pi/s);
 });
 test("under-lock owner cancellation prevents late publication and cleans temporary draft", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "policy-guard-"));

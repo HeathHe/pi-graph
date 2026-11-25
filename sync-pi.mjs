@@ -14,7 +14,7 @@
  * Usage:
  *   node sync-pi.mjs                 # sync .pi-sync/ and verify
  *   node sync-pi.mjs --also-pi       # additionally deploy the converted
- *                                    # mirror (skills/ + agents/) to .pi/
+ *                                    # skills to resources/skills and agents to .pi/agents
  *   node sync-pi.mjs --skip-verify   # skip the parity check
  *
  * Environment overrides (mainly for verification / phase 2):
@@ -28,7 +28,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync, rmSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
-import { deployMirrorSubdir, deployPackagedAgents, removeRetiredPackageAgentsFile, topLevelEntryNames } from './deploy-pi-mirror.mjs';
+import { deployConvertedPiMirror, deployPackagedAgents, removeRetiredPackageAgentsFile } from './deploy-pi-mirror.mjs';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = dirname(fileURLToPath(import.meta.url));
@@ -157,33 +157,23 @@ if (!SKIP_VERIFY) {
 }
 
 // ---------------------------------------------------------------------------
-// Optional: deploy the converted mirror from .pi-sync/ to .pi/
+// Optional: deploy converted skills and agents to their canonical sources.
 // ---------------------------------------------------------------------------
 
 if (ALSO_PI) {
-  log('\n══════ Deploy converted mirror to .pi/ ══════');
-  const piDir = join(repoRoot, '.pi');
-  for (const sub of ['skills', 'agents']) {
-    const from = join(DST, sub);
-    const to = join(piDir, sub);
-    if (!existsSync(from)) continue;
-    deployMirrorSubdir(from, to, previousManaged[sub] ?? []);
-    log(`  ✓ .pi/${sub} ← .pi-sync/${sub} (${countFiles(to)} files, Pi-native entries preserved)`);
-  }
+  log('\n══════ Deploy converted mirror to resources/skills and .pi/agents ══════');
+  const managed = deployConvertedPiMirror(repoRoot, DST, previousManaged);
   // Package mirror: the published pi-graph npm package ships its role
   // catalog at <pkgRoot>/.pi/agents. The teammate package resolver finds that
   // sibling in global npm installs and uses the workspace-root canonical .pi
   // as a dev/npm-link fallback, so roles remain discoverable from ANY cwd.
   const pkgAgentsDir = join(repoRoot, 'packages', 'pi-graph', '.pi', 'agents');
-  const canonicalAgentsDir = join(piDir, 'agents');
+  const canonicalAgentsDir = join(repoRoot, '.pi', 'agents');
   if (existsSync(canonicalAgentsDir)) {
     const packaged = deployPackagedAgents(canonicalAgentsDir, pkgAgentsDir);
     log(`  ✓ packages/pi-graph/.pi/agents ← .pi/agents (${packaged.deployed} role files)`);
   }
-  writeFileSync(MANAGED_MANIFEST_PATH, `${JSON.stringify({
-    skills: topLevelEntryNames(join(DST, 'skills')),
-    agents: topLevelEntryNames(join(DST, 'agents')),
-  }, null, 2)}\n`);
+  writeFileSync(MANAGED_MANIFEST_PATH, `${JSON.stringify(managed, null, 2)}\n`);
 }
 
 log('\n✓ sync-pi complete.');

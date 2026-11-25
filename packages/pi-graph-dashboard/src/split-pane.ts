@@ -283,7 +283,7 @@ export function createSplitPaneController(options: SplitPaneControllerOptions = 
 		tui = nextTui;
 		viewportStability = attachViewportStability(nextTui);
 		originalRender = previousRender;
-		wrappedRender = function (this: TUI, terminalWidth: number): string[] {
+		wrappedRender = function (this: TUI, terminalWidth: number) {
 			reconcileResizeWidth(terminalWidth);
 			const reserved = effectiveSidebarWidth(terminalWidth);
 			syncOverlayWidth(terminalWidth);

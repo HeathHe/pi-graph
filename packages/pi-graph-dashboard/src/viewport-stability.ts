@@ -7,13 +7,36 @@ type ApplyLineResets = (lines: string[]) => string[];
 
 interface ComponentLayout {
 	width: number;
-	children: Array<{ component: LayoutComponent; height: number }>;
+	children: readonly { component: LayoutComponent; height: number }[];
 }
 
 interface LayoutComponent {
-	render?: (width: number) => string[];
+	render?: (width: number) => readonly string[];
 	children?: LayoutComponent[];
 	mouseLayout?: ComponentLayout;
+	childLines?: {
+		width: number;
+		children: readonly LayoutComponent[];
+		parts: readonly (readonly string[])[];
+	};
+}
+
+function measuredLayout(node: LayoutComponent, width: number): ComponentLayout | undefined {
+	// Pi 1.6 records child render fragments instead of mouse-only row heights.
+	// Both layouts provide evidence from the actual render, not a second pass.
+	const cached = node.childLines;
+	if (cached !== undefined) {
+		if (!cached || cached.width !== width || !Array.isArray(cached.children) || !Array.isArray(cached.parts)
+			|| cached.children.length !== cached.parts.length) return undefined;
+		const children: { component: LayoutComponent; height: number }[] = [];
+		for (let index = 0; index < cached.children.length; index += 1) {
+			const part = cached.parts[index];
+			if (!Array.isArray(part)) return undefined;
+			children.push({ component: cached.children[index]!, height: part.length });
+		}
+		return { width, children };
+	}
+	return node.mouseLayout;
 }
 
 interface HiddenComponent {
@@ -82,8 +105,8 @@ function measuredComponents(
 		if (height === 0) return true;
 		if (seen.has(node)) return false;
 		seen.add(node);
-		const layout = node.mouseLayout;
 		if (node.render === Container.prototype.render && Array.isArray(node.children)) {
+			const layout = measuredLayout(node, width);
 			if (!layout || layout.width !== width || layout.children.length !== node.children.length) return false;
 			let total = 0;
 			for (let index = 0; index < layout.children.length; index += 1) {

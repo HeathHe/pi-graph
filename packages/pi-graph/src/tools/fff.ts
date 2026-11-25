@@ -450,7 +450,7 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
     const root = resolve(workspaceRoot);
     const denied = unsafeBasePathReason(root);
     if (denied) {
-      throw new Error(`search does not index ${denied}; start Pi from a specific project directory`);
+      throw new Error(`graph_search does not index ${denied}; start Pi from a specific project directory`);
     }
     const scopePath = resolveSearchScopePath(input.path, root);
     const scopePrefix = scopePrefixOf(root, scopePath);
@@ -463,7 +463,7 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
     const globNeedsRg = input.glob?.startsWith("!") ?? false;
     if (mode === "fuzzy" && (forcedInsensitive || globNeedsRg)) {
       throw new Error(
-        "search mode=fuzzy requires the FFF index and does not support forced ignoreCase or negated globs",
+        "graph_search mode=fuzzy requires the FFF index and does not support forced ignoreCase or negated globs",
       );
     }
 
@@ -511,7 +511,7 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
   };
 
   pi.registerTool({
-    name: "search",
+    name: "graph_search",
     label: "Search",
     description:
       "Search workspace contents: scoped searches use the shared FFF index in an isolated child process; root-wide plain/regex searches use time-bounded ripgrep (rg) to avoid blocking on large indexes. Fuzzy matching requires the index. Supports literal/regex/fuzzy and lines/files/count output; does not invoke GNU grep. Specify path or glob for large projects. Prefer this over running grep or rg through bash.",
@@ -523,12 +523,12 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
       "path scopes to a directory or a single file inside the workspace; omit it only for intentional root-wide search (rg, with an 8-second scan budget). glob filters file names at any depth and supports '!' negation.",
       "Limited or timed-out results end with a bracketed note; narrow with a more specific pattern, path, or glob before raising limit. Root search may return partial results on timeout.",
       "Typical calls: {pattern: \"handleRequest\", output: \"files\"} to locate; {pattern: \"class \\w+Service\", mode: \"regex\", glob: \"*.ts\"} for typed patterns; {pattern: \"TODO\", ignoreCase: true, context: 2} for annotated hits; {pattern: \"getUsr\", mode: \"fuzzy\"} when the spelling is unknown.",
-      "Use fffind for file-path search instead of content search.",
+      "Use graph_fffind for file-path search instead of content search.",
     ],
     parameters: SearchToolParameters,
     async execute(_id, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) {
-        const error = new Error("search aborted.");
+        const error = new Error("graph_search aborted.");
         error.name = "AbortError";
         throw error;
       }
@@ -537,13 +537,13 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
     renderShell: "self",
     renderCall(args, theme, ctx) {
       if (ctx?.isPartial === false) return new Text("", 0, 0);
-      return toolCallLine(theme, "search", `"${String(args.pattern ?? "")}"`);
+      return toolCallLine(theme, "graph_search", `"${String(args.pattern ?? "")}"`);
     },
     renderResult(result, opts, theme, ctx) {
       if (opts.isPartial) return new Text("", 0, 0);
       const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
       return toolResultLine(theme, {
-        name: "search",
+        name: "graph_search",
         ok: text !== "No matches found" && text.length > 0,
         arg: `"${String(ctx.args.pattern ?? "")}"`,
         summary: resultSummary(result),
@@ -554,10 +554,10 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
   });
 
   pi.registerTool({
-    name: "fffind",
+    name: "graph_fffind",
     label: "Find",
     description:
-      "Fuzzy file path search over the workspace index. For content search use `search`.",
+      "Fuzzy file path search over the workspace index. For content search use `graph_search`.",
     promptSnippet: "Fuzzy file path search via the workspace index.",
     parameters: Type.Object({
       pattern: Type.String({ minLength: 1, description: "Fuzzy file path fragment" }),
@@ -566,7 +566,7 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) {
-        const error = new Error("fffind aborted.");
+        const error = new Error("graph_fffind aborted.");
         error.name = "AbortError";
         throw error;
       }
@@ -579,11 +579,11 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
       let exhausted = false;
       const pageSize = Math.min(Math.max(limit * 2, 50), 500);
       for (let pageIndex = 0; items.length < limit && pageIndex < MAX_DRAIN_PAGES; pageIndex += 1) {
-        if (signal?.aborted) throw fffAbortError("fffind");
-        const result = await awaitFffOperation(finder.fileSearch(params.pattern, { pageIndex, pageSize }), signal, "fffind");
-        if (finder.isDestroyed) throw new Error("fffind index ended");
+        if (signal?.aborted) throw fffAbortError("graph_fffind");
+        const result = await awaitFffOperation(finder.fileSearch(params.pattern, { pageIndex, pageSize }), signal, "graph_fffind");
+        if (finder.isDestroyed) throw new Error("graph_fffind index ended");
         if (!result.ok) {
-          throw new Error(`fffind failed: ${result.error}`);
+          throw new Error(`graph_fffind failed: ${result.error}`);
         }
         for (const item of result.value.items) {
           if (inScope(item.relativePath, scopePrefix)) items.push(item);
@@ -605,13 +605,13 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
     renderShell: "self",
     renderCall(args, theme, ctx) {
       if (ctx?.isPartial === false) return new Text("", 0, 0);
-      return toolCallLine(theme, "fffind", `"${String(args.pattern ?? "")}"`);
+      return toolCallLine(theme, "graph_fffind", `"${String(args.pattern ?? "")}"`);
     },
     renderResult(result, opts, theme, ctx) {
       if (opts.isPartial) return new Text("", 0, 0);
       const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
       return toolResultLine(theme, {
-        name: "fffind",
+        name: "graph_fffind",
         ok: text !== "No files found",
         arg: `"${String(ctx.args.pattern ?? "")}"`,
         summary: resultSummary(result),
@@ -624,7 +624,7 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
   return { search };
 }
 
-async function awaitFffOperation<T>(operation: T | Promise<T>, signal?: AbortSignal, toolName = "search"): Promise<T> {
+async function awaitFffOperation<T>(operation: T | Promise<T>, signal?: AbortSignal, toolName = "graph_search"): Promise<T> {
   const pending = Promise.resolve(operation);
   if (!signal) return pending;
   let onAbort!: () => void;
@@ -640,7 +640,7 @@ async function awaitFffOperation<T>(operation: T | Promise<T>, signal?: AbortSig
   }
 }
 
-function fffAbortError(toolName = "search"): Error {
+function fffAbortError(toolName = "graph_search"): Error {
   const error = new Error(`${toolName} aborted.`);
   error.name = "AbortError";
   return error;

@@ -1,6 +1,6 @@
 {
   "name": "pi-graph-dashboard",
-  "version": "0.24.5",
+  "version": "0.24.6",
   "description": "Responsive Maestro operations sidebar, fallback status widgets, and footer for Pi.",
   "type": "module",
   "engines": {
@@ -35,7 +35,7 @@
     ]
   },
   "dependencies": {
-    "pi-graph-shared-settings": "0.2.3",
+    "pi-graph-shared-settings": "0.2.4",
     "proper-lockfile": "4.1.2"
   },
   "bundledDependencies": [
@@ -75,8 +75,8 @@
     "@earendil-works/pi-coding-agent": "1.6.0",
     "@earendil-works/pi-tui": "1.6.0",
     "@types/node": "^22.0.0",
-    "pi-graph-agent-runtime": "2.10.2",
-    "typebox": "1.4.7",
+    "pi-graph-agent-runtime": "2.10.3",
+    "typebox": "1.3.27",
     "typescript": "^5.5.0"
   },
   "main": "./src/index.ts",

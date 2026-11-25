@@ -23,7 +23,7 @@
    - [lsp — 语言服务器集成](#31-lsp--语言服务器集成)
    - [browser — 浏览器控制](#32-browser--浏览器控制)
    - [smart_search — 网络搜索与研究](#33-smart_search--网络搜索与研究)
-   - [search / fffind — 快速搜索](#34-search--fffind--快速搜索)
+   - [graph_search / graph_fffind — 快速搜索](#34-graph_search--graph_fffind--快速搜索)
    - [search_tool_bm25 — 工具发现](#35-search_tool_bm25--工具发现)
 4. [MCP 集成](#4-mcp-集成)
 5. [权限系统](#5-权限系统)
@@ -84,7 +84,7 @@ pi list
 
 Pi 0.99+ 由宿主管理工具 loadout、`tool_search`、模型/classifier、MCP 与键盘能力；缺少原生 API 不会自动启动第二套 legacy runtime。Pi 核心 optional peer 的 `*` 范围不变。MCP 使用原生 `/mcp`；迁移旧配置前先禁用 `builtin:mcp`，再运行 `/maestro-mcp-migrate` 预览并批准，完成后恢复原生管理器。
 
-- `search` 替代 `ffgrep`：支持 literal/regex/fuzzy 与 lines/files/count；索引不可用及工作区根目录 plain/regex 搜索可走有界 `rg`，fuzzy 仍需索引。大项目应限定 path/glob。
+- `graph_search` 替代 `ffgrep`：支持 literal/regex/fuzzy 与 lines/files/count；索引不可用及工作区根目录 plain/regex 搜索可走有界 `rg`，fuzzy 仍需索引。大项目应限定 path/glob。
 - `open-code-review` 需要单独安装 `ocr` CLI。`preview`/`rules` 只解析文件与规则，`review` 使用运行时模型执行 OCR 管理的评审；`health` 检查连通性。模型配置入口为 `/api-manager open-code-review`，安装说明见 `packages/pi-graph/optional/OCR-SETUP.md`。
 - 可选 Ask transport 与本地 TUI 竞速并取消另一端；Mobile 取消也会关闭本地向导。Plan confirm/review 暴露可选 transport seam 和 revision 检查，不代表所有客户端都已实现 Plan UI。v0.35.0 的 Refine transport 则只镜像本地面板并回传操作意图，不另开子代理；本地 TUI 保持权威，镜像失败不关闭本地界面。优化草稿须经 PlanStore 提交后才报告 `applied`，评审反馈仍进入讨论，不等于草稿已应用或 Plan 已批准。
 - 原生 Quiet 模式支持 live 切换且不额外激活工具；首次恢复历史渲染和第三方 execution-only override 仍有边界，详见文档站 [Cockpit](../docs-site/src/content/docs/guides/cockpit.md)。
@@ -108,8 +108,8 @@ Pi 0.99+ 由宿主管理工具 loadout、`tool_search`、模型/classifier、MCP
 | pi-graph | `lsp` | 语言服务器协议集成 |
 | pi-graph | `browser` | Chromium 浏览器控制 |
 | pi-graph | `smart_search` | 网络搜索/深度研究/URL 抓取 |
-| pi-graph | `search` | FFF 索引内容搜索（literal/regex/fuzzy，rg 兜底） |
-| pi-graph | `fffind` | FFF 快速模糊文件搜索 |
+| pi-graph | `graph_search` | FFF 索引内容搜索（literal/regex/fuzzy，rg 兜底） |
+| pi-graph | `graph_fffind` | FFF 快速模糊文件搜索 |
 | pi-graph | `search_tool_bm25` | BM25 工具发现 |
 | pi-graph | `model-availability` | 无密钥的模型注册与路由诊断 |
 | pi-graph | `plan-enter` | 进入计划模式 |
@@ -569,27 +569,27 @@ smart_search({ mode: "fetch", query: "https://docs.example.com/api/auth" })
 
 ---
 
-### 3.4 search / fffind — 快速搜索
+### 3.4 graph_search / graph_fffind — 快速搜索
 
 基于 [FFF](https://github.com/fff-labs/fff) 的工作区级原生索引搜索。索引在会话启动时预热并驻留内存；teammate 子会话通过 broker 共享同一索引：
 
 ```javascript
 // 字面内容搜索（默认 mode="plain"）
-search({ pattern: "validateToken", context: 3, limit: 20 })
+graph_search({ pattern: "validateToken", context: 3, limit: 20 })
 
 // 正则 / 模糊内容搜索
-search({ pattern: "fn\\s+validate\\w*", mode: "regex" })
-search({ pattern: "valdiate token", mode: "fuzzy" })
+graph_search({ pattern: "fn\\s+validate\\w*", mode: "regex" })
+graph_search({ pattern: "valdiate token", mode: "fuzzy" })
 
 // 输出形态：files = 仅文件路径；count = 每文件命中数
-search({ pattern: "TODO", output: "files" })
-search({ pattern: "deprecated", output: "count", glob: "*.ts" })
+graph_search({ pattern: "TODO", output: "files" })
+graph_search({ pattern: "deprecated", output: "count", glob: "*.ts" })
 
 // 模糊文件路径搜索
-fffind({ pattern: "auth middleware", limit: 10 })
+graph_fffind({ pattern: "auth middleware", limit: 10 })
 ```
 
-索引不可用时 `search` 自动降级为 ripgrep（结果附 `[engine: rg]` 标注）；`mode="fuzzy"` 无降级等价物，索引不可用时返回明确错误。
+索引不可用时 `graph_search` 自动降级为 ripgrep（结果附 `[engine: rg]` 标注）；`mode="fuzzy"` 无降级等价物，索引不可用时返回明确错误。
 
 ---
 
@@ -751,7 +751,7 @@ Persistent profile 的 `enable|disable` 修改持久启用意图；`start|stop|r
 
 以下工具在任何模式下都自动允许（只读或无副作用）：
 
-`Read`, `Grep`, `Glob`, `Ls`, `Find`, `search`, `fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
+`Read`, `Grep`, `Glob`, `Ls`, `Find`, `graph_search`, `graph_fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
 
 ### Teammate 子进程权限中继
 
@@ -915,7 +915,7 @@ teammate-send({ to: "my-agent", mode: "abort" })
 | **自动修剪** | 上下文达到阈值（~70%）时自动修剪大型工具结果（≥4KB） |
 | **保留近期** | 始终保留最近 ~20K Token 的对话内容 |
 | **预留空间** | 预留 ~16K Token 给模型响应 |
-| **可重放工具** | `read`, `grep`, `glob`, `search`, `find` 的结果可安全修剪（需要时可重新执行） |
+| **可重放工具** | `read`, `grep`, `glob`, `graph_search`, `find` 的结果可安全修剪（需要时可重新执行） |
 | **压缩续行** | 压缩后自动注入续行提示，Agent 从中断点继续 |
 | **状态持久化** | 修剪状态持久化，跨会话保持 |
 

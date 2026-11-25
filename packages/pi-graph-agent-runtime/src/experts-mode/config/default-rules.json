@@ -84,8 +84,8 @@
       "bash": "deny",
       "bash_bg": "deny",
       "read": "allow",
-      "search": "allow",
-      "fffind": "allow",
+      "graph_search": "allow",
+      "graph_fffind": "allow",
       "teammate": "allow",
       "observe": "allow",
       "todo": "allow",
@@ -195,7 +195,7 @@
       "defaultTaskType": "explore",
       "label": "Code explorer",
       "capabilities": ["explore", "search"],
-      "tools": ["read", "search", "fffind", "bash"],
+      "tools": ["read", "graph_search", "graph_fffind", "bash"],
       "skills": []
     },
     "planner": {

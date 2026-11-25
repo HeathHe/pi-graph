@@ -150,6 +150,9 @@ test("packed consumer installs real tarballs and loads in a fresh Pi process", {
     assert.equal(teammatePacked[0].version, localTeammatePackage.version);
     assert.equal(flowPacked[0].version, localFlowPackage.version);
     assert.ok(flowPacked[0].files.some(({ path }) => path === "src/gateway/public/v1/index.ts"));
+    assert.ok(flowPacked[0].files.some(({ path }) => path === "skills/team-swarm/scripts/aco.py"));
+    assert.ok(flowPacked[0].files.some(({ path }) => path === ".pi/instructions/knowledge.md"));
+    assert.equal(flowPacked[0].files.some(({ path }) => path.startsWith(".pi/skills/")), false);
     for (const removed of ["src/mcpx-bridge.ts", "src/tui/mcpx-overlay.ts", "src/tui/mcpx-wizard.ts", "src/tui/mcpx-client.ts"]) {
       assert.equal(flowPacked[0].files.some(({ path }) => path === removed), false, `${removed} must not be packed`);
     }
@@ -289,7 +292,7 @@ test("packed consumer installs real tarballs and loads in a fresh Pi process", {
     const smartSearchRegression = JSON.parse(smartSearchRegressionOutput.slice(smartSearchRegressionOutput.indexOf("{")));
     assert.equal(smartSearchRegression.ok, true);
     assert.equal(smartSearchRegression.mode, "mock");
-    assert.equal(existsSync(join(installed, ".pi", "skills", "workflow-skill-designer", "SKILL.md")), true);
+    assert.equal(existsSync(join(installed, "skills", "workflow-skill-designer", "SKILL.md")), true);
     assert.equal(existsSync(join(installed, "src", "extension", "index.ts")), true);
     const extensionPath = join(installed, "src", "extension", "index.ts");
     const piCommand = [

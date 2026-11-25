@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # self-evolve skill full-cycle 端到端演练（Item 3）
-# 按 .pi/skills/self-evolve/SKILL.md 的文档化步骤在真实 run 上执行：
+# 按 resources/skills/self-evolve/SKILL.md 的文档化步骤在真实 run 上执行：
 #   run create → frontmatter 事实决策 → run check → session done(seal)
 #   → review --refresh(TOCTOU fence) → promote --all(T2 事实型自动晋升)
 #   → approval receipt → search 验证 → health sidecar 反映

@@ -786,7 +786,7 @@ test("extension registers Board, LSP, browser, host-owned discovery, and the Gat
     options: { expanded: boolean; isPartial: boolean },
     theme: { fg(name: string, text: string): string; bold(text: string): string },
     context: { args: Record<string, unknown> },
-  ) => { render(width: number): string[] };
+  ) => { render(width: number): readonly string[] };
   const todoTheme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
   const todoCallLines = renderTodoCall(
     { action: "create", subject: "hidden\tTodo\u001b[31m\nsubject" },
@@ -1224,7 +1224,7 @@ test("teammate child registers interaction, local Bash, and parent-permission su
   assert.match(childTodoGuidelines, /cannot change the completed advance retroactively/);
   assert.match(childTodoGuidelines, /critical makes it a priority before beginning the next Todo/);
   assert.match(childTodoGuidelines, /never infer a pressure reminder without a Todo completion checkpoint/);
-  const workflowMirrorSkill = readFileSync(join(import.meta.dirname, "../../../.pi/skills/maestro/SKILL.md"), "utf8");
+  const workflowMirrorSkill = readFileSync(join(import.meta.dirname, "../../../resources/skills/maestro/SKILL.md"), "utf8");
   assert.match(workflowMirrorSkill, /Advance only with `todo\(\{ action: "next" \}\)`/);
   assert.deepEqual([...handlers.keys()], [
     "session_start",

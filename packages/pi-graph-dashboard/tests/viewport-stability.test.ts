@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Container, CURSOR_MARKER, TuiAltScreen, TuiMainScreen, type Terminal, type TUI } from "@earendil-works/pi-tui";
+import { Container, CURSOR_MARKER, TuiAltScreen, TuiMainScreen, type ProgramStatus, type Terminal, type TUI } from "@earendil-works/pi-tui";
 import { attachViewportStability } from "../src/viewport-stability.ts";
 import { createDynamicTuiReference, createSwitchingDynamicTuiReference } from "./dynamic-tui-reference.ts";
 
@@ -8,6 +8,7 @@ class FakeTerminal implements Terminal {
 	columns = 40;
 	rows = 3;
 	kittyProtocolActive = false;
+	programStatus: ProgramStatus | undefined;
 	writes: string[] = [];
 	start(): void {}
 	stop(): void {}
@@ -21,6 +22,10 @@ class FakeTerminal implements Terminal {
 	clearScreen(): void {}
 	setTitle(): void {}
 	setProgress(): void {}
+	setProgramStatus(status: ProgramStatus): void {
+		// Model a terminal without OSC 7501 support: retain the host state, but do not write it.
+		this.programStatus = status.state === "clear" ? undefined : status;
+	}
 }
 
 interface TuiInternals {

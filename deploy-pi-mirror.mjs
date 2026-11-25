@@ -6,6 +6,20 @@ export function topLevelEntryNames(directory) {
   return readdirSync(directory).sort();
 }
 
+export function deployConvertedPiMirror(repoRoot, mirrorRoot, previousManaged = {}) {
+  const managed = { ...previousManaged };
+  for (const [name, target] of [
+    ['skills', join(repoRoot, 'resources', 'skills')],
+    ['agents', join(repoRoot, '.pi', 'agents')],
+  ]) {
+    const source = join(mirrorRoot, name);
+    if (!existsSync(source)) continue;
+    deployMirrorSubdir(source, target, previousManaged[name] ?? []);
+    managed[name] = topLevelEntryNames(source);
+  }
+  return managed;
+}
+
 export function removeRetiredPackageAgentsFile(packageRoot) {
   const target = join(packageRoot, 'AGENTS.md');
   const removed = existsSync(target);

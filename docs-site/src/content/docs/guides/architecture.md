@@ -34,7 +34,7 @@ Teammate 并行完成使用按任务 reservation 与父 dispatch 分组，处理
 - **工具面由宿主版本与 active/discovery 选择决定**
   - 调度：`teammate` · `teammate-send/list` · `observe`（watch/wait 为 opt-in legacy observation tools）
   - 编排：`maestro` · `goal` · `todo` · `run-control` · `plan-*`
-  - 连接：原生 `/mcp`（legacy 才注册 Maestro `mcp`）· `lsp` · `browser` · `smart_search` · `search`/`fffind`
+  - 连接：原生 `/mcp`（legacy 才注册 Maestro `mcp`）· `lsp` · `browser` · `smart_search` · `graph_search`/`graph_fffind`
   - 其他：`bash_bg` · `ask-user-question` · `open-code-review`；原生 `tool_search`（legacy 才用 `search_tool_bm25`）
 
 Plan 模式下额外激活 `plan-enter` / `plan-update` / `plan-review` / `plan-confirm` / `plan-exit` / `plan-status` 等只读规划工具。

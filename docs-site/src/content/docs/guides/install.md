@@ -68,7 +68,7 @@ Pi 0.99+ 使用宿主原生工具发现、模型/classifier、MCP 和键盘能�
 | pi-graph | `board` | 工作区共享 Gateway Board：任务、claim、依赖、Session/Plan/Todo 链接，见 [Gateway Board](/guides/gateway-board) |
 | pi-graph | `run-control` | 工作流 Run 生命周期 |
 | pi-graph | `ask-user-question` | 结构化用户输入收集 |
-| pi-graph | `lsp` / `browser` / `smart_search` / `search` / `fffind` / `search_tool_bm25` | 智能工具 |
+| pi-graph | `lsp` / `browser` / `smart_search` / `graph_search` / `graph_fffind` / `search_tool_bm25` | 智能工具 |
 | pi-graph | `plan-enter` 等 `plan-*` | 计划模式 |
 
 ## 验证安装

@@ -4,7 +4,7 @@ description: "Read-only architecture and execution planning specialist. Use to p
 systemPromptMode: replace
 inheritProjectContext: true
 thinking: high
-tools: read, search, find, ls
+tools: read, graph_search, find, ls
 inheritSkills: false
 ---
 

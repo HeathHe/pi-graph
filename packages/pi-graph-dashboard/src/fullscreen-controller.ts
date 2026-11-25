@@ -61,9 +61,9 @@ function clamp(value: number, minimum: number, maximum: number): number {
  * the main-screen document. Fields mirror TUI's render state; cast because they
  * are not part of the public surface.
  */
-function seedBaseline(tui: TUI, frame: string[], width: number): void {
+function seedBaseline(tui: TUI, frame: readonly string[], width: number): void {
 	const state = tui as unknown as {
-		previousLines: string[];
+		previousLines: readonly string[];
 		previousWidth: number;
 		previousHeight: number;
 		previousViewportTop: number;
@@ -133,7 +133,7 @@ export function createFullscreenController(options: FullscreenControllerOptions 
 		}
 	};
 
-	const compose = (rendered: string[], terminalRows: number): string[] => {
+	const compose = (rendered: ReturnType<RenderFunction>, terminalRows: number) => {
 		const startIndex = rendered.findIndex((line) => line.includes(EDITOR_START_SENTINEL));
 		if (startIndex < 0) return rendered;
 		const endIndex = rendered.findIndex((line, index) => index > startIndex && line.includes(EDITOR_END_SENTINEL));
@@ -259,7 +259,7 @@ export function createFullscreenController(options: FullscreenControllerOptions 
 
 		tui = nextTui;
 		originalRender = previousRender;
-		wrappedRender = function (this: TUI, width: number): string[] {
+		wrappedRender = function (this: TUI, width: number) {
 			const rendered = previousRender.call(nextTui, width);
 			try {
 				return compose(rendered, nextTui.terminal.rows);

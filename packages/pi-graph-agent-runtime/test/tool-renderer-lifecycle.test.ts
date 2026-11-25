@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { setQuietMode } from "pi-graph-shared-settings/ui";
-import { ToolExecutionComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
 import registerTeammateExtension from "../src/extension/index.ts";
 
-const plain = (lines: string[]) => lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()).filter(Boolean).join("\n");
+const plain = (lines: readonly string[]) => lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()).filter(Boolean).join("\n");
 afterEach(() => { setQuietMode(false, "check"); initTheme("dark", false); });
 
 function tools(): Map<string, ToolDefinition> {

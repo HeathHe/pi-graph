@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TuiMainScreen, type Component, type Terminal } from "@earendil-works/pi-tui";
+import { TuiMainScreen, type Component, type ProgramStatus, type Terminal } from "@earendil-works/pi-tui";
 import { attachViewportStability } from "../src/viewport-stability.ts";
 import { TerminalEmulator, stripAnsi } from "./terminal-emulator.ts";
 
@@ -8,6 +8,7 @@ class EmulatedTerminal implements Terminal {
 	columns: number;
 	rows: number;
 	kittyProtocolActive = false;
+	programStatus: ProgramStatus | undefined;
 	emu: TerminalEmulator;
 	constructor(columns: number, rows: number) {
 		this.columns = columns;
@@ -26,6 +27,10 @@ class EmulatedTerminal implements Terminal {
 	clearScreen(): void {}
 	setTitle(): void {}
 	setProgress(): void {}
+	setProgramStatus(status: ProgramStatus): void {
+		// Model a terminal without OSC 7501 support: retain the host state, but do not write it.
+		this.programStatus = status.state === "clear" ? undefined : status;
+	}
 }
 
 interface TuiInternals {
@@ -75,6 +80,19 @@ function assertScreenMatches(h: ReturnType<typeof harness>, label: string) {
 		`${label}\nexpected:\n${expected.map((l, i) => `  [${i}] ${l}`).join("\n")}\nactual:\n${actual.map((l, i) => `  [${i}] ${l}`).join("\n")}`,
 	);
 }
+
+test("emulator: program status does not alter the screen without OSC 7501 support", () => {
+	const h = harness(40, 3, ["visible text"]);
+	h.render();
+	const before = h.actualScreen();
+	const working: ProgramStatus = { state: "working", app: "pi", message: "Rendering" };
+	h.terminal.setProgramStatus(working);
+	assert.deepEqual(h.terminal.programStatus, working);
+	assert.deepEqual(h.actualScreen(), before);
+	h.terminal.setProgramStatus({ state: "clear" });
+	assert.equal(h.terminal.programStatus, undefined);
+	assert.deepEqual(h.actualScreen(), before);
+});
 
 test("emulator: transcript growth + dock churn leaves no residue", () => {
 	const W = 60;

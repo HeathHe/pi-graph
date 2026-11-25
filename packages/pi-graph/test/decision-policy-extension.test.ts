@@ -406,7 +406,7 @@ test("confirmation failure closes lane and leaves no policy", async (t) => {
 });
 
 test("manual Skill discovery and no-ideas project-to-suggestions-to-confirm contract", async () => {
-  const skill = await readFile(new URL("../../../.pi/skills/decision-policy/SKILL.md", import.meta.url), "utf8");
+  const skill = await readFile(new URL("../../../resources/skills/decision-policy/SKILL.md", import.meta.url), "utf8");
   assert.match(skill, /^---\nname: decision-policy\n/);
   assert.match(skill, /^disable-model-invocation: true$/m);
   assert.match(skill, /^session-mode: none$/m);
@@ -421,9 +421,6 @@ test("manual Skill discovery and no-ideas project-to-suggestions-to-confirm cont
   assert.match(skill, /Do not modify `\.pi\/decision-policy\.json` directly/);
   assert.match(skill, /evolve-capture/);
   assert.match(skill, /evolve-review/);
-  const pack = await readFile(new URL("../scripts/prepare-package-skills.mjs", import.meta.url), "utf8");
-  assert.match(pack, /sourceDir = resolve\(packageRoot, "\.\.", "\.\.", "\.pi"\)/);
-  assert.match(pack, /cpSync\(sourceDir, targetDir/);
   const extension = await readFile(new URL("../src/decision-policy/extension.ts", import.meta.url), "utf8");
   assert.doesNotMatch(extension, /executeAsk/);
   assert.match(extension, /saveDecisionPolicy\(current\.cwd, draft, revision, \(\) => authorized\(current, ctx, signal\)\)/);
@@ -582,7 +579,7 @@ test("host abort still closes panel after a save using the same lifetime signal"
 
 test("native Pi discovers the manual Skill but omits it from model prompts", async () => {
   const { loadSkillsFromDir, formatSkillsForPrompt } = await import("@earendil-works/pi-coding-agent");
-  const dir = fileURLToPath(new URL("../../../.pi/skills/decision-policy", import.meta.url));
+  const dir = fileURLToPath(new URL("../../../resources/skills/decision-policy", import.meta.url));
   const discovered = loadSkillsFromDir({ dir, source: "project" });
   assert.deepEqual(discovered.diagnostics, []);
   assert.equal(discovered.skills.length, 1);

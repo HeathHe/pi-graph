@@ -22,8 +22,8 @@
    - 4.8 [todo — 任务管理](#48-todo--任务管理)
    - 4.9 [run-control — 工作流 Run 控制](#49-run-control--工作流-run-控制)
    - 4.10 [ask-user-question — 结构化用户提问](#410-ask-user-question--结构化用户提问)
-   - 4.11 [search — 索引内容搜索](#411-search--索引内容搜索)
-   - 4.12 [fffind — FFF 文件路径搜索](#412-fffind--fff-文件路径搜索)
+   - 4.11 [graph_search — 索引内容搜索](#411-graph_search--索引内容搜索)
+   - 4.12 [graph_fffind — FFF 文件路径搜索](#412-graph_fffind--fff-文件路径搜索)
 5. [编程式 API（v1）](#5-编程式-apiv1)
 6. [GUI/UCL 侧车 HTTP API](#6-guiucl-侧车-http-api)
 7. [压缩设置与仲裁编程式接口](#7-压缩设置与仲裁编程式接口)
@@ -39,7 +39,7 @@
 
 | 包 | 版本 | 注册的工具 | 角色 |
 |----|------|-----------|------|
-| `pi-graph` | 0.5.0 | `maestro`、`goal`、`todo`、`run-control`、`ask-user-question`、`search`、`fffind` | 扩展包：流程命令、目标、任务、Run 控制、提问、索引搜索 |
+| `pi-graph` | 0.5.0 | `maestro`、`goal`、`todo`、`run-control`、`ask-user-question`、`graph_search`、`graph_fffind` | 扩展包：流程命令、目标、任务、Run 控制、提问、索引搜索 |
 | `pi-graph-agent-runtime` | 0.4.6 | `teammate`、`teammate-send`、`teammate-list`、`teammate-watch`、`teammate-wait` | 核心派发引擎：子代理 DAG 调度、RPC 消息 |
 
 **工具总览（12 个对外工具）**：
@@ -56,8 +56,8 @@
 | `todo` | 任务管理（create/update/list/get/delete/clear/next） | flow |
 | `run-control` | Maestro CLI 透传壳（Session/Run 生命周期，读写分类） | flow |
 | `ask-user-question` | 通过键盘优先的 TUI 向导收集结构化用户答案 | flow |
-| `search` | FFF 索引内容搜索（literal/regex/fuzzy，rg 兜底） | flow |
-| `fffind` | FFF 后端模糊文件路径搜索 | flow |
+| `graph_search` | FFF 索引内容搜索（literal/regex/fuzzy，rg 兜底） | flow |
+| `graph_fffind` | FFF 后端模糊文件路径搜索 | flow |
 
 > **对接方式选择**
 > - 在 Pi 代理 / LLM 上下文内调用 → 直接按工具名发起 JSON 工具调用（见 §3、§4）。
@@ -414,7 +414,7 @@ askUserQuestion({ questions: [
 
 ---
 
-### 4.11 `search` — 索引内容搜索
+### 4.11 `graph_search` — 索引内容搜索
 
 基于 [FFF](https://github.com/ff-labs/fff-node) 工作区原生索引的内容搜索，支持字面/正则/模糊三种模式与 lines/files/count 三种输出。索引只在 workspace root 建立一份、会话启动时预热；teammate 子会话通过 child-tool broker 共享同一索引。索引不可用时自动降级 ripgrep（`details.engine` 标注 `fff`/`rg`）。
 
@@ -436,15 +436,15 @@ askUserQuestion({ questions: [
 **示例**：
 
 ```js
-search({ pattern: "CompactionArbiter", context: 2, limit: 10 })
-search({ pattern: "TODO", output: "count", glob: "*.ts" })
+graph_search({ pattern: "CompactionArbiter", context: 2, limit: 10 })
+graph_search({ pattern: "TODO", output: "count", glob: "*.ts" })
 ```
 
 **注意**：`mode="fuzzy"` 依赖 FFF 索引且无 rg 等价物，索引不可用时返回明确错误；强制 `ignoreCase` 的含大写 pattern、以及 `!` 取反 glob 直接路由到 ripgrep。
 
 ---
 
-### 4.12 `fffind` — FFF 文件路径搜索
+### 4.12 `graph_fffind` — FFF 文件路径搜索
 
 基于 FFF 原生索引的模糊文件路径搜索。
 
@@ -460,10 +460,10 @@ search({ pattern: "TODO", output: "count", glob: "*.ts" })
 **示例**：
 
 ```js
-fffind({ pattern: "compaction arbiter", limit: 5 })
+graph_fffind({ pattern: "compaction arbiter", limit: 5 })
 ```
 
-**注意**：与 `search` 共享同一个 workspace-root `FileFinder` 实例和索引生命周期。两个工具均在权限白名单中（`ALWAYS_ALLOWED_TOOLS`），所有审批模式下自动放行。
+**注意**：与 `graph_search` 共享同一个 workspace-root `FileFinder` 实例和索引生命周期。两个工具均在权限白名单中（`ALWAYS_ALLOWED_TOOLS`），所有审批模式下自动放行。
 
 ---
 
@@ -890,8 +890,8 @@ console.log("风险清单:", risks);
 | `todo` | `action`（+`subject`/`id` 视 action） | `status`/`context`/`skills`/`filter`/`summary`/`goalId` | `{ tasks[], action, error? }` |
 | `run-control` | `argv`（Maestro CLI 参数） | — | CLI stdout + `{ argv, classification, command, snapshot, ownership? }` |
 | `ask-user-question` | `questions` | `options`/`multiSelect`/`header` | 结构化答案文本 |
-| `search` | `pattern` | `mode`/`output`/`glob`/`context`/`limit` | `path:line: content` 文本 |
-| `fffind` | `pattern` | `limit` | 相对路径列表文本 |
+| `graph_search` | `pattern` | `mode`/`output`/`glob`/`context`/`limit` | `path:line: content` 文本 |
+| `graph_fffind` | `pattern` | `limit` | 相对路径列表文本 |
 
 ---
 

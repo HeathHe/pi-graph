@@ -26,8 +26,8 @@ const BUILTIN_FALLBACK_RULES: ExpertsRules = {
     default: "deny",
     tools: {
       read: "allow",
-      search: "allow",
-      fffind: "allow",
+      graph_search: "allow",
+      graph_fffind: "allow",
       teammate: "allow",
       observe: "allow",
       todo: "allow",

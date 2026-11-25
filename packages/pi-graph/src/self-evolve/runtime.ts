@@ -300,7 +300,7 @@ export const SOP_TOOL_NAMES = new Set(["browser", "computer_use"]);
  * this closes the gap for the coarse ToolCallEvidence path.
  */
 export const EVIDENCE_TOOL_NAMES = new Set([
-  "bash", "read", "edit", "write", "grep", "find", "ls", "glob", "search", "fffind",
+  "bash", "read", "edit", "write", "grep", "find", "ls", "glob", "graph_search", "graph_fffind",
 ]);
 
 /** Error fragments mapped to structured outcomes (failure-mode signals). */

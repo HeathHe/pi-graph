@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import crossSpawn from "cross-spawn";
 import {
   cleanPackagedOptionalSkills,
-  cleanPackagedSkills,
   preparePackagedOptionalSkills,
-  preparePackagedSkills,
 } from "../scripts/prepare-package-skills.mjs";
 
 test("package preparation copies optional skills into the package root", () => {
@@ -28,45 +28,68 @@ test("package preparation copies optional skills into the package root", () => {
     assert.equal(existsSync(targetDir), false);
   } finally {
     cleanPackagedOptionalSkills({ targetDir });
-    cleanPackagedSkills({ targetDir: root });
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("package skill preparation copies canonical skills and removes generated output", () => {
-  const root = join(tmpdir(), `pi-maestro-pack-skills-${process.pid}-${Date.now()}`);
-  const sourceDir = join(root, "source");
-  const targetDir = join(root, "package", ".pi", "skills");
-  const skillPath = join(sourceDir, "workflow-skill-designer", "SKILL.md");
-  const teamSwarmPath = join(sourceDir, "team-swarm", "SKILL.md");
-  mkdirSync(join(sourceDir, "workflow-skill-designer"), { recursive: true });
-  mkdirSync(join(sourceDir, "team-swarm"), { recursive: true });
-  mkdirSync(join(sourceDir, "scratch"), { recursive: true });
-  mkdirSync(join(sourceDir, "instructions"), { recursive: true });
-  for (const name of ["plan", "review", "knowledge", "architecture"]) {
-    writeFileSync(join(sourceDir, "instructions", `${name}.md`), `# ${name} instructions\n`, "utf8");
-  }
-  writeFileSync(skillPath, "# Workflow skills\n", "utf8");
-  writeFileSync(teamSwarmPath, "# Team Swarm\n", "utf8");
-  writeFileSync(join(sourceDir, "SYSTEM.md"), "# System\n", "utf8");
-  writeFileSync(join(sourceDir, "settings.local.json"), "{}\n", "utf8");
-  writeFileSync(join(sourceDir, "model-failover.json"), "{}\n", "utf8");
-  writeFileSync(join(sourceDir, "scratch", "dbg.log"), "log\n", "utf8");
-
+test("prepack stages only distributed skills; publish whitelist and cleanup preserve the worktree split", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-graph-pack-skills-"));
+  const packageDir = join(root, "packages", "pi-graph");
+  const script = join(packageDir, "scripts", "prepare-package-skills.mjs");
+  const sources = {
+    "resources/skills/team-swarm/SKILL.md": "# Team Swarm\n",
+    "resources/skills/team-swarm/scripts/aco.py": "# Swarm script\n",
+    "optional/skills/scholar-writing/SKILL.md": "# Optional skill\n",
+    ".pi/skills/local-only/SKILL.md": "# User-owned work\n",
+    ".pi/instructions/knowledge.md": "# Knowledge\n",
+    ".pi/settings.local.json": "{}\n",
+    ".pi/model-failover.json": "{}\n",
+    ".pi/scratch/debug.log": "log\n",
+    "packages/pi-graph/src/unrelated.ts": "// Unsaved work\n",
+  };
   try {
-    preparePackagedSkills({ sourceDir, targetDir });
-    assert.equal(readFileSync(join(targetDir, "workflow-skill-designer", "SKILL.md"), "utf8"), "# Workflow skills\n");
-    assert.equal(readFileSync(join(targetDir, "team-swarm", "SKILL.md"), "utf8"), "# Team Swarm\n");
-    assert.equal(readFileSync(join(targetDir, "SYSTEM.md"), "utf8"), "# System\n");
-    for (const name of ["plan", "review", "knowledge", "architecture"]) {
-      assert.equal(readFileSync(join(targetDir, "instructions", `${name}.md`), "utf8"), `# ${name} instructions\n`);
+    for (const [relativePath, content] of Object.entries(sources)) {
+      const path = join(root, relativePath);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, content);
     }
-    assert.equal(existsSync(join(targetDir, "settings.local.json")), false, "settings.local.json is local-only");
-    assert.equal(existsSync(join(targetDir, "model-failover.json")), false, "model-failover.json is local-only");
-    assert.equal(existsSync(join(targetDir, "scratch")), false, "scratch is local-only");
-    cleanPackagedSkills({ targetDir });
-    assert.equal(existsSync(targetDir), false);
+    mkdirSync(join(packageDir, "scripts"), { recursive: true });
+    copyFileSync(new URL("../scripts/prepare-package-skills.mjs", import.meta.url), script);
+    copyFileSync(new URL("../package.json", import.meta.url), join(packageDir, "package.json"));
+
+    execFileSync(process.execPath, [script], { cwd: packageDir });
+    const included = [
+      "skills/team-swarm/SKILL.md",
+      "skills/team-swarm/scripts/aco.py",
+      ".pi/instructions/knowledge.md",
+      "optional/skills/scholar-writing/SKILL.md",
+    ];
+    for (const path of included) assert.ok(existsSync(join(packageDir, path)), path);
+    for (const path of [".pi/skills", ".pi/settings.local.json", ".pi/model-failover.json", ".pi/scratch"]) {
+      assert.equal(existsSync(join(packageDir, path)), false, path);
+    }
+    assert.equal(existsSync(join(packageDir, "skills", "local-only")), false);
+
+    // Even stale nested .pi/skills in the package cannot bypass the whitelist.
+    mkdirSync(join(packageDir, ".pi", "skills", "local-only"), { recursive: true });
+    writeFileSync(join(packageDir, ".pi", "skills", "local-only", "SKILL.md"), "# Stale package mirror\n");
+    const npmArgs = ["pack", "--dry-run", "--ignore-scripts", "--offline", "--json", "--cache", join(root, "npm-cache")];
+    const npmCli = process.env.npm_execpath;
+    const dryRun = crossSpawn.sync(npmCli ? process.execPath : "npm", npmCli ? [npmCli, ...npmArgs] : npmArgs, {
+      cwd: packageDir, encoding: "utf8", timeout: 15_000,
+    });
+    assert.ifError(dryRun.error);
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    const [packed] = JSON.parse(dryRun.stdout);
+    const published = packed.files.map(({ path }) => path);
+    for (const path of included) assert.ok(published.includes(path), path);
+    assert.ok(published.every((path) => !path.startsWith(".pi/skills/") && !path.includes("local-only")));
+
+    for (let i = 0; i < 2; i++) execFileSync(process.execPath, [script, "--clean"], { cwd: packageDir });
+    assert.equal(existsSync(join(packageDir, "skills")), false);
+    assert.equal(existsSync(join(packageDir, ".pi")), false);
+    for (const [path, content] of Object.entries(sources)) assert.equal(readFileSync(join(root, path), "utf8"), content, path);
   } finally {
-    cleanPackagedSkills({ targetDir });
-    cleanPackagedSkills({ targetDir: root });
+    rmSync(root, { recursive: true, force: true });
   }
 });

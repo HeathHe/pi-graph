@@ -128,7 +128,7 @@ node scripts/self-evolve-approval.mjs record|query|reconcile   # 晋升审计回
 node scripts/self-evolve-phase5.mjs canary|proposal|apply|revert  # 在线验证 / skill 演化
 ```
 
-详见 [self-evolve SKILL](../.pi/skills/self-evolve/SKILL.md) 与 [扩展 README](../packages/pi-graph/src/self-evolve/README.md)。
+详见 [self-evolve SKILL](../resources/skills/self-evolve/SKILL.md) 与 [扩展 README](../packages/pi-graph/src/self-evolve/README.md)。
 
 ## 6. 其他增强
 

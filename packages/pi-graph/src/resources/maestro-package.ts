@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -11,6 +11,26 @@ export function resolveOwnPackageJson(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+export function resolveBundledSkills(
+  packageJsonPath = resolveOwnPackageJson(),
+): { packageRoot: string; skillsDir: string } | undefined {
+  if (!packageJsonPath) return undefined;
+  try {
+    const manifest = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    if (manifest?.name !== "pi-graph" || manifest.private === true || !Array.isArray(manifest.pi?.skills)) return undefined;
+    const packageRoot = dirname(packageJsonPath);
+    // A legacy path is valid only when declared by the package itself.
+    for (const path of ["./skills", "./.pi/skills"]) {
+      if (!manifest.pi.skills.includes(path)) continue;
+      const skillsDir = join(packageRoot, path);
+      if (statSync(skillsDir, { throwIfNoEntry: false })?.isDirectory()) return { packageRoot, skillsDir };
+    }
+  } catch {
+    // Missing or unreadable package manifest/resources.
+  }
+  return undefined;
 }
 
 function resolveWorkspaceRoot(packageDir: string): string | undefined {

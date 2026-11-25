@@ -147,7 +147,7 @@ export async function searchScopeBlockReason(
   cwd: string,
   options: SearchScopeGuardOptions = {},
 ): Promise<string | undefined> {
-  if (toolName !== "grep" && toolName !== "search" && toolName !== "fffind") return undefined;
+  if (toolName !== "grep" && toolName !== "graph_search" && toolName !== "graph_fffind") return undefined;
 
   const workspaceRoot = resolve(cwd);
   const searchPath = resolveSearchScopePath(input.path, workspaceRoot);

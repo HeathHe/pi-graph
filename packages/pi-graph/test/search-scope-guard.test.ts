@@ -47,7 +47,7 @@ test("search scope guard rejects symlink and junction escapes", async () => {
     await symlink(outside, join(workspace, "external"), process.platform === "win32" ? "junction" : "dir");
 
     assert.match(
-      await searchScopeBlockReason("search", { path: "external" }, workspace) ?? "",
+      await searchScopeBlockReason("graph_search", { path: "external" }, workspace) ?? "",
       /outside the current workspace/,
     );
   } finally {
@@ -88,7 +88,7 @@ test("search scope guard blocks large root searches when no applicable ignore fi
     assert.match(grepReason ?? "", /root search blocked/);
     assert.match(grepReason ?? "", /no applicable ignore file/);
 
-    const fffReason = await searchScopeBlockReason("search", {}, root, { maxEntries: 3 });
+    const fffReason = await searchScopeBlockReason("graph_search", {}, root, { maxEntries: 3 });
     assert.match(fffReason ?? "", /add \.gitignore/);
 
     let clock = 0;
@@ -130,13 +130,13 @@ test("search scope guard recognizes tool-specific ignore files", async () => {
       undefined,
     );
     assert.match(
-      await searchScopeBlockReason("search", {}, root, { maxEntries: 1 }) ?? "",
+      await searchScopeBlockReason("graph_search", {}, root, { maxEntries: 1 }) ?? "",
       /add \.gitignore/,
     );
 
     await writeFile(join(root, ".gitignore"), "generated/\n");
     assert.equal(
-      await searchScopeBlockReason("search", {}, root, { maxEntries: 1 }),
+      await searchScopeBlockReason("graph_search", {}, root, { maxEntries: 1 }),
       undefined,
     );
   });

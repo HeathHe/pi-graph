@@ -8,7 +8,7 @@ import { SKILL_SESSION_MODES } from "../src/skills/skill-loader.ts";
 import { transformPiContent } from "../../../convert-pi.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const skillsRoot = join(repoRoot, ".pi", "skills");
+const skillsRoot = join(repoRoot, "resources", "skills");
 const coreSkills = new Set([
   "maestro-next",
   "maestro-ralph",

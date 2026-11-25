@@ -10,8 +10,34 @@ import {
   loadBundledAgentsInstructions,
   registerMaestroPackageResources,
   resolveBundledAgentsPath,
+  resolveBundledSkills,
   resolvePackageOrWorkspaceResource,
 } from "../src/resources/maestro-package.ts";
+
+test("bundled Skill lookup only uses existing paths declared by the Graph package", () => {
+  const root = join(tmpdir(), `pi-graph-bundled-skills-${process.pid}-${Date.now()}`);
+  const packageRoot = join(root, "packages", "pi-graph");
+  const packageJson = join(packageRoot, "package.json");
+  const legacySkills = join(packageRoot, ".pi", "skills");
+  const canonicalSkills = join(packageRoot, "skills");
+  const manifest = (skills: string[], isPrivate = false) => JSON.stringify({ name: "pi-graph", private: isPrivate, pi: { skills } });
+  try {
+    for (const dir of [join(root, ".pi", "skills"), join(root, "resources", "skills"), legacySkills]) {
+      mkdirSync(dir, { recursive: true });
+    }
+    writeFileSync(join(root, "package.json"), manifest(["./.pi/skills"], true));
+    writeFileSync(packageJson, manifest(["./skills"]));
+    assert.equal(resolveBundledSkills(packageJson), undefined);
+    assert.equal(resolveBundledSkills(join(root, "package.json")), undefined);
+
+    mkdirSync(canonicalSkills);
+    assert.deepEqual(resolveBundledSkills(packageJson), { packageRoot, skillsDir: canonicalSkills });
+    writeFileSync(packageJson, manifest(["./.pi/skills"]));
+    assert.deepEqual(resolveBundledSkills(packageJson), { packageRoot, skillsDir: legacySkills });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("package resources prefer the installed npm package and configure teammate agents", () => {
   const root = join(tmpdir(), `pi-maestro-package-resources-${process.pid}-${Date.now()}`);

@@ -178,7 +178,7 @@ test("importing health helpers never runs maestro or writes snapshot/handled fil
 });
 
 test("Skill routes publication through canonical closeout, never default bulk or session-sealed gates", () => {
-  const skill = readFileSync(new URL("../../../.pi/skills/self-evolve/SKILL.md", import.meta.url), "utf8");
+  const skill = readFileSync(new URL("../../../resources/skills/self-evolve/SKILL.md", import.meta.url), "utf8");
   assert.match(skill, /~\/\.maestro\/ref\/knowledge-closeout\.md/);
   assert.match(skill, /session\/3\.0/);
   for (const word of ["content hash", "identity/revision", "evidence roots/hash", "最终提交", "固定", "人工批准", "数据不足"]) {

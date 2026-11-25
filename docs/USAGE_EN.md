@@ -23,7 +23,7 @@
    - [lsp — Language Server Integration](#31-lsp--language-server-integration)
    - [browser — Browser Control](#32-browser--browser-control)
    - [smart_search — Web Search & Research](#33-smart_search--web-search--research)
-   - [search / fffind — Fast Search](#34-search--fffind--fast-search)
+   - [graph_search / graph_fffind — Fast Search](#34-graph_search--graph_fffind--fast-search)
    - [search_tool_bm25 — Tool Discovery](#35-search_tool_bm25--tool-discovery)
 4. [MCP Integration](#4-mcp-integration)
 5. [Permission System](#5-permission-system)
@@ -84,7 +84,7 @@ Upgrades migrate Flow-managed companion registrations. A same-name local develop
 
 On Pi 0.99+, the host owns the tool loadout, `tool_search`, model/classifier runtime, MCP, and keyboard capabilities. Missing native APIs do not start a second legacy runtime. Optional Pi host peers keep their `*` ranges. Use native `/mcp`; disable `builtin:mcp` before previewing and approving old-config migration with `/maestro-mcp-migrate`, then restore the native manager.
 
-- `search` replaces `ffgrep`: literal/regex/fuzzy matching and lines/files/count output; bounded `rg` handles unavailable indexes and root-wide plain/regex searches. Fuzzy still requires the index. Narrow path/glob for large projects.
+- `graph_search` replaces `ffgrep`: literal/regex/fuzzy matching and lines/files/count output; bounded `rg` handles unavailable indexes and root-wide plain/regex searches. Fuzzy still requires the index. Narrow path/glob for large projects.
 - `open-code-review` needs a separately installed `ocr` CLI. `preview`/`rules` resolve files/rules only; `review` performs OCR-managed review with the runtime model; `health` checks connectivity. Configure the model via `/api-manager open-code-review`; see `packages/pi-graph/optional/OCR-SETUP.md` for installation.
 - Optional Ask transports race the local TUI and cancel the other surface; Mobile cancellation also closes the local wizard. Plan confirm/review exposes an optional transport seam with revision checks, not a promise that every client already has a Plan UI. The v0.35.0 Refine transport instead mirrors the local panel and relays intents without running another subagent. The local TUI stays authoritative and survives mirror failure. Optimized drafts report `applied` only after the PlanStore commit; review feedback still returns to discussion, not draft application or Plan approval.
 - Native Quiet mode toggles live without activating extra tools; initial resumed-history rendering and third-party execution-only overrides remain limitations. See the docs-site [Cockpit guide](../docs-site/src/content/docs/guides/cockpit.md).
@@ -108,8 +108,8 @@ After installation, the plugin registers these tools with Pi:
 | pi-graph | `lsp` | Language Server Protocol integration |
 | pi-graph | `browser` | Chromium browser control |
 | pi-graph | `smart_search` | Web search / deep research / URL fetch |
-| pi-graph | `search` | FFF indexed content search (literal/regex/fuzzy, rg fallback) |
-| pi-graph | `fffind` | FFF fast fuzzy file search |
+| pi-graph | `graph_search` | FFF indexed content search (literal/regex/fuzzy, rg fallback) |
+| pi-graph | `graph_fffind` | FFF fast fuzzy file search |
 | pi-graph | `search_tool_bm25` | BM25 tool discovery |
 | pi-graph | `model-availability` | Secret-free model registration and route diagnostics |
 | pi-graph | `plan-enter` | Enter Plan mode |
@@ -590,27 +590,27 @@ Configure via `Alt+S` or `/smart-search-config`.
 
 ---
 
-### 3.4 search / fffind — Fast Search
+### 3.4 graph_search / graph_fffind — Fast Search
 
 Workspace-native index search powered by [FFF](https://github.com/fff-labs/fff). The index warms up at session start and stays in memory; teammate child sessions share the same index through a broker:
 
 ```javascript
 // Literal content search (default mode="plain")
-search({ pattern: "validateToken", context: 3, limit: 20 })
+graph_search({ pattern: "validateToken", context: 3, limit: 20 })
 
 // Regex / fuzzy content search
-search({ pattern: "fn\\s+validate\\w*", mode: "regex" })
-search({ pattern: "valdiate token", mode: "fuzzy" })
+graph_search({ pattern: "fn\\s+validate\\w*", mode: "regex" })
+graph_search({ pattern: "valdiate token", mode: "fuzzy" })
 
 // Output shapes: files = paths only; count = per-file hit counts
-search({ pattern: "TODO", output: "files" })
-search({ pattern: "deprecated", output: "count", glob: "*.ts" })
+graph_search({ pattern: "TODO", output: "files" })
+graph_search({ pattern: "deprecated", output: "count", glob: "*.ts" })
 
 // Fuzzy file path search
-fffind({ pattern: "auth middleware", limit: 10 })
+graph_fffind({ pattern: "auth middleware", limit: 10 })
 ```
 
-When the index is unavailable, `search` falls back to ripgrep (results are annotated `[engine: rg]`); `mode="fuzzy"` has no fallback equivalent and reports an explicit error instead.
+When the index is unavailable, `graph_search` falls back to ripgrep (results are annotated `[engine: rg]`); `mode="fuzzy"` has no fallback equivalent and reports an explicit error instead.
 
 ---
 
@@ -754,7 +754,7 @@ Rules can be configured at session level (temporary) or local settings file (per
 
 These tools are auto-allowed in all modes (read-only or side-effect free):
 
-`Read`, `Grep`, `Glob`, `Ls`, `Find`, `search`, `fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
+`Read`, `Grep`, `Glob`, `Ls`, `Find`, `graph_search`, `graph_fffind`, `ask-user-question`, `teammate`, `teammate-send`, `teammate-list`, `teammate-watch`, `goal`, `todo`, `plan-*`, `search_tool_bm25`
 
 ### Teammate Child Permission Relay
 
@@ -942,7 +942,7 @@ Intelligent context window management preventing long session overflow:
 | **Auto-prune** | Automatically prunes large tool results (≥4KB) when context hits threshold (~70%) |
 | **Keep recent** | Always preserves ~20K tokens of recent conversation |
 | **Reserve space** | Reserves ~16K tokens for model response |
-| **Replayable tools** | `read`, `grep`, `glob`, `search`, `find`, `resource` results safely prunable (re-executable on demand; pruned `resource` results keep their URI for re-reading) |
+| **Replayable tools** | `read`, `grep`, `glob`, `graph_search`, `find`, `resource` results safely prunable (re-executable on demand; pruned `resource` results keep their URI for re-reading) |
 | **Compaction continue** | Auto-injects continuation prompt after compaction, agent resumes from checkpoint |
 | **State persistence** | Prune state persisted across sessions |
 

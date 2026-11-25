@@ -15,7 +15,7 @@
 
 ---
 
-**pi-graph** is the **all-in-one** entry point of the three-plugin suite. A single `pi install npm:pi-graph@0.2.7` upgrades the [Pi coding agent](https://github.com/earendil-works/pi) into a coordinated engineering team:
+**pi-graph** is the **all-in-one** entry point of the three-plugin suite. A single `pi install npm:pi-graph@0.2.8` upgrades the [Pi coding agent](https://github.com/earendil-works/pi) into a coordinated engineering team:
 
 > **Source checkout:** Pi Graph starts from upstream Flow 0.35.1, Teammate 2.10.2, and Cockpit 0.24.5. The Graph npm install examples apply only after publication. See [source setup and package mapping](https://github.com/HeathHe/pi-graph/blob/main/docs/GRAPH-PACKAGING.md).
 
@@ -60,8 +60,8 @@ The companion plugins are dependencies and **auto-register on postinstall** — 
 | **Todo tool** | 1 | `todo` (create / update / list / get / delete / clear / next / advance) |
 | **Run control** | 1 | `run-control` (`session status`; `run brief/check/next/complete`; `session chain insert/update`) |
 | **Shell tool** | 1 | `bash_bg` (adaptive foreground/background execution) |
-| **Intelligence tools** | host-dependent | `lsp`, `browser`, `smart_search`, `source_check`; native `tool_search` (legacy `search_tool_bm25`) |
-| **Search tools** | 2 | `search`, `fffind` (shared index; bounded rg for plain/regex fallback) |
+| **Intelligence tools** | host-dependent | `lsp`, `browser`, `smart_search`, `graph_source_check`; native `tool_search` (legacy `search_tool_bm25`) |
+| **Search tools** | 2 | `graph_search`, `graph_fffind` (shared index; bounded rg for plain/regex fallback) |
 | **Other tools** | host-dependent | `ask-user-question`, `model-availability`, `open-code-review`; Pi 0.99+ owns MCP |
 | **Plan tools** | 5 | `plan-enter`, `plan-update`, `plan-review`, `plan-confirm`, `plan-exit` (+ `plan-status`) |
 | **Workflow docs** | 87 | Installed from `maestro-flow` to `~/.maestro/workflows` |
@@ -81,7 +81,7 @@ Skills (63, maintained by [Maestro Flow](https://github.com/catlog22/maestro-flo
 
 ```bash
 # From npm, including upgrades
-pi install npm:pi-graph@0.2.7
+pi install npm:pi-graph@0.2.8
 
 # Or from local path (development)
 pi install ./packages/pi-graph
@@ -91,7 +91,7 @@ After installation:
 - Maestro dispatch is available through the single `maestro` tool
 - Autonomous Goal state is available through `goal`; use `/goal stop`, `/goal resume`, and `/goal clear` for lifecycle control
 - Adaptive foreground/background shell is available through `bash_bg` (auto-backgrounds on timeout, notifies on completion)
-- LSP navigation/refactoring, named-tab browser control, smart search, and source verification are available through `lsp`, `browser`, `smart_search`, and `source_check`; Pi 0.99+ owns `tool_search`, while legacy hosts use `search_tool_bm25`
+- LSP navigation/refactoring, named-tab browser control, smart search, and source verification are available through `lsp`, `browser`, `smart_search`, and `graph_source_check`; Pi 0.99+ owns `tool_search`, while legacy hosts use `search_tool_bm25`
 - Compaction capacity management, API retry settings, and model failover are configured through `/maestro-compaction`, `/api-manager`, and `/model-failover`
 - Vision delegation is active when the primary model is text-only: `describe_image` is auto-activated and routes image analysis to a multimodal model; configure with `/vision`
 - Pi 0.99+ uses native `/mcp` and `/mcp login <name>`; `/mcp auth` is legacy-only. Disable `builtin:mcp` before previewing and approving migration with `/maestro-mcp-migrate`.
@@ -196,16 +196,15 @@ run-control({ argv: ["run", "complete", "run-123", "--session", "session-123", "
 
 ## Pi Skill Conversion
 
-Pi skills are generated in two stages. `convert.mjs` performs the source-to-Pi
-directory conversion; `convert-pi.mjs --dst .pi` then applies Pi-specific prompt
-semantics, including the current Run/Session command surface. The latter is not an
-install or prepack concern: package preparation copies the already converted canonical
-`.pi/skills` tree unchanged.
+`sync-pi.mjs` prepares a converted mirror under `.pi-sync/`, including the current
+Run/Session command surface. `node sync-pi.mjs --also-pi` deploys converted skills to
+`resources/skills/` and agents to `.pi/agents/`, leaving project-local `.pi/skills/` alone.
+Conversion is not an install or prepack concern: package preparation copies the already
+converted canonical `resources/skills/` tree.
 
 Use these checks before publishing a skill change:
 
 ```bash
-node convert-pi.mjs --dst .pi
 npm --prefix packages/pi-graph run test:conversion
 npm --prefix packages/pi-graph run check:maestro-run-cli
 ```
@@ -214,7 +213,7 @@ Generated core Pi skills include `run-control` in `allowed-tools` and route life
 
 ## Skills
 
-63 skills are bundled in the canonical `.pi/skills/` directory and maintained by the [Maestro Flow](https://github.com/catlog22/maestro-flow) project. They span six categories:
+Bundled skills live in `resources/skills/` in this repository and are maintained by the [Maestro Flow](https://github.com/catlog22/maestro-flow) project. The skill catalog includes these categories:
 
 | Category | Count | Examples |
 |----------|-------|---------|
@@ -611,24 +610,23 @@ so the normal Todo loader can re-inject the canonical skill after compaction.
 
 ## Project skills and teammate agents
 
-Skills are authored and maintained by the [Maestro Flow](https://github.com/catlog22/maestro-flow) project; this package bundles the canonical `.pi/skills/` tree as a Pi package resource. The npm package declares its skill set through `pi.skills`, pointing to
-the bundled `.pi/skills/` directory. In this repository the canonical source set lives under
-the root `.pi/skills`; prepack copies it into `packages/pi-graph/.pi/skills` for npm,
-while the root `.pi/settings.json` references its local `skills` directory for development. Install the package through
-`pi install npm:pi-graph@0.2.7` (or register a local package path) and Pi discovers
-the bundled skills through its standard package resource loader.
+The npm package declares `pi.skills: ["./skills"]`. Prepack copies the canonical
+`resources/skills/` source into `packages/pi-graph/skills/` for npm. The repository's
+`.pi/skills/` is for project-local skills only and is not packaged. Install the package
+through `pi install npm:pi-graph@0.2.8` (or register a prepared local package path)
+and Pi discovers the bundled skills through its standard package resource loader.
 
 Project system instructions use `.pi/SYSTEM.md` as their single authority; the
 previous bundled `AGENTS.md` injection is retired. Migrate projects that depended
 on that old injection to `.pi/SYSTEM.md`.
 
-`pi-graph@0.2.7` requires `maestro-flow >=0.5.91` as an associated workflow resource package (a range, not an exact pin). Package installation does not imply model inference validation.
+`pi-graph@0.2.8` requires `maestro-flow >=0.5.91` as an associated workflow resource package (a range, not an exact pin). Package installation does not imply model inference validation.
 During postinstall it calls Maestro's workflows-only installer from the prepared registry
 artifact, which includes the complete runtime `dist` tree and canonical workflow documents.
 The installer writes to `~/.maestro/workflows`. The active Maestro CLI remains an environment
 runtime, and local development may link the latest `maestro-flow` checkout explicitly.
 The extension does not register the installed `maestro-flow` package's `.agents/skills`
-directory, so compatibility mirrors cannot compete with the plugin's canonical `.pi/skills`
+directory, so compatibility mirrors cannot compete with the plugin's bundled `skills/`
 resources.
 
 Agent definitions are not a native Pi package resource type and must not be declared
@@ -719,8 +717,8 @@ MCP servers that require OAuth authentication are handled automatically: `/mcp a
 │  Extension tools:                        │
 │    maestro · goal · todo · run-control   │
 │    bash_bg · lsp · browser · mcp         │
-│    smart_search · source_check            │
-│    ffgrep/fffind · search_tool_bm25      │
+│    smart_search · graph_source_check      │
+│    ffgrep/graph_fffind · search_tool_bm25 │
 │    model-availability · plan-*            │
 │                                          │
 │  Subsystems:                             │

@@ -4,7 +4,7 @@ import { getPiHostMode } from "pi-graph-shared-settings/v1";
 
 const DEFERRED_TOOLS = new Set([
   "browser", "computer_use", "conflict", "loop", "lsp", "model-availability",
-  "smart_search", "source_check", "teammate-session-routing",
+  "smart_search", "graph_source_check", "teammate-session-routing",
 ]);
 const CONTROL_TOOLS = new Set([
   "maestro", "goal", "todo", "run-control", "ask-user-question", "new_context",

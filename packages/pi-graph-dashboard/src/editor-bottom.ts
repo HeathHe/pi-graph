@@ -71,7 +71,7 @@ export function createEditorBottomController(
 
 		tui = nextTui;
 		originalRender = previousRender;
-		wrappedRender = function (this: TUI, width: number): string[] {
+		wrappedRender = function (this: TUI, width: number) {
 			const rendered = previousRender.call(nextTui, width);
 			const markerIndex = rendered.findIndex((line) => line.includes(EDITOR_BOTTOM_SENTINEL));
 			if (markerIndex < 0) return rendered;

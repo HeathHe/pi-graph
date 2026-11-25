@@ -1,6 +1,6 @@
 {
   "name": "pi-graph-shared-settings",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Versioned Settings and i18n contracts shared by Pi Graph plugins.",
   "type": "module",
   "engines": {

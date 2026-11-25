@@ -104,7 +104,7 @@ Pi Graph classifies intent and routes automatically: **simple tasks** run direct
 - **19 always-on tools + 5 dynamic Plan tools**
   - Dispatch: `teammate` · `teammate-send/list/watch/wait`
   - Orchestration: `maestro` · `goal` · `todo` · `run-control` · `plan-*`
-  - Connectivity: `mcp` · `lsp` · `browser` · `smart_search` · `search`/`fffind`
+  - Connectivity: `mcp` · `lsp` · `browser` · `smart_search` · `graph_search`/`graph_fffind`
   - Other: `bash_bg` · `ask-user-question` · `search_tool_bm25`
 - **63 skills** (maintained by [Maestro Flow](https://github.com/catlog22/maestro-flow)) — spanning workflow orchestration, knowledge management, team coordination, UI design, academic writing, and skill tooling. Full catalog: [Maestro Flow skills directory](https://github.com/catlog22/maestro-flow/tree/main/skills)
 - **32 agent roles** — 7 built-in (explorer, planner, analyst, research, general, verifier, workflow) + 25 project-level (executor, reviewer, debugger, roadmapper…)
@@ -130,7 +130,7 @@ Full tool parameters and workflow definitions live in the **[Usage Guide](docs/U
 
 - **[Maestro-Flow](https://github.com/catlog22/maestro-flow)** — intent-driven workflow orchestration by [@catlog22](https://github.com/catlog22)
 - **[Pi Coding Agent](https://github.com/earendil-works/pi)** — terminal coding harness (host runtime) by [@earendil-works](https://github.com/earendil-works)
-- Upstream libraries powering built-in tools: [@modelcontextprotocol/sdk](https://modelcontextprotocol.io) (`mcp`; SDK `1.32.1`) · [Puppeteer](https://github.com/puppeteer/puppeteer) (`browser`; `puppeteer-core 25.12.0`) · [@ff-labs/fff-node](https://github.com/dmtrKovalenko/fff) (`search`/`fffind`) · [@konbakuyomu/smart-search](https://github.com/konbakuyomu/smartsearch) (`smart_search`) · [pi-web-access](https://github.com/nicobailon/pi-web-access) (native web search/extraction/curator)
+- Upstream libraries powering built-in tools: [@modelcontextprotocol/sdk](https://modelcontextprotocol.io) (`mcp`; SDK `1.32.1`) · [Puppeteer](https://github.com/puppeteer/puppeteer) (`browser`; `puppeteer-core 25.12.0`) · [@ff-labs/fff-node](https://github.com/dmtrKovalenko/fff) (`graph_search`/`graph_fffind`) · [@konbakuyomu/smart-search](https://github.com/konbakuyomu/smartsearch) (`smart_search`) · [pi-web-access](https://github.com/nicobailon/pi-web-access) (native web search/extraction/curator)
 
 ## License
 

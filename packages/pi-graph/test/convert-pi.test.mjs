@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { convertPiDirectory, transformPiContent } from "../../../convert-pi.mjs";
 
-const piSkills = join(import.meta.dirname, "..", "..", "..", ".pi", "skills");
+const piSkills = join(import.meta.dirname, "..", "..", "..", "resources", "skills");
 
 test("converted team skill mirrors retain v3 Run contracts", () => {
   for (const name of ["team-arch-opt", "team-issue", "team-lifecycle-v4", "team-perf-opt",

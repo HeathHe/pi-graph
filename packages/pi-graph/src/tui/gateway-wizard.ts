@@ -14,8 +14,7 @@
  * Keys: ↑↓/jk select · Enter confirm · Esc back/close · g start tunnel · x stop tunnel
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-graph-shared-settings/ui";
 
@@ -26,6 +25,7 @@ const FRAME_UTILS = {
 };
 import { readTunnelState, startQuickTunnel as startCloudflareQuickTunnel, stopQuickTunnel as stopCloudflareQuickTunnel, writeGatewayConfigChanges } from "../gateway/workspace-client.ts";
 import { gatewayConfigPath } from "../gateway/state-paths.ts";
+import { resolveBundledSkills } from "../resources/maestro-package.ts";
 
 export interface GatewayWizardParams {
   cwd: string;
@@ -543,10 +543,10 @@ export class GatewayWizardOverlay implements Component, Focusable {
           option(1, "不添加"),
         ];
       case "skills": {
-        const detected = this.detectPiSkillsDir() ?? "未检测到 .pi/skills";
+        const detected = this.detectPiSkillsDir();
         return [
-          fitLine(`Skill 发现目录：追加 Pi 插件 skill 目录（detected: ${detected}）`, inner),
-          option(0, "追加", detected === "未检测到 .pi/skills" ? "（未检测到目录，可跳过）" : `追加 ${detected}`),
+          fitLine(`Skill 发现目录：追加 Pi 插件 skill 目录（detected: ${detected ?? "未检测到"}）`, inner),
+          option(0, "追加", detected ? `追加 ${detected}` : "（未检测到目录，可跳过）"),
           option(1, "跳过"),
         ];
       }
@@ -615,13 +615,7 @@ export class GatewayWizardOverlay implements Component, Focusable {
   }
 
   private detectPiSkillsDir(): string | undefined {
-    // Best-effort: the pi plugin skills live under {repo}/.pi/skills; the cwd is
-    // the most likely repo root, otherwise fall back to known check.
-    const candidates = [
-      join(this.params.cwd, ".pi", "skills"),
-      join(this.params.cwd, "..", ".pi", "skills"),
-    ];
-    return candidates.find((candidate) => existsSync(candidate));
+    return resolveBundledSkills()?.skillsDir;
   }
 
   handleInput(data: string): void {

@@ -49,7 +49,7 @@ test("native Flow renderer lifecycle preserves running rows and canonical contex
     { tool: tools.get("resource"), args: { uri: "agent://publication" } },
     { tool: tools.get("session_history"), args: { action: "timeline", scope: "current_session" } },
     { tool: tools.get("smart_search"), args: { mode: "search", query: "renderer lifecycle" } },
-    { tool: tools.get("source_check"), args: { claim: "Native context carries tool errors" } },
+    { tool: tools.get("graph_source_check"), args: { claim: "Native context carries tool errors" } },
     ...["plan-enter", "plan-update", "plan-review", "plan-confirm", "plan-decompose", "plan-exit", "plan-status"]
       .map((name) => ({ tool: tools.get(name), args: {} })),
   ];

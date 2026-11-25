@@ -36,7 +36,7 @@
     "@modelcontextprotocol/sdk": "1.32.1",
     "pi-graph-execution-api": "0.1.5",
     "pi-graph-device-api": "0.1.0",
-    "typebox": "1.4.7"
+    "typebox": "1.3.27"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-sdk-client": "*"

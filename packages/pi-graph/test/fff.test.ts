@@ -16,9 +16,9 @@ test("FFF tools are registered for the root Maestro session", () => {
     on() {},
   } as unknown as ExtensionAPI);
 
-  assert.ok(tools.includes("search"));
-  assert.ok(tools.includes("fffind"));
-  assert.ok(!tools.includes("ffgrep"), "ffgrep is replaced by search");
+  assert.ok(tools.includes("graph_search"));
+  assert.ok(tools.includes("graph_fffind"));
+  assert.ok(!tools.includes("ffgrep"), "ffgrep is replaced by graph_search");
 });
 
 test("FFF refuses home-directory workspace roots", async () => {
@@ -35,7 +35,7 @@ test("FFF refuses home-directory workspace roots", async () => {
   };
   registerFff(register as unknown as ExtensionAPI);
 
-  const grep = tools.find((tool) => tool.name === "search");
+  const grep = tools.find((tool) => tool.name === "graph_search");
   assert.ok(grep);
   const ctx = {
     cwd: homedir(),
@@ -105,7 +105,7 @@ test("FFF destroys an initializing finder when the session shuts down", async ()
     scanTimeoutMs: 60_000,
   });
 
-  const grep = tools.find((tool) => tool.name === "search");
+  const grep = tools.find((tool) => tool.name === "graph_search");
   assert.ok(grep);
   const root = join(tmpdir(), "pi-fff-pending");
   const ctx = { cwd: root } as unknown as ExtensionContext;
@@ -167,7 +167,7 @@ test("FFF loads its native index and searches a selected workspace subdirectory"
       ui: { notify() {} },
       sessionManager: { getEntries: () => [] },
     } as unknown as ExtensionContext;
-    const grep = tools.find((tool) => tool.name === "search");
+    const grep = tools.find((tool) => tool.name === "graph_search");
     assert.ok(grep);
     const result = await grep.execute(
       "fff-smoke",
@@ -178,7 +178,7 @@ test("FFF loads its native index and searches a selected workspace subdirectory"
     );
     assert.match(result.content[0]?.text ?? "", /needle\.ts/);
 
-    const find = tools.find((tool) => tool.name === "fffind");
+    const find = tools.find((tool) => tool.name === "graph_fffind");
     assert.ok(find);
     const found = await find.execute(
       "fff-find-smoke",
@@ -194,7 +194,7 @@ test("FFF loads its native index and searches a selected workspace subdirectory"
   }
 });
 
-test("FFF search and fffind report results omitted by the requested limit", async () => {
+test("FFF graph_search and graph_fffind report results omitted by the requested limit", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-fff-limits-"));
   const tools: ToolDefinition[] = [];
   let shutdown: (() => void) | undefined;
@@ -209,7 +209,7 @@ test("FFF search and fffind report results omitted by the requested limit", asyn
       },
     } as unknown as ExtensionAPI);
     const ctx = { cwd: root } as unknown as ExtensionContext;
-    const search = tools.find((tool) => tool.name === "search")!;
+    const search = tools.find((tool) => tool.name === "graph_search")!;
     for (const output of ["lines", "files", "count"]) {
       const result = await search.execute("fff-limit", {
         pattern: "NEEDLE", path: "src", output, limit: 1,
@@ -218,7 +218,7 @@ test("FFF search and fffind report results omitted by the requested limit", asyn
       assert.equal(result.details?.truncated, true);
       assert.equal(result.details?.exhausted, true, "the native scan itself completed");
     }
-    const find = tools.find((tool) => tool.name === "fffind")!;
+    const find = tools.find((tool) => tool.name === "graph_fffind")!;
     const found = await find.execute("fff-find-limit", {
       pattern: "needle", path: "src", limit: 1,
     }, undefined, undefined, ctx);
@@ -230,8 +230,8 @@ test("FFF search and fffind report results omitted by the requested limit", asyn
   }
 });
 
-test("FFF search and fffind cancellation does not wait for a shared index scan", async () => {
-  for (const name of ["search", "fffind"]) {
+test("FFF graph_search and graph_fffind cancellation does not wait for a shared index scan", async () => {
+  for (const name of ["graph_search", "graph_fffind"]) {
     const { tools, register } = fakeRegister();
     let finishScan!: (result: { ok: true; value: boolean }) => void;
     let queried = false;
@@ -248,7 +248,7 @@ test("FFF search and fffind cancellation does not wait for a shared index scan",
     const controller = new AbortController();
     const root = join(tmpdir(), `pi-fff-cancel-${name}`);
     // search uses the broker handle directly: it must also honor cancellation.
-    const pending = name === "search"
+    const pending = name === "graph_search"
       ? handle.search({ pattern: "needle", path: "src" }, root, controller.signal)
       : tools.find((tool) => tool.name === name)!.execute("fff-cancel", {
           pattern: "needle", path: "src",
@@ -272,7 +272,7 @@ test("FFF search and fffind cancellation does not wait for a shared index scan",
   }
 });
 
-test("fffind discloses an incomplete scoped drain instead of definitive empty results", async () => {
+test("graph_fffind discloses an incomplete scoped drain instead of definitive empty results", async () => {
   const { tools, register } = fakeRegister();
   let pages = 0;
   const finder = {
@@ -293,7 +293,7 @@ test("fffind discloses an incomplete scoped drain instead of definitive empty re
     },
   };
   registerFff(register, { createFinder: () => ({ ok: true, value: finder }) as never });
-  const result = await tools.find((tool) => tool.name === "fffind")!.execute("fff-drain", {
+  const result = await tools.find((tool) => tool.name === "graph_fffind")!.execute("fff-drain", {
     pattern: "needle", path: "src", limit: 1,
   }, undefined, undefined, { cwd: join(tmpdir(), "pi-fff-scoped-drain") } as unknown as ExtensionContext);
   assert.equal(pages, 200, "the drain remains bounded");
@@ -334,7 +334,7 @@ test("FFF destroys finders whose scan promise rejects and permits same-root retr
     },
     runRg: async () => ({ text: "No matches found", limitReached: false }),
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-rejected-scan") } as unknown as ExtensionContext;
 
@@ -366,7 +366,7 @@ test("FFF retries after createFinder throws synchronously without caching the re
       return { text: `fallback ${fallbackCount}`, limitReached: false };
     },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-sync-create-failure") } as unknown as ExtensionContext;
 
@@ -405,7 +405,7 @@ test("FFF bounds the failed-root cache and retries the oldest root after 33 fail
     },
     runRg: async () => ({ text: "No matches found", limitReached: false }),
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const roots = Array.from({ length: 33 }, (_, index) => join(tmpdir(), `pi-fff-failed-root-${index}`));
 
@@ -441,7 +441,7 @@ test("search falls back to ripgrep when the index cannot initialize", async () =
       return { text: "src/a.ts:3: hit", limitReached: false };
     },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-rg-fallback") } as unknown as ExtensionContext;
   const result = await search.execute(
@@ -471,7 +471,7 @@ test("root-wide plain search uses bounded rg without waiting for an index", asyn
       return { text: "src/a.ts:1: hit", limitReached: false, timedOut: true };
     },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-root-rg") } as unknown as ExtensionContext;
   const result = await search.execute("search-root", { pattern: "hit" }, new AbortController().signal, undefined, ctx);
@@ -499,7 +499,7 @@ test("root-wide search retains the index when rg is unavailable", async () => {
     },
     runRg: async () => { throw new Error("ripgrep (rg) is not available on PATH; install ripgrep or restore the FFF index"); },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-root-index-fallback") } as unknown as ExtensionContext;
   const result = await search.execute("search-root", { pattern: "hit" }, new AbortController().signal, undefined, ctx);
@@ -518,7 +518,7 @@ test("root-wide regex preserves invalid-regex literal fallback", async () => {
       return { text: "src/a.ts:1: foo(", limitReached: false };
     },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-root-regex") } as unknown as ExtensionContext;
   const result = await search.execute("search-root-regex", { pattern: "foo(", mode: "regex" }, new AbortController().signal, undefined, ctx);
@@ -536,7 +536,7 @@ test("search mode=fuzzy reports an explicit error when the index is unavailable"
       return { text: "", limitReached: false };
     },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-fuzzy") } as unknown as ExtensionContext;
   await assert.rejects(
@@ -581,7 +581,7 @@ test("search aggregates files/count output and filters by path prefix", async ()
     },
   };
   registerFff(register, { createFinder: () => ({ ok: true, value: finder }) as never });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-aggregate") } as unknown as ExtensionContext;
 
@@ -748,7 +748,7 @@ test("search routes forced-insensitive uppercase patterns to ripgrep", async () 
       return { text: "src/a.ts:1: HIT", limitReached: false };
     },
   });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-insensitive") } as unknown as ExtensionContext;
   const result = await search.execute(
@@ -793,7 +793,7 @@ test("search surfaces the index's regex-to-literal fallback as a note", async ()
     },
   };
   registerFff(register, { createFinder: () => ({ ok: true, value: finder }) as never });
-  const search = tools.find((tool) => tool.name === "search");
+  const search = tools.find((tool) => tool.name === "graph_search");
   assert.ok(search);
   const ctx = { cwd: join(tmpdir(), "pi-fff-regex-fallback") } as unknown as ExtensionContext;
   const result = await search.execute(

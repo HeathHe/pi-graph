@@ -117,8 +117,8 @@ test("permission modes each enforce their own behavior", () => {
   assert.equal(evaluatePermission(read, "dontAsk", empty).behavior, "allow");
   assert.equal(evaluatePermission({ toolName: "ls", input: { path: "." } }, "dontAsk", empty).behavior, "allow");
   assert.equal(evaluatePermission({ toolName: "find", input: { pattern: "*.ts" } }, "dontAsk", empty).behavior, "allow");
-  assert.equal(evaluatePermission({ toolName: "search", input: { pattern: "Todo" } }, "dontAsk", empty).behavior, "allow");
-  assert.equal(evaluatePermission({ toolName: "fffind", input: { pattern: "todo" } }, "dontAsk", empty).behavior, "allow");
+  assert.equal(evaluatePermission({ toolName: "graph_search", input: { pattern: "Todo" } }, "dontAsk", empty).behavior, "allow");
+  assert.equal(evaluatePermission({ toolName: "graph_fffind", input: { pattern: "todo" } }, "dontAsk", empty).behavior, "allow");
   assert.equal(evaluatePermission({ toolName: "session_history", input: { action: "search", scope: "workspace_sessions", query: "todo" } }, "dontAsk", empty).behavior, "allow");
   assert.equal(evaluatePermission({ toolName: "teammate", input: { agent: "explorer" } }, "dontAsk", empty).behavior, "allow");
   assert.equal(

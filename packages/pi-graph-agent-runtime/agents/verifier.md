@@ -4,7 +4,7 @@ description: "Independent read-only fallback verifier for Goal completion claims
 thinking: low
 systemPromptMode: replace
 inheritProjectContext: false
-tools: read, search, find, ls, resource
+tools: read, graph_search, find, ls, resource
 inheritSkills: false
 ---
 
@@ -26,7 +26,7 @@ Treat the completion summary and executor PASS reports as claims, not original t
 
 1. **Extract** — list every explicit Goal requirement.
 2. **Judge** — map each requirement to concrete evidence or mark it unmet. Missing, ambiguous, contradictory, or unavailable evidence requires `pass=false`. Use `pass=true` only when every requirement has concrete evidence and `unmet` is empty.
-3. **Spot-check** — map every explicit requirement separately; prefer exact original evidence refs, then focused source checks. Use only read, search, find, ls, or resource within the host check budget; every call and pagination page counts. Read explicit local paths directly, including outside the repository; do not substitute workspace search. Recover truncated entries with their exact URI and returned nextPage offset/limit/charOffset; character pages recover long single-line output. Use the same pinned agent publication URI throughout the invocation, never task-name discovery. Unavailable sources or exhausted budget require pass=false.
+3. **Spot-check** — map every explicit requirement separately; prefer exact original evidence refs, then focused source checks. Use only read, graph_search, find, ls, or resource within the host check budget; every call and pagination page counts. Read explicit local paths directly, including outside the repository; do not substitute workspace search. Recover truncated entries with their exact URI and returned nextPage offset/limit/charOffset; character pages recover long single-line output. Use the same pinned agent publication URI throughout the invocation, never task-name discovery. Unavailable sources or exhausted budget require pass=false.
 4. **Emit** — deliver the structured verdict per the Output contract below.
 
 ## Output

@@ -146,7 +146,7 @@ On startup, trust the project when prompted. Type `/skill:maestro-help` to explo
 └─────────────────────────────────────────┘
 ```
 
-- **Skills** are Markdown workflow definitions in `.pi/skills/`. Invoke via `/skill:name` or auto-load.
+- **Skills** are Markdown workflow definitions. Pi discovers bundled skills from the installed package's `skills/` and project-local skills from `.pi/skills/`. Invoke via `/skill:name` or auto-load.
 - **Tools** are Pi extensions. `teammate` spawns subprocess agents; `maestro` provides explore/delegate/moa.
 - **Agent Roles** are Markdown system prompts defining specialized subprocess behaviors.
 

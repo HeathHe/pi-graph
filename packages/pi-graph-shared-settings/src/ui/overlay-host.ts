@@ -83,6 +83,11 @@ export interface HostComponent {
 	dispose?(): void;
 }
 
+/** The TUI can invalidate any mounted component, even when it does not cache. */
+interface MountedOverlayComponent extends HostComponent {
+	invalidate(): void;
+}
+
 /** Structural subset of ctx.ui used by the host. */
 export interface OverlayUI {
 	custom<T>(
@@ -91,7 +96,7 @@ export interface OverlayUI {
 			theme: OverlayTheme,
 			keybindings: OverlayKeybindings,
 			done: (result: T) => void,
-		) => HostComponent | Promise<HostComponent>,
+		) => MountedOverlayComponent | Promise<MountedOverlayComponent>,
 		options?: {
 			overlay?: boolean;
 			overlayOptions?: Record<string, unknown> | (() => Record<string, unknown>);
@@ -176,7 +181,7 @@ export async function openOverlay<T = unknown>(
 	const result = await ctx.ui.custom<T | undefined>(
 		(tui, theme, keybindings, done) => {
 			const keys = createOverlayKeys(deps.matchesKey, keybindings);
-			const component: HostComponent = {
+			const component: MountedOverlayComponent = {
 				focused: true,
 				render(width: number) {
 					const inner = controller.render(Math.max(0, width - 2), Math.max(0, h - 2), theme);
@@ -269,9 +274,34 @@ export async function openOverlayLegacy<T = unknown>(
 	const overlayOptions =
 		options.overlayOptions ??
 		(options.preset ? { ...PRESETS[options.preset], anchor: "center" } : undefined);
-	return ctx.ui.custom<T>(factory, {
+	return ctx.ui.custom<T>((...args) => {
+		const component = factory(...args);
+		return "then" in component ? component.then(mountLegacyComponent) : mountLegacyComponent(component);
+	}, {
 		overlay: true,
-		overlayOptions: overlayOptions as Record<string, unknown>,
+		overlayOptions,
 		onHandle: options.onHandle,
 	});
+}
+
+function hasInvalidation(component: HostComponent): component is MountedOverlayComponent {
+	return typeof component.invalidate === "function";
+}
+
+function mountLegacyComponent(component: HostComponent): MountedOverlayComponent {
+	if (hasInvalidation(component)) return component;
+	// Keep legacy methods bound to their original instance, and do not mutate it.
+	const mounted: MountedOverlayComponent = {
+		render: component.render.bind(component),
+		handleInput: component.handleInput?.bind(component),
+		dispose: component.dispose?.bind(component),
+		invalidate() {},
+	};
+	if ("focused" in component) {
+		Object.defineProperty(mounted, "focused", {
+			get: () => component.focused,
+			set: (value: boolean) => { component.focused = value; },
+		});
+	}
+	return mounted;
 }
